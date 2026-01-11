@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Keys and secrets
+.env
+
+# Data files
+data/
+
+# Project-local CLIProxyAPI (keep config/state local)
+.cli-proxy-api/**
+!.cli-proxy-api/.gitignore
+!.cli-proxy-api/README.md
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/*.DS_Store

@@ -1,0 +1,14 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Stage5FinalReview",
+    "type": "object",
+    "required": ["vote", "required_changes", "optional_changes", "quality_score_1to10"],
+    "properties": {
+      "vote": { "type": "string", "enum": ["APPROVE", "REVISE"] },
+      "required_changes": { "type": "array", "items": { "type": "string" } },
+      "optional_changes": { "type": "array", "items": { "type": "string" } },
+      "quality_score_1to10": { "type": "integer", "minimum": 1, "maximum": 10 }
+    },
+    "additionalProperties": false
+  }
+  

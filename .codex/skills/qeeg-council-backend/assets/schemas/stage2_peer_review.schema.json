@@ -1,0 +1,30 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Stage2PeerReview",
+    "type": "object",
+    "required": ["reviews", "overall_ranking"],
+    "properties": {
+      "reviews": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "required": ["strengths", "issues", "missing", "suggestions"],
+          "properties": {
+            "strengths": { "type": "array", "items": { "type": "string" } },
+            "issues": { "type": "array", "items": { "type": "string" } },
+            "missing": { "type": "array", "items": { "type": "string" } },
+            "suggestions": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        }
+      },
+      "overall_ranking": {
+        "type": "array",
+        "items": { "type": "string" },
+        "minItems": 1
+      },
+      "notes": { "type": "string" }
+    },
+    "additionalProperties": false
+  }
+  
