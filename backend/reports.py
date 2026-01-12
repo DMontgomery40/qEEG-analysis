@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import os
+import re
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -104,8 +105,12 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
 
 def extract_text_enhanced(pdf_path: Path) -> str:
     """
-    Enhanced text extraction: runs OCR on ALL pages (not just empty ones).
-    This captures tables and text rendered as images that pypdf misses.
+    Enhanced text extraction: runs OCR on ALL pages (not just empty ones) and
+    combines pypdf text + OCR text to avoid losing tables/figures that are
+    embedded as images.
+
+    "No compromise on data availability" means we prefer redundancy over
+    heuristic selection when both sources have content.
     """
     reader = PdfReader(str(pdf_path))
     page_count = len(reader.pages)
@@ -123,14 +128,31 @@ def extract_text_enhanced(pdf_path: Path) -> str:
             if image_bytes:
                 ocr_text = _ocr_image_bytes(image_bytes)
 
-        # Combine: use OCR if it's significantly longer (captured tables/images)
-        # or if pypdf extraction failed
-        if not pypdf_text.strip():
-            final_text = ocr_text
-        elif len(ocr_text) > len(pypdf_text) * 1.2:  # OCR captured 20%+ more content
-            final_text = ocr_text
+        p = (pypdf_text or "").strip()
+        o = (ocr_text or "").strip()
+
+        def norm(s: str) -> str:
+            return re.sub(r"\s+", " ", s).strip().lower()
+
+        if not p and not o:
+            final_text = ""
+        elif not o:
+            final_text = p
+        elif not p:
+            final_text = o
         else:
-            final_text = pypdf_text
+            # If effectively identical, keep the longer/cleaner looking version.
+            np = norm(p)
+            no = norm(o)
+            if np == no:
+                final_text = p if len(p) >= len(o) else o
+            elif np in no:
+                final_text = o
+            elif no in np:
+                final_text = p
+            else:
+                # Keep both sources so tables/figures are not dropped.
+                final_text = f"--- PYPDF TEXT ---\n{p}\n\n--- OCR TEXT ---\n{o}"
 
         header = f"=== PAGE {idx} / {page_count} ==="
         body = final_text.strip() or "[NO TEXT EXTRACTED]"
