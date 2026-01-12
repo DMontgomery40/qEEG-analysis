@@ -86,6 +86,72 @@ COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
 
 DEFAULT_CONSOLIDATOR = os.getenv("DEFAULT_CONSOLIDATOR", "")
 
+# Models that support vision/multimodal input (can process images)
+# These will receive page images in addition to text for Stage 1 analysis
+VISION_CAPABLE_MODELS: set[str] = {
+    # OpenAI vision models (GPT-4o, GPT-4-turbo, GPT-5+ all support vision)
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-vision-preview",
+    "gpt-4-turbo",
+    "gpt-5",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5-codex",
+    "gpt-5.1-codex",
+    "gpt-5.2-codex",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "openai/gpt-4-vision-preview",
+    "openai/gpt-4-turbo",
+    # Anthropic Claude models (all Claude 3+ support vision)
+    "claude-3-opus",
+    "claude-3-sonnet",
+    "claude-3-haiku",
+    "claude-3.5-sonnet",
+    "claude-3-5-haiku",
+    "claude-3-7-sonnet",
+    "claude-sonnet-4",
+    "claude-opus-4",
+    "claude-sonnet-4-5",
+    "claude-opus-4-5",
+    "claude-haiku-4-5",
+    "anthropic/claude-3-opus",
+    "anthropic/claude-3-sonnet",
+    "anthropic/claude-3-haiku",
+    "anthropic/claude-3.5-sonnet",
+    "anthropic/claude-sonnet-4",
+    "anthropic/claude-opus-4",
+    # Google Gemini models (all Gemini 1.5+ support vision)
+    "gemini-pro-vision",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3-pro",
+    "gemini-3-flash",
+    "google/gemini-pro-vision",
+    "google/gemini-1.5-pro",
+    "google/gemini-1.5-flash",
+    "google/gemini-2.0-flash",
+}
+
+
+def is_vision_capable(model_id: str) -> bool:
+    """Check if a model supports vision/multimodal input."""
+    # Check exact match
+    if model_id in VISION_CAPABLE_MODELS:
+        return True
+    # Check if any vision model ID is a substring (handles variations)
+    model_lower = model_id.lower()
+    for vision_model in VISION_CAPABLE_MODELS:
+        if vision_model.lower() in model_lower:
+            return True
+    return False
+
+
 DISCOVERED_MODEL_IDS: set[str] = set()
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -30,7 +31,7 @@ from .council import QEEGCouncilWorkflow
 from .cliproxy_status import status_payload
 from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient, UpstreamError
-from .reports import extract_text_from_pdf, save_report_upload
+from .reports import extract_pdf_with_images, extract_text_from_pdf, save_report_upload
 
 
 app = FastAPI(title="qEEG Council API")
@@ -250,6 +251,32 @@ def _run_detached_brew_install(log_path: Path, *, tap_router_for_me: bool) -> in
     return int(proc.pid)
 
 
+def _get_mock_llm_client() -> AsyncOpenAICompatClient | None:
+    """
+    Create a mock LLM client for testing if QEEG_MOCK_LLM env var is set.
+    Returns None if not in mock mode.
+    """
+    if not os.getenv("QEEG_MOCK_LLM"):
+        return None
+
+    try:
+        from backend.tests.fixtures.mock_llm import create_mock_transport, MOCK_MODEL_IDS
+    except ImportError:
+        # Tests not available (e.g., production deployment)
+        return None
+
+    transport = create_mock_transport()
+    client = AsyncOpenAICompatClient(
+        base_url="http://mock-cliproxy",
+        api_key="",
+        timeout_s=120.0,
+        transport=transport,
+    )
+    # Pre-set discovered models for mock mode
+    set_discovered_model_ids(MOCK_MODEL_IDS)
+    return client
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     ensure_data_dirs()
@@ -257,18 +284,27 @@ async def _startup() -> None:
     _ensure_project_clipr_config()
     _sync_home_auth_to_project()
 
-    app.state.llm = AsyncOpenAICompatClient(
-        base_url=CLIPROXY_BASE_URL, api_key=CLIPROXY_API_KEY, timeout_s=120.0
-    )
+    # Check for mock mode (for testing)
+    mock_client = _get_mock_llm_client()
+    if mock_client is not None:
+        app.state.llm = mock_client
+        app.state.mock_mode = True
+    else:
+        app.state.llm = AsyncOpenAICompatClient(
+            base_url=CLIPROXY_BASE_URL, api_key=CLIPROXY_API_KEY, timeout_s=120.0
+        )
+        app.state.mock_mode = False
+
     app.state.workflow = QEEGCouncilWorkflow(llm=app.state.llm)
     app.state.broker = _EventBroker()
     app.state.cliproxy_pid = None
 
-    try:
-        discovered = await app.state.llm.list_models()
-    except Exception:
-        discovered = []
-    set_discovered_model_ids(discovered)
+    if not app.state.mock_mode:
+        try:
+            discovered = await app.state.llm.list_models()
+        except Exception:
+            discovered = []
+        set_discovered_model_ids(discovered)
 
 
 @app.on_event("shutdown")
@@ -281,6 +317,21 @@ async def _shutdown() -> None:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     llm: AsyncOpenAICompatClient = app.state.llm
+    mock_mode: bool = getattr(app.state, "mock_mode", False)
+
+    # In mock mode, always return healthy
+    if mock_mode:
+        from backend.tests.fixtures.mock_llm import MOCK_MODEL_IDS
+        return {
+            **status_payload(
+                base_url="http://mock-cliproxy",
+                reachable=True,
+                discovered_model_count=len(MOCK_MODEL_IDS),
+                error=None,
+            ),
+            "mock_mode": True,
+        }
+
     try:
         discovered = await llm.list_models()
         set_discovered_model_ids(discovered)
@@ -464,6 +515,7 @@ async def upload_report(patient_id: str, file: UploadFile = File(...)) -> dict[s
     with storage.session_scope() as session:
         report = storage.create_report(
             session,
+            report_id=report_id,  # Use the same ID used for file storage
             patient_id=patient_id,
             filename=file.filename or "upload",
             mime_type=mime_type,
@@ -507,9 +559,53 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
     if original_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Re-extract only supported for PDFs")
 
+    # Always regenerate extracted.txt (used as the "source of truth" for later stages).
     text = extract_text_from_pdf(original_path)
     extracted_path.write_text(text, encoding="utf-8")
-    return {"ok": True, "chars": len(text)}
+
+    # Best-effort: also regenerate enhanced OCR text + page images for multimodal Stage 1.
+    # IMPORTANT: write into the same folder as extracted_path (some older reports used a
+    # different folder id than report_id).
+    report_dir = extracted_path.parent
+    enhanced_chars: int | None = None
+    page_images_written = 0
+    try:
+        enhanced_text, page_images = extract_pdf_with_images(original_path)
+        enhanced_path = report_dir / "extracted_enhanced.txt"
+        enhanced_path.write_text(enhanced_text, encoding="utf-8")
+        enhanced_chars = len(enhanced_text)
+
+        pages_dir = report_dir / "pages"
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        for img in page_images:
+            if not isinstance(img, dict):
+                continue
+            page_num = img.get("page")
+            b64_png = img.get("base64_png")
+            if not isinstance(page_num, int) or not isinstance(b64_png, str):
+                continue
+            try:
+                img_bytes = base64.b64decode(b64_png)
+                (pages_dir / f"page-{page_num}.png").write_bytes(img_bytes)
+                page_images_written += 1
+            except Exception:
+                continue
+
+        metadata = {
+            "page_count": len(page_images),
+            "has_enhanced_ocr": True,
+            "has_page_images": page_images_written > 0,
+        }
+        (report_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "chars": len(text),
+        "enhanced_chars": enhanced_chars,
+        "page_images_written": page_images_written,
+    }
 
 
 @app.get("/api/patients/{patient_id}/runs")

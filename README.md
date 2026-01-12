@@ -1,59 +1,52 @@
 # qEEG Council
 
-Local 6-stage deliberation workflow for analyzing qEEG reports with multiple LLMs, using **CLIProxyAPI** as the only upstream.
+6-stage LLM deliberation workflow for analyzing qEEG/ERP reports. Uses CLIProxyAPI as the upstream router to OpenAI, Anthropic, and Google models.
 
 ## Architecture
 
-- Frontend: React + Vite (`http://localhost:5173`)
-- Backend: FastAPI (`http://localhost:8000`)
-- LLM upstream: CLIProxyAPI (`http://127.0.0.1:8317`)
+```
+Frontend (React/Vite)  →  Backend (FastAPI)  →  CLIProxyAPI  →  LLM providers
+     :5173                    :8000                :8317
+```
 
-## Prereqs
+### Data Flow
 
-- Python 3.11+ and `uv`
+1. Upload PDF → extract text + OCR + page images
+2. Run 6-stage council workflow with selected models
+3. Export consolidated report as Markdown/PDF
+
+### Storage
+
+- `data/app.db` - SQLite metadata (patients, reports, runs, artifacts)
+- `data/reports/{patient_id}/{report_id}/` - uploaded files, extracted text, page images
+- `data/artifacts/{run_id}/stage-{n}/` - stage outputs per model
+- `data/exports/{run_id}/` - final exported reports
+
+## 6-Stage Workflow
+
+| Stage | Output | Description |
+|-------|--------|-------------|
+| 1 | Markdown | Initial analysis (per model, multimodal for vision models) |
+| 2 | JSON | Peer review (anonymized cross-evaluation) |
+| 3 | Markdown | Revision (incorporate peer feedback) |
+| 4 | Markdown | Consolidation (single model synthesizes all revisions) |
+| 5 | JSON | Final review (vote APPROVE/REVISE with required changes) |
+| 6 | Markdown | Final draft (apply changes, publication-ready) |
+
+Vision-capable models (GPT-4o+, Claude 3+, Gemini 1.5+) receive PDF page images in Stage 1.
+
+## Requirements
+
+- Python 3.11+
 - Node.js 18+
-- CLIProxyAPI installed and logged in
-
-## CLIProxyAPI
-
-Start CLIProxyAPI (example):
-
-```bash
-cliproxyapi -config /opt/homebrew/etc/cliproxyapi.conf
-```
-
-Optional env vars:
-
-```bash
-export CLIPROXY_BASE_URL="http://127.0.0.1:8317"
-export CLIPROXY_API_KEY=""
-```
-
-Check discovered models:
-
-```bash
-uv run python backend/scripts/cliproxy_models.py
-```
-
-Project-local CLIProxyAPI config (recommended):
-
-- `./start.sh` will create `./.cli-proxy-api/cliproxyapi.conf` automatically.
-- It disables client API-key auth (single-user localhost) and stores OAuth tokens under `./.cli-proxy-api/auth`.
+- CLIProxyAPI running on port 8317
+- Tesseract (optional, for OCR)
 
 ## Install
 
-Backend:
-
 ```bash
-uv sync
-```
-
-Frontend:
-
-```bash
-cd frontend
-npm install
-cd ..
+uv sync                    # backend
+cd frontend && npm install # frontend
 ```
 
 ## Run
@@ -62,19 +55,22 @@ cd ..
 ./start.sh
 ```
 
-- Frontend: `http://localhost:5173`
-- Backend health: `http://localhost:8000/api/health`
+Opens:
+- Frontend: http://localhost:5173
+- Backend: http://localhost:8000/api/health
 
-## Workflow (6 stages)
+## API Endpoints
 
-1. Initial analysis (per model, Markdown)
-2. Peer review (per model, anonymized, JSON)
-3. Revision (per model, Markdown)
-4. Consolidation (single consolidator, Markdown)
-5. Final review (per model vote, JSON)
-6. Final drafts (per model, Markdown)
-
-The UI lets you select either the consolidated report (Stage 4) or a final draft (Stage 6), then export to `final.md` and `final.pdf`.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/health | CLIProxyAPI status |
+| GET | /api/models | Available models |
+| GET/POST | /api/patients | List/create patients |
+| POST | /api/patients/{id}/reports | Upload PDF |
+| POST | /api/runs | Create analysis run |
+| POST | /api/runs/{id}/start | Start 6-stage workflow |
+| GET | /api/runs/{id}/stream | SSE progress events |
+| POST | /api/runs/{id}/export | Generate final.md + final.pdf |
 
 ## Tests
 
@@ -82,7 +78,12 @@ The UI lets you select either the consolidated report (Stage 4) or a final draft
 uv run pytest -q
 ```
 
-## Notes
+## Environment
 
-- Metadata is stored in `data/app.db` (SQLite).
-- Large text, uploads, artifacts, and exports are stored under `data/`.
+Optional `.env` variables:
+
+```
+CLIPROXY_BASE_URL=http://127.0.0.1:8317
+CLIPROXY_API_KEY=
+DEFAULT_CONSOLIDATOR=claude-opus-4-5-20251101
+```

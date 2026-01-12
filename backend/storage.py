@@ -175,6 +175,7 @@ def list_reports(session: Session, patient_id: str) -> list[Report]:
 def create_report(
     session: Session,
     *,
+    report_id: str | None = None,
     patient_id: str,
     filename: str,
     mime_type: str,
@@ -182,6 +183,7 @@ def create_report(
     extracted_text_path: Path,
 ) -> Report:
     report = Report(
+        id=report_id if report_id else _new_id(),
         patient_id=patient_id,
         filename=filename,
         mime_type=mime_type,

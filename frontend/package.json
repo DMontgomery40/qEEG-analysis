@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "playwright test",
+    "test:mocked": "playwright test --config=playwright.config.js",
+    "test:fullstack": "playwright test --config=playwright-fullstack.config.js"
   },
   "dependencies": {
     "react": "^19.2.0",
@@ -16,6 +19,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@playwright/test": "^1.52.0",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",

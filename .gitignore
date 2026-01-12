@@ -24,3 +24,9 @@ data/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/*.DS_Store
+
+# Playwright tests
+.playwright/
+.playwright/node_modules/
+.playwright/results/
+.playwright/report/

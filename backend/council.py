@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .config import ARTIFACTS_DIR
+from .config import ARTIFACTS_DIR, is_vision_capable
 from .llm_client import AsyncOpenAICompatClient, UpstreamError
-from .reports import extract_text_from_pdf
+from .reports import extract_pdf_with_images, extract_text_from_pdf, get_page_images_base64, get_enhanced_text
 from .storage import (
     Artifact,
     Report,
@@ -183,6 +184,58 @@ class QEEGCouncilWorkflow:
                     continue
                 raise
 
+    async def _call_model_multimodal(
+        self,
+        *,
+        model_id: str,
+        prompt_text: str,
+        images_base64: list[str],
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        """Call a vision-capable model with text and images."""
+        # Build multimodal content array
+        content: list[dict] = [{"type": "text", "text": prompt_text}]
+
+        # Add images (limit to first 10 pages to avoid token limits)
+        for i, img_base64 in enumerate(images_base64[:10]):
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{img_base64}",
+                    "detail": "high"  # Use high detail for clinical data
+                }
+            })
+
+        messages = [{"role": "user", "content": content}]
+
+        attempts = 0
+        while True:
+            try:
+                return await self._llm.chat_completions(
+                    model_id=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=False,
+                )
+            except UpstreamError as e:
+                if e.status_code == 401:
+                    raise _NeedsAuth(str(e)) from e
+                if e.status_code in {429, 502, 503} and attempts < 4:
+                    await _sleep_backoff(attempts)
+                    attempts += 1
+                    continue
+                # If multimodal fails, fall back to text-only
+                if attempts == 0:
+                    return await self._call_model_chat(
+                        model_id=model_id,
+                        prompt_text=prompt_text,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                raise
+
     async def _write_artifact(
         self,
         *,
@@ -220,6 +273,30 @@ class QEEGCouncilWorkflow:
         report_text_path = Path(report.extracted_text_path)
         report_text = report_text_path.read_text(encoding="utf-8", errors="replace")
 
+        # Derive the on-disk report folder from the stored/extracted paths.
+        # Important: some older uploads used a different folder id than report.id, so don't assume
+        # REPORTS_DIR/<patient_id>/<report.id>/... exists.
+        report_dir = report_text_path.parent
+        if not report_dir.exists():
+            try:
+                report_dir = Path(report.stored_path).parent
+            except Exception:
+                report_dir = report_text_path.parent
+
+        # Prefer enhanced OCR text if available (captures tables/images better).
+        # First try the file adjacent to extracted.txt, then fall back to legacy lookup.
+        enhanced_text: str | None = None
+        enhanced_path = report_dir / "extracted_enhanced.txt"
+        if enhanced_path.exists():
+            enhanced_text = enhanced_path.read_text(encoding="utf-8", errors="replace")
+        else:
+            try:
+                enhanced_text = get_enhanced_text(report.patient_id, report.id)
+            except Exception:
+                enhanced_text = None
+        if enhanced_text and len(enhanced_text) > len(report_text):
+            report_text = enhanced_text
+
         # Auto-upgrade older extractions (and OCR image-only pages when possible).
         # If the extracted text lacks per-page markers, regenerate from the original PDF/text.
         if "=== PAGE 1 /" not in report_text and Path(report.stored_path).suffix.lower() == ".pdf":
@@ -230,15 +307,56 @@ class QEEGCouncilWorkflow:
                     report_text = regenerated
             except Exception:
                 pass
+
+        # Get page images for multimodal models.
+        # Prefer images stored under the report folder; fall back to legacy lookup; finally, generate on the fly.
+        page_images_base64: list[str] = []
+        pages_dir = report_dir / "pages"
+        if pages_dir.exists():
+            page_files = sorted(
+                pages_dir.glob("page-*.png"),
+                key=lambda p: int(p.stem.split("-")[1]) if "-" in p.stem else 0,
+            )
+            for p in page_files:
+                try:
+                    page_images_base64.append(base64.b64encode(p.read_bytes()).decode("utf-8"))
+                except Exception:
+                    continue
+        if not page_images_base64:
+            try:
+                page_images_base64 = get_page_images_base64(report.patient_id, report.id)
+            except Exception:
+                page_images_base64 = []
+        if not page_images_base64 and any(is_vision_capable(m) for m in council_model_ids):
+            try:
+                _enh_text, page_images = extract_pdf_with_images(Path(report.stored_path))
+                page_images_base64 = [
+                    img.get("base64_png")
+                    for img in page_images
+                    if isinstance(img, dict) and isinstance(img.get("base64_png"), str)
+                ]
+            except Exception:
+                page_images_base64 = []
+
         prompt_text = f"{prompt}\n\n---\n\nqEEG Report Text:\n\n{report_text}\n"
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
 
         async def one(model_id: str) -> tuple[str, str] | None:
             try:
-                text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=2200
-                )
+                # Use multimodal messages for vision-capable models
+                if is_vision_capable(model_id) and page_images_base64:
+                    text = await self._call_model_multimodal(
+                        model_id=model_id,
+                        prompt_text=prompt_text,
+                        images_base64=page_images_base64,
+                        temperature=0.2,
+                        max_tokens=8000,
+                    )
+                else:
+                    text = await self._call_model_chat(
+                        model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=8000
+                    )
                 return model_id, text
             except Exception:
                 return None
@@ -271,6 +389,13 @@ class QEEGCouncilWorkflow:
 
         with session_scope() as session:
             artifacts = _stage_artifacts(session, run_id, 1, kind="analysis")
+            run = get_run(session, run_id)
+            report = get_report(session, run.report_id) if run else None
+
+        # Get original report text for context propagation
+        report_text = ""
+        if report and report.extracted_text_path:
+            report_text = Path(report.extracted_text_path).read_text(encoding="utf-8", errors="replace")
 
         analyses_by_model: dict[str, str] = {}
         for a in artifacts:
@@ -314,16 +439,17 @@ class QEEGCouncilWorkflow:
             filtered_text = "\n\n".join(filtered)
             prompt_text = (
                 f"{prompt}\n\n---\n\n"
+                f"ORIGINAL qEEG REPORT (for verification - cross-reference all claims against this):\n\n{report_text}\n\n---\n\n"
                 f"Reviewer Model ID: {reviewer_model_id}\n"
                 f"Your own analysis label (do not review yourself): {reviewer_label}\n\n"
-                f"{filtered_text}\n"
+                f"ANALYSES TO REVIEW:\n\n{filtered_text}\n"
             )
             try:
                 text = await self._call_model_chat(
                     model_id=reviewer_model_id,
                     prompt_text=prompt_text,
                     temperature=0.1,
-                    max_tokens=1400,
+                    max_tokens=2000,
                 )
                 _json_loads_loose(text)  # sanity
                 return reviewer_model_id, _strip_to_json(text)
@@ -362,6 +488,12 @@ class QEEGCouncilWorkflow:
             s2 = _stage_artifacts(session, run_id, 2, kind="peer_review")
             run = get_run(session, run_id)
             label_map = json.loads(run.label_map_json or "{}") if run is not None else {}
+            report = get_report(session, run.report_id) if run else None
+
+        # Get original report text for context propagation
+        report_text = ""
+        if report and report.extracted_text_path:
+            report_text = Path(report.extracted_text_path).read_text(encoding="utf-8", errors="replace")
 
         analyses_by_model = {
             a.model_id: Path(a.content_path).read_text(encoding="utf-8", errors="replace") for a in s1
@@ -384,6 +516,7 @@ class QEEGCouncilWorkflow:
             pr_text = "\n\n".join([f"Peer review by {mid}:\n{txt}" for mid, txt in peer_reviews]).strip()
             prompt_text = (
                 f"{prompt}\n\n---\n\n"
+                f"ORIGINAL qEEG REPORT (for fact-checking your revision):\n\n{report_text}\n\n---\n\n"
                 f"Your Model ID: {model_id}\n"
                 f"Your analysis label (if present): {my_label}\n\n"
                 f"Your original analysis:\n\n{analysis}\n\n"
@@ -391,7 +524,7 @@ class QEEGCouncilWorkflow:
             )
             try:
                 text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=2200
+                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=6000
                 )
                 return model_id, text
             except Exception:
@@ -430,6 +563,12 @@ class QEEGCouncilWorkflow:
                 raise RuntimeError("Run not found")
             consolidator = run.consolidator_model_id
             revisions = _stage_artifacts(session, run_id, 3, kind="revision")
+            report = get_report(session, run.report_id) if run else None
+
+        # Get original report text for context propagation
+        report_text = ""
+        if report and report.extracted_text_path:
+            report_text = Path(report.extracted_text_path).read_text(encoding="utf-8", errors="replace")
 
         if not revisions:
             raise RuntimeError("Consolidation requires at least one revision artifact")
@@ -440,11 +579,15 @@ class QEEGCouncilWorkflow:
                 for a in revisions
             ]
         )
-        prompt_text = f"{prompt}\n\n---\n\n{revision_text}\n"
+        prompt_text = (
+            f"{prompt}\n\n---\n\n"
+            f"ORIGINAL qEEG REPORT (the source of truth - verify all claims against this):\n\n{report_text}\n\n---\n\n"
+            f"REVISED ANALYSES TO CONSOLIDATE:\n\n{revision_text}\n"
+        )
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
         text = await self._call_model_chat(
-            model_id=consolidator, prompt_text=prompt_text, temperature=0.2, max_tokens=2600
+            model_id=consolidator, prompt_text=prompt_text, temperature=0.2, max_tokens=8000
         )
         await self._write_artifact(run_id=run_id, stage=stage, model_id=consolidator, text=text)
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "complete"})
@@ -460,6 +603,14 @@ class QEEGCouncilWorkflow:
 
         with session_scope() as session:
             s4 = _stage_artifacts(session, run_id, 4, kind="consolidation")
+            run = get_run(session, run_id)
+            report = get_report(session, run.report_id) if run else None
+
+        # Get original report text for context propagation
+        report_text = ""
+        if report and report.extracted_text_path:
+            report_text = Path(report.extracted_text_path).read_text(encoding="utf-8", errors="replace")
+
         if not s4:
             raise RuntimeError("Stage 5 requires Stage 4 consolidation artifact")
 
@@ -468,10 +619,14 @@ class QEEGCouncilWorkflow:
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
 
         async def one(model_id: str) -> tuple[str, str] | None:
-            prompt_text = f"{prompt}\n\n---\n\nConsolidated Report:\n\n{consolidated}\n"
+            prompt_text = (
+                f"{prompt}\n\n---\n\n"
+                f"ORIGINAL qEEG REPORT (for verification):\n\n{report_text}\n\n---\n\n"
+                f"CONSOLIDATED REPORT TO REVIEW:\n\n{consolidated}\n"
+            )
             try:
                 text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.1, max_tokens=1200
+                    model_id=model_id, prompt_text=prompt_text, temperature=0.1, max_tokens=1500
                 )
                 payload = _json_loads_loose(text)
                 _validate_stage5(payload)
@@ -510,6 +665,14 @@ class QEEGCouncilWorkflow:
         with session_scope() as session:
             s4 = _stage_artifacts(session, run_id, 4, kind="consolidation")
             s5 = _stage_artifacts(session, run_id, 5, kind="final_review")
+            run = get_run(session, run_id)
+            report = get_report(session, run.report_id) if run else None
+
+        # Get original report text for context propagation
+        report_text = ""
+        if report and report.extracted_text_path:
+            report_text = Path(report.extracted_text_path).read_text(encoding="utf-8", errors="replace")
+
         if not s4:
             raise RuntimeError("Stage 6 requires Stage 4 consolidation artifact")
         consolidated = Path(s4[0].content_path).read_text(encoding="utf-8", errors="replace")
@@ -522,12 +685,13 @@ class QEEGCouncilWorkflow:
             changes = "\n".join([f"- {c}" for c in required_changes]) if required_changes else "(none)"
             prompt_text = (
                 f"{prompt}\n\n---\n\n"
+                f"ORIGINAL qEEG REPORT (for any needed verification):\n\n{report_text}\n\n---\n\n"
                 f"Required changes to apply:\n{changes}\n\n"
-                f"Consolidated Report:\n\n{consolidated}\n"
+                f"CONSOLIDATED REPORT:\n\n{consolidated}\n"
             )
             try:
                 text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=2600
+                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=8000
                 )
                 return model_id, text
             except Exception:

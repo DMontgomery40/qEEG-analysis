@@ -1,10 +1,15 @@
 # qEEG Council Workflow (6 stages)
 
 ## Stage 1: Initial analysis (parallel)
-Input: extracted qEEG text
+Input: extracted qEEG text (prefer enhanced OCR when available) + optional PDF page images for vision-capable models
 Output (per model): Markdown analysis
 Artifact kind: analysis
 File ext: .md
+
+Notes:
+- Stage 1 is the only stage that currently supports multimodal “page images” input.
+- Some PDFs exceed the per-call image budget; if “all data must be available,” implement multi-pass Stage 1 (e.g., pages 1–10 then 11–N).
+- If extraction is missing key tables, regenerate via `POST /api/reports/{report_id}/reextract` (writes `extracted.txt`, `extracted_enhanced.txt`, and `pages/page-*.png`).
 
 ## Stage 2: Peer review (parallel, anonymized)
 Input: other models' Stage 1 analyses labeled A/B/C

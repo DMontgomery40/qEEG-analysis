@@ -11,6 +11,7 @@ Primary mission
 Project reality
 - CLIProxyAPI is the only upstream. No direct provider SDK calls.
 - No browser automation.
+- “WAVi” (and similar strings) appear in report PDFs as vendor content; they are not code concepts.
 
 Key contracts
 - CLIProxyAPI base URL comes from env `CLIPROXY_BASE_URL` with default `http://127.0.0.1:8317`
@@ -25,6 +26,11 @@ Commands
 - Run tests: `uv run pytest -q`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
+
+Useful local scripts
+- CLIProxy reachability/models: `uv run python -m backend.cliproxy_status`
+- Model list (direct): `uv run python backend/scripts/cliproxy_models.py`
+- Backend smoke test: `uv run python backend/scripts/smoke_api.py`
 
 Implementation rules
 - Store metadata in SQLite and store large artifacts on disk.
@@ -47,26 +53,48 @@ API surface
   - configured council models
   - discovered upstream models
   - availability flags
+- CLIProxy helpers (local convenience):
+  - `POST /api/cliproxy/start`
+  - `POST /api/cliproxy/login`
+  - `POST /api/cliproxy/install`
 - Patient and report endpoints:
   - `GET/POST/PUT /api/patients`
   - `POST /api/patients/{id}/reports`
   - `GET /api/patients/{id}/reports`
+  - `GET /api/reports/{report_id}/extracted`
+  - `POST /api/reports/{report_id}/reextract`
 - Run endpoints:
   - `POST /api/runs`
   - `POST /api/runs/{run_id}/start`
   - `GET /api/runs/{run_id}`
+  - `GET /api/runs/{run_id}/artifacts`
   - `GET /api/runs/{run_id}/stream`
+  - `POST /api/runs/{run_id}/select`
   - `GET /api/patients/{id}/runs`
   - `POST /api/runs/{run_id}/export`
+  - `GET /api/runs/{run_id}/export/final.md`
+  - `GET /api/runs/{run_id}/export/final.pdf`
 
 Workflow requirements
 - Stage 1: markdown analysis per model
+  - Uses extracted text; for vision-capable models also attaches PDF page images (multimodal).
+  - Current implementation limits a single multimodal call to the first 10 pages; for PDFs >10 pages, implement multi-pass if “all data must be available”.
 - Stage 2: JSON peer reviews per reviewer, anonymized labels A/B/C per run
 - Stage 3: markdown revisions per model
 - Stage 4: markdown consolidation by consolidator
 - Stage 5: JSON final review votes per model
 - Stage 6: markdown final drafts per model
 - Selection happens in UI, backend persists selected artifact reference and exports
+
+Report storage layout (critical gotcha)
+- Report files live under: `data/reports/<patient_id>/<upload_id>/...`
+- The DB `report_id` is not guaranteed to equal `<upload_id>` (folder name).
+- Always locate report assets via `reports.stored_path` / `reports.extracted_text_path`, not by constructing paths from ids.
+- `POST /api/reports/{report_id}/reextract` regenerates:
+  - `extracted.txt`
+  - `extracted_enhanced.txt`
+  - `pages/page-*.png`
+  - `metadata.json`
 
 Reliability
 - Handle upstream errors with bounded retries:

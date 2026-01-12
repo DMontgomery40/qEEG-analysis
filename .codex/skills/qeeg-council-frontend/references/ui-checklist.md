@@ -12,6 +12,8 @@
 - upload (pdf or text)
 - extracted text preview
 - store returned report_id
+- view extracted (opens /api/reports/{report_id}/extracted)
+- re-extract (OCR) (POST /api/reports/{report_id}/reextract)
 
 ## Runs
 - run wizard:

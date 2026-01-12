@@ -22,10 +22,16 @@ metadata:
 - Discover model IDs from `GET /v1/models` at startup and expose them via `/api/models`.
 - Prefer `POST /v1/chat/completions`. Retry once with `POST /v1/responses` when a model rejects chat completions.
 - Store metadata in SQLite and large text artifacts on disk.
+- “WAVi” is vendor/report content (common in PDFs), not a code concept.
+
+## Modes
+- Real mode (default): backend calls CLIProxyAPI and uses real discovered model IDs.
+- Mock mode (tests only): set `QEEG_MOCK_LLM=1` before starting the backend. Mock mode is not valid for evaluating report quality.
 
 ## Quick start checks
-- Run: `python scripts/cliproxy_models.py`
-- Run: `python scripts/smoke_api.py`
+- CLIProxyAPI reachability + discovered models: `uv run python -m backend.cliproxy_status`
+- Backend smoke test (requires backend running): `uv run python backend/scripts/smoke_api.py`
+- CLIProxyAPI model list (direct): `uv run python backend/scripts/cliproxy_models.py`
 
 ## Canonical references
 - Workflow spec: [references/workflow.md](references/workflow.md)
@@ -49,11 +55,22 @@ metadata:
    - per-run anonymization map (A/B/C)
    - artifact writing per stage
    - stage completion events for SSE
+   - Stage 1 multimodal:
+     - uses extracted text plus page images for vision-capable models
+     - current implementation limits a single multimodal call to 10 pages; for PDFs >10 pages, implement multi-pass if “all data must be available”
 
 4. `backend/main.py`
    - health endpoint validates CLIProxyAPI reachability
    - model endpoint returns configured + discovered models
    - run endpoints support start + SSE stream + export
+   - report endpoints support extracted text viewing and re-extraction/OCR:
+     - `GET /api/reports/{report_id}/extracted`
+     - `POST /api/reports/{report_id}/reextract`
+
+## Report storage gotcha (don’t miss)
+- Report files live under `data/reports/<patient_id>/<upload_id>/...`
+- The DB `report_id` is not guaranteed to equal `<upload_id>` (folder name).
+- Always locate report assets via `stored_path` / `extracted_text_path`, not by constructing paths from ids.
 
 ## Validation utilities
 - Stage 2 JSON validation: `python scripts/validate_stage2_peer_review.py path/to/file.json`

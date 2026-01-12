@@ -1,71 +1,63 @@
 ---
 name: qeeg-council-frontend
-description: "Build and maintain the qEEG Council React frontend: patients, reports, runs, SSE progress, artifact viewers, selection, and exports."
-version: "1.0.0"
+description: Build and maintain the qEEG Council React frontend: patients, reports, run wizard, 6-stage progress UI, SSE streaming, artifact viewers, and exports.
 license: MIT
---- 
+compatibility: Designed for Claude Code and Codex CLI. Requires node + npm. Backend default http://127.0.0.1:8000 and frontend dev http://localhost:5173.
+metadata:
+  author: dmontgomery
+  version: "1.0"
+---
 
 # qEEG Council Frontend Skill
 
-## Purpose
-Build and maintain the UI for:
-- Patients (list, create, detail)
-- Reports (upload, extracted text preview)
-- Runs (new run wizard, 6-stage progress, artifact viewing)
-- Final selection and export (Markdown and PDF)
+## Use this Skill for
+- building React pages and components for patients, reports, runs
+- wiring SSE progress updates into the UI
+- rendering markdown and JSON artifacts per stage
+- presenting model availability and source badges
 
-## Required UI flows
-### Patients
-- Patient list with search and create
-- Patient detail page with:
-  - notes
-  - reports list
-  - run history list
-
-### Reports
-- Upload PDF or text
-- Show extracted text preview returned by backend
-- Store report_id and use it in run creation
-
-### Runs
-- New run wizard:
-  - choose report_id
-  - choose council models from `/api/models` discovered list
-  - choose consolidator
-  - create run and start it
-- Run page:
+## UI must-haves
+- Patient list with search
+- Patient detail showing reports and run history
+- New run wizard: choose report, choose council models from discovered list, choose consolidator
+- Run detail page:
   - 6-stage progress indicator
-  - Stage 1, 3, 6: per-model markdown tabs
-  - Stage 2 and 5: JSON viewer
-  - Stage 4: consolidated markdown panel
-  - Selection control that calls `POST /api/runs/{run_id}/select`
-  - Export buttons that call `POST /api/runs/{run_id}/export` then download final.md and final.pdf
+  - per-stage artifact views
+  - per-model tabs for Stage 1, 3, 6
+  - Stage 2 peer review view with anonymized labels plus UI de-anonymization
+  - Stage 4 consolidated report panel
+  - Stage 5 votes panel
+  - Stage 6 final draft compare + selection
+  - export buttons for MD and PDF
 
 ## Networking contract
-Backend base URL default: `http://127.0.0.1:8000`
+- Model list: GET /api/models
+- Runs:
+  - POST /api/runs
+  - POST /api/runs/{run_id}/start
+  - GET /api/runs/{run_id}
+  - SSE: GET /api/runs/{run_id}/stream
+  - GET /api/runs/{run_id}/artifacts
+  - POST /api/runs/{run_id}/select
+  - POST /api/runs/{run_id}/export
+  - GET /api/runs/{run_id}/export/final.md
+  - GET /api/runs/{run_id}/export/final.pdf
 
-Endpoints used:
-- `GET /api/health`
-- `GET /api/models`
-- `GET/POST/PUT /api/patients`
-- `POST /api/patients/{id}/reports`
-- `GET /api/patients/{id}/reports`
-- `POST /api/runs`
-- `POST /api/runs/{run_id}/start`
-- `GET /api/runs/{run_id}`
-- `GET /api/runs/{run_id}/stream` (SSE)
-- `POST /api/runs/{run_id}/select`
-- `POST /api/runs/{run_id}/export`
-- `GET /api/runs/{run_id}/export/final.md`
-- `GET /api/runs/{run_id}/export/final.pdf`
+- Reports:
+  - POST /api/patients/{id}/reports
+  - GET /api/reports/{report_id}/extracted
+  - POST /api/reports/{report_id}/reextract
+
+- CLIProxy helpers (used by the UI):
+  - POST /api/cliproxy/start
+  - POST /api/cliproxy/login
+  - POST /api/cliproxy/install
 
 ## SSE integration
-- Use `EventSource` to `GET /api/runs/{run_id}/stream`
-- Update stage progress on stage completion events
-- Show error banners for upstream down, model unavailable, needs_auth, rate limited
+- Use EventSource on the GET stream endpoint.
+- Update stage UI on events.
+- Keep a clear “needs-auth / upstream down / rate limited” error state.
 
-## Rendering rules
-- Render markdown artifacts with your existing markdown renderer
-- Render JSON artifacts with a collapsible JSON viewer
-- Show model `source` badge next to model name
-- If a configured model is missing from discovered `/v1/models`, show it disabled
+## References
+- UI checklist: [references/ui-checklist.md](references/ui-checklist.md)
+- API quick map: [references/api-quick-map.md](references/api-quick-map.md)
