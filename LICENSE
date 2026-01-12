@@ -1,0 +1,69 @@
+qEEG Council Restricted License v1.0
+(Source-available; Noncommercial; No qEEG/EEG/ERP Use)
+
+Copyright (c) 2026 David Montgomery
+
+NOTICE: This is a source-available license. It is NOT an open source license.
+
+1. Definitions
+
+1.1 "Software" means the source code and documentation made available in this repository, including any modifications.
+
+1.2 "You" means any individual or entity that uses, copies, modifies, or distributes the Software.
+
+1.3 "Noncommercial Purpose" means a purpose that is not primarily intended for, or directed toward, commercial advantage or monetary compensation.
+
+1.4 "Commercial Use" means any use of the Software that is not a Noncommercial Purpose, including (without limitation) use:
+    (a) in a commercial product or service,
+    (b) to provide services to third parties (including hosted/SaaS access),
+    (c) for internal business operations of a for-profit organization, or
+    (d) in connection with any activity that is revenue-generating, sales-enabling, or monetized.
+
+1.5 "qEEG/EEG/ERP Use" means any use of the Software in connection with:
+    (a) electroencephalography (EEG) data, quantitative EEG (qEEG), event-related potentials (ERP), evoked potentials, neurofeedback, brain mapping, or similar electrophysiology signals originating from the brain; or
+    (b) generating, assisting with, or validating analysis, interpretation, reports, recommendations, or conclusions about EEG/qEEG/ERP data;
+    whether for clinical, research, educational, product development, internal evaluation, quality assurance, demonstration, or any other purpose.
+    For clarity: "qEEG/EEG/ERP Use" includes "research" uses.
+
+2. License Grant (Permitted Use)
+
+Subject to Your full compliance with this License, the Licensor grants You a worldwide, non-exclusive, royalty-free license to:
+    (a) use, copy, and modify the Software; and
+    (b) distribute the Software (modified or unmodified),
+ONLY for Noncommercial Purposes AND ONLY when such use is NOT qEEG/EEG/ERP Use.
+
+3. Prohibited Uses
+
+You may NOT, under any circumstances:
+    (a) use the Software for any qEEG/EEG/ERP Use; or
+    (b) make any Commercial Use of the Software,
+unless You have obtained the Licensor’s prior written permission in a separate written agreement.
+
+4. Redistribution and Forks
+
+If You distribute the Software (modified or unmodified), You must:
+    (a) provide a copy of this License with the distribution;
+    (b) retain all copyright notices and attribution notices; and
+    (c) license Your modifications and any larger work that contains the Software under this same License (i.e., no re-licensing).
+
+5. No Trademark / No Endorsement
+
+This License does not grant any rights in the names, logos, or trademarks of the Licensor. You may not imply endorsement by the Licensor.
+
+6. Termination
+
+Any breach of this License automatically terminates Your rights under this License. Upon termination, You must cease use and distribution of the Software.
+
+7. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+8. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+9. Commercial / qEEG Licensing
+
+To request a commercial license or any permission that would otherwise be prohibited (including any qEEG/EEG/ERP Use), contact:
+    GitHub: @DMontgomery40 (open an issue or contact the repository owner)
+

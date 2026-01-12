@@ -87,3 +87,7 @@ CLIPROXY_BASE_URL=http://127.0.0.1:8317
 CLIPROXY_API_KEY=
 DEFAULT_CONSOLIDATOR=claude-opus-4-5-20251101
 ```
+
+## License
+
+Source-available. Noncommercial use only. No qEEG/EEG/ERP use (including research). Commercial licensing available by permission—contact the repository owner.
