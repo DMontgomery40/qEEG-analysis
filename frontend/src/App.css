@@ -7,8 +7,8 @@
   height: 100vh;
   width: 100vw;
   overflow: hidden;
-  background: radial-gradient(circle at 20% 10%, #172554 0%, #0b1020 60%);
-  color: rgba(255, 255, 255, 0.92);
+  background: radial-gradient(circle at 20% 10%, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 60%);
+  color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
@@ -23,19 +23,20 @@
 }
 
 .error-banner {
-  background: rgba(255, 0, 0, 0.14);
-  border: 1px solid rgba(255, 0, 0, 0.25);
+  background: var(--status-error-bg);
+  border: 1px solid rgba(255, 80, 80, 0.25);
   padding: 10px 12px;
   margin: 12px 12px 0 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
+  animation: slideIn var(--transition-normal);
 }
 
 .warn-banner {
-  background: rgba(255, 200, 0, 0.12);
+  background: var(--status-warning-bg);
   border: 1px solid rgba(255, 200, 0, 0.25);
   padding: 10px 12px;
   margin: 12px 12px 0 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
 }
 
 .warn-banner summary {
@@ -43,10 +44,31 @@
 }
 
 .muted {
-  opacity: 0.75;
+  color: var(--text-muted);
 }
 
 .inline-input {
   margin-left: 10px;
   width: 220px;
+}
+
+/* Utility animations */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
 }

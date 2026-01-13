@@ -11,23 +11,32 @@
 }
 
 .tab {
-  padding: 6px 10px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
-  color: white;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--surface-card);
+  color: var(--text-secondary);
   cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all var(--transition-fast);
+}
+
+.tab:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
 }
 
 .tab.active {
-  border-color: rgba(255, 255, 255, 0.35);
-  background: rgba(255, 255, 255, 0.12);
+  border-color: var(--border-strong);
+  background: var(--surface-elevated);
+  color: var(--text-primary);
 }
 
 .tab-content {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   padding: 14px;
-  background: rgba(0, 0, 0, 0.15);
+  background: var(--surface-input);
 }
 

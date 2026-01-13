@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
 import Tabs from './Tabs';
 import ModelBadge from './ModelBadge';
+import SourceDataView from './SourceDataView';
 import './RunPage.css';
 
 const STAGES = [
@@ -37,6 +38,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
   const [artifacts, setArtifacts] = useState([]);
   const [exporting, setExporting] = useState(false);
   const [activeStageNum, setActiveStageNum] = useState(1);
+  const [showSourceData, setShowSourceData] = useState(false);
   const esRef = useRef(null);
   const initializedStageRef = useRef(false);
 
@@ -50,6 +52,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
     setRun(null);
     setArtifacts([]);
     setActiveStageNum(1);
+    setShowSourceData(false);
     initializedStageRef.current = false;
     (async () => {
       try {
@@ -126,18 +129,36 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
             <button
               key={s.num}
               className={`stage-pill ${stageComplete(s.num) ? 'done' : ''} ${
-                activeStageNum === s.num ? 'active' : ''
+                activeStageNum === s.num && !showSourceData ? 'active' : ''
               }`}
-              onClick={() => setActiveStageNum(s.num)}
+              onClick={() => {
+                setActiveStageNum(s.num);
+                setShowSourceData(false);
+              }}
               type="button"
             >
               Stage {s.num}: {s.name}
             </button>
           ))}
+          <span className="stage-divider" />
+          <button
+            className={`stage-pill source-data-pill ${showSourceData ? 'active' : ''}`}
+            onClick={() => setShowSourceData(true)}
+            type="button"
+          >
+            Source Data
+          </button>
         </div>
       </div>
 
-      {activeStageNum === 1 ? (
+      {showSourceData ? (
+        <div className="card source-data-card">
+          <div className="card-title">Source Data</div>
+          <SourceDataView reportId={run.report_id} onError={onError} />
+        </div>
+      ) : null}
+
+      {!showSourceData && activeStageNum === 1 ? (
         <StageView
           stageNum={1}
           title="Stage 1: Initial Analysis"
@@ -147,7 +168,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         />
       ) : null}
 
-      {activeStageNum === 2 ? (
+      {!showSourceData && activeStageNum === 2 ? (
         <StagePeerReview
           stageNum={2}
           title="Stage 2: Peer Review"
@@ -157,7 +178,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         />
       ) : null}
 
-      {activeStageNum === 3 ? (
+      {!showSourceData && activeStageNum === 3 ? (
         <StageView
           stageNum={3}
           title="Stage 3: Revision"
@@ -167,7 +188,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         />
       ) : null}
 
-      {activeStageNum === 4 ? (
+      {!showSourceData && activeStageNum === 4 ? (
         <StageConsolidation
           title="Stage 4: Consolidation"
           artifacts={byStage.get('4') || []}
@@ -183,7 +204,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         />
       ) : null}
 
-      {activeStageNum === 5 ? (
+      {!showSourceData && activeStageNum === 5 ? (
         <StageFinalReview
           title="Stage 5: Final Review"
           artifacts={byStage.get('5') || []}
@@ -191,7 +212,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         />
       ) : null}
 
-      {activeStageNum === 6 ? (
+      {!showSourceData && activeStageNum === 6 ? (
         <StageFinalDrafts
           title="Stage 6: Final Drafts"
           artifacts={byStage.get('6') || []}

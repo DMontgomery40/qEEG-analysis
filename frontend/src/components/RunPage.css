@@ -4,16 +4,23 @@
 }
 
 .card {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
   padding: 14px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--surface-card);
   margin-bottom: 14px;
+  box-shadow: var(--shadow-card);
+  transition: box-shadow var(--transition-normal);
+}
+
+.card:hover {
+  box-shadow: var(--shadow-elevated);
 }
 
 .card-title {
   font-weight: 700;
   margin-bottom: 10px;
+  color: var(--text-primary);
 }
 
 .row {
@@ -27,46 +34,91 @@
 }
 
 .muted {
-  opacity: 0.7;
+  color: var(--text-muted);
 }
 
 .error-banner {
-  background: rgba(255, 0, 0, 0.12);
-  border: 1px solid rgba(255, 0, 0, 0.25);
+  background: var(--status-error-bg);
+  border: 1px solid rgba(255, 80, 80, 0.25);
   padding: 10px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   margin-bottom: 12px;
+  animation: slideIn var(--transition-normal);
 }
 
 .stage-grid {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  align-items: center;
 }
 
 .stage-pill {
-  padding: 6px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 6px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-default);
   opacity: 0.7;
-  background: rgba(255, 255, 255, 0.04);
-  color: rgba(255, 255, 255, 0.92);
+  background: var(--surface-card);
+  color: var(--text-primary);
   cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all var(--transition-fast);
+}
+
+.stage-pill:hover {
+  opacity: 1;
+  background: var(--surface-hover);
 }
 
 .stage-pill.done {
   opacity: 1;
-  border-color: rgba(0, 255, 160, 0.25);
+  border-color: var(--accent-teal);
+  background: var(--accent-teal-soft);
 }
 
 .stage-pill.active {
   opacity: 1;
-  border-color: rgba(140, 200, 255, 0.35);
-  background: rgba(140, 200, 255, 0.10);
+  border-color: var(--accent-blue);
+  background: var(--accent-blue-soft);
+  box-shadow: 0 0 12px var(--accent-blue-soft);
+}
+
+/* Stage divider between stages and Source Data */
+.stage-divider {
+  display: inline-block;
+  width: 1px;
+  height: 24px;
+  background: var(--border-default);
+  margin: 0 4px;
+  align-self: center;
+}
+
+/* Source Data pill - amber/gold accent */
+.source-data-pill {
+  border-color: rgba(255, 191, 105, 0.25);
+}
+
+.source-data-pill:hover {
+  border-color: var(--accent-amber);
+  background: var(--accent-amber-soft);
+}
+
+.source-data-pill.active {
+  border-color: var(--accent-amber);
+  background: var(--accent-amber-soft);
+  color: var(--accent-gold);
+  box-shadow: 0 0 12px var(--accent-amber-soft);
+}
+
+/* Source Data card styling */
+.source-data-card {
+  min-height: 500px;
 }
 
 .selected {
-  border-color: rgba(0, 255, 160, 0.35);
+  border-color: var(--accent-teal);
+  background: var(--accent-teal-soft);
 }
 
 .tab-label {

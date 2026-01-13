@@ -1,9 +1,33 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import { api } from './api';
 import Sidebar from './components/Sidebar';
 import PatientPage from './components/PatientPage';
 import RunPage from './components/RunPage';
+import ResizeHandle from './components/ResizeHandle';
+
+// Panel size persistence
+const STORAGE_KEY = 'qeeg-panel-sizes';
+const DEFAULT_SIDEBAR_WIDTH = 300;
+const MIN_SIDEBAR_WIDTH = 200;
+const MAX_SIDEBAR_WIDTH = 500;
+
+function loadPanelSizes() {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePanelSizes(sizes) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(sizes));
+  } catch {
+    // ignore
+  }
+}
 
 function App() {
   const [health, setHealth] = useState(null);
@@ -14,6 +38,23 @@ function App() {
   const [error, setError] = useState('');
   const autoStartTriedRef = useRef(false);
   const [geminiProjectId, setGeminiProjectId] = useState('');
+
+  // Resizable sidebar
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const sizes = loadPanelSizes();
+    return sizes.sidebarWidth ?? DEFAULT_SIDEBAR_WIDTH;
+  });
+
+  const handleSidebarResize = useCallback((delta) => {
+    setSidebarWidth((prev) => {
+      const next = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, prev + delta));
+      return next;
+    });
+  }, []);
+
+  const handleSidebarResizeEnd = useCallback(() => {
+    savePanelSizes({ ...loadPanelSizes(), sidebarWidth });
+  }, [sidebarWidth]);
 
   const discoveredModels = useMemo(() => models?.discovered_models || [], [models]);
   const modelMetaById = useMemo(() => {
@@ -92,6 +133,13 @@ function App() {
             setError(String(e?.message || e));
           }
         }}
+        style={{ width: sidebarWidth }}
+      />
+
+      <ResizeHandle
+        direction="horizontal"
+        onResize={handleSidebarResize}
+        onResizeEnd={handleSidebarResizeEnd}
       />
 
       <div className="main">

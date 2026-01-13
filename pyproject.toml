@@ -17,6 +17,10 @@ dependencies = [
     "pymupdf>=1.24.0",
     "pytesseract>=0.3.10",
     "pillow>=10.0.0",
+    # Apple Vision OCR (macOS only)
+    "pyobjc-framework-Vision==12.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz==12.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa==12.0; sys_platform == 'darwin'",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]

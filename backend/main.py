@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import storage
@@ -31,7 +31,7 @@ from .council import QEEGCouncilWorkflow
 from .cliproxy_status import status_payload
 from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient, UpstreamError
-from .reports import extract_pdf_with_images, extract_text_from_pdf, save_report_upload
+from .reports import extract_pdf_full, extract_text_from_pdf, save_report_upload
 
 
 app = FastAPI(title="qEEG Council API")
@@ -266,10 +266,14 @@ def _get_mock_llm_client() -> AsyncOpenAICompatClient | None:
         return None
 
     transport = create_mock_transport()
+    try:
+        timeout_s = float(os.getenv("QEEG_LLM_TIMEOUT_S", "600") or "600")
+    except Exception:
+        timeout_s = 600.0
     client = AsyncOpenAICompatClient(
         base_url="http://mock-cliproxy",
         api_key="",
-        timeout_s=120.0,
+        timeout_s=timeout_s,
         transport=transport,
     )
     # Pre-set discovered models for mock mode
@@ -290,8 +294,14 @@ async def _startup() -> None:
         app.state.llm = mock_client
         app.state.mock_mode = True
     else:
+        try:
+            timeout_s = float(os.getenv("QEEG_LLM_TIMEOUT_S", "600") or "600")
+        except Exception:
+            timeout_s = 600.0
+        if timeout_s <= 0:
+            timeout_s = 600.0
         app.state.llm = AsyncOpenAICompatClient(
-            base_url=CLIPROXY_BASE_URL, api_key=CLIPROXY_API_KEY, timeout_s=120.0
+            base_url=CLIPROXY_BASE_URL, api_key=CLIPROXY_API_KEY, timeout_s=timeout_s
         )
         app.state.mock_mode = False
 
@@ -541,9 +551,29 @@ async def get_report_extracted(report_id: str):
         report = storage.get_report(session, report_id)
         if report is None:
             raise HTTPException(status_code=404, detail="Report not found")
-        path = Path(report.extracted_text_path)
+        extracted_path = Path(report.extracted_text_path)
+        report_dir = extracted_path.parent
+
+        # Prefer the enhanced multi-source extraction when present so the UI preview never shows only a
+        # single (potentially noisy) OCR engine.
+        enhanced_path = report_dir / "extracted_enhanced.txt"
+        path = enhanced_path if enhanced_path.exists() and enhanced_path.stat().st_size > 0 else extracted_path
         if not path.exists():
             raise HTTPException(status_code=404, detail="Extracted text not found")
+        if path == enhanced_path:
+            # Older artifacts may label Apple Vision OCR as "VISION OCR" which is easy to confuse with a
+            # multimodal "vision model". Normalize labels at read-time for clarity without requiring a re-extract.
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                normalized = (
+                    text.replace("--- VISION OCR ---", "--- APPLE VISION OCR ---")
+                    .replace("--- OCR TEXT ---", "--- TESSERACT OCR ---")
+                    .replace("--- OCR ---", "--- TESSERACT OCR ---")
+                )
+                if normalized != text:
+                    return PlainTextResponse(normalized)
+            except Exception:
+                pass
         return FileResponse(str(path), media_type="text/plain", filename="extracted.txt")
 
 
@@ -559,10 +589,6 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
     if original_path.suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Re-extract only supported for PDFs")
 
-    # Always regenerate extracted.txt (used as the "source of truth" for later stages).
-    text = extract_text_from_pdf(original_path)
-    extracted_path.write_text(text, encoding="utf-8")
-
     # Best-effort: also regenerate enhanced OCR text + page images for multimodal Stage 1.
     # IMPORTANT: write into the same folder as extracted_path (some older reports used a
     # different folder id than report_id).
@@ -570,7 +596,11 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
     enhanced_chars: int | None = None
     page_images_written = 0
     try:
-        enhanced_text, page_images = extract_pdf_with_images(original_path)
+        full = extract_pdf_full(original_path)
+        enhanced_text = full.enhanced_text
+        page_images = full.page_images
+        # Keep extracted.txt aligned with enhanced extraction so UI/verification always sees the full union.
+        extracted_path.write_text(enhanced_text, encoding="utf-8")
         enhanced_path = report_dir / "extracted_enhanced.txt"
         enhanced_path.write_text(enhanced_text, encoding="utf-8")
         enhanced_chars = len(enhanced_text)
@@ -591,21 +621,151 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
             except Exception:
                 continue
 
-        metadata = {
-            "page_count": len(page_images),
-            "has_enhanced_ocr": True,
-            "has_page_images": page_images_written > 0,
-        }
+        # Save per-page source text (audit/debug)
+        sources_dir = report_dir / "sources"
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        for p in full.per_page_sources:
+            page_num = p.get("page")
+            if not isinstance(page_num, int):
+                continue
+            try:
+                (sources_dir / f"page-{page_num}.pypdf.txt").write_text(p.get("pypdf_text", ""), encoding="utf-8")
+                (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(p.get("pymupdf_text", ""), encoding="utf-8")
+                (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(p.get("vision_ocr_text", ""), encoding="utf-8")
+                (sources_dir / f"page-{page_num}.tesseract.txt").write_text(p.get("tesseract_ocr_text", ""), encoding="utf-8")
+            except Exception:
+                continue
+
+        metadata = dict(full.metadata)
+        metadata.update(
+            {
+                "has_enhanced_ocr": True,
+                "has_page_images": page_images_written > 0,
+                "page_images_written": page_images_written,
+                "sources_dir": "sources",
+            }
+        )
         (report_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     except Exception:
-        pass
+        # Fallback: regenerate extracted.txt with basic extraction (no multimodal assets).
+        text = extract_text_from_pdf(original_path)
+        extracted_path.write_text(text, encoding="utf-8")
+        return {
+            "ok": True,
+            "chars": len(text),
+            "enhanced_chars": None,
+            "page_images_written": 0,
+        }
 
-    return {
-        "ok": True,
-        "chars": len(text),
-        "enhanced_chars": enhanced_chars,
-        "page_images_written": page_images_written,
-    }
+    return {"ok": True, "chars": enhanced_chars or 0, "enhanced_chars": enhanced_chars, "page_images_written": page_images_written}
+
+
+@app.get("/api/reports/{report_id}/original")
+async def get_report_original(report_id: str):
+    """Serve the original PDF file for a report."""
+    with storage.session_scope() as session:
+        report = storage.get_report(session, report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not found")
+        original_path = Path(report.stored_path)
+
+    if not original_path.exists():
+        raise HTTPException(status_code=404, detail="Original file not found on disk")
+
+    # Determine media type from extension
+    suffix = original_path.suffix.lower()
+    media_type = "application/pdf" if suffix == ".pdf" else "application/octet-stream"
+
+    return FileResponse(
+        str(original_path),
+        media_type=media_type,
+        filename=original_path.name,
+    )
+
+
+@app.get("/api/reports/{report_id}/pages")
+async def list_report_pages(report_id: str) -> dict[str, Any]:
+    """List available extracted page images for a report."""
+    with storage.session_scope() as session:
+        report = storage.get_report(session, report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not found")
+        extracted_path = Path(report.extracted_text_path)
+
+    # Pages are stored in the same directory as extracted text
+    report_dir = extracted_path.parent
+    pages_dir = report_dir / "pages"
+
+    if not pages_dir.exists():
+        return {"pages": [], "total": 0}
+
+    # Find all page-N.png files
+    pages: list[dict[str, Any]] = []
+    for png_file in sorted(pages_dir.glob("page-*.png")):
+        # Extract page number from filename like "page-0.png"
+        try:
+            page_num = int(png_file.stem.split("-")[1])
+            pages.append({
+                "page": page_num,
+                "url": f"/api/reports/{report_id}/pages/{page_num}",
+            })
+        except (IndexError, ValueError):
+            continue
+
+    # Sort by page number
+    pages.sort(key=lambda p: p["page"])
+
+    return {"pages": pages, "total": len(pages)}
+
+
+@app.get("/api/reports/{report_id}/pages/{page_num}")
+async def get_report_page(report_id: str, page_num: int):
+    """Serve a single extracted page image."""
+    with storage.session_scope() as session:
+        report = storage.get_report(session, report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not found")
+        extracted_path = Path(report.extracted_text_path)
+
+    report_dir = extracted_path.parent
+    page_path = report_dir / "pages" / f"page-{page_num}.png"
+
+    if not page_path.exists():
+        raise HTTPException(status_code=404, detail=f"Page {page_num} not found")
+
+    return FileResponse(
+        str(page_path),
+        media_type="image/png",
+        filename=f"page-{page_num}.png",
+    )
+
+
+@app.get("/api/reports/{report_id}/metadata")
+async def get_report_metadata(report_id: str) -> dict[str, Any]:
+    """Get extraction metadata for a report."""
+    with storage.session_scope() as session:
+        report = storage.get_report(session, report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not found")
+        extracted_path = Path(report.extracted_text_path)
+
+    report_dir = extracted_path.parent
+    metadata_path = report_dir / "metadata.json"
+
+    if not metadata_path.exists():
+        # Return basic info if no metadata file
+        return {
+            "report_id": report_id,
+            "has_metadata_file": False,
+        }
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["report_id"] = report_id
+        metadata["has_metadata_file"] = True
+        return metadata
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read metadata: {e}")
 
 
 @app.get("/api/patients/{patient_id}/runs")

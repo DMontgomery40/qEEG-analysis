@@ -38,7 +38,8 @@ Core directories:
 - `backend/`
   - `main.py`: FastAPI endpoints + SSE
   - `council.py`: `QEEGCouncilWorkflow` (6-stage pipeline + Stage-1 data pack)
-  - `reports.py`: PDF extraction (pypdf + PyMuPDF render + Tesseract OCR)
+  - `reports.py`: PDF extraction (pypdf + PyMuPDF render + Apple Vision OCR (macOS) + Tesseract backstop)
+  - `apple_vision_ocr.py`: Apple Vision OCR wrapper (PyObjC; macOS only)
   - `storage.py`: SQLite + file artifacts
   - `prompts/`: stage prompts
 - `frontend/`
@@ -60,11 +61,15 @@ Stage 1 is the only stage that directly uses images. Stage 2–6 now also receiv
 
 This repo’s extraction model assumes you must preserve redundancy, not “choose one” text source:
 - `backend/reports.py` `extract_text_enhanced(pdf_path)`:
-  - runs pypdf text extraction AND OCR on ALL pages (if OCR deps exist)
-  - if both sources have unique content, it keeps both with markers:
+  - runs pypdf text extraction AND PyMuPDF text extraction AND OCR on ALL pages (if any OCR engine is available)
+  - Apple Vision OCR (macOS) is used when available (can be disabled via env var); Tesseract remains as backstop
+  - if sources have unique content, it keeps multiple with markers (deduping trivial duplicates/subsets):
     - `--- PYPDF TEXT ---`
-    - `--- OCR TEXT ---`
+    - `--- PYMUPDF TEXT ---`
+    - `--- TESSERACT OCR ---`
+    - `--- APPLE VISION OCR ---`
   - this prevents losing image-embedded tables/figures
+  - per-page source outputs are also saved under `sources/` in each report directory for audit/debug
 
 Operationally, the “repair” button is:
 - `POST /api/reports/{report_id}/reextract`
@@ -98,7 +103,8 @@ Key file paths:
 
 ## What changed in this pass (the important deltas)
 
-All changes are centered in `backend/council.py` (plus a few docs updates).
+Most Stage‑1 strictness work is centered in `backend/council.py`. OCR + extraction improvements also touched
+`backend/reports.py` and added `backend/apple_vision_ocr.py` (plus dependency updates in `pyproject.toml` / `uv.lock`).
 
 ### Code-level map (how Stage 1 now works end-to-end)
 
@@ -290,6 +296,12 @@ Updated:
     - non-PDF uploads
     - all-mock model runs
 
+- `QEEG_ALLOW_NONSTRICT_DATA_AVAILABILITY` (default false)
+  - When true, allows setting `QEEG_STRICT_DATA_AVAILABILITY=0` for PDFs (not recommended for real report quality runs).
+
+- `QEEG_ENFORCE_ALL_SOURCES` (default true)
+  - When true (recommended), strict runs require **all** extraction layers: pypdf text, PyMuPDF text, Apple Vision OCR, and Tesseract OCR.
+
 - `QEEG_VISION_PAGES_PER_CALL` (default `"8"`)
   - Number of page images per multimodal call.
   - If the PDF has >10 pages, this value is clamped to 10 to guarantee 2+ passes.
@@ -298,6 +310,9 @@ Updated:
   - If true, saves debug artifacts even when strict mode is off.
   - In strict mode, debug saving is enabled automatically.
 
+- `QEEG_PDF_RENDER_ZOOM` (default `"3.0"`)
+  - Render zoom for page PNGs used by OCR and Stage‑1 multimodal (higher = larger images/cost; also can improve readability).
+
 - `QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL` (default `"2"`)
   - Pages per multimodal call when generating `stage-1/_vision_transcript.md`.
   - If the PDF has >10 pages, this value is clamped to 10 (still guaranteeing 2+ passes).
@@ -305,9 +320,21 @@ Updated:
 - `QEEG_VISION_TRANSCRIPT_MAX_TOKENS` (default `"4000"`)
   - Max output tokens per multimodal call when generating `stage-1/_vision_transcript.md`.
 
+- `QEEG_LLM_TIMEOUT_S` (default `"600"`)
+  - HTTP timeout (seconds) for CLIProxyAPI calls; large multimodal passes can require higher timeouts.
+
 - `QEEG_STAGE1_PER_MODEL_VISION_NOTES` (default false)
   - If true, Stage 1 will also run per-model multimodal “page notes” ingestion even when the run-level
     vision transcript exists (expensive; mostly useful for debugging/model comparisons).
+
+- `QEEG_DISABLE_APPLE_VISION_OCR` (default false)
+  - Force-disable Apple Vision OCR even on macOS (falls back to Tesseract if available).
+
+- `QEEG_APPLE_VISION_RECOGNITION_LEVEL` (default `"accurate"`)
+  - Apple Vision OCR quality/speed tradeoff (`fast` | `accurate`).
+
+- `QEEG_APPLE_VISION_LANGUAGE_CORRECTION` (default false)
+  - If true, Apple Vision applies language correction (often harmful for numeric-heavy tables/figures).
 
 ---
 
@@ -359,6 +386,9 @@ Session mapping:
 ## Validation performed in this pass (sanity checks)
 
 - Unit tests: `uv run pytest -q` (passed locally in this repo state).
+- Apple Vision OCR sanity:
+  - Verified `backend.apple_vision_ocr.apple_vision_available()` returns true on this machine.
+  - Verified `backend.reports.extract_text_enhanced()` includes `--- APPLE VISION OCR ---` blocks on a real 16-page WAVi PDF where page 1 has no pypdf text (PDF-native extraction failure).
 - Manual verification against the known-good run:
   - loaded `data/artifacts/e69e1c2b-9d2f-40cf-b384-233bf2f07f5a/stage-1/_data_pack.json`
   - verified `_missing_required_fields()` returns empty for sessions `[1,2,3]`
@@ -373,7 +403,7 @@ For a given report directory: `data/reports/<patient_id>/<upload_id>/`
 Verify it contains:
 - `original.pdf`
 - `extracted.txt`
-- `extracted_enhanced.txt`
+- `extracted_enhanced.txt` (may include `--- APPLE VISION OCR ---` / `--- TESSERACT OCR ---` blocks when OCR adds unique content)
 - `pages/page-1.png ... page-N.png`
 - `metadata.json` (nice-to-have, not required for Stage 1 to run)
 
@@ -559,13 +589,16 @@ These are likely the next “big wins” for completeness and auditability:
    - If some report templates omit specific required fields (e.g., Peak Frequency absent), don’t disable strict mode globally.
    - Implement template detection + explicit “not present” rules + alternative required facts.
 
-5) Apple Vision OCR (future):
-   - Tesseract is the current OCR engine.
-   - Apple Vision OCR code exists elsewhere on disk but is not integrated (pyobjc Vision not installed here).
-   - If adopting Vision:
-     - prefer VNRecognizeTextRequest Accurate
-     - capture bounding boxes + confidence
-     - keep Tesseract as backstop/cross-check
+5) (Done) Apple Vision OCR (macOS):
+   - `backend/reports.py` now uses Apple Vision OCR (VNRecognizeTextRequest) on macOS when available, with
+     Tesseract retained as a backstop/cross-check.
+   - Env vars:
+     - `QEEG_DISABLE_APPLE_VISION_OCR=1` to force-disable
+     - `QEEG_APPLE_VISION_RECOGNITION_LEVEL=fast|accurate` (default `accurate`)
+     - `QEEG_APPLE_VISION_LANGUAGE_CORRECTION=1` (default false; numeric-heavy pages usually prefer false)
+   - Implementation reference source of truth lives on disk in:
+     - `/Users/davidmontgomery/secondbrain/src/second_brain/ocr/apple_vision_ocr.py`
+     - `/Users/davidmontgomery/secondbrain-ds/brain_scans/ocr_all_pages.py`
 
 ---
 

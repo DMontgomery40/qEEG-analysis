@@ -1,0 +1,67 @@
+.resize-handle {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 10;
+  transition: background var(--transition-fast);
+}
+
+/* Horizontal handle (for left/right resizing) */
+.resize-handle-horizontal {
+  width: 8px;
+  cursor: col-resize;
+  margin: 0 -4px;
+}
+
+.resize-handle-horizontal .resize-handle-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: var(--border-subtle);
+  transition: all var(--transition-fast);
+}
+
+.resize-handle-horizontal:hover .resize-handle-line,
+.resize-handle-horizontal.dragging .resize-handle-line {
+  background: var(--accent-amber);
+  width: 3px;
+  box-shadow: 0 0 8px var(--accent-amber-soft);
+}
+
+/* Vertical handle (for top/bottom resizing) */
+.resize-handle-vertical {
+  height: 8px;
+  cursor: row-resize;
+  margin: -4px 0;
+}
+
+.resize-handle-vertical .resize-handle-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+  background: var(--border-subtle);
+  transition: all var(--transition-fast);
+}
+
+.resize-handle-vertical:hover .resize-handle-line,
+.resize-handle-vertical.dragging .resize-handle-line {
+  background: var(--accent-amber);
+  height: 3px;
+  box-shadow: 0 0 8px var(--accent-amber-soft);
+}
+
+/* Focus state for accessibility */
+.resize-handle:focus-visible .resize-handle-line {
+  background: var(--accent-amber);
+  box-shadow: 0 0 0 2px var(--border-focus);
+}
+
+/* Dragging state */
+.resize-handle.dragging {
+  z-index: 100;
+}

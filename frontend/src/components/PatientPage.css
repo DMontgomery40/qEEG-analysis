@@ -1,24 +1,41 @@
 .page {
   padding: 18px;
   overflow: auto;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
 }
 
-.grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
+/* Horizontal flex row for Reports/New Run columns */
+.grid-row {
+  display: flex;
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+  margin-bottom: 0;
+}
+
+.grid-row > .card {
+  overflow: auto;
 }
 
 .card {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
   padding: 14px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--surface-card);
+  box-shadow: var(--shadow-card);
+  transition: box-shadow var(--transition-normal);
+}
+
+.card:hover {
+  box-shadow: var(--shadow-elevated);
 }
 
 .card-title {
   font-weight: 700;
   margin-bottom: 10px;
+  color: var(--text-primary);
 }
 
 .row {
@@ -37,15 +54,22 @@
 .list-item {
   text-align: left;
   padding: 10px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
   background: rgba(255, 255, 255, 0.02);
-  color: white;
+  color: var(--text-primary);
   cursor: pointer;
+  transition: all var(--transition-normal);
+}
+
+.list-item:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
 }
 
 .list-item.active {
-  background: rgba(255, 255, 255, 0.10);
+  background: var(--surface-elevated);
+  border-color: var(--accent-amber-soft);
 }
 
 .list-item-title {
@@ -53,12 +77,12 @@
 }
 
 .list-item-sub {
-  opacity: 0.7;
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .muted {
-  opacity: 0.7;
+  color: var(--text-muted);
 }
 
 label {
@@ -66,16 +90,27 @@ label {
   flex-direction: column;
   gap: 6px;
   margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 14px;
 }
 
 input,
 textarea,
 select {
-  background: rgba(0, 0, 0, 0.25);
-  color: white;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
+  background: var(--surface-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   padding: 8px 10px;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-amber-soft);
+  outline: none;
 }
 
 select.multi-select {
@@ -94,17 +129,40 @@ textarea {
 }
 
 button {
-  background: rgba(255, 255, 255, 0.10);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 10px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   padding: 8px 12px;
-  color: white;
+  color: var(--text-primary);
   cursor: pointer;
+  font-weight: 500;
+  transition: all var(--transition-fast);
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(0);
 }
 
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Primary button variant */
+button.primary {
+  background: var(--accent-amber-soft);
+  border-color: var(--accent-amber);
+  color: var(--accent-gold);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-amber-hover);
 }
 
 .preview {
@@ -117,9 +175,22 @@ button:disabled {
 }
 
 .preview pre {
-  background: rgba(0, 0, 0, 0.25);
+  background: var(--surface-input);
   padding: 10px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   overflow: auto;
   max-height: 240px;
+}
+
+/* Run History card with fixed height and scroll */
+.run-history-card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.run-history-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import './Sidebar.css';
 
-function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient }) {
+function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient, style }) {
   const [query, setQuery] = useState('');
   const [newLabel, setNewLabel] = useState('');
 
@@ -12,7 +12,7 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
   }, [patients, query]);
 
   return (
-    <div className="sidebar">
+    <div className="sidebar" style={style}>
       <div className="sidebar-header">
         <div className="sidebar-title">qEEG Council</div>
         <input

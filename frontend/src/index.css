@@ -7,6 +7,65 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Base dark theme */
+  --bg-base: #0b1020;
+  --bg-gradient-start: #172554;
+  --bg-gradient-end: #0b1020;
+
+  /* Text */
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.75);
+  --text-muted: rgba(255, 255, 255, 0.55);
+
+  /* Cool accents (existing, refined) */
+  --accent-blue: rgba(140, 200, 255, 0.95);
+  --accent-blue-hover: rgba(140, 200, 255, 0.20);
+  --accent-blue-soft: rgba(140, 200, 255, 0.12);
+  --accent-teal: rgba(0, 255, 160, 0.35);
+  --accent-teal-soft: rgba(0, 255, 160, 0.15);
+
+  /* Warm accents (NEW) */
+  --accent-amber: rgba(255, 191, 105, 0.95);
+  --accent-amber-hover: rgba(255, 191, 105, 0.20);
+  --accent-amber-soft: rgba(255, 191, 105, 0.12);
+  --accent-gold: rgba(255, 215, 140, 0.90);
+  --accent-gold-soft: rgba(255, 215, 140, 0.15);
+
+  /* Surfaces */
+  --surface-card: rgba(255, 255, 255, 0.04);
+  --surface-elevated: rgba(255, 255, 255, 0.08);
+  --surface-input: rgba(0, 0, 0, 0.25);
+  --surface-hover: rgba(255, 255, 255, 0.06);
+
+  /* Borders */
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-default: rgba(255, 255, 255, 0.12);
+  --border-strong: rgba(255, 255, 255, 0.22);
+  --border-focus: rgba(255, 191, 105, 0.50);
+
+  /* Status */
+  --status-success: rgba(0, 255, 160, 0.35);
+  --status-success-bg: rgba(0, 255, 160, 0.12);
+  --status-error: rgba(255, 80, 80, 0.90);
+  --status-error-bg: rgba(255, 80, 80, 0.12);
+  --status-warning: rgba(255, 200, 0, 0.90);
+  --status-warning-bg: rgba(255, 200, 0, 0.12);
+
+  /* Shadows */
+  --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.25);
+  --shadow-elevated: 0 8px 32px rgba(0, 0, 0, 0.35);
+
+  /* Transitions */
+  --transition-fast: 0.1s ease;
+  --transition-normal: 0.15s ease;
+  --transition-slow: 0.25s ease;
+
+  /* Border radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
 }
 
 * {
@@ -19,7 +78,8 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #0b1020;
+  background: var(--bg-base);
+  color: var(--text-primary);
 }
 
 #root {
@@ -29,9 +89,9 @@ body {
 }
 
 pre {
-  background: rgba(0, 0, 0, 0.25);
+  background: var(--surface-input);
   padding: 10px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   overflow: auto;
 }
 
@@ -41,5 +101,23 @@ code {
 }
 
 a {
-  color: rgba(140, 200, 255, 0.95);
+  color: var(--accent-blue);
+  text-decoration: none;
+  transition: opacity var(--transition-fast);
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Focus ring for accessibility */
+:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* Selection styling */
+::selection {
+  background: var(--accent-amber-soft);
+  color: var(--text-primary);
 }

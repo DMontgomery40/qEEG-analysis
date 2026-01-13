@@ -1,6 +1,33 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import './PatientPage.css';
+import ResizeHandle from './ResizeHandle';
+
+// Panel size persistence
+const STORAGE_KEY = 'qeeg-patient-panel-sizes';
+const DEFAULT_LEFT_COL_PERCENT = 50;
+const MIN_COL_PERCENT = 25;
+const MAX_COL_PERCENT = 75;
+const DEFAULT_RUN_HISTORY_HEIGHT = 280;
+const MIN_RUN_HISTORY_HEIGHT = 120;
+const MAX_RUN_HISTORY_HEIGHT = 600;
+
+function loadPanelSizes() {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePanelSizes(sizes) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(sizes));
+  } catch {
+    // ignore
+  }
+}
 
 function PatientPage({
   patientId,
@@ -25,6 +52,58 @@ function PatientPage({
   const [selectedConsolidator, setSelectedConsolidator] = useState('');
   const [starting, setStarting] = useState(false);
   const [geminiProjectId, setGeminiProjectId] = useState('');
+
+  // Resizable panel state
+  const [leftColPercent, setLeftColPercent] = useState(() => {
+    const sizes = loadPanelSizes();
+    return sizes.leftColPercent ?? DEFAULT_LEFT_COL_PERCENT;
+  });
+  const [runHistoryHeight, setRunHistoryHeight] = useState(() => {
+    const sizes = loadPanelSizes();
+    return sizes.runHistoryHeight ?? DEFAULT_RUN_HISTORY_HEIGHT;
+  });
+  const [gridContainerWidth, setGridContainerWidth] = useState(0);
+  const gridContainerRef = useRef(null);
+
+  // Measure grid container width for percentage-based column resizing
+  useEffect(() => {
+    const el = gridContainerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setGridContainerWidth(entry.contentRect.width);
+      }
+    });
+    observer.observe(el);
+    // Initial measurement
+    setGridContainerWidth(el.offsetWidth);
+    return () => observer.disconnect();
+  }, []);
+
+  const handleColumnResize = useCallback((delta) => {
+    if (gridContainerWidth <= 0) return;
+    const percentDelta = (delta / gridContainerWidth) * 100;
+    setLeftColPercent((prev) => {
+      const next = Math.max(MIN_COL_PERCENT, Math.min(MAX_COL_PERCENT, prev + percentDelta));
+      return next;
+    });
+  }, [gridContainerWidth]);
+
+  const handleColumnResizeEnd = useCallback(() => {
+    savePanelSizes({ ...loadPanelSizes(), leftColPercent });
+  }, [leftColPercent]);
+
+  const handleRunHistoryResize = useCallback((delta) => {
+    setRunHistoryHeight((prev) => {
+      // Negative delta means dragging up (making taller), positive means dragging down (making shorter)
+      const next = Math.max(MIN_RUN_HISTORY_HEIGHT, Math.min(MAX_RUN_HISTORY_HEIGHT, prev - delta));
+      return next;
+    });
+  }, []);
+
+  const handleRunHistoryResizeEnd = useCallback(() => {
+    savePanelSizes({ ...loadPanelSizes(), runHistoryHeight });
+  }, [runHistoryHeight]);
 
   const discoveredOptions = useMemo(
     () =>
@@ -109,8 +188,8 @@ function PatientPage({
         </label>
       </div>
 
-      <div className="grid">
-        <div className="card">
+      <div className="grid-row" ref={gridContainerRef}>
+        <div className="card" style={{ width: `${leftColPercent}%`, flexShrink: 0 }}>
           <div className="card-title">Reports</div>
           <div className="row">
             <input
@@ -181,7 +260,13 @@ function PatientPage({
           </div>
         </div>
 
-        <div className="card">
+        <ResizeHandle
+          direction="horizontal"
+          onResize={handleColumnResize}
+          onResizeEnd={handleColumnResizeEnd}
+        />
+
+        <div className="card" style={{ flex: 1, minWidth: 0 }}>
           <div className="card-title">New Run</div>
           <label>
             Report
@@ -313,9 +398,15 @@ function PatientPage({
         </div>
       </div>
 
-      <div className="card">
+      <ResizeHandle
+        direction="vertical"
+        onResize={handleRunHistoryResize}
+        onResizeEnd={handleRunHistoryResizeEnd}
+      />
+
+      <div className="card run-history-card" style={{ height: runHistoryHeight, flexShrink: 0 }}>
         <div className="card-title">Run History</div>
-        <div className="list">
+        <div className="list run-history-list">
           {runs.map((r) => (
             <button key={r.id} className="list-item" onClick={() => onSelectRun(r.id)}>
               <div className="list-item-title">

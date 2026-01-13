@@ -76,6 +76,26 @@ export const api = {
     return request(`/api/reports/${reportId}/reextract`, { method: 'POST' });
   },
 
+  // Original PDF URL (for inline viewing)
+  reportOriginalUrl(reportId) {
+    return `${API_BASE}/api/reports/${reportId}/original`;
+  },
+
+  // List extracted page images
+  reportPages(reportId) {
+    return request(`/api/reports/${reportId}/pages`);
+  },
+
+  // Single page image URL
+  reportPageUrl(reportId, pageNum) {
+    return `${API_BASE}/api/reports/${reportId}/pages/${pageNum}`;
+  },
+
+  // Get extraction metadata
+  reportMetadata(reportId) {
+    return request(`/api/reports/${reportId}/metadata`);
+  },
+
   listRuns(patientId) {
     return request(`/api/patients/${patientId}/runs`);
   },

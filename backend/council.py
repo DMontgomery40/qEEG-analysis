@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable
 
 from .config import ARTIFACTS_DIR, is_vision_capable
 from .llm_client import AsyncOpenAICompatClient, UpstreamError
-from .reports import extract_pdf_with_images, extract_text_from_pdf, get_page_images_base64, get_enhanced_text
+from .reports import extract_pdf_full, extract_text_from_pdf, get_page_images_base64, get_enhanced_text
 from .storage import (
     Artifact,
     Report,
@@ -459,6 +459,16 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
 
     out: list[dict[str, Any]] = []
 
+    def tail_after(haystack: str, needle: str) -> str:
+        h = haystack or ""
+        n = needle or ""
+        if not h or not n:
+            return h
+        idx = h.lower().find(n.lower())
+        if idx == -1:
+            return h
+        return h[idx + len(n) :]
+
     # Physical Reaction Time (includes SDs).
     rt_line = find_line_contains("Physical Reaction Time")
     if rt_line:
@@ -554,7 +564,8 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
     # Audio P300 Delay/Voltage.
     delay_line = find_line_contains("Audio P300 Delay")
     if delay_line:
-        toks = _number_tokens(delay_line)
+        # Avoid pulling digits from the label itself (e.g., "P300" -> 300).
+        toks = _number_tokens(tail_after(delay_line, "Audio P300 Delay"))
         if len(toks) >= len(expected_sessions):
             vals = toks[: len(expected_sessions)]
             range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
@@ -580,7 +591,8 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
 
     volt_line = find_line_contains("Audio P300 Voltage")
     if volt_line:
-        toks = _number_tokens(volt_line)
+        # Avoid pulling digits from the label itself (e.g., "P300" -> 300).
+        toks = _number_tokens(tail_after(volt_line, "Audio P300 Voltage"))
         if len(toks) >= len(expected_sessions):
             vals = toks[: len(expected_sessions)]
             range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
@@ -613,7 +625,8 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
         line = find_line_contains(needle)
         if not line:
             continue
-        toks = _number_tokens(line)
+        # Avoid pulling digits from the label itself (e.g., "F3/F4" -> 3, 4).
+        toks = _number_tokens(tail_after(line, needle))
         if len(toks) < len(expected_sessions):
             continue
         vals = toks[: len(expected_sessions)]
@@ -797,15 +810,15 @@ def _load_best_report_text(report: Report, report_dir: Path) -> str:
     if enhanced_text and enhanced_text.strip():
         report_text = enhanced_text
 
-    # Auto-upgrade older extractions lacking page markers (best-effort).
+    # Never re-extract on the fly here: to avoid widening the error surface in later stages, we require
+    # extraction artifacts to already be present and well-formed.
     if "=== PAGE 1 /" not in report_text and Path(report.stored_path).suffix.lower() == ".pdf":
-        try:
-            regenerated = extract_text_from_pdf(Path(report.stored_path))
-            if regenerated and len(regenerated) > len(report_text):
-                report_text_path.write_text(regenerated, encoding="utf-8")
-                report_text = regenerated
-        except Exception:
-            pass
+        raise RuntimeError(
+            "Report text is missing page markers (expected '=== PAGE 1 /').\n"
+            f"Report: {report.filename} ({report.id})\n"
+            f"Paths checked: {enhanced_path} and {report_text_path}\n"
+            "Fix: re-generate extraction artifacts via POST /api/reports/{report_id}/reextract"
+        )
 
     return report_text
 
@@ -830,7 +843,7 @@ def _load_page_images(report: Report, report_dir: Path) -> list[PageImage]:
         if out:
             return out
 
-    # Legacy fallback: no page numbers, assume sequential.
+    # Fallback for older artifact formats: no page numbers, assume sequential.
     try:
         images = get_page_images_base64(report.patient_id, report.id)
     except Exception:
@@ -1087,6 +1100,108 @@ class QEEGCouncilWorkflow:
             deduped.append(fact)
         return deduped
 
+    @staticmethod
+    def _fact_key(fact: dict[str, Any]) -> str | None:
+        ftype = fact.get("fact_type")
+        if not isinstance(ftype, str):
+            return None
+        key_parts = [ftype]
+        for k in ("metric", "site", "region", "session_index"):
+            v = fact.get(k)
+            if v is None:
+                continue
+            key_parts.append(f"{k}={v}")
+        key_parts.append(f"page={fact.get('source_page')}")
+        return "|".join(key_parts)
+
+    @staticmethod
+    def _fact_numeric_signature(fact: dict[str, Any]) -> tuple[Any, ...] | None:
+        """
+        Return a tuple representing the numeric payload of a fact for conflict detection.
+
+        We intentionally ignore incidental fields (e.g., labels, units, target ranges) and focus on required numbers.
+        """
+        def coerce(val: Any) -> Any:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                if isinstance(val, float) and val.is_integer():
+                    return int(val)
+                return val
+            if isinstance(val, str):
+                s = val.strip().replace("−", "-")
+                if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+                    try:
+                        num = float(s)
+                    except Exception:
+                        return val
+                    return int(num) if num.is_integer() else num
+            return val
+
+        shown_as = fact.get("shown_as")
+        if isinstance(shown_as, str) and shown_as.strip().upper() == "N/A":
+            return ("NA",)
+        ftype = fact.get("fact_type")
+        if ftype in {"performance_metric", "evoked_potential", "state_metric", "peak_frequency"}:
+            val = coerce(fact.get("value"))
+            if val is None:
+                return None
+            return ("value", val)
+        if ftype == "p300_cp_site":
+            uv = coerce(fact.get("uv"))
+            ms = coerce(fact.get("ms"))
+            if uv is None or ms is None:
+                return None
+            return ("uv_ms", uv, ms)
+        if ftype == "n100_central_frontal_average":
+            uv = coerce(fact.get("uv"))
+            ms = coerce(fact.get("ms"))
+            if uv is None or ms is None:
+                return None
+            return ("uv_ms", uv, ms)
+        # Default: best-effort, include common numeric fields if present.
+        payload: list[Any] = ["generic"]
+        for k in ("value", "uv", "ms", "yield"):
+            if k in fact:
+                payload.append(coerce(fact.get(k)))
+        return tuple(payload)
+
+    @classmethod
+    def _find_fact_conflicts(cls, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for f in facts:
+            if not isinstance(f, dict):
+                continue
+            key = cls._fact_key(f)
+            if not key:
+                continue
+            by_key.setdefault(key, []).append(f)
+
+        conflicts: list[dict[str, Any]] = []
+        for key, items in by_key.items():
+            if len(items) < 2:
+                continue
+            sigs: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+            for f in items:
+                sig = cls._fact_numeric_signature(f)
+                if sig is None:
+                    continue
+                sigs.setdefault(sig, []).append(f)
+            if len(sigs) > 1:
+                conflicts.append(
+                    {
+                        "key": key,
+                        "variants": [
+                            {
+                                "signature": list(sig),
+                                "facts": group,
+                            }
+                            for sig, group in sigs.items()
+                        ],
+                    }
+                )
+        return conflicts
+
     async def _ensure_data_pack(
         self,
         *,
@@ -1106,6 +1221,7 @@ class QEEGCouncilWorkflow:
         """
         out_path = _data_pack_path(run_id)
         expected_sessions = _expected_session_indices(report_text)
+        expected_pages = sorted({img.page for img in page_images if isinstance(img.page, int)})
 
         # If an existing data pack is present, upgrade it in-place with deterministic facts and derived views.
         if out_path.exists():
@@ -1115,14 +1231,42 @@ class QEEGCouncilWorkflow:
                 existing = None
 
             if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
+                # If the report was re-extracted or page images changed, ensure the cached data pack actually
+                # covers the current pages (older runs could have partial page coverage).
+                try:
+                    existing_pages = existing.get("pages_processed") or existing.get("pages_seen") or []
+                    existing_pages_set = {p for p in existing_pages if isinstance(p, int)}
+                except Exception:
+                    existing_pages_set = set()
+                existing_page_count = existing.get("page_count")
+                if expected_pages and (
+                    existing_page_count != len(expected_pages) or not existing_pages_set.issuperset(set(expected_pages))
+                ):
+                    existing = None
+
+            if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
                 facts = existing.get("facts")
                 if isinstance(facts, list):
                     base_facts = [f for f in facts if isinstance(f, dict)]
                     add_facts: list[dict[str, Any]] = []
                     add_facts.extend(_facts_from_report_text_summary(report_text, expected_sessions=expected_sessions))
                     add_facts.extend(_facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions))
-                    existing["facts"] = self._dedupe_facts(base_facts + add_facts)
+                    for f in add_facts:
+                        if isinstance(f, dict):
+                            f.setdefault("extraction_method", "deterministic_report_text")
+                    for f in base_facts:
+                        if isinstance(f, dict):
+                            f.setdefault("extraction_method", f.get("extraction_method") or "vision_llm")
+                    conflicts = self._find_fact_conflicts(add_facts + base_facts)
+                    if conflicts and strict:
+                        # Cached pack is inconsistent; rebuild from scratch so strict runs are never silently
+                        # grounded in conflicting numbers.
+                        existing = None
+                    else:
+                        # Deterministic facts come first so they override duplicates from older model output.
+                        existing["facts"] = self._dedupe_facts(add_facts + base_facts)
 
+            if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
                 existing["derived"] = self._derive_data_pack_views(existing, expected_sessions=expected_sessions)
                 missing = self._missing_required_fields(existing, expected_sessions=expected_sessions)
                 if not (missing and strict):
@@ -1161,6 +1305,27 @@ class QEEGCouncilWorkflow:
                 debug_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
                 debug_dir = None
+
+        def apply_deterministic_facts(merged: dict[str, Any]) -> list[dict[str, Any]]:
+            merged_facts = merged.get("facts")
+            if not isinstance(merged_facts, list):
+                return []
+            model_facts: list[dict[str, Any]] = [f for f in merged_facts if isinstance(f, dict)]
+            for f in model_facts:
+                f.setdefault("extraction_method", "vision_llm")
+
+            add_facts: list[dict[str, Any]] = []
+            add_facts.extend(_facts_from_report_text_summary(report_text, expected_sessions=expected_sessions))
+            add_facts.extend(_facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions))
+            for f in add_facts:
+                if isinstance(f, dict):
+                    f.setdefault("extraction_method", "deterministic_report_text")
+
+            combined = add_facts + model_facts
+            if combined:
+                # Deterministic facts come first so they override duplicates from model output.
+                merged["facts"] = self._dedupe_facts(combined)
+            return self._find_fact_conflicts(combined)
 
         # Multi-pass extraction across all pages.
         errors: list[str] = []
@@ -1243,18 +1408,8 @@ class QEEGCouncilWorkflow:
                     },
                 )
 
-                # Fill in deterministic summary facts from OCR text (page 1) to avoid strict-mode flakiness.
-                merged_facts = merged.get("facts")
-                if isinstance(merged_facts, list):
-                    text_facts = _facts_from_report_text_summary(report_text, expected_sessions=expected_sessions)
-                    n100_facts = _facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions)
-                    add_facts: list[dict[str, Any]] = []
-                    if text_facts:
-                        add_facts.extend(text_facts)
-                    if n100_facts:
-                        add_facts.extend(n100_facts)
-                    if add_facts:
-                        merged["facts"] = self._dedupe_facts([f for f in merged_facts if isinstance(f, dict)] + add_facts)
+                # Fill in deterministic facts from OCR/PDF text (page-grounded markers) to reduce flakiness.
+                fact_conflicts = apply_deterministic_facts(merged)
 
                 merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
 
@@ -1272,17 +1427,7 @@ class QEEGCouncilWorkflow:
                         debug_dir=debug_dir,
                         attempt_log=attempt_log,
                     )
-                    merged_facts = merged.get("facts")
-                    if isinstance(merged_facts, list):
-                        text_facts = _facts_from_report_text_summary(report_text, expected_sessions=expected_sessions)
-                        n100_facts = _facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions)
-                        add_facts: list[dict[str, Any]] = []
-                        if text_facts:
-                            add_facts.extend(text_facts)
-                        if n100_facts:
-                            add_facts.extend(n100_facts)
-                        if add_facts:
-                            merged["facts"] = self._dedupe_facts([f for f in merged_facts if isinstance(f, dict)] + add_facts)
+                    fact_conflicts = apply_deterministic_facts(merged)
                     merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
                     missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
 
@@ -1296,21 +1441,11 @@ class QEEGCouncilWorkflow:
                         debug_dir=debug_dir,
                         attempt_log=attempt_log,
                     )
-                    merged_facts = merged.get("facts")
-                    if isinstance(merged_facts, list):
-                        text_facts = _facts_from_report_text_summary(report_text, expected_sessions=expected_sessions)
-                        n100_facts = _facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions)
-                        add_facts: list[dict[str, Any]] = []
-                        if text_facts:
-                            add_facts.extend(text_facts)
-                        if n100_facts:
-                            add_facts.extend(n100_facts)
-                        if add_facts:
-                            merged["facts"] = self._dedupe_facts([f for f in merged_facts if isinstance(f, dict)] + add_facts)
+                    fact_conflicts = apply_deterministic_facts(merged)
                     merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
                     missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
 
-                if missing and strict:
+                if strict and (missing or fact_conflicts):
                     failure_path = _stage_dir(run_id, 1) / "_data_pack_failure.json"
                     try:
                         failure_payload = {
@@ -1322,6 +1457,7 @@ class QEEGCouncilWorkflow:
                             "pages_processed": [img.page for img in page_images],
                             "pages_per_call": chunk_size,
                             "missing_fields": sorted(missing),
+                            "conflicts": fact_conflicts,
                             "debug_dir": str(debug_dir) if debug_dir is not None else None,
                             "attempt_log": attempt_log,
                             "partial_data_pack": merged,
@@ -1340,7 +1476,8 @@ class QEEGCouncilWorkflow:
                     )
                     msg_lines = [
                         "Required data could not be extracted from the PDF images.",
-                        f"Missing fields: {', '.join(sorted(missing))}",
+                        f"Missing fields: {', '.join(sorted(missing)) if missing else '(none)'}",
+                        f"Conflicts: {len(fact_conflicts)}" if fact_conflicts else "Conflicts: (none)",
                         f"Expected sessions: {expected_sessions}",
                         f"Pages processed: {[img.page for img in page_images]}",
                         f"Multimodal passes (pages_per_call={chunk_size}): {chunk_pages}",
@@ -1403,7 +1540,15 @@ class QEEGCouncilWorkflow:
             try:
                 existing = out_path.read_text(encoding="utf-8", errors="replace")
                 if existing.strip():
-                    return existing
+                    # Ensure cached transcripts cover all current pages (older runs could have partial coverage).
+                    expected_pages = sorted({img.page for img in page_images if isinstance(img.page, int)})
+                    found_pages = {
+                        int(m.group(1))
+                        for m in re.finditer(r"(?m)^##\\s*Page\\s+(\\d+)\\b", existing)
+                        if m.group(1).isdigit()
+                    }
+                    if not expected_pages or found_pages.issuperset(set(expected_pages)):
+                        return existing
             except Exception:
                 pass
 
@@ -2160,7 +2305,7 @@ class QEEGCouncilWorkflow:
             except UpstreamError as e:
                 if e.status_code == 401:
                     raise _NeedsAuth(str(e)) from e
-                if e.status_code in {429, 502, 503} and attempts < 4:
+                if (e.status_code in {429, 500, 502, 503, 504} or e.status_code is None) and attempts < 4:
                     await _sleep_backoff(attempts)
                     attempts += 1
                     continue
@@ -2209,7 +2354,7 @@ class QEEGCouncilWorkflow:
             except UpstreamError as e:
                 if e.status_code == 401:
                     raise _NeedsAuth(str(e)) from e
-                if e.status_code in {429, 502, 503} and attempts < 4:
+                if (e.status_code in {429, 500, 502, 503, 504} or e.status_code is None) and attempts < 4:
                     await _sleep_backoff(attempts)
                     attempts += 1
                     continue
@@ -2260,7 +2405,7 @@ class QEEGCouncilWorkflow:
         report_dir = _derive_report_dir(report)
         report_text = _load_best_report_text(report, report_dir)
 
-        # Load images from the report folder (preferred), then legacy lookup.
+        # Load images from the report folder (preferred), then fallback lookup.
         page_images = _load_page_images(report, report_dir)
 
         needs_images = any(is_vision_capable(m) for m in council_model_ids)
@@ -2273,16 +2418,20 @@ class QEEGCouncilWorkflow:
         # If a vision-capable model is selected but images are missing/incomplete, generate on the fly.
         if needs_images and Path(report.stored_path).suffix.lower() == ".pdf" and (not page_images or missing_pages):
             try:
-                enhanced_text, page_images_raw = extract_pdf_with_images(Path(report.stored_path))
+                full = extract_pdf_full(Path(report.stored_path))
+                enhanced_text = full.enhanced_text
                 if enhanced_text and enhanced_text.strip():
                     report_text = enhanced_text
                     try:
                         (report_dir / "extracted_enhanced.txt").write_text(enhanced_text, encoding="utf-8")
+                        # Keep extracted.txt aligned so the UI preview and any verification tooling never
+                        # shows only a single OCR engine.
+                        (report_dir / "extracted.txt").write_text(enhanced_text, encoding="utf-8")
                     except Exception:
                         pass
 
                 page_images = []
-                for img in page_images_raw:
+                for img in full.page_images:
                     if not isinstance(img, dict):
                         continue
                     page = img.get("page")
@@ -2290,7 +2439,7 @@ class QEEGCouncilWorkflow:
                     if isinstance(page, int) and isinstance(b64, str):
                         page_images.append(PageImage(page=page, base64_png=b64))
 
-                # Best-effort persist generated images for later stages/debugging.
+                # Best-effort persist generated images + per-page sources/metadata for later stages/debugging.
                 if page_images:
                     try:
                         pages_dir = report_dir / "pages"
@@ -2300,18 +2449,129 @@ class QEEGCouncilWorkflow:
                             out.write_bytes(base64.b64decode(img.base64_png))
                     except Exception:
                         pass
+
+                try:
+                    sources_dir = report_dir / "sources"
+                    sources_dir.mkdir(parents=True, exist_ok=True)
+                    for p in full.per_page_sources:
+                        page_num = p.get("page")
+                        if not isinstance(page_num, int):
+                            continue
+                        (sources_dir / f"page-{page_num}.pypdf.txt").write_text(p.get("pypdf_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(p.get("pymupdf_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(p.get("vision_ocr_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.tesseract.txt").write_text(p.get("tesseract_ocr_text", ""), encoding="utf-8")
+
+                    meta = dict(full.metadata)
+                    meta.update(
+                        {
+                            "has_enhanced_ocr": True,
+                            "has_page_images": True,
+                            "page_images_written": len(page_images),
+                            "sources_dir": "sources",
+                        }
+                    )
+                    (report_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
             except Exception:
                 page_images = []
 
+        is_pdf = Path(report.stored_path).suffix.lower() == ".pdf"
         strict_data = _truthy_env("QEEG_STRICT_DATA_AVAILABILITY", True)
         # Non-PDF uploads can't be validated via page images.
-        if Path(report.stored_path).suffix.lower() != ".pdf":
+        if not is_pdf:
             strict_data = False
+        # Prevent accidental non-strict PDF runs unless explicitly allowed.
+        if is_pdf and not strict_data and not _truthy_env("QEEG_ALLOW_NONSTRICT_DATA_AVAILABILITY", False):
+            strict_data = True
         # Tests/mocks: don't hard-fail on missing multimodal extraction.
         if all(mid.startswith("mock-") for mid in council_model_ids):
             strict_data = False
 
+        # In strict mode, enforce multi-source extraction coverage (PDF-native + Apple Vision OCR + Tesseract OCR).
+        enforce_all_sources = _truthy_env("QEEG_ENFORCE_ALL_SOURCES", True)
+        if strict_data and is_pdf and enforce_all_sources:
+            meta_path = report_dir / "metadata.json"
+            meta: dict[str, Any] | None = None
+            if meta_path.exists():
+                try:
+                    loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        meta = loaded
+                except Exception:
+                    meta = None
+
+            engines: dict[str, Any] = {}
+            if isinstance(meta, dict) and meta.get("schema_version") == 2 and isinstance(meta.get("engines"), dict):
+                engines = meta["engines"]
+
+            if not engines:
+                # Metadata missing/outdated: regenerate report assets in-place (best effort) so strict runs always have
+                # a full audit trail (sources/ + metadata.json).
+                try:
+                    full = extract_pdf_full(Path(report.stored_path))
+                    enhanced_text = full.enhanced_text
+                    if enhanced_text and enhanced_text.strip():
+                        report_text = enhanced_text
+                        (report_dir / "extracted_enhanced.txt").write_text(enhanced_text, encoding="utf-8")
+                        (report_dir / "extracted.txt").write_text(enhanced_text, encoding="utf-8")
+
+                    page_images = []
+                    for img in full.page_images:
+                        page = img.get("page") if isinstance(img, dict) else None
+                        b64 = img.get("base64_png") if isinstance(img, dict) else None
+                        if isinstance(page, int) and isinstance(b64, str):
+                            page_images.append(PageImage(page=page, base64_png=b64))
+
+                    pages_dir = report_dir / "pages"
+                    pages_dir.mkdir(parents=True, exist_ok=True)
+                    for img in page_images:
+                        (pages_dir / f"page-{img.page}.png").write_bytes(base64.b64decode(img.base64_png))
+
+                    sources_dir = report_dir / "sources"
+                    sources_dir.mkdir(parents=True, exist_ok=True)
+                    for p in full.per_page_sources:
+                        page_num = p.get("page")
+                        if not isinstance(page_num, int):
+                            continue
+                        (sources_dir / f"page-{page_num}.pypdf.txt").write_text(p.get("pypdf_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(p.get("pymupdf_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(p.get("vision_ocr_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.tesseract.txt").write_text(p.get("tesseract_ocr_text", ""), encoding="utf-8")
+
+                    meta2 = dict(full.metadata)
+                    meta2.update(
+                        {
+                            "has_enhanced_ocr": True,
+                            "has_page_images": True,
+                            "page_images_written": len(page_images),
+                            "sources_dir": "sources",
+                        }
+                    )
+                    meta_path.write_text(json.dumps(meta2, indent=2), encoding="utf-8")
+                    engines = meta2.get("engines") if isinstance(meta2.get("engines"), dict) else {}
+                except Exception:
+                    engines = engines or {}
+
+            required = ["pypdf", "pymupdf", "apple_vision", "tesseract"]
+            missing_engines = [k for k in required if not engines.get(k)]
+            if missing_engines:
+                raise RuntimeError(
+                    "Strict data availability requested, but required extraction sources are unavailable.\n"
+                    f"Missing sources: {', '.join(missing_engines)}\n"
+                    f"Report: {report.filename} ({report.id})\n"
+                    f"Metadata: {meta_path}\n"
+                    "Fix: ensure Apple Vision OCR + Tesseract are available, then re-run: POST /api/reports/{report_id}/reextract"
+                )
+
         extractor_models = [m for m in council_model_ids if is_vision_capable(m)]
+        if strict_data and not extractor_models:
+            raise RuntimeError(
+                "Strict data availability requested, but no vision-capable models were selected.\n"
+                "Stage 1 requires at least one vision-capable model to process ALL PDF pages.\n"
+                "Select a vision-capable model in the run's council_model_ids (see /api/models)."
+            )
 
         data_pack = await self._ensure_data_pack(
             run_id=run_id,
