@@ -248,6 +248,7 @@ function StageView({ title, artifacts, type, modelMetaById }) {
       </span>
     ),
     content: a.content,
+    contentType: a.content_type,
   }));
 
   return (
@@ -255,9 +256,13 @@ function StageView({ title, artifacts, type, modelMetaById }) {
       <div className="card-title">{title}</div>
       <Tabs
         tabs={tabs}
-        render={(t) =>
-          type === 'md' ? <ReactMarkdown>{t.content}</ReactMarkdown> : <pre>{t.content}</pre>
-        }
+        render={(t) => {
+          if (t.contentType?.includes?.('json')) {
+            const parsed = tryJson(t.content);
+            return <pre>{parsed ? JSON.stringify(parsed, null, 2) : t.content}</pre>;
+          }
+          return type === 'md' ? <ReactMarkdown>{t.content}</ReactMarkdown> : <pre>{t.content}</pre>;
+        }}
       />
     </div>
   );

@@ -57,7 +57,10 @@ metadata:
    - stage completion events for SSE
    - Stage 1 multimodal:
      - uses extracted text plus page images for vision-capable models
-     - current implementation limits a single multimodal call to 10 pages; for PDFs >10 pages, implement multi-pass if “all data must be available”
+     - runs multi-pass multimodal ingestion to cover ALL pages; per-call chunk size is controlled by `QEEG_VISION_PAGES_PER_CALL` and is clamped to 10 pages/call (PDFs >10 pages always run 2+ passes)
+     - writes run-level multimodal artifacts for downstream stages:
+       - `data/artifacts/<run_id>/stage-1/_data_pack.json` (structured required facts)
+       - `data/artifacts/<run_id>/stage-1/_vision_transcript.md` (broad transcription of image-only tables/figures; configured via `QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL` and `QEEG_VISION_TRANSCRIPT_MAX_TOKENS`)
 
 4. `backend/main.py`
    - health endpoint validates CLIProxyAPI reachability

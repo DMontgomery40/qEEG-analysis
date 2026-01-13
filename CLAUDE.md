@@ -134,7 +134,10 @@ Important gotcha:
   - regenerates `extracted.txt`
   - regenerates `extracted_enhanced.txt`
   - regenerates `pages/page-*.png`
-- Current implementation limits a single multimodal Stage 1 call to the **first 10 page images** (see `backend/council.py`). For PDFs >10 pages, Stage 1 must be extended to **multi-pass** to guarantee full coverage.
+- Stage 1 processes page images in **multiple multimodal passes** as needed to cover **ALL pages**. Chunk size is controlled by `QEEG_VISION_PAGES_PER_CALL` (default 8) and is clamped to 10 pages per call; PDFs >10 pages will always run 2+ passes.
+- Stage 1 writes run-level artifacts for downstream stages:
+  - `data/artifacts/<run_id>/stage-1/_data_pack.json` (structured required facts)
+  - `data/artifacts/<run_id>/stage-1/_vision_transcript.md` (broad transcription of image-only tables/figures)
 
 ## Commands
 

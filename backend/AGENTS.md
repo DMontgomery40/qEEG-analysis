@@ -78,7 +78,10 @@ API surface
 Workflow requirements
 - Stage 1: markdown analysis per model
   - Uses extracted text; for vision-capable models also attaches PDF page images (multimodal).
-  - Current implementation limits a single multimodal call to the first 10 pages; for PDFs >10 pages, implement multi-pass if “all data must be available”.
+  - Stage 1 performs multi-pass multimodal ingestion across **ALL pages** as needed; per-call chunk size is controlled by `QEEG_VISION_PAGES_PER_CALL` and is clamped to 10 pages/call to guarantee 2+ passes for PDFs >10 pages.
+  - Stage 1 writes run-level multimodal artifacts for downstream stages:
+    - `data/artifacts/<run_id>/stage-1/_data_pack.json` (structured required facts)
+    - `data/artifacts/<run_id>/stage-1/_vision_transcript.md` (broad transcription of image-only tables/figures)
 - Stage 2: JSON peer reviews per reviewer, anonymized labels A/B/C per run
 - Stage 3: markdown revisions per model
 - Stage 4: markdown consolidation by consolidator

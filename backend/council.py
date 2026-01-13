@@ -49,6 +49,7 @@ STAGES: list[StageDef] = [
 
 DATA_PACK_SCHEMA_VERSION = 1
 DATA_PACK_FILENAME = "_data_pack.json"
+VISION_TRANSCRIPT_FILENAME = "_vision_transcript.md"
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,63 @@ def _try_build_p300_cp_site_crops(page_image: PageImage) -> list[PageImage]:
     return crops
 
 
+def _try_build_summary_table_crops(page_image: PageImage) -> list[PageImage]:
+    """
+    Best-effort helper for WAVi-style PAGE 1 summary tables.
+
+    Produces upscaled crops for:
+    - performance/evoked/state summary table block
+    - peak frequency block (frontal/central-parietal/occipital)
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:
+        return []
+
+    try:
+        raw = base64.b64decode(page_image.base64_png)
+    except Exception:
+        return []
+
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        return []
+
+    w, h = img.size
+
+    def crop_frac(label: str, x0: float, y0: float, x1: float, y1: float) -> PageImage | None:
+        try:
+            box = (int(w * x0), int(h * y0), int(w * x1), int(h * y1))
+            crop = img.crop(box).resize(
+                (max(900, box[2] - box[0]) * 2, max(650, box[3] - box[1]) * 2),
+                resample=Image.Resampling.LANCZOS,
+            )
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+            return PageImage(
+                page=page_image.page,
+                base64_png=base64.b64encode(buf.getvalue()).decode("utf-8"),
+                label=label,
+            )
+        except Exception:
+            return None
+
+    crops: list[PageImage] = []
+    # Summary table area (performance, evoked potentials, state).
+    c1 = crop_frac("summary_table", 0.05, 0.20, 0.95, 0.58)
+    if c1 is not None:
+        crops.append(c1)
+    # Peak frequency region, just below the state metrics.
+    c2 = crop_frac("peak_frequency", 0.08, 0.48, 0.92, 0.70)
+    if c2 is not None:
+        crops.append(c2)
+
+    return crops
+
+
 def _chunked(items: list[Any], size: int) -> list[list[Any]]:
     if size <= 0:
         return [items]
@@ -254,6 +312,38 @@ def _truthy_env(name: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _save_debug_images(*, model_dir: Path, stem: str, images: list[PageImage]) -> list[str]:
+    """
+    Best-effort helper to persist the exact PNGs sent to a multimodal call.
+
+    This is intentionally "best effort": failures should never break the run.
+    """
+    try:
+        images_dir = model_dir / f"{stem}.images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+
+    def safe_component(raw: str) -> str:
+        cleaned = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in (raw or ""))
+        return cleaned.strip("_")[:80]
+
+    saved: list[str] = []
+    for idx, img in enumerate(images, start=1):
+        label = safe_component(img.label or "")
+        name = f"img-{idx:02d}-page-{img.page}"
+        if label:
+            name += f"-{label}"
+        name += ".png"
+        out_path = images_dir / name
+        try:
+            out_path.write_bytes(base64.b64decode(img.base64_png))
+            saved.append(str(out_path))
+        except Exception:
+            continue
+    return saved
 
 
 def _expected_session_indices(report_text: str) -> list[int]:
@@ -288,6 +378,16 @@ def _page_section(report_text: str, *, page_num: int) -> str:
     if end == -1:
         end = len(report_text)
     return report_text[start:end]
+
+
+def _page_count_from_markers(report_text: str) -> int | None:
+    m = re.search(r"=== PAGE 1 / (\d+) ===", report_text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
 def _find_p300_rare_comparison_pages(report_text: str, *, page_count: int) -> list[int]:
@@ -351,6 +451,10 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
 
     def find_line_contains(needle: str) -> str | None:
         m = re.search(rf"(?im)^.*{re.escape(needle)}.*$", page1)
+        return m.group(0).strip() if m else None
+
+    def find_line_startswith(label: str) -> str | None:
+        m = re.search(rf"(?im)^{re.escape(label)}\b.*$", page1)
         return m.group(0).strip() if m else None
 
     out: list[dict[str, Any]] = []
@@ -534,6 +638,64 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
                 }
             )
 
+    # Peak frequency by region (typically PAGE 1).
+    peak_lines = [
+        ("Frontal", "frontal_peak_frequency_ec"),
+        ("Central-Parietal", "central_parietal_peak_frequency_ec"),
+        ("Occipital", "occipital_peak_frequency_ec"),
+    ]
+    for label, metric in peak_lines:
+        line = find_line_startswith(label)
+        if not line:
+            continue
+
+        target = None
+        value_part = line
+        m_range = re.search(r"(?i)(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*Hz\b", line)
+        if m_range:
+            target = f"{m_range.group(1)}-{m_range.group(2)} Hz"
+            value_part = line[: m_range.start()].strip()
+
+        value_part = re.sub(rf"(?im)^{re.escape(label)}\b", "", value_part, count=1).strip()
+        tokens = re.findall(r"(?i)(?:-?\d+(?:\.\d+)?|N/?A)\b", value_part)
+        if len(tokens) < len(expected_sessions):
+            tokens = _number_tokens(value_part)
+        if len(tokens) < len(expected_sessions):
+            continue
+
+        for sess, tok in zip(expected_sessions, tokens[: len(expected_sessions)]):
+            t = (tok or "").strip()
+            if t.upper().replace("/", "") == "NA":
+                out.append(
+                    {
+                        "fact_type": "peak_frequency",
+                        "metric": metric,
+                        "session_index": sess,
+                        "value": None,
+                        "unit": "Hz",
+                        "target_range": target,
+                        "shown_as": "N/A",
+                        "source_page": 1,
+                    }
+                )
+                continue
+
+            val = _safe_float(t)
+            if val is None:
+                continue
+            out.append(
+                {
+                    "fact_type": "peak_frequency",
+                    "metric": metric,
+                    "session_index": sess,
+                    "value": val,
+                    "unit": "Hz",
+                    "target_range": target,
+                    "shown_as": None,
+                    "source_page": 1,
+                }
+            )
+
     return out
 
 
@@ -632,7 +794,7 @@ def _load_best_report_text(report: Report, report_dir: Path) -> str:
         except Exception:
             enhanced_text = None
 
-    if enhanced_text and len(enhanced_text) > len(report_text):
+    if enhanced_text and enhanced_text.strip():
         report_text = enhanced_text
 
     # Auto-upgrade older extractions lacking page markers (best-effort).
@@ -680,6 +842,10 @@ def _data_pack_path(run_id: str) -> Path:
     return _stage_dir(run_id, 1) / DATA_PACK_FILENAME
 
 
+def _vision_transcript_path(run_id: str) -> Path:
+    return _stage_dir(run_id, 1) / VISION_TRANSCRIPT_FILENAME
+
+
 def _workflow_context_block(*, stage_num: int, stage_name: str) -> str:
     extra = ""
     if stage_num == 1:
@@ -718,6 +884,8 @@ def _workflow_context_block(*, stage_num: int, stage_name: str) -> str:
         f"- You are working in Stage {stage_num}: {stage_name}.\n"
         "- A structured DATA PACK may be provided below. It is generated by processing ALL PDF pages, "
         "including graphics/tables, using multi-pass vision when needed.\n"
+        "- A MULTIMODAL VISION TRANSCRIPT may also be provided. Use it to capture image-only tables/figures that OCR\n"
+        "  may miss; do not claim data is missing when it is present there.\n"
         "- Treat the DATA PACK as authoritative for transcribed numeric values; do not claim data is missing "
         "when it is present in the DATA PACK or the report text.\n"
         "- Do not invent numbers. If a value is shown as N/A, report it as present but N/A.\n"
@@ -736,6 +904,7 @@ def _data_pack_prompt(*, pages: list[int], focus: str) -> str:
         "- performance_metric.metric: physical_reaction_time | trail_making_test_a | trail_making_test_b\n"
         "- evoked_potential.metric: audio_p300_delay | audio_p300_voltage\n"
         "- state_metric.metric: cz_theta_beta_ratio_ec | f3_f4_alpha_ratio_ec\n"
+        "- peak_frequency.metric: frontal_peak_frequency_ec | central_parietal_peak_frequency_ec | occipital_peak_frequency_ec\n"
         "- p300_cp_site.site: C3 | CZ | C4 | P3 | PZ | P4\n"
         "- n100_central_frontal_average.fact_type: n100_central_frontal_average\n\n"
         "JSON schema:\n"
@@ -788,6 +957,16 @@ def _data_pack_prompt(*, pages: list[int], focus: str) -> str:
         "      \"source_page\": 1\n"
         "    },\n"
         "    {\n"
+        "      \"fact_type\": \"peak_frequency\",\n"
+        "      \"metric\": \"frontal_peak_frequency_ec\",\n"
+        "      \"session_index\": 1,\n"
+        "      \"value\": 8.5,\n"
+        "      \"unit\": \"Hz\",\n"
+        "      \"target_range\": \"9.0-11.0 Hz\",\n"
+        "      \"shown_as\": null,\n"
+        "      \"source_page\": 1\n"
+        "    },\n"
+        "    {\n"
         "      \"fact_type\": \"p300_cp_site\",\n"
         "      \"site\": \"C3\",\n"
         "      \"session_index\": 1,\n"
@@ -817,6 +996,7 @@ def _data_pack_prompt(*, pages: list[int], focus: str) -> str:
         "- If the report shows N/A, set the numeric field to null and set \"shown_as\" to \"N/A\".\n"
         "- Always include \"source_page\" for each fact.\n"
         "- Maintain session_index mapping exactly as shown in the legend (Session 1/2/3 color key).\n"
+        "- When Peak Frequency is shown, extract it for Frontal, Central-Parietal, and Occipital for every session.\n"
         "- Critical: When the page includes P300 Rare Comparison, extract central-parietal per-site values for "
         "C3, CZ, C4, P3, PZ, P4 for EVERY session shown. Capture yield (#), uv (µV), and ms.\n"
         "- Also extract CENTRAL-FRONTAL AVERAGE N100 values (yield, µV, ms) if present on the page.\n"
@@ -955,22 +1135,39 @@ class QEEGCouncilWorkflow:
 
         if not page_images or not candidate_extractor_model_ids:
             if strict:
+                report_dir = _derive_report_dir(report)
                 raise RuntimeError(
-                    "Strict data availability requested, but no vision-capable model and/or page images are available."
+                    "Strict data availability requested, but Stage 1 multimodal extraction cannot run.\n"
+                    f"Report: {report.filename} ({report.id})\n"
+                    f"Vision-capable extractor models selected: {candidate_extractor_model_ids}\n"
+                    f"Page images available: {len(page_images)}\n"
+                    f"Expected page images directory: {report_dir / 'pages'}\n"
+                    "If report assets look incomplete, re-run: POST /api/reports/{report_id}/reextract"
                 )
             return None
 
         chunk_size = int(os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
         if chunk_size <= 0:
             chunk_size = 8
+        # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
+        if len(page_images) > 10 and chunk_size > 10:
+            chunk_size = 10
+
+        debug_dir: Path | None = None
+        attempt_log: list[dict[str, Any]] = []
+        if strict or _truthy_env("QEEG_SAVE_DATA_PACK_DEBUG", False):
+            try:
+                debug_dir = _stage_dir(run_id, 1) / "_data_pack_debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                debug_dir = None
 
         # Multi-pass extraction across all pages.
-        attempts: list[dict[str, Any]] = []
         errors: list[str] = []
         for extractor_model_id in candidate_extractor_model_ids:
             try:
                 parts: list[dict[str, Any]] = []
-                for chunk in _chunked(page_images, chunk_size):
+                for chunk_index, chunk in enumerate(_chunked(page_images, chunk_size), start=1):
                     pages = [img.page for img in chunk]
                     prompt_text = _data_pack_prompt(
                         pages=pages,
@@ -987,11 +1184,48 @@ class QEEGCouncilWorkflow:
                         max_tokens=3500,
                         allow_text_fallback=False,
                     )
+                    if debug_dir is not None:
+                        try:
+                            safe_model = "".join(
+                                c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id
+                            ) or "model"
+                            model_dir = debug_dir / safe_model
+                            model_dir.mkdir(parents=True, exist_ok=True)
+                            pages_key = "-".join(str(p) for p in pages)
+                            stem = f"pass-{chunk_index:02d}-pages-{pages_key}"
+                            (model_dir / f"{stem}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+                            (model_dir / f"{stem}.raw.txt").write_text(raw, encoding="utf-8")
+                            image_paths = _save_debug_images(model_dir=model_dir, stem=stem, images=chunk)
+                            attempt_log.append(
+                                {
+                                    "kind": "chunk",
+                                    "model_id": extractor_model_id,
+                                    "chunk_index": chunk_index,
+                                    "pages": pages,
+                                    "raw_path": str(model_dir / f"{stem}.raw.txt"),
+                                    "image_paths": image_paths,
+                                }
+                            )
+                        except Exception:
+                            pass
                     part = _json_loads_loose(raw)
                     if not isinstance(part, dict):
                         raise ValueError("Data pack part must be a JSON object")
                     if part.get("schema_version") != DATA_PACK_SCHEMA_VERSION:
                         raise ValueError("Data pack schema_version mismatch")
+                    if debug_dir is not None:
+                        try:
+                            safe_model = "".join(
+                                c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id
+                            ) or "model"
+                            model_dir = debug_dir / safe_model
+                            pages_key = "-".join(str(p) for p in pages)
+                            stem = f"pass-{chunk_index:02d}-pages-{pages_key}"
+                            (model_dir / f"{stem}.parsed.json").write_text(
+                                json.dumps(part, indent=2, sort_keys=True), encoding="utf-8"
+                            )
+                        except Exception:
+                            pass
                     parts.append(part)
 
                 merged = self._merge_data_pack_parts(
@@ -1035,6 +1269,32 @@ class QEEGCouncilWorkflow:
                         expected_sessions=expected_sessions,
                         missing=missing,
                         candidate_pages=candidate_pages,
+                        debug_dir=debug_dir,
+                        attempt_log=attempt_log,
+                    )
+                    merged_facts = merged.get("facts")
+                    if isinstance(merged_facts, list):
+                        text_facts = _facts_from_report_text_summary(report_text, expected_sessions=expected_sessions)
+                        n100_facts = _facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions)
+                        add_facts: list[dict[str, Any]] = []
+                        if text_facts:
+                            add_facts.extend(text_facts)
+                        if n100_facts:
+                            add_facts.extend(n100_facts)
+                        if add_facts:
+                            merged["facts"] = self._dedupe_facts([f for f in merged_facts if isinstance(f, dict)] + add_facts)
+                    merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
+                    missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
+
+                if missing:
+                    merged = await self._targeted_retry_summary_missing(
+                        extractor_model_id=extractor_model_id,
+                        page_images=page_images,
+                        merged=merged,
+                        expected_sessions=expected_sessions,
+                        missing=missing,
+                        debug_dir=debug_dir,
+                        attempt_log=attempt_log,
                     )
                     merged_facts = merged.get("facts")
                     if isinstance(merged_facts, list):
@@ -1051,12 +1311,47 @@ class QEEGCouncilWorkflow:
                     missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
 
                 if missing and strict:
-                    raise RuntimeError(
-                        "Required data could not be extracted from the PDF images.\n"
-                        f"Missing fields: {', '.join(sorted(missing))}\n"
-                        f"Pages processed: {len(page_images)} (chunk size {chunk_size})\n"
-                        f"Extractor model: {extractor_model_id}"
+                    failure_path = _stage_dir(run_id, 1) / "_data_pack_failure.json"
+                    try:
+                        failure_payload = {
+                            "run_id": run_id,
+                            "report_id": report.id,
+                            "report_filename": report.filename,
+                            "extraction_model_id": extractor_model_id,
+                            "expected_session_indices": expected_sessions,
+                            "pages_processed": [img.page for img in page_images],
+                            "pages_per_call": chunk_size,
+                            "missing_fields": sorted(missing),
+                            "debug_dir": str(debug_dir) if debug_dir is not None else None,
+                            "attempt_log": attempt_log,
+                            "partial_data_pack": merged,
+                        }
+                        failure_path.write_text(json.dumps(failure_payload, indent=2, sort_keys=True), encoding="utf-8")
+                    except Exception:
+                        pass
+
+                    chunk_pages = [pages for pages in _chunked([img.page for img in page_images], chunk_size)]
+                    retry_kinds = sorted(
+                        {
+                            a.get("kind")
+                            for a in attempt_log
+                            if isinstance(a, dict) and isinstance(a.get("kind"), str) and a.get("kind") != "chunk"
+                        }
                     )
+                    msg_lines = [
+                        "Required data could not be extracted from the PDF images.",
+                        f"Missing fields: {', '.join(sorted(missing))}",
+                        f"Expected sessions: {expected_sessions}",
+                        f"Pages processed: {[img.page for img in page_images]}",
+                        f"Multimodal passes (pages_per_call={chunk_size}): {chunk_pages}",
+                        f"Targeted retries: {', '.join(retry_kinds) if retry_kinds else 'none'}",
+                        f"Extractor model: {extractor_model_id}",
+                        f"Failure artifact: {failure_path}",
+                    ]
+                    if debug_dir is not None:
+                        msg_lines.append(f"Debug artifacts: {debug_dir}")
+                    msg_lines.append("If report assets look incomplete, re-run: POST /api/reports/{report_id}/reextract")
+                    raise RuntimeError("\n".join(msg_lines))
 
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
@@ -1068,7 +1363,7 @@ class QEEGCouncilWorkflow:
                         run_id=run_id,
                         stage_num=1,
                         stage_name=STAGES[0].name,
-                        model_id=extractor_model_id,
+                        model_id="_data_pack",
                         kind="data_pack",
                         content_path=out_path,
                         content_type="application/json",
@@ -1086,6 +1381,142 @@ class QEEGCouncilWorkflow:
             raise RuntimeError(msg)
 
         return None
+
+    async def _ensure_vision_transcript(
+        self,
+        *,
+        run_id: str,
+        report: Report,
+        page_images: list[PageImage],
+        transcript_model_id: str | None,
+        strict: bool,
+    ) -> str | None:
+        """
+        Build a run-level multimodal transcript so later stages (2-6) can access image-only tables/figures.
+
+        This is intentionally separate from the structured data pack:
+        - Data pack is strict + normalized for required metrics.
+        - Vision transcript is broad + best-effort for everything visible on the pages.
+        """
+        out_path = _vision_transcript_path(run_id)
+        if out_path.exists():
+            try:
+                existing = out_path.read_text(encoding="utf-8", errors="replace")
+                if existing.strip():
+                    return existing
+            except Exception:
+                pass
+
+        if not page_images or not transcript_model_id:
+            if strict:
+                report_dir = _derive_report_dir(report)
+                raise RuntimeError(
+                    "Strict data availability requested, but no vision transcript can be generated.\n"
+                    f"Report: {report.filename} ({report.id})\n"
+                    f"Transcript model: {transcript_model_id}\n"
+                    f"Page images available: {len(page_images)}\n"
+                    f"Expected page images directory: {report_dir / 'pages'}\n"
+                    "If report assets look incomplete, re-run: POST /api/reports/{report_id}/reextract"
+                )
+            return None
+
+        chunk_size = int(os.getenv("QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL", "2") or "2")
+        if chunk_size <= 0:
+            chunk_size = 2
+        # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
+        if len(page_images) > 10 and chunk_size > 10:
+            chunk_size = 10
+
+        max_tokens = int(os.getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000")
+        if max_tokens <= 0:
+            max_tokens = 4000
+
+        parts: list[str] = []
+        errors: list[str] = []
+        chunks = _chunked(page_images, chunk_size)
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            pages = [img.page for img in chunk]
+            pages_str = ", ".join(str(p) for p in pages) if pages else "(unknown)"
+            prompt_text = (
+                "You are performing LOSSLESS MULTIMODAL TRANSCRIPTION from qEEG report page images.\n\n"
+                "Goal: Ensure ALL information embedded in page graphics/tables is available downstream as text.\n\n"
+                "Output format: Markdown.\n\n"
+                "Rules:\n"
+                "- Do NOT interpret or summarize. Do NOT diagnose.\n"
+                "- Do NOT invent numbers. Transcribe only what is visible.\n"
+                "- For each page, start a section with: \"## Page <n>\".\n"
+                "- Under each page, transcribe every table/figure caption and any clearly printed numeric values.\n"
+                "- When a page contains a table, reproduce it as a markdown table (keep row/column labels).\n"
+                "- Preserve units, target ranges, N/A markings, and any symbols (e.g., *, #) when shown.\n"
+                "- If a color key maps sessions to colors, transcribe the key explicitly.\n\n"
+                f"Pages in this pass: {pages_str}\n"
+                f"Pass {chunk_index} of {len(chunks)}\n"
+            )
+            try:
+                text = await self._call_model_multimodal(
+                    model_id=transcript_model_id,
+                    prompt_text=prompt_text,
+                    images=chunk,
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                    allow_text_fallback=not strict,
+                )
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+            except Exception as e:
+                errors.append(f"pass {chunk_index} pages {pages_str}: {e}")
+                if strict:
+                    raise RuntimeError(
+                        "Strict data availability requested, but multimodal vision transcript generation failed.\n"
+                        f"Model: {transcript_model_id}\n"
+                        f"Failed pass: {chunk_index} / {len(chunks)}\n"
+                        f"Pages: {pages_str}\n"
+                        f"Output path: {out_path}\n"
+                        "If report assets look incomplete, re-run: POST /api/reports/{report_id}/reextract"
+                    ) from e
+                continue
+
+        transcript_body = "\n\n".join(parts).strip()
+        if not transcript_body:
+            if strict:
+                msg = "Strict data availability requested, but vision transcript output was empty."
+                if errors:
+                    msg = f"{msg}\n\nAttempts:\n- " + "\n- ".join(errors)
+                raise RuntimeError(msg)
+            return None
+
+        header = (
+            "# Multimodal Vision Transcript\n"
+            f"- run_id: {run_id}\n"
+            f"- report: {report.filename} ({report.id})\n"
+            f"- model_id: {transcript_model_id}\n"
+            f"- pages_per_call: {chunk_size}\n"
+            f"- page_count: {len(page_images)}\n\n"
+        )
+        transcript = f"{header}{transcript_body}\n"
+
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(transcript, encoding="utf-8")
+        except Exception:
+            pass
+
+        try:
+            with session_scope() as session:
+                create_artifact(
+                    session,
+                    run_id=run_id,
+                    stage_num=1,
+                    stage_name=STAGES[0].name,
+                    model_id="_vision_transcript",
+                    kind="vision_transcript",
+                    content_path=out_path,
+                    content_type="text/markdown",
+                )
+        except Exception:
+            pass
+
+        return transcript
 
     @staticmethod
     def _merge_data_pack_parts(parts: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
@@ -1137,6 +1568,152 @@ class QEEGCouncilWorkflow:
             if isinstance(shown_as, str) and shown_as.strip():
                 return shown_as.strip()
             return None
+
+        def get_fact(*, fact_type: str, metric: str, session_index: int) -> dict[str, Any] | None:
+            for f in facts:
+                if not isinstance(f, dict):
+                    continue
+                if f.get("fact_type") != fact_type:
+                    continue
+                if f.get("metric") != metric:
+                    continue
+                if f.get("session_index") != session_index:
+                    continue
+                return f
+            return None
+
+        def short_shown_value(f: dict[str, Any]) -> str | None:
+            shown = shown_as_or_na(f)
+            if not shown:
+                return None
+            if shown.strip().upper() == "N/A":
+                return "N/A"
+            if re.match(r"^[<>≥≤]?\s*-?\d+(?:\.\d+)?\s*(?:ms|µV|uV|Hz|sec|s|ratio)?\s*$", shown):
+                return shown
+            return None
+
+        # Summary tables (PAGE 1 style).
+        perf_specs = [
+            ("Physical Reaction Time", "physical_reaction_time"),
+            ("Trail Making Test A", "trail_making_test_a"),
+            ("Trail Making Test B", "trail_making_test_b"),
+        ]
+        perf_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        perf_rows = ["| " + " | ".join(perf_headers) + " |", "|" + "|".join(["---"] * len(perf_headers)) + "|"]
+        for label, metric in perf_specs:
+            target = ""
+            cells: list[str] = [label]
+            for sess in expected_sessions:
+                f = get_fact(fact_type="performance_metric", metric=metric, session_index=sess)
+                if not f:
+                    cells.append("MISSING")
+                    continue
+                if not target and isinstance(f.get("target_range"), str):
+                    target = f["target_range"]
+                shown = short_shown_value(f)
+                if shown == "N/A":
+                    cells.append("N/A")
+                    continue
+                val = f.get("value")
+                if val is None:
+                    cells.append(shown_as_or_na(f) or "N/A")
+                    continue
+                unit = f.get("unit") if isinstance(f.get("unit"), str) else ""
+                sd = f.get("sd_plus_minus")
+                if metric == "physical_reaction_time" and isinstance(sd, (int, float)):
+                    cells.append(f"{fmt_num(val)} ±{fmt_num(sd)} {unit}".strip())
+                else:
+                    cells.append(f"{fmt_num(val)} {unit}".strip())
+            cells.append(target)
+            perf_rows.append("| " + " | ".join(cells) + " |")
+        performance_table = "\n".join(perf_rows)
+
+        evoked_specs = [
+            ("Audio P300 Delay", "audio_p300_delay"),
+            ("Audio P300 Voltage", "audio_p300_voltage"),
+        ]
+        evoked_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        evoked_rows = ["| " + " | ".join(evoked_headers) + " |", "|" + "|".join(["---"] * len(evoked_headers)) + "|"]
+        for label, metric in evoked_specs:
+            target = ""
+            cells = [label]
+            for sess in expected_sessions:
+                f = get_fact(fact_type="evoked_potential", metric=metric, session_index=sess)
+                if not f:
+                    cells.append("MISSING")
+                    continue
+                if not target and isinstance(f.get("target_range"), str):
+                    target = f["target_range"]
+                shown = short_shown_value(f)
+                if shown == "N/A":
+                    cells.append("N/A")
+                    continue
+                val = f.get("value")
+                if val is None:
+                    cells.append(shown_as_or_na(f) or "N/A")
+                    continue
+                unit = f.get("unit") if isinstance(f.get("unit"), str) else ""
+                cells.append(f"{fmt_num(val)} {unit}".strip())
+            cells.append(target)
+            evoked_rows.append("| " + " | ".join(cells) + " |")
+        evoked_table = "\n".join(evoked_rows)
+
+        state_specs = [
+            ("CZ Eyes Closed Theta/Beta (Power)", "cz_theta_beta_ratio_ec"),
+            ("F3/F4 Eyes Closed Alpha (Power)", "f3_f4_alpha_ratio_ec"),
+        ]
+        state_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        state_rows = ["| " + " | ".join(state_headers) + " |", "|" + "|".join(["---"] * len(state_headers)) + "|"]
+        for label, metric in state_specs:
+            target = ""
+            cells = [label]
+            for sess in expected_sessions:
+                f = get_fact(fact_type="state_metric", metric=metric, session_index=sess)
+                if not f:
+                    cells.append("MISSING")
+                    continue
+                if not target and isinstance(f.get("target_range"), str):
+                    target = f["target_range"]
+                shown = short_shown_value(f)
+                if shown:
+                    cells.append(shown)
+                    continue
+                val = f.get("value")
+                cells.append(fmt_num(val) if val is not None else (shown_as_or_na(f) or "N/A"))
+            cells.append(target)
+            state_rows.append("| " + " | ".join(cells) + " |")
+        state_table = "\n".join(state_rows)
+
+        peak_specs = [
+            ("Frontal", "frontal_peak_frequency_ec"),
+            ("Central-Parietal", "central_parietal_peak_frequency_ec"),
+            ("Occipital", "occipital_peak_frequency_ec"),
+        ]
+        peak_headers = ["Region"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        peak_rows = ["| " + " | ".join(peak_headers) + " |", "|" + "|".join(["---"] * len(peak_headers)) + "|"]
+        for label, metric in peak_specs:
+            target = ""
+            cells = [label]
+            for sess in expected_sessions:
+                f = get_fact(fact_type="peak_frequency", metric=metric, session_index=sess)
+                if not f:
+                    cells.append("MISSING")
+                    continue
+                if not target and isinstance(f.get("target_range"), str):
+                    target = f["target_range"]
+                shown = short_shown_value(f)
+                if shown == "N/A":
+                    cells.append("N/A")
+                    continue
+                val = f.get("value")
+                if val is None:
+                    cells.append(shown_as_or_na(f) or "N/A")
+                    continue
+                unit = f.get("unit") if isinstance(f.get("unit"), str) else ""
+                cells.append(f"{fmt_num(val)} {unit}".strip())
+            cells.append(target)
+            peak_rows.append("| " + " | ".join(cells) + " |")
+        peak_table = "\n".join(peak_rows)
 
         # CP per-site P300 table (C3, CZ, C4, P3, PZ, P4).
         cp_sites = ["C3", "CZ", "C4", "P3", "PZ", "P4"]
@@ -1204,6 +1781,10 @@ class QEEGCouncilWorkflow:
         n100_table = "\n".join(n100_rows)
 
         return {
+            "summary_performance_table_markdown": performance_table,
+            "summary_evoked_table_markdown": evoked_table,
+            "summary_state_table_markdown": state_table,
+            "peak_frequency_table_markdown": peak_table,
             "p300_cp_table_markdown": p300_cp_table,
             "n100_central_frontal_table_markdown": n100_table,
         }
@@ -1268,6 +1849,21 @@ class QEEGCouncilWorkflow:
                 ):
                     missing.add(f"state:{metric}:session_{sess}")
 
+        # Peak frequency by region (Frontal, Central-Parietal, Occipital).
+        for metric in (
+            "frontal_peak_frequency_ec",
+            "central_parietal_peak_frequency_ec",
+            "occipital_peak_frequency_ec",
+        ):
+            for sess in expected_sessions:
+                if not has_fact(
+                    lambda f, m=metric, s=sess: f.get("fact_type") == "peak_frequency"
+                    and f.get("metric") == m
+                    and f.get("session_index") == s
+                    and has_values_or_na(f, fields=("value",))
+                ):
+                    missing.add(f"peak_frequency:{metric}:session_{sess}")
+
         # CP per-site P300 table.
         cp_sites = ["C3", "CZ", "C4", "P3", "PZ", "P4"]
         for site in cp_sites:
@@ -1300,6 +1896,8 @@ class QEEGCouncilWorkflow:
         expected_sessions: list[int],
         missing: set[str],
         candidate_pages: list[int] | None = None,
+        debug_dir: Path | None = None,
+        attempt_log: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         # Focused retry for P300 Rare Comparison page(s).
         need_cp = any(k.startswith("p300_cp_site:") for k in missing)
@@ -1360,9 +1958,132 @@ class QEEGCouncilWorkflow:
             max_tokens=2500,
             allow_text_fallback=False,
         )
+
+        if debug_dir is not None:
+            try:
+                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                model_dir = debug_dir / safe_model
+                model_dir.mkdir(parents=True, exist_ok=True)
+                pages_key = "-".join(str(p) for p in sorted({img.page for img in retry_images}))
+                stem = f"retry-p300-{pages_key}"
+                (model_dir / f"{stem}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+                (model_dir / f"{stem}.raw.txt").write_text(raw, encoding="utf-8")
+                image_paths = _save_debug_images(model_dir=model_dir, stem=stem, images=retry_images)
+                if attempt_log is not None:
+                    attempt_log.append(
+                        {
+                            "kind": "retry_p300_cp_n100",
+                            "model_id": extractor_model_id,
+                            "pages": sorted({img.page for img in retry_images}),
+                            "labels_sample": [img.label for img in retry_images[:12]],
+                            "raw_path": str(model_dir / f"{stem}.raw.txt"),
+                            "image_paths": image_paths,
+                        }
+                    )
+            except Exception:
+                pass
         part = _json_loads_loose(raw)
         if not isinstance(part, dict) or part.get("schema_version") != DATA_PACK_SCHEMA_VERSION:
             return merged
+
+        if debug_dir is not None:
+            try:
+                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                model_dir = debug_dir / safe_model
+                pages_key = "-".join(str(p) for p in sorted({img.page for img in retry_images}))
+                stem = f"retry-p300-{pages_key}"
+                (model_dir / f"{stem}.parsed.json").write_text(
+                    json.dumps(part, indent=2, sort_keys=True), encoding="utf-8"
+                )
+            except Exception:
+                pass
+
+        merged2 = self._merge_data_pack_parts([merged, part], meta={k: v for k, v in merged.items() if k != "derived"})
+        merged2["derived"] = self._derive_data_pack_views(merged2, expected_sessions=expected_sessions)
+        return merged2
+
+    async def _targeted_retry_summary_missing(
+        self,
+        *,
+        extractor_model_id: str,
+        page_images: list[PageImage],
+        merged: dict[str, Any],
+        expected_sessions: list[int],
+        missing: set[str],
+        debug_dir: Path | None = None,
+        attempt_log: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        need_summary = any(
+            k.startswith("performance:")
+            or k.startswith("evoked:")
+            or k.startswith("state:")
+            or k.startswith("peak_frequency:")
+            for k in missing
+        )
+        if not need_summary:
+            return merged
+
+        img_by_page = {img.page: img for img in page_images}
+        page1 = img_by_page.get(1)
+        if page1 is None:
+            return merged
+
+        retry_images = _try_build_summary_table_crops(page1) or [page1]
+        focus = (
+            "RETRY: Extract PAGE-1 SUMMARY metrics for every session shown:\n"
+            "- Performance: Physical Reaction Time (ms), Trail Making Test A (sec), Trail Making Test B (sec)\n"
+            "- Evoked: Audio P300 Delay (ms), Audio P300 Voltage (µV)\n"
+            "- State: CZ Eyes Closed Theta/Beta (Power), F3/F4 Eyes Closed Alpha (Power)\n"
+            "- Peak Frequency: Frontal, Central-Parietal, Occipital (Hz)\n"
+            "Use the canonical identifiers and include target ranges when shown."
+        )
+        prompt_text = _data_pack_prompt(pages=[img.page for img in retry_images], focus=focus)
+
+        raw = await self._call_model_multimodal(
+            model_id=extractor_model_id,
+            prompt_text=prompt_text,
+            images=retry_images,
+            temperature=0.0,
+            max_tokens=2500,
+            allow_text_fallback=False,
+        )
+
+        if debug_dir is not None:
+            try:
+                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                model_dir = debug_dir / safe_model
+                model_dir.mkdir(parents=True, exist_ok=True)
+                stem = "retry-summary-page-1"
+                (model_dir / f"{stem}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+                (model_dir / f"{stem}.raw.txt").write_text(raw, encoding="utf-8")
+                image_paths = _save_debug_images(model_dir=model_dir, stem=stem, images=retry_images)
+                if attempt_log is not None:
+                    attempt_log.append(
+                        {
+                            "kind": "retry_summary_page_1",
+                            "model_id": extractor_model_id,
+                            "pages": sorted({img.page for img in retry_images}),
+                            "labels_sample": [img.label for img in retry_images[:12]],
+                            "raw_path": str(model_dir / f"{stem}.raw.txt"),
+                            "image_paths": image_paths,
+                        }
+                    )
+            except Exception:
+                pass
+
+        part = _json_loads_loose(raw)
+        if not isinstance(part, dict) or part.get("schema_version") != DATA_PACK_SCHEMA_VERSION:
+            return merged
+
+        if debug_dir is not None:
+            try:
+                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                model_dir = debug_dir / safe_model
+                (model_dir / "retry-summary-page-1.parsed.json").write_text(
+                    json.dumps(part, indent=2, sort_keys=True), encoding="utf-8"
+                )
+            except Exception:
+                pass
 
         merged2 = self._merge_data_pack_parts([merged, part], meta={k: v for k, v in merged.items() if k != "derived"})
         merged2["derived"] = self._derive_data_pack_views(merged2, expected_sessions=expected_sessions)
@@ -1542,11 +2263,18 @@ class QEEGCouncilWorkflow:
         # Load images from the report folder (preferred), then legacy lookup.
         page_images = _load_page_images(report, report_dir)
 
-        # If a vision-capable model is selected but no images exist on disk, generate on the fly.
-        if not page_images and any(is_vision_capable(m) for m in council_model_ids):
+        needs_images = any(is_vision_capable(m) for m in council_model_ids)
+        expected_page_count = _page_count_from_markers(report_text)
+        pages_present = {img.page for img in page_images}
+        missing_pages: list[int] = []
+        if expected_page_count:
+            missing_pages = [p for p in range(1, expected_page_count + 1) if p not in pages_present]
+
+        # If a vision-capable model is selected but images are missing/incomplete, generate on the fly.
+        if needs_images and Path(report.stored_path).suffix.lower() == ".pdf" and (not page_images or missing_pages):
             try:
                 enhanced_text, page_images_raw = extract_pdf_with_images(Path(report.stored_path))
-                if enhanced_text and len(enhanced_text) > len(report_text):
+                if enhanced_text and enhanced_text.strip():
                     report_text = enhanced_text
                     try:
                         (report_dir / "extracted_enhanced.txt").write_text(enhanced_text, encoding="utf-8")
@@ -1569,8 +2297,6 @@ class QEEGCouncilWorkflow:
                         pages_dir.mkdir(parents=True, exist_ok=True)
                         for img in page_images:
                             out = pages_dir / f"page-{img.page}.png"
-                            if out.exists():
-                                continue
                             out.write_bytes(base64.b64decode(img.base64_png))
                     except Exception:
                         pass
@@ -1596,23 +2322,50 @@ class QEEGCouncilWorkflow:
             strict=strict_data,
         )
 
+        transcript_model_id: str | None = None
+        if isinstance(data_pack, dict) and isinstance(data_pack.get("extraction_model_id"), str):
+            transcript_model_id = data_pack["extraction_model_id"]
+        elif extractor_models:
+            transcript_model_id = extractor_models[0]
+
+        vision_transcript_text = await self._ensure_vision_transcript(
+            run_id=run_id,
+            report=report,
+            page_images=page_images,
+            transcript_model_id=transcript_model_id,
+            strict=strict_data,
+        )
+
         data_pack_block = ""
         if data_pack:
-            p300_table = ""
-            n100_table = ""
+            derived_tables: list[str] = []
             derived = data_pack.get("derived")
-            if isinstance(derived, dict) and isinstance(derived.get("p300_cp_table_markdown"), str):
-                p300_table = derived["p300_cp_table_markdown"].strip()
-            if isinstance(derived, dict) and isinstance(derived.get("n100_central_frontal_table_markdown"), str):
-                n100_table = derived["n100_central_frontal_table_markdown"].strip()
+            if isinstance(derived, dict):
+                for key in (
+                    "summary_performance_table_markdown",
+                    "summary_evoked_table_markdown",
+                    "summary_state_table_markdown",
+                    "peak_frequency_table_markdown",
+                    "p300_cp_table_markdown",
+                    "n100_central_frontal_table_markdown",
+                ):
+                    val = derived.get(key)
+                    if isinstance(val, str) and val.strip():
+                        derived_tables.append(val.strip())
             dp_json = json.dumps(data_pack, indent=2, sort_keys=True)
             data_pack_block = (
                 "STRUCTURED DATA PACK (authoritative transcription from ALL PDF pages, including graphics):\n\n"
-                + (f"{p300_table}\n\n" if p300_table else "")
-                + (f"{n100_table}\n\n" if n100_table else "")
+                + ("\n\n".join(derived_tables) + "\n\n" if derived_tables else "")
                 + "```json\n"
                 + dp_json
                 + "\n```\n\n"
+            )
+
+        vision_transcript_block = ""
+        if isinstance(vision_transcript_text, str) and vision_transcript_text.strip():
+            vision_transcript_block = (
+                "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
+                f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
@@ -1621,6 +2374,7 @@ class QEEGCouncilWorkflow:
             f"{prompt}\n\n---\n\n"
             f"{workflow_context}\n\n---\n\n"
             f"{data_pack_block}"
+            f"{vision_transcript_block}"
             "FULL qEEG REPORT OCR TEXT (all pages; may include OCR artifacts):\n\n"
             f"{report_text}\n"
         )
@@ -1632,10 +2386,14 @@ class QEEGCouncilWorkflow:
                 # Multi-pass multimodal ingestion for vision models: build page-grounded notes in chunks, then write
                 # the final long-form report using the notes + full OCR + data pack.
                 notes_text = ""
-                if is_vision_capable(model_id) and page_images:
+                per_model_notes = _truthy_env("QEEG_STAGE1_PER_MODEL_VISION_NOTES", False)
+                if is_vision_capable(model_id) and page_images and (per_model_notes or not vision_transcript_block):
                     chunk_size = int(os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
                     if chunk_size <= 0:
                         chunk_size = 8
+                    # Hard requirement: PDFs >10 pages must be ingested in 2+ multimodal passes.
+                    if len(page_images) > 10 and chunk_size > 10:
+                        chunk_size = 10
                     notes_parts: list[str] = []
                     for chunk in _chunked(page_images, chunk_size):
                         pages = [img.page for img in chunk]
@@ -1655,7 +2413,7 @@ class QEEGCouncilWorkflow:
                             images=chunk,
                             temperature=0.0,
                             max_tokens=2500,
-                            allow_text_fallback=True,
+                            allow_text_fallback=not strict_data,
                         )
                         notes_parts.append(notes)
                     notes_text = "\n\n".join(notes_parts).strip()
@@ -1721,12 +2479,27 @@ class QEEGCouncilWorkflow:
             except Exception:
                 data_pack_text = ""
 
+        vision_transcript_text = ""
+        vt_path = _vision_transcript_path(run_id)
+        if vt_path.exists():
+            try:
+                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                vision_transcript_text = ""
+
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
                 "STRUCTURED DATA PACK (authoritative transcription from ALL PDF pages, including graphics):\n\n"
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
+            )
+
+        vision_transcript_block = ""
+        if vision_transcript_text.strip():
+            vision_transcript_block = (
+                "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
+                f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
         analyses_by_model: dict[str, str] = {}
@@ -1773,6 +2546,7 @@ class QEEGCouncilWorkflow:
                 f"{prompt}\n\n---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
+                f"{vision_transcript_block}"
                 f"ORIGINAL qEEG REPORT (for verification - cross-reference all claims against this):\n\n{report_text}\n\n---\n\n"
                 f"Reviewer Model ID: {reviewer_model_id}\n"
                 f"Your own analysis label (do not review yourself): {reviewer_label}\n\n"
@@ -1837,12 +2611,27 @@ class QEEGCouncilWorkflow:
             except Exception:
                 data_pack_text = ""
 
+        vision_transcript_text = ""
+        vt_path = _vision_transcript_path(run_id)
+        if vt_path.exists():
+            try:
+                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                vision_transcript_text = ""
+
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
                 "STRUCTURED DATA PACK (authoritative transcription from ALL PDF pages, including graphics):\n\n"
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
+            )
+
+        vision_transcript_block = ""
+        if vision_transcript_text.strip():
+            vision_transcript_block = (
+                "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
+                f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
         analyses_by_model = {
@@ -1868,6 +2657,7 @@ class QEEGCouncilWorkflow:
                 f"{prompt}\n\n---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
+                f"{vision_transcript_block}"
                 f"ORIGINAL qEEG REPORT (for fact-checking your revision):\n\n{report_text}\n\n---\n\n"
                 f"Your Model ID: {model_id}\n"
                 f"Your analysis label (if present): {my_label}\n\n"
@@ -1930,12 +2720,27 @@ class QEEGCouncilWorkflow:
             except Exception:
                 data_pack_text = ""
 
+        vision_transcript_text = ""
+        vt_path = _vision_transcript_path(run_id)
+        if vt_path.exists():
+            try:
+                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                vision_transcript_text = ""
+
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
                 "STRUCTURED DATA PACK (authoritative transcription from ALL PDF pages, including graphics):\n\n"
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
+            )
+
+        vision_transcript_block = ""
+        if vision_transcript_text.strip():
+            vision_transcript_block = (
+                "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
+                f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
         if not revisions:
@@ -1951,6 +2756,7 @@ class QEEGCouncilWorkflow:
             f"{prompt}\n\n---\n\n"
             f"{workflow_context}\n\n---\n\n"
             f"{data_pack_block}"
+            f"{vision_transcript_block}"
             f"ORIGINAL qEEG REPORT (the source of truth - verify all claims against this):\n\n{report_text}\n\n---\n\n"
             f"REVISED ANALYSES TO CONSOLIDATE:\n\n{revision_text}\n"
         )
@@ -1989,12 +2795,27 @@ class QEEGCouncilWorkflow:
             except Exception:
                 data_pack_text = ""
 
+        vision_transcript_text = ""
+        vt_path = _vision_transcript_path(run_id)
+        if vt_path.exists():
+            try:
+                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                vision_transcript_text = ""
+
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
                 "STRUCTURED DATA PACK (authoritative transcription from ALL PDF pages, including graphics):\n\n"
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
+            )
+
+        vision_transcript_block = ""
+        if vision_transcript_text.strip():
+            vision_transcript_block = (
+                "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
+                f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
         if not s4:
@@ -2009,6 +2830,7 @@ class QEEGCouncilWorkflow:
                 f"{prompt}\n\n---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
+                f"{vision_transcript_block}"
                 f"ORIGINAL qEEG REPORT (for verification):\n\n{report_text}\n\n---\n\n"
                 f"CONSOLIDATED REPORT TO REVIEW:\n\n{consolidated}\n"
             )
@@ -2069,12 +2891,27 @@ class QEEGCouncilWorkflow:
             except Exception:
                 data_pack_text = ""
 
+        vision_transcript_text = ""
+        vt_path = _vision_transcript_path(run_id)
+        if vt_path.exists():
+            try:
+                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                vision_transcript_text = ""
+
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
                 "STRUCTURED DATA PACK (authoritative transcription from ALL PDF pages, including graphics):\n\n"
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
+            )
+
+        vision_transcript_block = ""
+        if vision_transcript_text.strip():
+            vision_transcript_block = (
+                "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
+                f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
         if not s4:
@@ -2091,6 +2928,7 @@ class QEEGCouncilWorkflow:
                 f"{prompt}\n\n---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
+                f"{vision_transcript_block}"
                 f"ORIGINAL qEEG REPORT (for any needed verification):\n\n{report_text}\n\n---\n\n"
                 f"Required changes to apply:\n{changes}\n\n"
                 f"CONSOLIDATED REPORT:\n\n{consolidated}\n"
