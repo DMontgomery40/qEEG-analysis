@@ -1,13 +1,3 @@
-# macOS / Finder cruft
-.DS_Store
-._*
-.AppleDouble
-.LSOverride
-
-# macOS filesystem metadata
-.Spotlight-V100
-.Trashes
-
 # Python-generated files
 __pycache__/
 *.py[oc]

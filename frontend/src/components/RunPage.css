@@ -73,15 +73,18 @@
 
 .stage-pill.done {
   opacity: 1;
-  border-color: var(--accent-teal);
-  background: var(--accent-teal-soft);
+  border-color: var(--accent-green);
+  background: var(--accent-green-soft);
+  color: var(--accent-green-bright);
+  box-shadow: var(--shadow-glow-green);
 }
 
 .stage-pill.active {
   opacity: 1;
-  border-color: var(--accent-blue);
-  background: var(--accent-blue-soft);
-  box-shadow: 0 0 12px var(--accent-blue-soft);
+  border-color: var(--accent-teal);
+  background: var(--accent-teal-soft);
+  color: var(--accent-teal-bright);
+  box-shadow: var(--shadow-glow-teal);
 }
 
 /* Stage divider between stages and Source Data */

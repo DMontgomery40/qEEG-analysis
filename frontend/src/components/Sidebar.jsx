@@ -1,6 +1,28 @@
 import { useMemo, useState } from 'react';
 import './Sidebar.css';
 
+// EEG Wave Icon Component
+function EEGWaveIcon({ className }) {
+  return (
+    <svg className={className} viewBox="0 0 40 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M2 12 L8 12 L10 4 L14 20 L18 8 L22 16 L26 6 L30 18 L34 12 L38 12"
+        stroke="url(#wave-gradient)"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <defs>
+        <linearGradient id="wave-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stopColor="#00CED1" />
+          <stop offset="50%" stopColor="#9370DB" />
+          <stop offset="100%" stopColor="#4A90D9" />
+        </linearGradient>
+      </defs>
+    </svg>
+  );
+}
+
 function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient, style }) {
   const [query, setQuery] = useState('');
   const [newLabel, setNewLabel] = useState('');
@@ -14,7 +36,13 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
   return (
     <div className="sidebar" style={style}>
       <div className="sidebar-header">
-        <div className="sidebar-title">qEEG Council</div>
+        <div className="sidebar-logo-container">
+          <EEGWaveIcon className="sidebar-logo-icon" />
+          <div className="sidebar-logo-text-group">
+            <div className="sidebar-logo-text">qEEG Council</div>
+            <div className="sidebar-tagline">Multi-Model Analysis</div>
+          </div>
+        </div>
         <input
           className="sidebar-search"
           placeholder="Search patients…"

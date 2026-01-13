@@ -69,7 +69,9 @@
 
 .list-item.active {
   background: var(--surface-elevated);
-  border-color: var(--accent-amber-soft);
+  border-color: var(--accent-teal);
+  border-left: 3px solid var(--accent-teal-bright);
+  box-shadow: var(--shadow-glow-teal);
 }
 
 .list-item-title {
@@ -141,8 +143,9 @@ button {
 
 button:hover:not(:disabled) {
   background: var(--surface-hover);
-  border-color: var(--border-strong);
+  border-color: var(--accent-teal);
   transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 206, 209, 0.15);
 }
 
 button:active:not(:disabled) {
@@ -156,13 +159,16 @@ button:disabled {
 
 /* Primary button variant */
 button.primary {
-  background: var(--accent-amber-soft);
-  border-color: var(--accent-amber);
-  color: var(--accent-gold);
+  background: var(--gradient-button);
+  border-color: transparent;
+  color: white;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 button.primary:hover:not(:disabled) {
-  background: var(--accent-amber-hover);
+  background: var(--gradient-button-hover);
+  box-shadow: 0 4px 12px rgba(0, 206, 209, 0.3);
 }
 
 .preview {

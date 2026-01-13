@@ -14,23 +14,43 @@
   --bg-gradient-end: #0b1020;
 
   /* Text */
-  --text-primary: rgba(255, 255, 255, 0.92);
-  --text-secondary: rgba(255, 255, 255, 0.75);
+  --text-primary: rgba(255, 255, 255, 0.95);
+  --text-secondary: rgba(255, 255, 255, 0.80);
   --text-muted: rgba(255, 255, 255, 0.55);
 
-  /* Cool accents (existing, refined) */
-  --accent-blue: rgba(140, 200, 255, 0.95);
-  --accent-blue-hover: rgba(140, 200, 255, 0.20);
-  --accent-blue-soft: rgba(140, 200, 255, 0.12);
-  --accent-teal: rgba(0, 255, 160, 0.35);
-  --accent-teal-soft: rgba(0, 255, 160, 0.15);
+  /* PRIMARY: Medical Teal - trustworthy, clinical, calming */
+  --accent-teal: #00CED1;
+  --accent-teal-bright: #40E0D0;
+  --accent-teal-soft: rgba(0, 206, 209, 0.18);
+  --accent-teal-glow: rgba(0, 206, 209, 0.45);
 
-  /* Warm accents (NEW) */
-  --accent-amber: rgba(255, 191, 105, 0.95);
-  --accent-amber-hover: rgba(255, 191, 105, 0.20);
-  --accent-amber-soft: rgba(255, 191, 105, 0.12);
-  --accent-gold: rgba(255, 215, 140, 0.90);
-  --accent-gold-soft: rgba(255, 215, 140, 0.15);
+  /* SECONDARY: Medical Green - growth, health, vitality */
+  --accent-green: #3CB371;
+  --accent-green-bright: #66CDAA;
+  --accent-green-soft: rgba(60, 179, 113, 0.18);
+
+  /* TERTIARY: Professional Blue - intelligence, trust */
+  --accent-blue: #4A90D9;
+  --accent-blue-bright: #6BB3FA;
+  --accent-blue-soft: rgba(74, 144, 217, 0.18);
+  --accent-blue-hover: rgba(74, 144, 217, 0.25);
+
+  /* ACCENT: Neural Purple - brain activity, cognition */
+  --accent-purple: #9370DB;
+  --accent-purple-bright: #BA55D3;
+  --accent-purple-soft: rgba(147, 112, 219, 0.18);
+
+  /* Warm accents (for warnings/important) */
+  --accent-amber: #FFB347;
+  --accent-amber-hover: rgba(255, 179, 71, 0.25);
+  --accent-amber-soft: rgba(255, 179, 71, 0.15);
+  --accent-gold: #FFD700;
+  --accent-gold-soft: rgba(255, 215, 0, 0.15);
+
+  /* Gradients */
+  --gradient-logo: linear-gradient(135deg, #00CED1 0%, #9370DB 50%, #4A90D9 100%);
+  --gradient-button: linear-gradient(135deg, #3CB371 0%, #00CED1 100%);
+  --gradient-button-hover: linear-gradient(135deg, #40E0D0 0%, #66CDAA 100%);
 
   /* Surfaces */
   --surface-card: rgba(255, 255, 255, 0.04);
@@ -42,19 +62,24 @@
   --border-subtle: rgba(255, 255, 255, 0.08);
   --border-default: rgba(255, 255, 255, 0.12);
   --border-strong: rgba(255, 255, 255, 0.22);
-  --border-focus: rgba(255, 191, 105, 0.50);
+  --border-focus: rgba(0, 206, 209, 0.60);
 
-  /* Status */
-  --status-success: rgba(0, 255, 160, 0.35);
-  --status-success-bg: rgba(0, 255, 160, 0.12);
-  --status-error: rgba(255, 80, 80, 0.90);
-  --status-error-bg: rgba(255, 80, 80, 0.12);
-  --status-warning: rgba(255, 200, 0, 0.90);
-  --status-warning-bg: rgba(255, 200, 0, 0.12);
+  /* Status - vibrant */
+  --status-success: #3CB371;
+  --status-success-bg: rgba(60, 179, 113, 0.18);
+  --status-error: #FF6B6B;
+  --status-error-bg: rgba(255, 107, 107, 0.15);
+  --status-warning: #FFB347;
+  --status-warning-bg: rgba(255, 179, 71, 0.15);
+  --status-running: #00CED1;
+  --status-running-bg: rgba(0, 206, 209, 0.18);
 
   /* Shadows */
   --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.25);
   --shadow-elevated: 0 8px 32px rgba(0, 0, 0, 0.35);
+  --shadow-glow-teal: 0 0 20px rgba(0, 206, 209, 0.3);
+  --shadow-glow-green: 0 0 15px rgba(60, 179, 113, 0.3);
+  --shadow-glow-purple: 0 0 20px rgba(147, 112, 219, 0.3);
 
   /* Transitions */
   --transition-fast: 0.1s ease;
