@@ -38,6 +38,49 @@
   color: var(--text-primary);
 }
 
+.card-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.card-title-row .card-title {
+  margin-bottom: 0;
+}
+
+.explainer-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(0, 206, 209, 0.22);
+  background: linear-gradient(135deg, rgba(0, 206, 209, 0.12) 0%, rgba(147, 112, 219, 0.10) 100%);
+  box-shadow:
+    0 0 16px rgba(0, 206, 209, 0.16),
+    0 0 22px rgba(147, 112, 219, 0.14);
+}
+
+.explainer-label {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  background: var(--gradient-logo);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  text-shadow:
+    0 0 20px rgba(0, 206, 209, 0.35),
+    0 0 30px rgba(147, 112, 219, 0.25);
+}
+
+.explainer-play {
+  padding: 6px 10px;
+}
+
 .row {
   display: flex;
   gap: 10px;
@@ -186,6 +229,106 @@ button.primary:hover:not(:disabled) {
   border-radius: var(--radius-md);
   overflow: auto;
   max-height: 240px;
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+.section-divider {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.subsection-title {
+  font-weight: 700;
+  margin-bottom: 6px;
+  color: var(--text-primary);
+}
+
+.file-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.file-open {
+  flex: 1;
+}
+
+.file-delete {
+  flex-shrink: 0;
+  border-color: rgba(255, 107, 107, 0.35);
+  background: rgba(255, 107, 107, 0.12);
+}
+
+.file-delete:hover:not(:disabled) {
+  border-color: rgba(255, 107, 107, 0.65);
+  background: rgba(255, 107, 107, 0.18);
+}
+
+.video-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  backdrop-filter: blur(6px);
+}
+
+.video-modal {
+  width: min(980px, 100%);
+  max-height: 90vh;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: rgba(11, 16, 32, 0.92);
+  box-shadow: var(--shadow-elevated);
+  overflow: hidden;
+}
+
+.video-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.video-modal-title {
+  font-weight: 800;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  background: var(--gradient-logo);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  text-shadow:
+    0 0 18px rgba(0, 206, 209, 0.28),
+    0 0 24px rgba(147, 112, 219, 0.18);
+}
+
+.video-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.video-modal-body {
+  padding: 14px;
+}
+
+.video-modal-player {
+  width: 100%;
+  max-height: calc(90vh - 120px);
+  background: black;
+  border-radius: var(--radius-md);
+  outline: 1px solid var(--border-subtle);
 }
 
 /* Run History card with fixed height and scroll */

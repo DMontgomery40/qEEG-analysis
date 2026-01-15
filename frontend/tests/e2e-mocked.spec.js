@@ -47,6 +47,8 @@ const MOCK_REPORTS = [
   },
 ];
 
+const MOCK_PATIENT_FILES = [];
+
 const MOCK_RUNS = [
   {
     id: MOCK_RUN_ID,
@@ -81,6 +83,7 @@ async function setupMockApi(page, options = {}) {
     models = MOCK_MODELS,
     patients = [...MOCK_PATIENTS],
     reports = [...MOCK_REPORTS],
+    patientFiles = [...MOCK_PATIENT_FILES],
     runs = [...MOCK_RUNS],
     artifacts = [...MOCK_ARTIFACTS],
   } = options;
@@ -153,6 +156,38 @@ async function setupMockApi(page, options = {}) {
       reports.push(newReport);
       await route.fulfill({ json: newReport });
     }
+  });
+
+  // GET /api/patients/:id/files
+  await page.route('**/api/patients/*/files', async (route, request) => {
+    const url = request.url();
+    const patientId = url.split('/api/patients/')[1]?.split('/')[0];
+
+    if (request.method() === 'GET') {
+      const files = patientFiles.filter((f) => f.patient_id === patientId);
+      await route.fulfill({ json: files });
+    } else if (request.method() === 'POST') {
+      const newFile = {
+        id: `file-${Date.now()}`,
+        patient_id: patientId,
+        filename: 'uploaded-file.mp4',
+        mime_type: 'video/mp4',
+        size_bytes: 1024 * 1024,
+        created_at: new Date().toISOString(),
+      };
+      patientFiles.push(newFile);
+      await route.fulfill({ json: { file: newFile } });
+    }
+  });
+
+  // GET/DELETE /api/patient_files/:id
+  await page.route('**/api/patient_files/*', async (route, request) => {
+    if (request.method() === 'DELETE') {
+      await route.fulfill({ json: { ok: true } });
+      return;
+    }
+    // For GET (download), just return a stub
+    await route.fulfill({ body: 'stub', contentType: 'application/octet-stream' });
   });
 
   // GET /api/patients/:id/runs

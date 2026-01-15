@@ -20,10 +20,16 @@ GET /api/models
 ## Patients
 GET /api/patients
 POST /api/patients
+POST /api/patients/bulk_upload
 GET /api/patients/{id}
 PUT /api/patients/{id}
 GET /api/patients/{id}/reports
 GET /api/patients/{id}/runs
+GET /api/patients/{id}/files
+POST /api/patients/{id}/files
+
+GET /api/patient_files/{file_id}
+DELETE /api/patient_files/{file_id}
 
 ## Reports
 POST /api/patients/{id}/reports
@@ -35,6 +41,18 @@ GET /api/reports/{report_id}/extracted
 
 POST /api/reports/{report_id}/reextract
 - regenerates extracted text and (if available) OCR + page images
+
+GET /api/reports/{report_id}/original
+- returns the original uploaded PDF (for inline viewing or download)
+
+GET /api/reports/{report_id}/pages
+- returns JSON list of extracted page images and URLs
+
+GET /api/reports/{report_id}/pages/{page_num}
+- returns a single page image (PNG)
+
+GET /api/reports/{report_id}/metadata
+- returns extraction metadata (JSON) when available
 
 ## Runs
 POST /api/runs

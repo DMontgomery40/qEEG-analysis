@@ -14,7 +14,9 @@ This file is for **AI agents working in this repo**. For architecture details, r
 
 - Backend guidance: `backend/AGENTS.md`
 - Frontend guidance: `frontend/AGENTS.md`
-- Codex skill references: `.codex/skills/`
+- Skill references:
+  - Codex: `.codex/skills/`
+  - Claude Code: `.claude/skills/`
 
 ## Quick commands (common)
 

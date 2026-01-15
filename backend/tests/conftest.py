@@ -27,11 +27,12 @@ def temp_data_dir(tmp_path: Path, monkeypatch):
 
     Must be used before any test that creates patients, reports, runs, or artifacts.
     """
-    from backend import config, storage, reports, council
+    from backend import config, council, patient_files, reports, storage
 
     # Patch config module paths
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(config, "PATIENT_FILES_DIR", tmp_path / "patient_files")
     monkeypatch.setattr(config, "ARTIFACTS_DIR", tmp_path / "artifacts")
     monkeypatch.setattr(config, "EXPORTS_DIR", tmp_path / "exports")
 
@@ -40,6 +41,9 @@ def temp_data_dir(tmp_path: Path, monkeypatch):
 
     # Patch reports module's cached import of REPORTS_DIR
     monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
+
+    # Patch patient_files module's cached import of PATIENT_FILES_DIR
+    monkeypatch.setattr(patient_files, "PATIENT_FILES_DIR", tmp_path / "patient_files")
 
     # Patch council module's cached import of ARTIFACTS_DIR
     monkeypatch.setattr(council, "ARTIFACTS_DIR", tmp_path / "artifacts")

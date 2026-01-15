@@ -99,6 +99,27 @@ export const api = {
   listRuns(patientId) {
     return request(`/api/patients/${patientId}/runs`);
   },
+
+  async bulkUploadPatients(files) {
+    const form = new FormData();
+    for (const f of files || []) form.append('files', f);
+    return request('/api/patients/bulk_upload', { method: 'POST', body: form });
+  },
+
+  listPatientFiles(patientId) {
+    return request(`/api/patients/${patientId}/files`);
+  },
+  async uploadPatientFile(patientId, file) {
+    const form = new FormData();
+    form.append('file', file);
+    return request(`/api/patients/${patientId}/files`, { method: 'POST', body: form });
+  },
+  patientFileUrl(fileId) {
+    return `${API_BASE}/api/patient_files/${fileId}`;
+  },
+  deletePatientFile(fileId) {
+    return request(`/api/patient_files/${fileId}`, { method: 'DELETE' });
+  },
   createRun(payload) {
     return request('/api/runs', {
       method: 'POST',

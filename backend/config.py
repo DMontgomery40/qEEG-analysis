@@ -17,6 +17,7 @@ CLIPROXY_API_KEY = os.getenv("CLIPROXY_API_KEY", "")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 REPORTS_DIR = DATA_DIR / "reports"
+PATIENT_FILES_DIR = DATA_DIR / "patient_files"
 ARTIFACTS_DIR = DATA_DIR / "artifacts"
 EXPORTS_DIR = DATA_DIR / "exports"
 
@@ -161,5 +162,5 @@ def set_discovered_model_ids(model_ids: list[str]) -> None:
 
 
 def ensure_data_dirs() -> None:
-    for d in (DATA_DIR, REPORTS_DIR, ARTIFACTS_DIR, EXPORTS_DIR):
+    for d in (DATA_DIR, REPORTS_DIR, PATIENT_FILES_DIR, ARTIFACTS_DIR, EXPORTS_DIR):
         d.mkdir(parents=True, exist_ok=True)

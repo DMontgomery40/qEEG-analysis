@@ -1,0 +1,126 @@
+.bulk-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bulk-help {
+  margin-bottom: 12px;
+}
+
+.bulk-controls {
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.bulk-hidden-input {
+  display: none;
+}
+
+.bulk-preview {
+  margin-top: 14px;
+}
+
+.bulk-preview-title,
+.bulk-result-title {
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.bulk-warnings .warn-banner {
+  margin: 8px 0 0 0;
+}
+
+.bulk-file-list {
+  gap: 6px;
+}
+
+.bulk-file-row {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bulk-file-name {
+  font-weight: 600;
+}
+
+.bulk-file-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.bulk-file-label {
+  color: var(--text-secondary);
+}
+
+.bulk-tag {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  padding: 2px 8px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.bulk-tag-skip {
+  border-color: rgba(255, 179, 71, 0.35);
+  background: var(--accent-amber-soft);
+}
+
+.bulk-result {
+  margin-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 16px;
+}
+
+.bulk-counts {
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.bulk-subtitle {
+  font-weight: 700;
+  margin-top: 12px;
+  margin-bottom: 6px;
+}
+
+.bulk-created-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.bulk-created-title {
+  font-weight: 700;
+}
+
+.bulk-skip-row,
+.bulk-error-row {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.bulk-skip-title {
+  font-weight: 600;
+}
+

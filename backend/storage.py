@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, select
+from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from .config import DATA_DIR, ensure_data_dirs
@@ -39,6 +39,7 @@ class Patient(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     reports: Mapped[list["Report"]] = relationship(back_populates="patient")
+    files: Mapped[list["PatientFile"]] = relationship(back_populates="patient")
     runs: Mapped[list["Run"]] = relationship(back_populates="patient")
 
 
@@ -55,6 +56,20 @@ class Report(Base):
 
     patient: Mapped[Patient] = relationship(back_populates="reports")
     runs: Mapped[list["Run"]] = relationship(back_populates="report")
+
+
+class PatientFile(Base):
+    __tablename__ = "patient_files"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_new_id)
+    patient_id: Mapped[str] = mapped_column(ForeignKey("patients.id"), nullable=False)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(nullable=False, default=0)
+    stored_path: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    patient: Mapped[Patient] = relationship(back_populates="files")
 
 
 class Run(Base):
@@ -140,6 +155,13 @@ def list_patients(session: Session) -> list[Patient]:
     return list(session.scalars(select(Patient).order_by(Patient.created_at.desc())))
 
 
+def find_patients_by_label(session: Session, label: str) -> list[Patient]:
+    normalized = (label or "").strip()
+    if not normalized:
+        return []
+    return list(session.scalars(select(Patient).where(func.lower(Patient.label) == normalized.lower())))
+
+
 def get_patient(session: Session, patient_id: str) -> Patient | None:
     return session.get(Patient, patient_id)
 
@@ -170,6 +192,53 @@ def list_reports(session: Session, patient_id: str) -> list[Report]:
             select(Report).where(Report.patient_id == patient_id).order_by(Report.created_at.desc())
         )
     )
+
+
+def list_patient_files(session: Session, patient_id: str) -> list[PatientFile]:
+    return list(
+        session.scalars(
+            select(PatientFile)
+            .where(PatientFile.patient_id == patient_id)
+            .order_by(PatientFile.created_at.desc())
+        )
+    )
+
+
+def create_patient_file(
+    session: Session,
+    *,
+    file_id: str | None = None,
+    patient_id: str,
+    filename: str,
+    mime_type: str,
+    size_bytes: int,
+    stored_path: Path,
+) -> PatientFile:
+    f = PatientFile(
+        id=file_id if file_id else _new_id(),
+        patient_id=patient_id,
+        filename=filename,
+        mime_type=mime_type,
+        size_bytes=int(size_bytes),
+        stored_path=str(stored_path),
+    )
+    session.add(f)
+    session.commit()
+    session.refresh(f)
+    return f
+
+
+def get_patient_file(session: Session, file_id: str) -> PatientFile | None:
+    return session.get(PatientFile, file_id)
+
+
+def delete_patient_file(session: Session, file_id: str) -> PatientFile | None:
+    f = session.get(PatientFile, file_id)
+    if f is None:
+        return None
+    session.delete(f)
+    session.commit()
+    return f
 
 
 def create_report(

@@ -26,7 +26,7 @@
   Core directories:
   - backend/
     - main.py: FastAPI endpoints
-    - council.py: QEEGCouncilWorkflow (6 stages)
+    - council/: qEEG Council workflow package (QEEGCouncilWorkflow + Stage 1 data pack)
     - reports.py: PDF text extraction + OCR + image rendering helpers
     - storage.py: SQLite + file-based artifacts
     - prompts/: stage prompts (markdown/json)
@@ -36,7 +36,7 @@
   - DO NOT run with QEEG_MOCK_LLM=1 for real quality runs.
     That mode swaps in hardcoded mock responses and produces “trash” artifacts in seconds.
 
-  6-stage workflow (backend/council.py)
+  6-stage workflow (backend/council/)
   =====================================
   Stage 1: Initial analyses (parallel across models)
   - The ONLY stage that directly uses page images (multimodal).
@@ -166,7 +166,7 @@
 
   Deterministic N100 extraction added (important)
   ==============================================
-  backend/council.py now includes a deterministic parser:
+  backend/council/report_text.py now includes a deterministic parser:
   - _facts_from_report_text_n100_central_frontal(report_text, expected_sessions=[1,2,3])
 
   It extracts CENTRAL-FRONTAL AVERAGE “N100-UV MS” from OCR text on the P300 Rare Comparison page
@@ -206,7 +206,7 @@
     - full report OCR text
     - consolidation and/or required changes
 
-  Verify this pattern remains in backend/council.py.
+  Verify this pattern remains in the stage prompt composition + Stage 1 data pack logic under `backend/council/workflow/`.
 
   Known-good reference run (real, non-mock)
   =========================================
@@ -280,7 +280,7 @@
      - GET http://127.0.0.1:8317/v1/models
 
   2) Start backend:
-     - uvicorn backend.main:app --reload --port 8000
+     - uv run python -m backend.main
 
   3) Upload report via UI or API, create a run.
 
@@ -301,28 +301,21 @@
      - stage-4 consolidation artifact
      - exported final.md includes numeric tables
 
-  Apple Vision OCR (exploratory future improvement; not currently integrated)
-  ==========================================================================
-  Current qEEG-analysis OCR engine: Tesseract (pytesseract) + PyMuPDF rendering.
+  Apple Vision OCR (macOS; integrated)
+  ===================================
+  Apple Vision OCR is integrated for enhanced extraction on macOS:
+  - implementation: backend/apple_vision_ocr.py
+  - used by: backend/reports.py (enhanced extraction path)
 
-  There is Apple Vision OCR code in:
-  - /Users/davidmontgomery/secondbrain/src/second_brain/ocr/apple_vision_ocr.py
-  - /Users/davidmontgomery/secondbrain-ds/brain_scans/ocr_pdfs.py
-  - parsing examples in /Users/davidmontgomery/secondbrain-ds/brain_scans/parse_wavi_reports.py
-    and parse_wavi_complete.py
-
-  Important notes before adopting:
-  - This repo’s current Python env does NOT have pyobjc Vision installed (import Vision fails).
-  - If adopting Apple Vision OCR:
-    - Use VNRecognizeTextRequest (Accurate), not Live Text private APIs unless willing to accept fragility.
-    - Disable language correction for numeric-heavy ROIs.
-    - Capture real confidence + bounding boxes (for audit/debug and deterministic parsing).
-    - Keep Tesseract as a backstop/cross-check (no single OCR engine is perfect).
+  Controls:
+  - QEEG_DISABLE_APPLE_VISION_OCR=1 to force-disable Apple Vision OCR (falls back to Tesseract when available)
+  - QEEG_APPLE_VISION_RECOGNITION_LEVEL=fast|accurate (default accurate)
+  - QEEG_APPLE_VISION_LANGUAGE_CORRECTION=1 (default false; usually harmful for numeric-heavy tables)
 
   Next task suggestions (likely priorities)
   ========================================
   - Improve deterministic extraction coverage for remaining “hard” pages (e.g., coherence heatmap tables)
-    using ROI-based OCR (and/or Apple Vision OCR once integrated), with strict schema validation.
+    using ROI-based OCR (plus multimodal transcription as a second source), with strict schema validation.
   - Add explicit per-page/ROI debug artifacts on failure (store crops + OCR tokens + confidences).
   - Ensure Stage 1’s data pack is “the authoritative facts” so Stage 2–6 never hallucinate missing data.
   - Consider PDF-native extraction (PyMuPDF text with coordinates) when numbers are vector text instead of raster,

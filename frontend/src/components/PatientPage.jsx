@@ -41,8 +41,14 @@ function PatientPage({
   const [patient, setPatient] = useState(null);
   const [reports, setReports] = useState([]);
   const [runs, setRuns] = useState([]);
+  const [patientFiles, setPatientFiles] = useState([]);
   const [uploadPreview, setUploadPreview] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [fileUploading, setFileUploading] = useState(false);
+  const [videoModalFile, setVideoModalFile] = useState(null);
+
+  const reportInputRef = useRef(null);
+  const patientFileInputRef = useRef(null);
 
   const [editLabel, setEditLabel] = useState('');
   const [editNotes, setEditNotes] = useState('');
@@ -120,18 +126,38 @@ function PatientPage({
     [discoveredModels]
   );
 
+  const explainerVideo = useMemo(() => {
+    for (const f of patientFiles || []) {
+      const mt = String(f?.mime_type || '').toLowerCase();
+      const name = String(f?.filename || '').toLowerCase();
+      if (mt === 'video/mp4' || name.endsWith('.mp4')) return f;
+    }
+    return null;
+  }, [patientFiles]);
+
+  useEffect(() => {
+    if (!videoModalFile) return;
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') setVideoModalFile(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [videoModalFile]);
+
   async function refresh() {
     if (!patientId) return;
-    const [p, r, ru] = await Promise.all([
+    const [p, r, ru, pf] = await Promise.all([
       api.getPatient(patientId),
       api.listReports(patientId),
       api.listRuns(patientId),
+      api.listPatientFiles(patientId),
     ]);
     setPatient(p);
     setEditLabel(p.label || '');
     setEditNotes(p.notes || '');
     setReports(r);
     setRuns(ru);
+    setPatientFiles(pf);
     if (r.length && !selectedReportId) setSelectedReportId(r[0].id);
   }
 
@@ -139,10 +165,12 @@ function PatientPage({
     setPatient(null);
     setReports([]);
     setRuns([]);
+    setPatientFiles([]);
     setUploadPreview('');
     setSelectedReportId('');
     setSelectedCouncilIds([]);
     setSelectedConsolidator('');
+    setVideoModalFile(null);
     (async () => {
       try {
         await refresh();
@@ -161,8 +189,51 @@ function PatientPage({
 
   return (
     <div className="page">
+      {videoModalFile ? (
+        <div
+          className="video-modal-overlay"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setVideoModalFile(null);
+          }}
+        >
+          <div className="video-modal">
+            <div className="video-modal-header">
+              <div className="video-modal-title">Explainer Video</div>
+              <div className="video-modal-actions">
+                <button onClick={() => window.open(api.patientFileUrl(videoModalFile.id), '_blank')}>
+                  Open
+                </button>
+                <button onClick={() => setVideoModalFile(null)}>Close</button>
+              </div>
+            </div>
+            <div className="video-modal-body">
+              <video
+                className="video-modal-player"
+                controls
+                autoPlay
+                crossOrigin="anonymous"
+                src={api.patientFileUrl(videoModalFile.id)}
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <div className="card">
-        <div className="card-title">Patient</div>
+        <div className="card-title-row">
+          <div className="card-title">Patient</div>
+          {explainerVideo ? (
+            <div className="explainer-banner">
+              <div className="explainer-label">Explainer Video</div>
+              <button
+                className="primary explainer-play"
+                onClick={() => setVideoModalFile(explainerVideo)}
+              >
+                Play
+              </button>
+            </div>
+          ) : null}
+        </div>
         <div className="row">
           <label>
             Label
@@ -192,7 +263,16 @@ function PatientPage({
         <div className="card" style={{ width: `${leftColPercent}%`, flexShrink: 0 }}>
           <div className="card-title">Reports</div>
           <div className="row">
+            <button
+              className="primary"
+              onClick={() => reportInputRef.current?.click()}
+              disabled={uploading}
+            >
+              {uploading ? 'Uploading…' : 'Upload report…'}
+            </button>
             <input
+              ref={reportInputRef}
+              className="hidden-file-input"
               type="file"
               accept=".pdf,.txt,text/plain,application/pdf"
               onChange={async (e) => {
@@ -207,6 +287,7 @@ function PatientPage({
                   onError(String(err?.message || err));
                 } finally {
                   setUploading(false);
+                  e.target.value = '';
                 }
               }}
               disabled={uploading}
@@ -257,6 +338,78 @@ function PatientPage({
               </button>
             ))}
             {!reports.length ? <div className="muted">No reports yet.</div> : null}
+          </div>
+
+          <div className="section-divider" />
+          <div className="subsection-title">Patient Files</div>
+          <div className="muted" style={{ fontSize: 13 }}>
+            PDFs, Markdown, and MP4 videos (e.g. explainer videos).
+          </div>
+
+          <div className="row" style={{ marginTop: 10 }}>
+            <button onClick={() => patientFileInputRef.current?.click()} disabled={fileUploading}>
+              {fileUploading ? 'Uploading…' : 'Upload file…'}
+            </button>
+            <input
+              ref={patientFileInputRef}
+              className="hidden-file-input"
+              type="file"
+              accept=".pdf,.md,.markdown,.mp4,application/pdf,text/markdown,video/mp4"
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                setFileUploading(true);
+                try {
+                  await api.uploadPatientFile(patientId, file);
+                  await refresh();
+                  await onRefreshGlobal?.();
+                } catch (err) {
+                  onError(String(err?.message || err));
+                } finally {
+                  setFileUploading(false);
+                  e.target.value = '';
+                }
+              }}
+              disabled={fileUploading}
+            />
+          </div>
+
+          <div className="list">
+            {patientFiles.map((f) => (
+              <div key={f.id} className="file-row">
+                <button
+                  className="list-item file-open"
+                  onClick={() => window.open(api.patientFileUrl(f.id), '_blank')}
+                >
+                  <div className="list-item-title">{f.filename}</div>
+                  <div className="list-item-sub">
+                    {f.mime_type}
+                    {typeof f.size_bytes === 'number' && f.size_bytes > 0
+                      ? ` • ${Math.round(f.size_bytes / 1024)} KB`
+                      : ''}
+                    {' • '}
+                    {new Date(f.created_at).toLocaleString()}
+                  </div>
+                </button>
+                <button
+                  className="file-delete"
+                  onClick={async () => {
+                    const ok = window.confirm(`Delete "${f.filename}"?`);
+                    if (!ok) return;
+                    try {
+                      await api.deletePatientFile(f.id);
+                      await refresh();
+                      await onRefreshGlobal?.();
+                    } catch (err) {
+                      onError(String(err?.message || err));
+                    }
+                  }}
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+            {!patientFiles.length ? <div className="muted">No files yet.</div> : null}
           </div>
         </div>
 

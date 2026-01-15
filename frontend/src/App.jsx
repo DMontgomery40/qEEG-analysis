@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import { api } from './api';
 import Sidebar from './components/Sidebar';
+import BulkUploadPage from './components/BulkUploadPage';
 import PatientPage from './components/PatientPage';
 import RunPage from './components/RunPage';
 import ResizeHandle from './components/ResizeHandle';
@@ -35,6 +36,7 @@ function App() {
   const [patients, setPatients] = useState([]);
   const [selectedPatientId, setSelectedPatientId] = useState(null);
   const [selectedRunId, setSelectedRunId] = useState(null);
+  const [showBulkUpload, setShowBulkUpload] = useState(false);
   const [error, setError] = useState('');
   const autoStartTriedRef = useRef(false);
   const [geminiProjectId, setGeminiProjectId] = useState('');
@@ -121,8 +123,13 @@ function App() {
         patients={patients}
         selectedPatientId={selectedPatientId}
         onSelectPatient={(id) => {
+          setShowBulkUpload(false);
           setSelectedRunId(null);
           setSelectedPatientId(id);
+        }}
+        onBulkUpload={() => {
+          setSelectedRunId(null);
+          setShowBulkUpload(true);
         }}
         onCreatePatient={async (payload) => {
           try {
@@ -267,7 +274,17 @@ function App() {
           </div>
         ) : null}
 
-        {showRun ? (
+        {showBulkUpload ? (
+          <BulkUploadPage
+            patients={patients}
+            onSelectPatient={(id) => {
+              setSelectedPatientId(id);
+            }}
+            onClose={() => setShowBulkUpload(false)}
+            onError={(msg) => setError(msg)}
+            onRefreshPatients={refreshPatients}
+          />
+        ) : showRun ? (
           <RunPage
             runId={selectedRunId}
             modelMetaById={modelMetaById}

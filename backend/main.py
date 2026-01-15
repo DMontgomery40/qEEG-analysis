@@ -15,6 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select as sa_select
 
 from . import storage
 from .config import (
@@ -31,7 +32,8 @@ from .council import QEEGCouncilWorkflow
 from .cliproxy_status import status_payload
 from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient, UpstreamError
-from .reports import extract_pdf_full, extract_text_from_pdf, save_report_upload
+from .patient_files import save_patient_file_upload
+from .reports import extract_pdf_full, extract_text_from_pdf, report_dir as report_storage_dir, save_report_upload
 
 
 app = FastAPI(title="qEEG Council API")
@@ -477,7 +479,20 @@ async def models() -> dict[str, Any]:
 async def list_patients() -> list[dict[str, Any]]:
     with storage.session_scope() as session:
         pts = storage.list_patients(session)
-        return [_patient_out(p) for p in pts]
+        patient_ids = [p.id for p in pts]
+        patient_ids_with_video: set[str] = set()
+        if patient_ids:
+            q = (
+                sa_select(storage.PatientFile.patient_id)
+                .where(
+                    storage.PatientFile.patient_id.in_(patient_ids),
+                    storage.PatientFile.mime_type == "video/mp4",
+                )
+                .distinct()
+            )
+            patient_ids_with_video = set(session.scalars(q).all())
+
+        return [_patient_out(p, has_explainer_video=(p.id in patient_ids_with_video)) for p in pts]
 
 
 @app.post("/api/patients")
@@ -487,13 +502,121 @@ async def create_patient(req: PatientCreate) -> dict[str, Any]:
         return _patient_out(p)
 
 
+@app.post("/api/patients/bulk_upload")
+async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """
+    Bulk upload qEEG report files. Each file creates a new patient whose label is the filename stem.
+
+    If a patient with the same label already exists (case-insensitive), the file is skipped and reported.
+    """
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    seen_labels: set[str] = set()
+    for file in files:
+        filename = (file.filename or "upload").strip() or "upload"
+        patient_label = Path(filename).stem.strip()
+        if not patient_label:
+            errors.append({"filename": filename, "error": "Empty filename stem (cannot derive patient label)"})
+            continue
+
+        label_key = patient_label.lower()
+        if label_key in seen_labels:
+            skipped.append(
+                {
+                    "filename": filename,
+                    "patient_label": patient_label,
+                    "reason": "duplicate_label_in_batch",
+                }
+            )
+            continue
+        seen_labels.add(label_key)
+
+        with storage.session_scope() as session:
+            existing = storage.find_patients_by_label(session, patient_label)
+            if existing:
+                skipped.append(
+                    {
+                        "filename": filename,
+                        "patient_label": patient_label,
+                        "reason": "patient_label_exists",
+                        "existing_patient_ids": [p.id for p in existing],
+                    }
+                )
+                continue
+
+        report_id = str(uuid.uuid4())
+        report_folder: Path | None = None
+        try:
+            file_bytes = await file.read()
+            preview = ""
+
+            with storage.session_scope() as session:
+                patient = storage.Patient(label=patient_label, notes="")
+                session.add(patient)
+                session.flush()
+                patient_id = patient.id
+
+                report_folder = report_storage_dir(patient_id, report_id)
+                original_path, extracted_path, mime_type, preview = save_report_upload(
+                    patient_id=patient_id,
+                    report_id=report_id,
+                    filename=filename,
+                    provided_mime_type=file.content_type,
+                    file_bytes=file_bytes,
+                )
+
+                report = storage.Report(
+                    id=report_id,
+                    patient_id=patient_id,
+                    filename=filename,
+                    mime_type=mime_type,
+                    stored_path=str(original_path),
+                    extracted_text_path=str(extracted_path),
+                )
+                session.add(report)
+                session.commit()
+                session.refresh(patient)
+                session.refresh(report)
+
+            created.append(
+                {
+                    "filename": filename,
+                    "patient": _patient_out(patient),
+                    "report": _report_out(report),
+                    "preview": preview,
+                }
+            )
+        except Exception as e:
+            if report_folder is not None:
+                try:
+                    shutil.rmtree(report_folder, ignore_errors=True)
+                except Exception:
+                    pass
+            errors.append({"filename": filename, "patient_label": patient_label, "error": str(e)})
+
+    return {
+        "created": created,
+        "skipped": skipped,
+        "errors": errors,
+        "counts": {"created": len(created), "skipped": len(skipped), "errors": len(errors)},
+    }
+
+
 @app.get("/api/patients/{patient_id}")
 async def get_patient(patient_id: str) -> dict[str, Any]:
     with storage.session_scope() as session:
         p = storage.get_patient(session, patient_id)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
-        return _patient_out(p)
+        q = (
+            sa_select(storage.PatientFile.id)
+            .where(storage.PatientFile.patient_id == patient_id, storage.PatientFile.mime_type == "video/mp4")
+            .limit(1)
+        )
+        has_video = session.scalars(q).first() is not None
+        return _patient_out(p, has_explainer_video=has_video)
 
 
 @app.put("/api/patients/{patient_id}")
@@ -502,7 +625,13 @@ async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
         p = storage.update_patient(session, patient_id, label=req.label, notes=req.notes)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
-        return _patient_out(p)
+        q = (
+            sa_select(storage.PatientFile.id)
+            .where(storage.PatientFile.patient_id == patient_id, storage.PatientFile.mime_type == "video/mp4")
+            .limit(1)
+        )
+        has_video = session.scalars(q).first() is not None
+        return _patient_out(p, has_explainer_video=has_video)
 
 
 @app.post("/api/patients/{patient_id}/reports")
@@ -543,6 +672,85 @@ async def list_reports(patient_id: str) -> list[dict[str, Any]]:
             raise HTTPException(status_code=404, detail="Patient not found")
         reps = storage.list_reports(session, patient_id)
         return [_report_out(r) for r in reps]
+
+
+@app.get("/api/patients/{patient_id}/files")
+async def list_patient_files(patient_id: str) -> list[dict[str, Any]]:
+    with storage.session_scope() as session:
+        p = storage.get_patient(session, patient_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        files = storage.list_patient_files(session, patient_id)
+        return [_patient_file_out(f) for f in files]
+
+
+@app.post("/api/patients/{patient_id}/files")
+async def upload_patient_file(patient_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    with storage.session_scope() as session:
+        p = storage.get_patient(session, patient_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+
+    file_id = str(uuid.uuid4())
+    filename = file.filename or "upload"
+    original_path, mime_type, size_bytes = save_patient_file_upload(
+        patient_id=patient_id,
+        file_id=file_id,
+        filename=filename,
+        provided_mime_type=file.content_type,
+        src=file.file,
+    )
+
+    with storage.session_scope() as session:
+        pf = storage.create_patient_file(
+            session,
+            file_id=file_id,
+            patient_id=patient_id,
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            stored_path=original_path,
+        )
+        return {"file": _patient_file_out(pf)}
+
+
+@app.get("/api/patient_files/{file_id}")
+async def get_patient_file(file_id: str):
+    with storage.session_scope() as session:
+        pf = storage.get_patient_file(session, file_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        path = Path(pf.stored_path)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="File not found on disk")
+        return FileResponse(
+            str(path),
+            media_type=pf.mime_type,
+            filename=pf.filename,
+            content_disposition_type="inline",
+        )
+
+
+@app.delete("/api/patient_files/{file_id}")
+async def delete_patient_file(file_id: str) -> dict[str, Any]:
+    with storage.session_scope() as session:
+        pf = storage.get_patient_file(session, file_id)
+        if pf is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        stored_path = Path(pf.stored_path)
+
+    with storage.session_scope() as session:
+        deleted = storage.delete_patient_file(session, file_id)
+        if deleted is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        # Delete the whole per-file folder (…/<patient_id>/<file_id>/…)
+        shutil.rmtree(stored_path.parent, ignore_errors=True)
+    except Exception:
+        pass
+
+    return {"ok": True}
 
 
 @app.get("/api/reports/{report_id}/extracted")
@@ -953,11 +1161,12 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _patient_out(p: storage.Patient) -> dict[str, Any]:
+def _patient_out(p: storage.Patient, *, has_explainer_video: bool = False) -> dict[str, Any]:
     return {
         "id": p.id,
         "label": p.label,
         "notes": p.notes,
+        "has_explainer_video": bool(has_explainer_video),
         "created_at": p.created_at.isoformat(),
         "updated_at": p.updated_at.isoformat(),
     }
@@ -970,6 +1179,17 @@ def _report_out(r: storage.Report) -> dict[str, Any]:
         "filename": r.filename,
         "mime_type": r.mime_type,
         "created_at": r.created_at.isoformat(),
+    }
+
+
+def _patient_file_out(f: storage.PatientFile) -> dict[str, Any]:
+    return {
+        "id": f.id,
+        "patient_id": f.patient_id,
+        "filename": f.filename,
+        "mime_type": f.mime_type,
+        "size_bytes": f.size_bytes,
+        "created_at": f.created_at.isoformat(),
     }
 
 

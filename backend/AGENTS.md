@@ -59,10 +59,19 @@ API surface
   - `POST /api/cliproxy/install`
 - Patient and report endpoints:
   - `GET/POST/PUT /api/patients`
+  - `POST /api/patients/bulk_upload`
   - `POST /api/patients/{id}/reports`
   - `GET /api/patients/{id}/reports`
   - `GET /api/reports/{report_id}/extracted`
   - `POST /api/reports/{report_id}/reextract`
+  - `GET /api/reports/{report_id}/original`
+  - `GET /api/reports/{report_id}/pages`
+  - `GET /api/reports/{report_id}/pages/{page_num}`
+  - `GET /api/reports/{report_id}/metadata`
+  - `GET /api/patients/{id}/files`
+  - `POST /api/patients/{id}/files`
+  - `GET /api/patient_files/{file_id}`
+  - `DELETE /api/patient_files/{file_id}`
 - Run endpoints:
   - `POST /api/runs`
   - `POST /api/runs/{run_id}/start`

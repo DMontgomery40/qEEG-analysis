@@ -23,7 +23,7 @@ function EEGWaveIcon({ className }) {
   );
 }
 
-function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient, style }) {
+function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient, onBulkUpload, style }) {
   const [query, setQuery] = useState('');
   const [newLabel, setNewLabel] = useState('');
 
@@ -68,6 +68,16 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
             New
           </button>
         </div>
+        <div className="sidebar-bulk">
+          <button
+            className="sidebar-bulk-button"
+            onClick={() => {
+              onBulkUpload?.();
+            }}
+          >
+            Bulk Upload
+          </button>
+        </div>
       </div>
 
       <div className="sidebar-list">
@@ -77,8 +87,15 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
             className={`sidebar-item ${p.id === selectedPatientId ? 'active' : ''}`}
             onClick={() => onSelectPatient(p.id)}
           >
-            <div className="sidebar-item-title">{p.label}</div>
-            <div className="sidebar-item-sub">{p.id.slice(0, 8)}</div>
+            <div className="sidebar-item-main">
+              <div className="sidebar-item-title">{p.label}</div>
+              <div className="sidebar-item-sub">{p.id.slice(0, 8)}</div>
+            </div>
+            {p.has_explainer_video ? (
+              <div className="sidebar-badge sidebar-badge-mp4" title="Explainer video uploaded">
+                MP4
+              </div>
+            ) : null}
           </button>
         ))}
         {!filtered.length ? <div className="sidebar-empty">No patients</div> : null}
@@ -88,4 +105,3 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
 }
 
 export default Sidebar;
-

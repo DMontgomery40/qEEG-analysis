@@ -71,6 +71,8 @@ qEEG Council is a **6-stage deliberation workflow** where multiple LLMs collabor
   - `data/reports/<patient_id>/<upload_id>/extracted_enhanced.txt` (OCR/table-friendly)
   - `data/reports/<patient_id>/<upload_id>/pages/page-<n>.png` (for multimodal Stage 1)
   - `data/reports/<patient_id>/<upload_id>/metadata.json`
+- Patient files:
+  - `data/patient_files/<patient_id>/<file_id>/original.<ext>`
 - Artifacts: `data/artifacts/<run_id>/stage-<n>/<model_id>.(md|json)`
 - Exports: `data/exports/<run_id>/final.(md|pdf)`
 
@@ -89,11 +91,14 @@ Important gotcha:
   - Prefer chat completions; fallback once to Responses when needed
 - `reports.py`
   - PDF text extraction, enhanced OCR, and page image rendering (`extract_pdf_with_images`)
-- `council.py`
+- `council/`
   - `QEEGCouncilWorkflow` orchestrates stages and writes artifacts
   - Stage 1 supports multimodal prompts for vision-capable models
+  - Workflow core lives in `backend/council/workflow/core.py`
 - `storage.py`
   - SQLite (patients/reports/runs/artifacts) + file paths for artifacts/exports
+- `patient_files.py`
+  - Patient file upload storage helpers (stored under `data/patient_files/`)
 - `main.py`
   - FastAPI app + SSE broker + orchestration endpoints
 
@@ -108,13 +113,22 @@ Important gotcha:
   - `POST /api/cliproxy/install`
 - Patients
   - `GET/POST /api/patients`
+  - `POST /api/patients/bulk_upload`
   - `GET/PUT /api/patients/{patient_id}`
   - `GET /api/patients/{patient_id}/reports`
   - `GET /api/patients/{patient_id}/runs`
+  - `GET /api/patients/{patient_id}/files`
+  - `POST /api/patients/{patient_id}/files`
+  - `GET /api/patient_files/{file_id}`
+  - `DELETE /api/patient_files/{file_id}`
 - Reports
   - `POST /api/patients/{patient_id}/reports` (upload)
   - `GET /api/reports/{report_id}/extracted`
   - `POST /api/reports/{report_id}/reextract` (regenerate extracted/enhanced/pages)
+  - `GET /api/reports/{report_id}/original`
+  - `GET /api/reports/{report_id}/pages`
+  - `GET /api/reports/{report_id}/pages/{page_num}`
+  - `GET /api/reports/{report_id}/metadata`
 - Runs
   - `POST /api/runs`
   - `POST /api/runs/{run_id}/start`
