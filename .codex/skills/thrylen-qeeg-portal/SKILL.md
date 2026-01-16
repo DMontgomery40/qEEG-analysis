@@ -1,0 +1,72 @@
+---
+name: thrylen-qeeg-portal
+description: "Maintain the Thrylen qEEG clinician portal hosted on Netlify (thrylen.com/qeeg and optionally qeeg.thrylen.com): shared login, patient folders (MM-DD-YYYY-N), versioned file uploads, and authenticated downloads backed by Netlify Blobs. Use when updating portal UI, functions, env vars, blob storage layout, or deployments."
+---
+
+# Thrylen qEEG Portal (Netlify)
+
+## Overview
+
+Operate the qEEG clinician portal served from the `thrylen` repo via Netlify: password login, patient folders, versioned file uploads, and authenticated downloads backed by Netlify Blobs.
+
+## Key Locations
+
+- Repo root: `/Users/davidmontgomery/thrylen`
+- Portal UI (static): `public/qeeg/*`
+- Netlify functions: `netlify/functions/qeeg-*.js` and `netlify/functions/_shared/qeeg.js`
+- Routing: `netlify.toml`
+
+## URLs And Routing
+
+- Main portal: `https://thrylen.com/qeeg/`
+- Optional: `https://qeeg.thrylen.com/` (add domain + DNS in Netlify; `netlify.toml` already rewrites `/` on that host to `/qeeg/index.html`)
+- API functions: `/.netlify/functions/qeeg-*`
+
+## Netlify Environment Variables (Do Not Commit)
+
+- `QEEG_PORTAL_USERNAME` (default `clinic`)
+- `QEEG_PORTAL_PASSWORD` (secret)
+- `QEEG_AUTH_KEY` (secret; signing key for the `qeeg_session` cookie)
+- `QEEG_BLOBS_STORE` (default `qeeg-portal`)
+- `QEEG_AUTH_RATE_STORE` (optional; default `qeeg-auth-rate`)
+
+Run Netlify env commands from `/Users/davidmontgomery/thrylen` after `netlify link`:
+
+```bash
+netlify env:set QEEG_VIDEOS_JSON '[]' --context production --scope functions
+netlify env:set QEEG_PORTAL_PASSWORD '...' --context production --scope functions
+```
+
+## Deploy
+
+```bash
+cd /Users/davidmontgomery/thrylen
+netlify deploy --prod --dir public --functions netlify/functions --no-build
+```
+
+## Blob Storage Layout
+
+Patient folders (all artifacts live under a patient ID):
+
+- Patient meta: `patients/<MM-DD-YYYY-N>/$meta.json`
+- Files: `patients/<MM-DD-YYYY-N>/files/<patientId>__<name>__v<version>__YYYY-MM-DD.<ext>`
+
+Files store user metadata (encoded in `x-amz-meta-user`) including `originalName`, `logicalName`, `version`, `uploadedAt`, `uploadedBy`, `size`, `contentType`.
+
+## API Endpoints (Functions)
+
+- Auth: `qeeg-login`, `qeeg-me`, `qeeg-logout`
+- Patients: `qeeg-patients` (list folders), `qeeg-patient-files` (list files)
+- Upload init: `qeeg-upload` (returns signed upload URLs + metadata headers; browser uploads directly)
+- Download: `qeeg-download` (auth-gated redirect to signed URL)
+
+## Notes On Netlify Limits
+
+Uploads and large downloads use signed URLs so they aren’t constrained by Netlify Functions request/response size limits.
+
+## Troubleshooting
+
+- “No project id found”: run commands inside `/Users/davidmontgomery/thrylen` (or run `netlify link`).
+- Login fails: verify `QEEG_PORTAL_USERNAME`, `QEEG_PORTAL_PASSWORD`, and `QEEG_AUTH_KEY` are set for Functions scope.
+- Upload fails (browser): check function logs for `qeeg-upload` and look for CORS errors on the signed upload URL PUT.
+- Files missing: confirm blobs exist under the `patients/` prefix and that `qeeg-patients` can list them.
