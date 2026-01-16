@@ -16,6 +16,10 @@ Operate the qEEG clinician portal served from the `thrylen` repo via Netlify: pa
 - Netlify functions: `netlify/functions/qeeg-*.js` and `netlify/functions/_shared/qeeg.js`
 - Routing: `netlify.toml`
 
+Local (gitignored) clinician-share staging folder:
+
+- `/Users/davidmontgomery/qEEG-analysis/data/portal_patients/<MM-DD-YYYY-N>/`
+
 ## URLs And Routing
 
 - Main portal: `https://thrylen.com/qeeg/`
