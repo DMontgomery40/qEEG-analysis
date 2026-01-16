@@ -15,6 +15,7 @@ Operate the qEEG clinician portal served from the `thrylen` repo via Netlify: pa
 - Portal UI (static): `public/qeeg/*`
 - Netlify functions: `netlify/functions/qeeg-*.js` and `netlify/functions/_shared/qeeg.js`
 - Routing: `netlify.toml`
+- Local→Netlify sync helpers: `scripts/qeeg_patients_sync.mjs`, `scripts/qeeg_patients_watch.mjs`
 
 Local (gitignored) clinician-share staging folder:
 
@@ -46,6 +47,22 @@ netlify env:set QEEG_PORTAL_PASSWORD '...' --context production --scope function
 ```bash
 cd /Users/davidmontgomery/thrylen
 netlify deploy --prod --dir public --functions netlify/functions --no-build
+```
+
+## Publish Local Patient Folders To Netlify
+
+Sync everything once:
+
+```bash
+cd /Users/davidmontgomery/thrylen
+npm run qeeg:patients:sync -- --dir /Users/davidmontgomery/qEEG-analysis/data/portal_patients
+```
+
+Watch for changes and auto-upload new versions:
+
+```bash
+cd /Users/davidmontgomery/thrylen
+npm run qeeg:patients:watch -- --dir /Users/davidmontgomery/qEEG-analysis/data/portal_patients
 ```
 
 ## Blob Storage Layout
