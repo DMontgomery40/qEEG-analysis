@@ -38,7 +38,6 @@ Local (gitignored) clinician-share staging folder:
 Run Netlify env commands from `/Users/davidmontgomery/thrylen` after `netlify link`:
 
 ```bash
-netlify env:set QEEG_VIDEOS_JSON '[]' --context production --scope functions
 netlify env:set QEEG_PORTAL_PASSWORD '...' --context production --scope functions
 ```
 
@@ -70,6 +69,7 @@ npm run qeeg:patients:watch -- --dir /Users/davidmontgomery/qEEG-analysis/data/p
 Patient folders (all artifacts live under a patient ID):
 
 - Patient meta: `patients/<MM-DD-YYYY-N>/$meta.json`
+- Optional index (fallback listing): `patients/<MM-DD-YYYY-N>/$index.json`
 - Files: `patients/<MM-DD-YYYY-N>/files/<patientId>__<name>__v<version>__YYYY-MM-DD.<ext>`
 
 Files store user metadata (encoded in `x-amz-meta-user`) including `originalName`, `logicalName`, `version`, `uploadedAt`, `uploadedBy`, `size`, `contentType`.
@@ -78,12 +78,13 @@ Files store user metadata (encoded in `x-amz-meta-user`) including `originalName
 
 - Auth: `qeeg-login`, `qeeg-me`, `qeeg-logout`
 - Patients: `qeeg-patients` (list folders), `qeeg-patient-files` (list files)
-- Upload init: `qeeg-upload` (returns signed upload URLs + metadata headers; browser uploads directly)
+- Upload: `qeeg-upload` (multipart form upload; stores files into Blobs under the patient folder)
 - Download: `qeeg-download` (auth-gated redirect to signed URL)
 
 ## Notes On Netlify Limits
 
-Uploads and large downloads use signed URLs so they aren’t constrained by Netlify Functions request/response size limits.
+- Downloads use signed URLs (large-friendly).
+- Browser uploads go through Netlify Functions, so keep portal uploads small (PDFs/notes). For larger items (especially MP4), publish via the local sync tool (`qeeg:patients:sync` / `qeeg:patients:watch`).
 
 ## Troubleshooting
 
