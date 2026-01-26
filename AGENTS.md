@@ -46,3 +46,4 @@ ground truth + publishing target.
 - Publish target folder (watched by `thrylen`): `data/portal_patients/<PATIENT_ID>/`
 - Visual QC default is **check-only** (no automated image edits). When issues are found, the explainer repo writes:
   - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`
+- In the explainer repo, **Generate/Regenerate** uses `qwen/qwen-image-2512` and **Edit Image** uses `qwen/qwen-image-edit-2511` (or DashScope `qwen-image-edit-max` when configured).

@@ -185,3 +185,4 @@ The “generate narrative + slides” pipeline lives in `../local-explainer-vide
 Visual QC note:
 - By default, the explainer repo runs visual QC in **check-only** mode (no automated image edits). When issues are found it writes:
   - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`
+- Image models (in the explainer repo): generate via `qwen/qwen-image-2512`, edit via `qwen/qwen-image-edit-2511` (or DashScope `qwen-image-edit-max` when configured).

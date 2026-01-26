@@ -270,16 +270,42 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
         if not line:
             continue
         # Avoid pulling digits from the label itself (e.g., "F3/F4" -> 3, 4).
-        toks = _number_tokens(tail_after(line, needle))
-        if len(toks) < len(expected_sessions):
-            continue
-        vals = toks[: len(expected_sessions)]
-        range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
+        value_part = tail_after(line, needle)
+        
+        # Extract target range first (at the end of the line).
         target = None
-        if len(range_toks) == 2:
-            target = f"{range_toks[0]}-{range_toks[1]}"
-        for sess, tok in zip(expected_sessions, vals):
-            val = _safe_float(tok)
+        m_range = re.search(r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*$", value_part)
+        if m_range:
+            target = f"{m_range.group(1)}-{m_range.group(2)}"
+            value_part = value_part[: m_range.start()].strip()
+        
+        # Match numbers OR N/A (including OCR artifacts like "mN/A" where ■ is misread as "m").
+        tokens = re.findall(r"(?i)(?:-?\d+(?:\.\d+)?|[m■]?N/?A)\b", value_part)
+        if len(tokens) < len(expected_sessions):
+            # Fallback to just numbers if N/A pattern didn't help.
+            tokens = _number_tokens(value_part)
+        if len(tokens) < len(expected_sessions):
+            continue
+        
+        for sess, tok in zip(expected_sessions, tokens[: len(expected_sessions)]):
+            t = (tok or "").strip()
+            # Handle N/A (including "mN/A" where ■ is OCR'd as "m").
+            if re.match(r"(?i)^[m■]?N/?A$", t):
+                out.append(
+                    {
+                        "fact_type": "state_metric",
+                        "metric": metric,
+                        "session_index": sess,
+                        "value": None,
+                        "unit": unit,
+                        "target_range": target,
+                        "shown_as": "N/A",
+                        "source_page": 1,
+                    }
+                )
+                continue
+            
+            val = _safe_float(t)
             if val is None:
                 continue
             out.append(

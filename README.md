@@ -86,6 +86,7 @@ Recommended workflow:
 - Run **QC + Publish** (Step 3) which verifies the narration + slide text against qEEG Council artifacts. Visual QC is **check-only by default** (writes `qc_visual_issues.json` when problems are found), and can optionally auto-fix slide text via image-edit (no regeneration). It then re-renders the MP4 and publishes:
   - `data/portal_patients/<PATIENT_ID>/<PATIENT_ID>.mp4`
   - Backend upload `POST /api/patients/{patient_uuid}/files` (DB-tracked)
+- Image models (in the explainer repo): generate via `qwen/qwen-image-2512`, edit via `qwen/qwen-image-edit-2511` (or DashScope `qwen-image-edit-max` when configured).
 
 ## Tests
 
