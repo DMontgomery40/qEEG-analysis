@@ -32,6 +32,7 @@ function savePanelSizes(sizes) {
 function PatientPage({
   patientId,
   discoveredModels,
+  allDiscoveredModels,
   modelMetaById,
   defaultConsolidator,
   onSelectRun,
@@ -58,6 +59,7 @@ function PatientPage({
   const [selectedConsolidator, setSelectedConsolidator] = useState('');
   const [starting, setStarting] = useState(false);
   const [geminiProjectId, setGeminiProjectId] = useState('');
+  const [showAllModels, setShowAllModels] = useState(false);
 
   // Resizable panel state
   const [leftColPercent, setLeftColPercent] = useState(() => {
@@ -111,19 +113,28 @@ function PatientPage({
     savePanelSizes({ ...loadPanelSizes(), runHistoryHeight });
   }, [runHistoryHeight]);
 
+  const modelPickerModels = useMemo(() => {
+    const base = showAllModels ? (allDiscoveredModels || []) : (discoveredModels || []);
+    const extras = [];
+    for (const id of [...(selectedCouncilIds || []), selectedConsolidator].filter(Boolean)) {
+      if (!base.includes(id) && !extras.includes(id)) extras.push(id);
+    }
+    return [...base, ...extras];
+  }, [allDiscoveredModels, discoveredModels, selectedConsolidator, selectedCouncilIds, showAllModels]);
+
   const discoveredOptions = useMemo(
     () =>
-      discoveredModels.map((id) => {
+      modelPickerModels.map((id) => {
         const meta = modelMetaById?.get?.(id);
         const label = meta?.name ? `${meta.name} (${id})` : id;
         return { id, label };
       }),
-    [discoveredModels, modelMetaById]
+    [modelMetaById, modelPickerModels]
   );
 
   const hasGemini = useMemo(
-    () => (discoveredModels || []).some((id) => String(id).toLowerCase().includes('gemini')),
-    [discoveredModels]
+    () => (modelPickerModels || []).some((id) => String(id).toLowerCase().includes('gemini')),
+    [modelPickerModels]
   );
 
   const explainerVideo = useMemo(() => {
@@ -437,6 +448,16 @@ function PatientPage({
 
           <label>
             Council models (multi-select)
+            <div className="muted" style={{ marginTop: 6 }}>
+              <label style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
+                <input
+                  type="checkbox"
+                  checked={showAllModels}
+                  onChange={(e) => setShowAllModels(e.target.checked)}
+                />
+                Show legacy models
+              </label>
+            </div>
             <select
               multiple
               className="multi-select"
@@ -464,7 +485,7 @@ function PatientPage({
               <option value="" disabled>
                 Select…
               </option>
-              {(selectedCouncilIds.length ? selectedCouncilIds : discoveredModels).map((id) => (
+              {(selectedCouncilIds.length ? selectedCouncilIds : modelPickerModels).map((id) => (
                 <option key={id} value={id}>
                   {modelMetaById?.get?.(id)?.name ? `${modelMetaById.get(id).name} (${id})` : id}
                 </option>

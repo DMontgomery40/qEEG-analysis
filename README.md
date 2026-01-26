@@ -21,6 +21,8 @@ Frontend (React/Vite)  →  Backend (FastAPI)  →  CLIProxyAPI  →  LLM provid
 - `data/reports/{patient_id}/{report_id}/` - uploaded files, extracted text, page images
 - `data/artifacts/{run_id}/stage-{n}/` - stage outputs per model
 - `data/exports/{run_id}/` - final exported reports
+- `data/patient_files/{patient_id}/{file_id}/` - DB-tracked uploaded patient files (MP4/PDF/etc)
+- `data/portal_patients/{patient_id}/` - clinician portal **sync folder** (drop final MP4s here)
 
 ## 6-Stage Workflow
 
@@ -71,6 +73,19 @@ Opens:
 | POST | /api/runs/{id}/start | Start 6-stage workflow |
 | GET | /api/runs/{id}/stream | SSE progress events |
 | POST | /api/runs/{id}/export | Generate final.md + final.pdf |
+
+## Explainer Video Publishing (local-explainer-video)
+
+This repo is the “ground truth + distribution” side of the patient explainer video pipeline:
+
+- Ground truth artifacts live under `data/artifacts/<run_id>/` (Stage 4 consolidation + Stage 1 `_data_pack.json`)
+- Final MP4s should be published into `data/portal_patients/<PATIENT_ID>/` so `thrylen` can sync them to the clinician portal
+
+Recommended workflow:
+- Generate the video in `../local-explainer-video`
+- Run **QC + Publish** (Step 3) which verifies the narration + slide text against qEEG Council artifacts. Visual QC is **check-only by default** (writes `qc_visual_issues.json` when problems are found), and can optionally auto-fix slide text via image-edit (no regeneration). It then re-renders the MP4 and publishes:
+  - `data/portal_patients/<PATIENT_ID>/<PATIENT_ID>.mp4`
+  - Backend upload `POST /api/patients/{patient_uuid}/files` (DB-tracked)
 
 ## Tests
 

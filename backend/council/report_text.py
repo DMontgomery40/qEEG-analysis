@@ -395,17 +395,63 @@ def _facts_from_report_text_n100_central_frontal(report_text: str, *, expected_s
         elif value_lines:
             break
 
+    # Reports typically state the N100 latency window (e.g., "Maximum N100 reported between 30-120 msec.").
+    # We use this as a report-defined sanity check to avoid OCR artifacts like "1230" for a "120" latency.
+    def n100_latency_window() -> tuple[int, int]:
+        for ln in lines[n100_idx : min(len(lines), n100_idx + 40)]:
+            m = re.search(
+                r"(?i)maximum\s+n100\s+reported\s+between\s+(\d+)\s*[-–—]\s*(\d+)\s*m(?:s|sec)\b",
+                ln,
+            )
+            if not m:
+                continue
+            lo = _safe_int(m.group(1))
+            hi = _safe_int(m.group(2))
+            if lo is None or hi is None:
+                continue
+            if lo <= 0 or hi <= 0:
+                continue
+            if hi < lo:
+                continue
+            return (lo, hi)
+        return (30, 120)
+
+    win_lo, win_hi = n100_latency_window()
+
+    def normalize_ms_token(token: str) -> int | None:
+        ms = _safe_int(token)
+        if ms is None:
+            return None
+        if win_lo <= ms <= win_hi:
+            return ms
+
+        # OCR sometimes inserts an extra digit/zero (e.g., "1230" instead of "120").
+        candidates: list[int] = []
+        for i in range(len(token)):
+            cand = _safe_int(token[:i] + token[i + 1 :])
+            if cand is None:
+                continue
+            if win_lo <= cand <= win_hi:
+                candidates.append(cand)
+        if candidates:
+            target = win_hi if ms > win_hi else win_lo
+            return min(candidates, key=lambda c: abs(c - target))
+        return None
+
     out: list[dict[str, Any]] = []
     for sess, ln in zip(expected_sessions, value_lines):
         m = re.match(r"^(?P<yield>\d+)\s+(?P<uv>-?\d+(?:\.\d+)?)\s+(?P<ms>\d+)\b", ln)
         if m:
+            ms_norm = normalize_ms_token(m.group("ms"))
+            if ms_norm is None:
+                continue
             out.append(
                 {
                     "fact_type": "n100_central_frontal_average",
                     "session_index": sess,
                     "yield": _safe_int(m.group("yield")),
                     "uv": _safe_float(m.group("uv")),
-                    "ms": _safe_int(m.group("ms")),
+                    "ms": ms_norm,
                     "shown_as": None,
                     "source_page": 2,
                 }
@@ -435,4 +481,3 @@ def _facts_from_report_text_n100_central_frontal(report_text: str, *, expected_s
         if f.get("uv") is not None and f.get("ms") is not None:
             cleaned.append(f)
     return cleaned
-

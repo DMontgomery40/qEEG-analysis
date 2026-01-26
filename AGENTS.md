@@ -34,3 +34,15 @@ Before blaming models, verify the backend has actually extracted and stored:
 - `pages/page-*.png`
 
 If missing/garbled, use `POST /api/reports/{report_id}/reextract` (or trigger it via the UI button “Re-extract (OCR)”).
+
+## Explainer Videos (cross-repo)
+
+The patient-facing “explainer video” pipeline lives in `../local-explainer-video`, but it depends on this repo as the
+ground truth + publishing target.
+
+- Patient mapping is by **patient label**: `MM-DD-YYYY-N` (must match across repos)
+- Narrative ground truth: **Stage 4 consolidation** artifact
+- Numeric ground truth: **Stage 1 `_data_pack.json`** artifact
+- Publish target folder (watched by `thrylen`): `data/portal_patients/<PATIENT_ID>/`
+- Visual QC default is **check-only** (no automated image edits). When issues are found, the explainer repo writes:
+  - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`

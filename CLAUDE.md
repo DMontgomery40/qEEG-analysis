@@ -73,6 +73,8 @@ qEEG Council is a **6-stage deliberation workflow** where multiple LLMs collabor
   - `data/reports/<patient_id>/<upload_id>/metadata.json`
 - Patient files:
   - `data/patient_files/<patient_id>/<file_id>/original.<ext>`
+- Portal sync folder:
+  - `data/portal_patients/<patient_label>/...` (best-effort local publish copies, watched by `thrylen`)
 - Artifacts: `data/artifacts/<run_id>/stage-<n>/<model_id>.(md|json)`
 - Exports: `data/exports/<run_id>/final.(md|pdf)`
 
@@ -166,3 +168,20 @@ Important gotcha:
 1. Run the backend as a module (`python -m backend.main`) from the repo root to avoid import issues.
 2. Don’t assume `report_id` == report folder name; always use `stored_path` / `extracted_text_path`.
 3. Mock mode (`QEEG_MOCK_LLM=1`) is for deterministic tests only; it will not generate realistic clinical-quality reports.
+
+## Explainer video integration
+
+This repo is the source of truth for the explainer-video QC gate:
+- Narrative truth: Stage 4 consolidation markdown (`kind='consolidation'`, `stage_num=4`)
+- Numeric truth: Stage 1 data pack JSON (`kind='data_pack'`, `stage_num=1`, `model_id='_data_pack'`)
+
+Publishing targets:
+- Portal sync folder: `data/portal_patients/<MM-DD-YYYY-N>/` (configurable via `QEEG_PORTAL_PATIENTS_DIR`)
+- DB-tracked upload: `POST /api/patients/{patient_uuid}/files` (also publishes a best-effort copy into the portal folder)
+
+The “generate narrative + slides” pipeline lives in `../local-explainer-video`. Its **QC + Publish** step reads
+`data/app.db` + artifacts from this repo, then writes the final MP4 into `data/portal_patients/` so `thrylen` can sync it.
+
+Visual QC note:
+- By default, the explainer repo runs visual QC in **check-only** mode (no automated image edits). When issues are found it writes:
+  - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`

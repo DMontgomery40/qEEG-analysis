@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -18,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 
 from . import storage
+from . import config as cfg
 from .config import (
     CLIPROXY_API_KEY,
     CLIPROXY_BASE_URL,
@@ -121,6 +124,98 @@ class CliproxyInstallRequest(BaseModel):
 def _repo_root() -> Path:
     # backend/main.py -> backend/ -> repo root
     return Path(__file__).resolve().parents[1]
+
+
+_PORTAL_PATIENT_ID_RE = re.compile(r"^(?P<mm>\d{2})-(?P<dd>\d{2})-(?P<yyyy>\d{4})-(?P<n>\d+)$")
+
+
+def _normalize_portal_patient_id(value: str) -> str | None:
+    raw = (value or "").strip()
+    m = _PORTAL_PATIENT_ID_RE.match(raw)
+    if not m:
+        return None
+    mm = int(m.group("mm"))
+    dd = int(m.group("dd"))
+    yyyy = int(m.group("yyyy"))
+    n = int(m.group("n"))
+    if mm < 1 or mm > 12:
+        return None
+    if dd < 1 or dd > 31:
+        return None
+    if yyyy < 1900 or yyyy > 2100:
+        return None
+    if n < 0 or n > 999:
+        return None
+    return f"{mm:02d}-{dd:02d}-{yyyy:04d}-{n}"
+
+
+def _portal_patients_dir() -> Path:
+    configured = os.getenv("QEEG_PORTAL_PATIENTS_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return cfg.DATA_DIR / "portal_patients"
+
+
+def _ensure_portal_patient_folder(label: str) -> None:
+    patient_id = _normalize_portal_patient_id(label)
+    if patient_id is None:
+        return
+    try:
+        base = _portal_patients_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        (base / patient_id).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Best-effort only; don't fail core API operations on local folder creation.
+        return
+
+
+def _safe_portal_filename(value: str, *, fallback: str = "upload.bin") -> str:
+    raw = os.path.basename(str(value or "").strip())
+    cleaned = re.sub(r"[/\\\u0000-\u001F\u007F]+", "_", raw).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned[:200]
+    return cleaned or fallback
+
+
+def _publish_file_to_portal_folder(*, patient_label: str, src_path: Path, filename: str) -> Path | None:
+    patient_id = _normalize_portal_patient_id(patient_label)
+    if patient_id is None:
+        return None
+
+    try:
+        out_dir = _portal_patients_dir() / patient_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = out_dir / _safe_portal_filename(filename)
+
+        tmp_path = dest_path.with_name(f".{dest_path.name}.partial")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        ext = dest_path.suffix.lower()
+        use_hardlink = ext in {".mp4", ".pdf", ".zip", ".docx", ".rtf"}
+
+        if dest_path.exists() and dest_path.is_file():
+            try:
+                dest_path.unlink()
+            except Exception:
+                pass
+
+        if use_hardlink:
+            try:
+                os.link(src_path, dest_path)
+                return dest_path
+            except Exception:
+                # Fall back to copy.
+                pass
+
+        shutil.copy2(src_path, tmp_path)
+        tmp_path.replace(dest_path)
+        return dest_path
+    except Exception:
+        # Best-effort only; don't fail core API operations on portal publishing.
+        return None
 
 
 def _default_clipr_config_path() -> str:
@@ -283,6 +378,89 @@ def _get_mock_llm_client() -> AsyncOpenAICompatClient | None:
     return client
 
 
+async def _refresh_discovered_models(*, llm: AsyncOpenAICompatClient) -> None:
+    try:
+        discovered = await llm.list_models()
+    except Exception:
+        return
+    set_discovered_model_ids(discovered)
+
+
+async def _model_refresh_loop(*, llm: AsyncOpenAICompatClient, interval_s: float) -> None:
+    # Default: weekly refresh to pick up CLIProxyAPI model catalog updates.
+    if interval_s <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval_s)
+        await _refresh_discovered_models(llm=llm)
+
+
+def _model_visible_in_ui(model_id: str) -> bool:
+    """
+    Reduce clutter in the frontend model picker by hiding older provider versions.
+
+    Policy (as requested):
+    - OpenAI: hide gpt-* models older than 5.1
+    - Anthropic: hide claude-* models older than 4.5
+    - Gemini: hide gemini-* models older than 3.x
+
+    Unknown/unparsed model ids are left visible.
+    """
+
+    mid = (model_id or "").strip()
+    if not mid:
+        return False
+    lower = mid.lower()
+
+    # OpenAI (gpt-*)
+    openai_id = lower.removeprefix("openai/")
+    m = re.match(r"^gpt-(?P<major>\d+)(?:\.(?P<minor>\d+))?", openai_id)
+    if m:
+        major = int(m.group("major"))
+        minor = int(m.group("minor") or "0")
+        return major > 5 or (major == 5 and minor >= 1)
+
+    # Anthropic (claude-*)
+    anthropic_id = lower.removeprefix("anthropic/")
+    if anthropic_id.startswith("claude-"):
+        parts = anthropic_id.split("-")
+
+        # New format:
+        # - claude-<family>-4-5-YYYYMMDD
+        # - claude-<family>-4-YYYYMMDD
+        if (
+            len(parts) >= 4
+            and parts[0] == "claude"
+            and parts[1] in {"opus", "sonnet", "haiku"}
+            and parts[2].isdigit()
+        ):
+            major = int(parts[2])
+            minor = 0
+            # Minor is present only when the 4th token is a small digit and the 5th token looks like a date.
+            if len(parts) >= 5 and parts[3].isdigit() and len(parts[3]) <= 2 and parts[4].isdigit() and len(parts[4]) >= 6:
+                minor = int(parts[3])
+            return major > 4 or (major == 4 and minor >= 5)
+
+        # Older format: claude-3-7-sonnet-YYYYMMDD
+        if len(parts) >= 5 and parts[0] == "claude" and parts[1].isdigit() and parts[2].isdigit():
+            major = int(parts[1])
+            minor = int(parts[2])
+            return major > 4 or (major == 4 and minor >= 5)
+
+        # If we can't parse, keep it visible.
+        return True
+
+    # Gemini (gemini-*)
+    gemini_id = lower.removeprefix("google/")
+    m = re.match(r"^gemini-(?P<major>\d+)(?:\.(?P<minor>\d+))?", gemini_id)
+    if m:
+        major = int(m.group("major"))
+        # minor unused for threshold (3.x+ only)
+        return major >= 3
+
+    return True
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     ensure_data_dirs()
@@ -310,17 +488,26 @@ async def _startup() -> None:
     app.state.workflow = QEEGCouncilWorkflow(llm=app.state.llm)
     app.state.broker = _EventBroker()
     app.state.cliproxy_pid = None
+    app.state.model_refresh_task = None
 
     if not app.state.mock_mode:
+        await _refresh_discovered_models(llm=app.state.llm)
         try:
-            discovered = await app.state.llm.list_models()
+            interval_s = float(os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0")
         except Exception:
-            discovered = []
-        set_discovered_model_ids(discovered)
+            interval_s = 7 * 24 * 60 * 60
+        if interval_s < 0:
+            interval_s = 0
+        app.state.model_refresh_task = asyncio.create_task(_model_refresh_loop(llm=app.state.llm, interval_s=interval_s))
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    task = getattr(app.state, "model_refresh_task", None)
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     llm: AsyncOpenAICompatClient | None = getattr(app.state, "llm", None)
     if llm is not None:
         await llm.aclose()
@@ -461,6 +648,7 @@ async def cliproxy_install(req: CliproxyInstallRequest) -> dict[str, Any]:
 @app.get("/api/models")
 async def models() -> dict[str, Any]:
     discovered = sorted(DISCOVERED_MODEL_IDS)
+    ui_models = [mid for mid in discovered if _model_visible_in_ui(mid)]
     configured = []
     for m in COUNCIL_MODELS:
         configured.append(
@@ -472,7 +660,11 @@ async def models() -> dict[str, Any]:
                 "available": m.id in DISCOVERED_MODEL_IDS if DISCOVERED_MODEL_IDS else False,
             }
         )
-    return {"discovered_models": discovered, "configured_models": configured}
+    return {
+        "discovered_models": discovered,
+        "ui_models": ui_models,
+        "configured_models": configured,
+    }
 
 
 @app.get("/api/patients")
@@ -499,6 +691,7 @@ async def list_patients() -> list[dict[str, Any]]:
 async def create_patient(req: PatientCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
         p = storage.create_patient(session, label=req.label, notes=req.notes)
+        _ensure_portal_patient_folder(p.label)
         return _patient_out(p)
 
 
@@ -557,6 +750,8 @@ async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str,
                 session.add(patient)
                 session.flush()
                 patient_id = patient.id
+
+                _ensure_portal_patient_folder(patient_label)
 
                 report_folder = report_storage_dir(patient_id, report_id)
                 original_path, extracted_path, mime_type, preview = save_report_upload(
@@ -625,6 +820,7 @@ async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
         p = storage.update_patient(session, patient_id, label=req.label, notes=req.notes)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
+        _ensure_portal_patient_folder(p.label)
         q = (
             sa_select(storage.PatientFile.id)
             .where(storage.PatientFile.patient_id == patient_id, storage.PatientFile.mime_type == "video/mp4")
@@ -690,6 +886,7 @@ async def upload_patient_file(patient_id: str, file: UploadFile = File(...)) -> 
         p = storage.get_patient(session, patient_id)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
+        patient_label = p.label
 
     file_id = str(uuid.uuid4())
     filename = file.filename or "upload"
@@ -711,7 +908,12 @@ async def upload_patient_file(patient_id: str, file: UploadFile = File(...)) -> 
             size_bytes=size_bytes,
             stored_path=original_path,
         )
-        return {"file": _patient_file_out(pf)}
+        portal_path = _publish_file_to_portal_folder(
+            patient_label=patient_label,
+            src_path=Path(pf.stored_path),
+            filename=pf.filename,
+        )
+        return {"file": _patient_file_out(pf), "portal_published_path": str(portal_path) if portal_path else None}
 
 
 @app.get("/api/patient_files/{file_id}")
@@ -1125,6 +1327,8 @@ async def export(run_id: str) -> dict[str, Any]:
         run = storage.get_run(session, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+        patient = storage.get_patient(session, run.patient_id)
+        patient_label = patient.label if patient is not None else ""
         if not run.selected_artifact_id:
             raise HTTPException(status_code=400, detail="No selected artifact for run")
         art = session.get(storage.Artifact, run.selected_artifact_id)
@@ -1138,7 +1342,25 @@ async def export(run_id: str) -> dict[str, Any]:
     pdf_path = export_dir / "final.pdf"
     md_path.write_text(md, encoding="utf-8")
     render_markdown_to_pdf(md, pdf_path)
-    return {"ok": True, "final_md": str(md_path), "final_pdf": str(pdf_path)}
+
+    portal_md = _publish_file_to_portal_folder(
+        patient_label=patient_label,
+        src_path=md_path,
+        filename=f"{patient_label}.md" if patient_label else "final.md",
+    )
+    portal_pdf = _publish_file_to_portal_folder(
+        patient_label=patient_label,
+        src_path=pdf_path,
+        filename=f"{patient_label}.pdf" if patient_label else "final.pdf",
+    )
+
+    return {
+        "ok": True,
+        "final_md": str(md_path),
+        "final_pdf": str(pdf_path),
+        "portal_final_md": str(portal_md) if portal_md else None,
+        "portal_final_pdf": str(portal_pdf) if portal_pdf else None,
+    }
 
 
 @app.get("/api/runs/{run_id}/export/final.md")

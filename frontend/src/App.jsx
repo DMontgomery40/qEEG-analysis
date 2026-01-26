@@ -58,7 +58,8 @@ function App() {
     savePanelSizes({ ...loadPanelSizes(), sidebarWidth });
   }, [sidebarWidth]);
 
-  const discoveredModels = useMemo(() => models?.discovered_models || [], [models]);
+  const allDiscoveredModels = useMemo(() => models?.discovered_models || [], [models]);
+  const discoveredModels = useMemo(() => models?.ui_models || models?.discovered_models || [], [models]);
   const modelMetaById = useMemo(() => {
     const map = new Map();
     for (const m of models?.configured_models || []) map.set(m.id, m);
@@ -295,6 +296,7 @@ function App() {
           <PatientPage
             patientId={selectedPatientId}
             discoveredModels={discoveredModels}
+            allDiscoveredModels={allDiscoveredModels}
             modelMetaById={modelMetaById}
             defaultConsolidator={discoveredModels[0] || ''}
             onSelectRun={(runId) => setSelectedRunId(runId)}

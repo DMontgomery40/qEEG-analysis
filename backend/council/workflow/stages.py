@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from ...config import is_vision_capable
+from ...config import DISCOVERED_MODEL_IDS, is_vision_capable
 from ...reports import extract_pdf_full
 from ...storage import Report, get_report, get_run, set_run_label_map
 from ...storage import session_scope
@@ -23,6 +23,34 @@ from ..utils import _chunked, _truthy_env
 
 
 class _StagesMixin:
+    @staticmethod
+    def _select_discovered_model_id(preferred: str) -> str | None:
+        pref = (preferred or "").strip()
+        if not pref:
+            return None
+
+        # Exact match first.
+        if pref in DISCOVERED_MODEL_IDS:
+            return pref
+
+        # Case-insensitive exact match.
+        pref_lower = pref.lower()
+        for mid in DISCOVERED_MODEL_IDS:
+            if mid.lower() == pref_lower:
+                return mid
+
+        # Substring match (prefer non-preview variants if both exist).
+        matches = [mid for mid in DISCOVERED_MODEL_IDS if pref_lower in mid.lower()]
+        if not matches:
+            return None
+
+        def rank(mid: str) -> tuple[int, int, str]:
+            lower = mid.lower()
+            preview_penalty = 1 if "preview" in lower else 0
+            return (preview_penalty, len(mid), mid)
+
+        return sorted(matches, key=rank)[0]
+
     async def _stage1(
         self,
         run_id: str,
@@ -35,10 +63,18 @@ class _StagesMixin:
         report_dir = _derive_report_dir(report)
         report_text = _load_best_report_text(report, report_dir)
 
+        # Prefer a single "checker" vision model for multimodal extraction + verification.
+        # This is intentionally independent from the selected council model set, so the council can use
+        # text-only models while still getting page-grounded structured data + transcript.
+        vision_checker_pref = os.getenv("QEEG_VISION_CHECKER_MODEL", "gemini-3-flash")
+        vision_checker_id = self._select_discovered_model_id(vision_checker_pref)
+        if vision_checker_id and not is_vision_capable(vision_checker_id):
+            vision_checker_id = None
+
         # Load images from the report folder (preferred), then fallback lookup.
         page_images = _load_page_images(report, report_dir)
 
-        needs_images = any(is_vision_capable(m) for m in council_model_ids)
+        needs_images = bool(vision_checker_id) or any(is_vision_capable(m) for m in council_model_ids)
         expected_page_count = _page_count_from_markers(report_text)
         pages_present = {img.page for img in page_images}
         missing_pages: list[int] = []
@@ -196,11 +232,15 @@ class _StagesMixin:
                 )
 
         extractor_models = [m for m in council_model_ids if is_vision_capable(m)]
+        if vision_checker_id:
+            extractor_models = [vision_checker_id] + [m for m in extractor_models if m != vision_checker_id]
         if strict_data and not extractor_models:
             raise RuntimeError(
                 "Strict data availability requested, but no vision-capable models were selected.\n"
                 "Stage 1 requires at least one vision-capable model to process ALL PDF pages.\n"
-                "Select a vision-capable model in the run's council_model_ids (see /api/models)."
+                "Select a vision-capable model in the run's council_model_ids OR ensure the vision checker model "
+                f"({vision_checker_pref}) is available in /v1/models.\n"
+                "See /api/models."
             )
 
         data_pack = await self._ensure_data_pack(
@@ -588,6 +628,39 @@ class _StagesMixin:
     ) -> None:
         stage = STAGES[3]
         prompt = _load_prompt("stage4_consolidation.md")
+        required_headings = [
+            "# Dataset and Sessions",
+            "# Key Empirical Findings",
+            "# Performance Assessments",
+            "# Auditory ERP: P300 and N100",
+            "# Background EEG Metrics",
+            "# Speculative Commentary and Interpretive Hypotheses",
+            "# Measurement Recommendations",
+            "# Uncertainties and Limits",
+        ]
+        end_sentinel = "<!-- END CONSOLIDATED REPORT -->"
+
+        def has_heading(text: str, heading: str) -> bool:
+            import re
+
+            return bool(re.search(rf"(?m)^{re.escape(heading)}\\s*$", text or ""))
+
+        def is_complete(text: str) -> bool:
+            if end_sentinel not in (text or ""):
+                return False
+            return all(has_heading(text, h) for h in required_headings)
+
+        def last_heading_present(text: str) -> tuple[str, int] | tuple[None, None]:
+            import re
+
+            positions: list[tuple[str, int]] = []
+            for h in required_headings:
+                m = re.search(rf"(?m)^{re.escape(h)}\\s*$", text or "")
+                if m:
+                    positions.append((h, m.start()))
+            if not positions:
+                return (None, None)
+            return max(positions, key=lambda x: x[1])
 
         with session_scope() as session:
             run = get_run(session, run_id)
@@ -642,19 +715,69 @@ class _StagesMixin:
                 for a in revisions
             ]
         )
-        prompt_text = (
-            f"{prompt}\n\n---\n\n"
+        base_prompt_text = (
+            f"{prompt}\n\n"
+            "IMPORTANT:\n"
+            f"- After finishing the full report, add a final line exactly: {end_sentinel}\n\n"
+            "---\n\n"
             f"{workflow_context}\n\n---\n\n"
             f"{data_pack_block}"
             f"{vision_transcript_block}"
             f"ORIGINAL qEEG REPORT (the source of truth - verify all claims against this):\n\n{report_text}\n\n---\n\n"
             f"REVISED ANALYSES TO CONSOLIDATE:\n\n{revision_text}\n"
         )
+        try:
+            max_tokens = int(os.getenv("QEEG_STAGE4_MAX_TOKENS", "8000") or "8000")
+        except Exception:
+            max_tokens = 8000
+        if max_tokens <= 0:
+            max_tokens = 8000
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
         text = await self._call_model_chat(
-            model_id=consolidator, prompt_text=prompt_text, temperature=0.2, max_tokens=8000
+            model_id=consolidator, prompt_text=base_prompt_text, temperature=0.2, max_tokens=max_tokens
         )
+
+        # Claude-style message APIs frequently clamp output tokens below the requested max, which can truncate
+        # long consolidations. Repair by regenerating from the last fully-started required section onward.
+        if not is_complete(text):
+            repaired = text
+            for _ in range(2):  # total up to 3 calls
+                start_heading, start_idx = last_heading_present(repaired)
+                if start_heading is None or start_idx is None:
+                    start_heading = required_headings[0]
+                    prefix = ""
+                else:
+                    prefix = (repaired[:start_idx] or "").rstrip()
+
+                continuation_instruction = (
+                    "Your previous output was cut off.\n"
+                    "Output ONLY the remaining portion of the consolidated report.\n"
+                    f"- Start with this exact heading (no text before it): {start_heading}\n"
+                    f"- Continue through: {required_headings[-1]}\n"
+                    f"- End with a final line exactly: {end_sentinel}\n"
+                )
+                cont_prompt = f"{base_prompt_text}\n\n---\n\n{continuation_instruction}"
+                cont = await self._call_model_chat(
+                    model_id=consolidator, prompt_text=cont_prompt, temperature=0.2, max_tokens=max_tokens
+                )
+
+                # Trim any preamble before the requested start heading.
+                clean = cont
+                try:
+                    import re
+
+                    m = re.search(rf"(?m)^{re.escape(start_heading)}\\s*$", cont or "")
+                    if m:
+                        clean = cont[m.start() :]
+                except Exception:
+                    clean = cont
+
+                repaired = f"{prefix}\n\n{(clean or '').strip()}\n"
+                if is_complete(repaired):
+                    break
+            text = repaired
+
         await self._write_artifact(run_id=run_id, stage=stage, model_id=consolidator, text=text)
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "complete"})
 
@@ -849,5 +972,3 @@ class _StagesMixin:
                 "requested_count": len(council_model_ids),
             }
         )
-
-
