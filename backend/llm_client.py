@@ -77,6 +77,29 @@ def _chat_unsupported(err: UpstreamError) -> bool:
     )
 
 
+def _openai_reasoning_effort(model_id: str) -> str | None:
+    """Infer a reasoning effort from GPT-5 model ids.
+
+    Defaults to medium for GPT-5.* ids when no explicit tier is encoded.
+    """
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return None
+    mid = mid.removeprefix("openai/")
+    if not mid.startswith("gpt-5."):
+        return None
+
+    # Prefer explicit effort suffix when present (e.g. "...-high", "...-xhigh").
+    for token in reversed([t for t in mid.split("-") if t]):
+        if token == "xhigh":
+            # OpenAI APIs accept up to "high"; map xhigh to highest compatible tier.
+            return "high"
+        if token in {"high", "medium"}:
+            return token
+
+    return "medium"
+
+
 class AsyncOpenAICompatClient:
     def __init__(
         self,
@@ -149,6 +172,7 @@ class AsyncOpenAICompatClient:
         stream: bool = False,
     ) -> str:
         client = self._get_client()
+        reasoning_effort = _openai_reasoning_effort(model_id)
         payload = {
             "model": model_id,
             "messages": messages,
@@ -156,6 +180,8 @@ class AsyncOpenAICompatClient:
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
 
         try:
             resp = await client.post("/v1/chat/completions", json=payload)
@@ -171,7 +197,10 @@ class AsyncOpenAICompatClient:
             if _chat_unsupported(err):
                 input_text = self._messages_to_input_text(messages)
                 return await self.responses(
-                    model_id=model_id, input_text=input_text, stream=stream
+                    model_id=model_id,
+                    input_text=input_text,
+                    stream=stream,
+                    reasoning_effort=reasoning_effort,
                 )
             raise err
 
@@ -193,9 +222,18 @@ class AsyncOpenAICompatClient:
             raise UpstreamError("CLIProxyAPI /v1/chat/completions returned non-text content")
         return content
 
-    async def responses(self, *, model_id: str, input_text: str, stream: bool = False) -> str:
+    async def responses(
+        self,
+        *,
+        model_id: str,
+        input_text: str,
+        stream: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> str:
         client = self._get_client()
         payload = {"model": model_id, "input": input_text, "stream": stream}
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
 
         try:
             resp = await client.post("/v1/responses", json=payload)

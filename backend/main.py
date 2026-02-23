@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -218,12 +219,123 @@ def _publish_file_to_portal_folder(*, patient_label: str, src_path: Path, filena
         return None
 
 
+def _truthy_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"", "0", "false", "no", "off", "n"}:
+        return False
+    if value in {"1", "true", "yes", "on", "y"}:
+        return True
+    return default
+
+
+async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroker) -> None:
+    """Best-effort post-run patient-facing generation into portal folder."""
+    if not _truthy_env("QEEG_AUTO_PATIENT_FACING", True):
+        return
+
+    with storage.session_scope() as session:
+        run = storage.get_run(session, run_id)
+        if run is None or (run.status or "") != "complete":
+            return
+        patient = storage.get_patient(session, run.patient_id)
+        if patient is None:
+            return
+        patient_label = (patient.label or "").strip()
+
+    normalized_patient_id = _normalize_portal_patient_id(patient_label)
+    if normalized_patient_id is None:
+        return
+
+    preferred_model = (os.getenv("QEEG_PATIENT_FACING_MODEL", "claude-opus-4-6") or "claude-opus-4-6").strip()
+    version_prefix = (os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto").strip() or "auto"
+    version = f"{version_prefix}-{run_id.split('-')[0]}"
+
+    cmd = [
+        sys.executable,
+        str(_repo_root() / "scripts" / "generate_patient_facing_writeups.py"),
+        "--patient-label",
+        normalized_patient_id,
+        "--model",
+        preferred_model,
+        "--version",
+        version,
+        "--overwrite",
+    ]
+    configured_portal_dir = (os.getenv("QEEG_PORTAL_PATIENTS_DIR", "") or "").strip()
+    if configured_portal_dir:
+        cmd.extend(["--portal-dir", configured_portal_dir])
+
+    await broker.publish(
+        run_id,
+        {
+            "run_id": run_id,
+            "stage_name": "patient_facing",
+            "status": "start",
+            "patient_label": normalized_patient_id,
+            "model_id": preferred_model,
+        },
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(_repo_root()),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        out_text = (stdout or b"").decode("utf-8", errors="replace")
+        err_text = (stderr or b"").decode("utf-8", errors="replace")
+        if proc.returncode == 0:
+            await broker.publish(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "stage_name": "patient_facing",
+                    "status": "complete",
+                    "patient_label": normalized_patient_id,
+                    "version": version,
+                    "log": out_text[-2000:],
+                },
+            )
+        else:
+            await broker.publish(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "stage_name": "patient_facing",
+                    "status": "failed",
+                    "patient_label": normalized_patient_id,
+                    "version": version,
+                    "error": (err_text or out_text)[-2000:],
+                },
+            )
+    except Exception as e:
+        await broker.publish(
+            run_id,
+            {
+                "run_id": run_id,
+                "stage_name": "patient_facing",
+                "status": "failed",
+                "patient_label": normalized_patient_id,
+                "version": version,
+                "error": str(e),
+            },
+        )
+
+
 def _default_clipr_config_path() -> str:
     if os.getenv("CLIPROXY_CONFIG"):
         return os.path.expanduser(os.getenv("CLIPROXY_CONFIG", ""))
     local_cfg = _repo_root() / ".cli-proxy-api" / "cliproxyapi.conf"
     if local_cfg.exists():
         return str(local_cfg)
+    local_yaml = _repo_root() / ".cli-proxy-api" / "config.yaml"
+    if local_yaml.exists():
+        return str(local_yaml)
     brew_cfg = Path("/opt/homebrew/etc/cliproxyapi.conf")
     if brew_cfg.exists():
         return str(brew_cfg)
@@ -243,7 +355,19 @@ def _start_detached(args: list[str], log_path: Path) -> int:
 
 
 def _cliproxy_bin() -> str:
-    return shutil.which("cliproxyapi") or "/opt/homebrew/bin/cliproxyapi"
+    candidates = [
+        shutil.which("cli-proxy-api-plus"),
+        str(Path.home() / ".local" / "bin" / "cli-proxy-api-plus"),
+        "/opt/homebrew/bin/cli-proxy-api-plus",
+        shutil.which("cliproxyapi"),
+        str(Path.home() / ".local" / "bin" / "cliproxyapi"),
+        "/opt/homebrew/bin/cliproxyapi",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    # Keep a deterministic fallback for error surfaces.
+    return "cli-proxy-api-plus"
 
 
 def _ensure_project_clipr_config() -> Path:
@@ -302,7 +426,7 @@ def _port_from_base_url(base_url: str) -> int | None:
 
 def _kill_cliproxy_listener(port: int) -> list[int]:
     """
-    Best-effort: kill cliproxyapi processes listening on the given TCP port.
+    Best-effort: kill CLIProxyAPI/CLIProxyAPIPlus processes listening on the given TCP port.
     Returns list of killed PIDs.
     """
     killed: list[int] = []
@@ -322,7 +446,7 @@ def _kill_cliproxy_listener(port: int) -> list[int]:
     for pid in pids:
         try:
             cmd = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True).strip()
-            if "cliproxyapi" not in cmd:
+            if "cliproxyapi" not in cmd and "cli-proxy-api-plus" not in cmd:
                 continue
             os.kill(pid, 15)
             killed.append(pid)
@@ -331,9 +455,38 @@ def _kill_cliproxy_listener(port: int) -> list[int]:
     return killed
 
 
-def _run_detached_brew_install(log_path: Path, *, tap_router_for_me: bool) -> int:
+def _run_detached_proxy_install(log_path: Path, *, tap_router_for_me: bool) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     script_lines = []
+    script_lines.append("set -u")
+    script_lines.append("echo '[install] trying CLIProxyAPI Plus release install'")
+    script_lines.append("OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')")
+    script_lines.append("ARCH_NAME=$(uname -m)")
+    script_lines.append("case \"$ARCH_NAME\" in arm64|aarch64) ARCH_NAME=arm64 ;; x86_64|amd64) ARCH_NAME=amd64 ;; esac")
+    script_lines.append(
+        "ASSET_URL=$(curl -fsSL https://api.github.com/repos/router-for-me/CLIProxyAPIPlus/releases/latest "
+        "| grep -Eo 'https://[^\\\"]*CLIProxyAPIPlus_[^\\\"]*_'\"$OS_NAME\"'_'\"$ARCH_NAME\"'\\.tar\\.gz' "
+        "| head -n 1 || true)"
+    )
+    script_lines.append("if [ -n \"$ASSET_URL\" ]; then")
+    script_lines.append("  TMP_DIR=$(mktemp -d)")
+    script_lines.append("  if curl -fsSL \"$ASSET_URL\" -o \"$TMP_DIR/cliproxy-plus.tar.gz\"; then")
+    script_lines.append("    if tar -xzf \"$TMP_DIR/cliproxy-plus.tar.gz\" -C \"$TMP_DIR\"; then")
+    script_lines.append("      mkdir -p \"$HOME/.local/bin\"")
+    script_lines.append("      if [ -f \"$TMP_DIR/cli-proxy-api-plus\" ]; then")
+    script_lines.append("        install -m 0755 \"$TMP_DIR/cli-proxy-api-plus\" \"$HOME/.local/bin/cli-proxy-api-plus\"")
+    script_lines.append("        ln -sf \"$HOME/.local/bin/cli-proxy-api-plus\" \"$HOME/.local/bin/cliproxyapi\" || true")
+    script_lines.append("        echo '[install] CLIProxyAPI Plus installed to $HOME/.local/bin/cli-proxy-api-plus'")
+    script_lines.append("        exit 0")
+    script_lines.append("      fi")
+    script_lines.append("    fi")
+    script_lines.append("  fi")
+    script_lines.append("fi")
+    script_lines.append("echo '[install] CLIProxyAPI Plus release install failed; trying Homebrew fallback'")
+    script_lines.append("if ! command -v brew >/dev/null 2>&1; then")
+    script_lines.append("  echo '[install] brew not found; cannot run Homebrew fallback'")
+    script_lines.append("  exit 1")
+    script_lines.append("fi")
     if tap_router_for_me:
         script_lines.append("brew tap router-for-me/tap || true")
     script_lines.append("brew install cliproxyapi")
@@ -400,11 +553,11 @@ def _model_visible_in_ui(model_id: str) -> bool:
     Reduce clutter in the frontend model picker by hiding older provider versions.
 
     Policy (as requested):
-    - OpenAI: hide gpt-* models older than 5.1
-    - Anthropic: hide claude-* models older than 4.5
-    - Gemini: hide gemini-* models older than 3.x
+    - OpenAI: show only GPT-5.2 / GPT-5.3 families (codex + non-codex), hide 5.1 and older
+    - Anthropic: hide claude-* models older than 4.6
+    - Gemini: hide gemini-* models older than 2.5
 
-    Unknown/unparsed model ids are left visible.
+    Unknown non-provider-specific model ids are left visible.
     """
 
     mid = (model_id or "").strip()
@@ -414,20 +567,40 @@ def _model_visible_in_ui(model_id: str) -> bool:
 
     # OpenAI (gpt-*)
     openai_id = lower.removeprefix("openai/")
-    m = re.match(r"^gpt-(?P<major>\d+)(?:\.(?P<minor>\d+))?", openai_id)
+    m = re.match(r"^gpt-(?P<major>\d+)\.(?P<minor>\d+)(?P<suffix>(?:-[a-z0-9][a-z0-9.]*)*)$", openai_id)
     if m:
         major = int(m.group("major"))
-        minor = int(m.group("minor") or "0")
-        return major > 5 or (major == 5 and minor >= 1)
+        minor = int(m.group("minor"))
+        if major != 5 or minor not in {2, 3}:
+            return False
+        suffix = m.group("suffix") or ""
+        tokens = [t for t in suffix.split("-") if t]
+        # Drop older sizing-style variants (for example "*-mini", "*-max") to keep
+        # the list focused on the requested reasoning tiers.
+        if any(t in {"mini", "max"} for t in tokens):
+            return False
+        efforts = [t for t in tokens if t in {"minimal", "low", "medium", "high", "xhigh"}]
+        if efforts and any(t not in {"medium", "high", "xhigh"} for t in efforts):
+            return False
+        return True
+    if openai_id.startswith("gpt-"):
+        return False
 
     # Anthropic (claude-*)
     anthropic_id = lower.removeprefix("anthropic/")
     if anthropic_id.startswith("claude-"):
-        parts = anthropic_id.split("-")
+        # Dot format: claude-<family>-4.6
+        m = re.match(r"^claude-(?:opus|sonnet|haiku)-(?P<major>\d+)\.(?P<minor>\d+)", anthropic_id)
+        if m:
+            major = int(m.group("major"))
+            minor = int(m.group("minor"))
+            return major > 4 or (major == 4 and minor >= 6)
 
-        # New format:
-        # - claude-<family>-4-5-YYYYMMDD
+        # Hyphen format:
+        # - claude-<family>-4-6-YYYYMMDD
+        # - claude-<family>-4-6
         # - claude-<family>-4-YYYYMMDD
+        parts = anthropic_id.split("-")
         if (
             len(parts) >= 4
             and parts[0] == "claude"
@@ -436,16 +609,18 @@ def _model_visible_in_ui(model_id: str) -> bool:
         ):
             major = int(parts[2])
             minor = 0
-            # Minor is present only when the 4th token is a small digit and the 5th token looks like a date.
-            if len(parts) >= 5 and parts[3].isdigit() and len(parts[3]) <= 2 and parts[4].isdigit() and len(parts[4]) >= 6:
+            # Minor may appear as the next small numeric token (with or without a date suffix).
+            # A long numeric token in this position is usually a date suffix and should not be treated as minor.
+            if parts[3].isdigit() and len(parts[3]) <= 2:
                 minor = int(parts[3])
-            return major > 4 or (major == 4 and minor >= 5)
+            return major > 4 or (major == 4 and minor >= 6)
 
         # Older format: claude-3-7-sonnet-YYYYMMDD
-        if len(parts) >= 5 and parts[0] == "claude" and parts[1].isdigit() and parts[2].isdigit():
-            major = int(parts[1])
-            minor = int(parts[2])
-            return major > 4 or (major == 4 and minor >= 5)
+        m = re.match(r"^claude-(?P<major>\d+)-(?P<minor>\d+)-", anthropic_id)
+        if m:
+            major = int(m.group("major"))
+            minor = int(m.group("minor"))
+            return major > 4 or (major == 4 and minor >= 6)
 
         # If we can't parse, keep it visible.
         return True
@@ -455,8 +630,10 @@ def _model_visible_in_ui(model_id: str) -> bool:
     m = re.match(r"^gemini-(?P<major>\d+)(?:\.(?P<minor>\d+))?", gemini_id)
     if m:
         major = int(m.group("major"))
-        # minor unused for threshold (3.x+ only)
-        return major >= 3
+        minor = int(m.group("minor") or "0")
+        return major > 2 or (major == 2 and minor >= 5)
+    if gemini_id.startswith("gemini-"):
+        return False
 
     return True
 
@@ -583,7 +760,10 @@ async def cliproxy_start(req: CliproxyStartRequest) -> dict[str, Any]:
     try:
         pid = _start_detached(args, log_path)
     except FileNotFoundError:
-        raise HTTPException(status_code=400, detail="'cliproxyapi' not found (try Homebrew install)")
+        raise HTTPException(
+            status_code=400,
+            detail="'cli-proxy-api-plus'/'cliproxyapi' not found (try /api/cliproxy/install)",
+        )
     app.state.cliproxy_pid = pid
     return {
         "ok": True,
@@ -624,7 +804,10 @@ async def cliproxy_login(req: CliproxyLoginRequest) -> dict[str, Any]:
     try:
         pid = _start_detached(args, log_path)
     except FileNotFoundError:
-        raise HTTPException(status_code=400, detail="'cliproxyapi' not found (try Homebrew install)")
+        raise HTTPException(
+            status_code=400,
+            detail="'cli-proxy-api-plus'/'cliproxyapi' not found (try /api/cliproxy/install)",
+        )
     return {"ok": True, "pid": pid, "log_path": str(log_path), "command": args}
 
 
@@ -632,16 +815,11 @@ async def cliproxy_login(req: CliproxyLoginRequest) -> dict[str, Any]:
 async def cliproxy_install(req: CliproxyInstallRequest) -> dict[str, Any]:
     """
     Best-effort helper for local single-user macOS setups:
-    installs CLIProxyAPI via Homebrew in the background and logs to data/.
+    installs CLIProxyAPI Plus in the background and logs to data/.
+    Falls back to Homebrew cliproxyapi when Plus install is unavailable.
     """
-    try:
-        # cheap check
-        subprocess.run(["brew", "--version"], check=True, capture_output=True, text=True)
-    except Exception:
-        raise HTTPException(status_code=400, detail="'brew' not found or not usable")
-
     log_path = Path("data") / "cliproxy_install.log"
-    pid = _run_detached_brew_install(log_path, tap_router_for_me=req.tap_router_for_me)
+    pid = _run_detached_proxy_install(log_path, tap_router_for_me=req.tap_router_for_me)
     return {"ok": True, "pid": pid, "log_path": str(log_path)}
 
 
@@ -1227,6 +1405,7 @@ async def start_run(run_id: str) -> dict[str, Any]:
             await broker.publish(run_id, payload)
 
         await workflow.run_pipeline(run_id, on_event=on_event)
+        await _auto_generate_patient_facing_for_run(run_id, broker)
 
     asyncio.create_task(_runner())
     return {"ok": True}

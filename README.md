@@ -1,11 +1,11 @@
 # qEEG Council
 
-6-stage LLM deliberation workflow for analyzing qEEG/ERP reports. Uses CLIProxyAPI as the upstream router to OpenAI, Anthropic, and Google models.
+6-stage LLM deliberation workflow for analyzing qEEG/ERP reports. Uses CLIProxyAPI/CLIProxyAPI Plus as the upstream router to OpenAI, Anthropic, and Google models.
 
 ## Architecture
 
 ```
-Frontend (React/Vite)  →  Backend (FastAPI)  →  CLIProxyAPI  →  LLM providers
+Frontend (React/Vite)  →  Backend (FastAPI)  →  CLIProxyAPI(Plus)  →  LLM providers
      :5173                    :8000                :8317
 ```
 
@@ -41,7 +41,7 @@ Vision-capable models (GPT-4o+, Claude 3+, Gemini 1.5+) receive PDF page images 
 
 - Python 3.11+
 - Node.js 18+
-- CLIProxyAPI running on port 8317
+- CLIProxyAPI Plus (recommended) or CLIProxyAPI running on port 8317
 - Tesseract (optional, for OCR)
 
 ## Install
@@ -101,7 +101,7 @@ Optional `.env` variables:
 ```
 CLIPROXY_BASE_URL=http://127.0.0.1:8317
 CLIPROXY_API_KEY=
-DEFAULT_CONSOLIDATOR=claude-opus-4-5-20251101
+DEFAULT_CONSOLIDATOR=claude-opus-4-6
 ```
 
 ## License

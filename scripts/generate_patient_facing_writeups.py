@@ -249,10 +249,10 @@ def _portal_markdown_sources(portal_patient_dir: Path) -> list[tuple[str, str]]:
 
 
 async def main() -> int:
-    ap = argparse.ArgumentParser(description="Generate patient-facing qEEG writeups (Opus 4.5) into portal folders.")
+    ap = argparse.ArgumentParser(description="Generate patient-facing qEEG writeups (Opus 4.6) into portal folders.")
     ap.add_argument("--portal-dir", default="data/portal_patients", help="Portal share dir (default: data/portal_patients)")
     ap.add_argument("--patient-label", action="append", default=[], help="Process only this patient label (repeatable)")
-    ap.add_argument("--model", default="claude-opus-4-5", help="Preferred model id (default: claude-opus-4-5)")
+    ap.add_argument("--model", default="claude-opus-4-6", help="Preferred model id (default: claude-opus-4-6)")
     ap.add_argument("--max-tokens", type=int, default=4000, help="Max output tokens (default: 4000)")
     ap.add_argument("--temperature", type=float, default=0.2, help="LLM temperature (default: 0.2)")
     ap.add_argument("--version", default="v1", help="Version tag for output filenames (default: v1)")
@@ -377,5 +377,4 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-
 

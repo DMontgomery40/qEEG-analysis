@@ -84,6 +84,60 @@ def _safe_int(token: str) -> int | None:
         return None
 
 
+def _parse_simple_range(text: str | None) -> tuple[float, float] | None:
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"^\s*(-?\d+(?:\.\d+)?)\s*[-–—]\s*(-?\d+(?:\.\d+)?)\s*$", text)
+    if not m:
+        return None
+    lo = _safe_float(m.group(1))
+    hi = _safe_float(m.group(2))
+    if lo is None or hi is None:
+        return None
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _normalize_ratio_value_token(token: str, *, value: float, target_range: str | None) -> float | None:
+    """
+    Normalize obvious OCR artifacts for ratio rows (for example "11" where "1.1" is expected).
+
+    Returns:
+    - a repaired/original float when plausible
+    - None when the token is too implausible to trust
+    """
+    bounds = _parse_simple_range(target_range)
+    max_reasonable = 9.0
+    if bounds is not None:
+        _lo, hi = bounds
+        # Keep a broad ceiling so we don't over-reject true outliers, while still catching
+        # obvious dropped-decimal OCR artifacts.
+        max_reasonable = max(5.0, hi * 4.0)
+
+    if value <= max_reasonable:
+        return value
+
+    t = (token or "").strip()
+    if "." in t or not t.isdigit() or len(t) < 2:
+        return None
+
+    candidates: list[float] = []
+    for i in range(1, len(t)):
+        cand = _safe_float(f"{t[:i]}.{t[i:]}")
+        if cand is None:
+            continue
+        if cand <= max_reasonable:
+            candidates.append(cand)
+    if not candidates:
+        return None
+
+    if bounds is not None:
+        center = (bounds[0] + bounds[1]) / 2.0
+        return min(candidates, key=lambda c: abs(c - center))
+    return min(candidates, key=lambda c: abs(c - 1.0))
+
+
 def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list[int]) -> list[dict[str, Any]]:
     """
     Deterministically extract key summary metrics from the OCR text (usually PAGE 1).
@@ -287,11 +341,13 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
         if len(tokens) < len(expected_sessions):
             continue
         
+        row_facts: list[dict[str, Any]] = []
+        row_had_repair = False
         for sess, tok in zip(expected_sessions, tokens[: len(expected_sessions)]):
             t = (tok or "").strip()
             # Handle N/A (including "mN/A" where ■ is OCR'd as "m").
             if re.match(r"(?i)^[m■]?N/?A$", t):
-                out.append(
+                row_facts.append(
                     {
                         "fact_type": "state_metric",
                         "metric": metric,
@@ -305,10 +361,16 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
                 )
                 continue
             
-            val = _safe_float(t)
+            raw_val = _safe_float(t)
+            if raw_val is None:
+                continue
+            val = _normalize_ratio_value_token(t, value=raw_val, target_range=target)
             if val is None:
                 continue
-            out.append(
+            shown_as_value: str | None = line.strip()
+            if val != raw_val:
+                row_had_repair = True
+            row_facts.append(
                 {
                     "fact_type": "state_metric",
                     "metric": metric,
@@ -316,10 +378,17 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
                     "value": val,
                     "unit": unit,
                     "target_range": target,
-                    "shown_as": line.strip(),
+                    "shown_as": shown_as_value,
                     "source_page": 1,
                 }
             )
+        # Avoid propagating known OCR-token artifacts (for example "11" repaired to "1.1")
+        # into downstream council prompts via shown_as strings.
+        if row_had_repair:
+            for f in row_facts:
+                if f.get("shown_as") != "N/A":
+                    f["shown_as"] = None
+        out.extend(row_facts)
 
     # Peak frequency by region (typically PAGE 1).
     peak_lines = [

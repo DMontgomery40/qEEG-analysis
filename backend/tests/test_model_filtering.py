@@ -6,22 +6,32 @@ from __future__ import annotations
 def test_model_visible_in_ui_filters_legacy_provider_versions(temp_data_dir):
     from backend.main import _model_visible_in_ui
 
-    # OpenAI: keep >= 5.1
+    # OpenAI: keep only 5.2 / 5.3 families (+codex, allowed effort tiers).
     assert _model_visible_in_ui("gpt-5") is False
-    assert _model_visible_in_ui("gpt-5.1") is True
-    assert _model_visible_in_ui("gpt-5.1-codex-max") is True
+    assert _model_visible_in_ui("gpt-5.1") is False
+    assert _model_visible_in_ui("gpt-5-codex") is False
+    assert _model_visible_in_ui("gpt-5.1-codex-max") is False
+    assert _model_visible_in_ui("gpt-5.2") is True
     assert _model_visible_in_ui("openai/gpt-5.2-codex") is True
+    assert _model_visible_in_ui("gpt-5.3-codex-high") is True
+    assert _model_visible_in_ui("gpt-5.3-xhigh") is True
+    assert _model_visible_in_ui("gpt-5.3-low") is False
+    assert _model_visible_in_ui("gpt-5.2-codex-mini") is False
 
-    # Anthropic: keep >= 4.5
+    # Anthropic: keep >= 4.6
     assert _model_visible_in_ui("claude-opus-4-20250514") is False
     assert _model_visible_in_ui("claude-opus-4-1-20250805") is False
-    assert _model_visible_in_ui("claude-sonnet-4-5-20250929") is True
+    assert _model_visible_in_ui("claude-sonnet-4-5-20250929") is False
+    assert _model_visible_in_ui("claude-sonnet-4-6-20260101") is True
+    assert _model_visible_in_ui("claude-sonnet-4-6") is True
+    assert _model_visible_in_ui("claude-opus-4-6") is True
+    assert _model_visible_in_ui("claude-opus-4.6") is True
     assert _model_visible_in_ui("claude-3-7-sonnet-20250219") is False
 
-    # Gemini: keep >= 3.x
-    assert _model_visible_in_ui("gemini-2.5-pro") is False
+    # Gemini: keep >= 2.5 (including 3.x previews).
+    assert _model_visible_in_ui("gemini-2.0-flash") is False
+    assert _model_visible_in_ui("gemini-2.5-pro") is True
     assert _model_visible_in_ui("google/gemini-3-flash-preview") is True
 
     # Unknown ids: keep visible
     assert _model_visible_in_ui("some-custom-model") is True
-

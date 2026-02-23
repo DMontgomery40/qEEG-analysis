@@ -6,6 +6,7 @@ This creates actual beautiful documents, not corporate garbage.
 from __future__ import annotations
 
 import base64
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -16,8 +17,33 @@ from weasyprint import HTML, CSS
 # Markdown extensions for tables
 MD_EXTENSIONS = ["tables", "smarty"]
 
-# Logo path - use the repo assets directory
-LOGO_PATH = Path(__file__).parent.parent / "assets" / "neuro-luminance-logo.png"
+def _resolve_logo_path() -> Path | None:
+    """Resolve patient-facing logo path with explicit override and safe fallbacks."""
+    env_path = (os.getenv("QEEG_PATIENT_FACING_LOGO_PATH", "") or "").strip()
+    candidates: list[Path] = []
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    repo_root = Path(__file__).resolve().parents[1]
+    prompts_dir = repo_root.parent / "local-explainer-video" / "prompts"
+    candidates.extend(
+        [
+            # Shared logo path in explainer repo prompts (preferred when present).
+            prompts_dir / "neuro-luminance-inc-logo.png",
+            prompts_dir / "neuro-luminance-logo.png",
+            prompts_dir / "NEW-LOGO.png",
+            prompts_dir / "neuro-luminance-logo.jpg",
+            prompts_dir / "neuro-luminance-logo.jpeg",
+            # Local fallbacks in this repo.
+            repo_root / "assets" / "neuro-luminance-logo.png",
+            repo_root / "assets" / "NEW-LOGO.png",
+        ]
+    )
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+    return None
 
 
 def render_patient_facing_markdown_to_pdf(
@@ -49,10 +75,13 @@ def render_patient_facing_markdown_to_pdf(
 
 def _get_logo_base64() -> str:
     """Get the logo as a base64 data URI."""
-    if LOGO_PATH.exists():
-        with open(LOGO_PATH, "rb") as f:
+    logo_path = _resolve_logo_path()
+    if logo_path is not None:
+        with open(logo_path, "rb") as f:
             data = base64.b64encode(f.read()).decode("utf-8")
-        return f"data:image/png;base64,{data}"
+        suffix = logo_path.suffix.lower()
+        mime = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+        return f"data:{mime};base64,{data}"
     return ""
 
 

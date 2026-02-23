@@ -51,7 +51,7 @@ def _ocr_available() -> bool:
     return apple_vision_available() or _tesseract_ocr_available()
 
 
-def _render_page_image(pdf_path: Path, page_index: int, dpi_zoom: float = 3.0) -> bytes | None:
+def _render_page_image(pdf_path: Path, page_index: int, dpi_zoom: float = 4.0) -> bytes | None:
     """Render a PDF page as PNG bytes. Returns None on failure."""
     try:
         import fitz  # PyMuPDF
@@ -192,7 +192,7 @@ def extract_pdf_full(pdf_path: Path) -> PdfFullExtraction:
 
     vision_ok = apple_vision_available() and not _truthy_env("QEEG_DISABLE_APPLE_VISION_OCR", False)
     tesseract_ok = _tesseract_ocr_available()
-    render_zoom = _float_env("QEEG_PDF_RENDER_ZOOM", 3.0)
+    render_zoom = _float_env("QEEG_PDF_RENDER_ZOOM", 4.0)
 
     fitz_doc = None
     fitz_ok = False

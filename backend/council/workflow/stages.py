@@ -51,6 +51,149 @@ class _StagesMixin:
 
         return sorted(matches, key=rank)[0]
 
+    @staticmethod
+    def _has_heading(text: str, heading: str) -> bool:
+        import re
+
+        return bool(re.search(rf"(?m)^{re.escape(heading)}\s*$", text or ""))
+
+    @classmethod
+    def _heading_positions(cls, text: str, required_headings: list[str]) -> list[tuple[str, int]]:
+        import re
+
+        positions: list[tuple[str, int]] = []
+        for h in required_headings:
+            m = re.search(rf"(?m)^{re.escape(h)}\s*$", text or "")
+            if m:
+                positions.append((h, m.start()))
+        return sorted(positions, key=lambda x: x[1])
+
+    @classmethod
+    def _first_missing_heading(cls, text: str, required_headings: list[str]) -> str | None:
+        for h in required_headings:
+            if not cls._has_heading(text, h):
+                return h
+        return None
+
+    @classmethod
+    def _is_longform_complete(
+        cls,
+        text: str,
+        *,
+        end_sentinel: str,
+        required_headings: list[str] | None,
+    ) -> bool:
+        if end_sentinel not in (text or ""):
+            return False
+        if not required_headings:
+            return True
+        return all(cls._has_heading(text, h) for h in required_headings)
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        try:
+            v = int(os.getenv(name, str(default)) or str(default))
+        except Exception:
+            v = default
+        return v
+
+    async def _call_longform_chat_with_repairs(
+        self,
+        *,
+        model_id: str,
+        prompt_text: str,
+        temperature: float,
+        max_tokens: int,
+        end_sentinel: str,
+        required_headings: list[str] | None = None,
+    ) -> str:
+        text = await self._call_model_chat(
+            model_id=model_id,
+            prompt_text=prompt_text,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        # Keep mock pipeline behavior stable for integration tests.
+        require_complete = _truthy_env("QEEG_LONGFORM_REQUIRE_COMPLETE", True)
+        if isinstance(model_id, str) and model_id.startswith("mock-"):
+            require_complete = False
+        if not require_complete:
+            return text
+
+        if self._is_longform_complete(text, end_sentinel=end_sentinel, required_headings=required_headings):
+            return text
+
+        repair_calls = self._int_env("QEEG_LONGFORM_REPAIR_CALLS", 6)
+        if repair_calls < 0:
+            repair_calls = 0
+        continuation_context_chars = self._int_env("QEEG_LONGFORM_CONTINUATION_CONTEXT_CHARS", 12000)
+        if continuation_context_chars <= 0:
+            continuation_context_chars = 12000
+
+        repaired = text
+        headings = required_headings or []
+        for _ in range(repair_calls):
+            start_heading = None
+            start_idx = None
+            if headings:
+                start_heading = self._first_missing_heading(repaired, headings)
+                pos = self._heading_positions(repaired, headings)
+                pos_map = {h: idx for h, idx in pos}
+                if start_heading:
+                    start_idx = pos_map.get(start_heading)
+                else:
+                    start_heading = pos[-1][0] if pos else headings[0]
+                    start_idx = pos_map.get(start_heading)
+
+            prefix = (repaired[:start_idx] if isinstance(start_idx, int) else repaired).rstrip()
+            partial_tail = (repaired or "")[-continuation_context_chars:]
+            instruction_lines = [
+                "Your previous output was cut off.",
+                "Output ONLY the remaining portion of the report.",
+            ]
+            if start_heading:
+                instruction_lines.append(f"- Start with this exact heading (no text before it): {start_heading}")
+            else:
+                instruction_lines.append("- Continue directly from where the text ended (do not restart).")
+            if headings:
+                instruction_lines.append(f"- Continue through: {headings[-1]}")
+            instruction_lines.append(f"- End with a final line exactly: {end_sentinel}")
+            continuation_instruction = "\n".join(instruction_lines)
+            cont_prompt = (
+                f"{prompt_text}\n\n---\n\n"
+                "CURRENT PARTIAL OUTPUT (tail; continue from this context, do not restart):\n\n"
+                f"{partial_tail}\n\n---\n\n"
+                f"{continuation_instruction}"
+            )
+
+            cont = await self._call_model_chat(
+                model_id=model_id,
+                prompt_text=cont_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+            clean = (cont or "").strip()
+            if start_heading:
+                try:
+                    import re
+
+                    m = re.search(rf"(?m)^{re.escape(start_heading)}\s*$", clean)
+                    if m:
+                        clean = clean[m.start() :]
+                except Exception:
+                    pass
+                repaired = f"{prefix}\n\n{clean}\n"
+            else:
+                repaired = f"{prefix}\n\n{clean}\n"
+
+            if self._is_longform_complete(repaired, end_sentinel=end_sentinel, required_headings=required_headings):
+                return repaired
+
+        # Return best-effort text; caller can decide whether to hard-fail.
+        return repaired
+
     async def _stage1(
         self,
         run_id: str,
@@ -60,13 +203,14 @@ class _StagesMixin:
     ) -> None:
         stage = STAGES[0]
         prompt = _load_prompt("stage1_analysis.md")
+        end_sentinel = "<!-- END STAGE1 ANALYSIS -->"
         report_dir = _derive_report_dir(report)
         report_text = _load_best_report_text(report, report_dir)
 
         # Prefer a single "checker" vision model for multimodal extraction + verification.
         # This is intentionally independent from the selected council model set, so the council can use
         # text-only models while still getting page-grounded structured data + transcript.
-        vision_checker_pref = os.getenv("QEEG_VISION_CHECKER_MODEL", "gemini-3-flash")
+        vision_checker_pref = os.getenv("QEEG_VISION_CHECKER_MODEL", "gemini-pro-vision")
         vision_checker_id = self._select_discovered_model_id(vision_checker_pref)
         if vision_checker_id and not is_vision_capable(vision_checker_id):
             vision_checker_id = None
@@ -301,7 +445,10 @@ class _StagesMixin:
         workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
 
         base_prompt_text = (
-            f"{prompt}\n\n---\n\n"
+            f"{prompt}\n\n"
+            "IMPORTANT:\n"
+            f"- After finishing the full analysis, add a final line exactly: {end_sentinel}\n\n"
+            "---\n\n"
             f"{workflow_context}\n\n---\n\n"
             f"{data_pack_block}"
             f"{vision_transcript_block}"
@@ -310,6 +457,10 @@ class _StagesMixin:
         )
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        stage1_max_tokens = self._int_env("QEEG_STAGE1_MAX_TOKENS", 12000)
+        if stage1_max_tokens <= 0:
+            stage1_max_tokens = 12000
+        stage1_require_complete = _truthy_env("QEEG_STAGE1_REQUIRE_COMPLETE", True)
 
         async def one(model_id: str) -> tuple[str, str] | None:
             try:
@@ -355,12 +506,26 @@ class _StagesMixin:
                         "MULTIMODAL INGESTION NOTES (generated from ALL PDF pages in multiple passes):\n\n"
                         f"{notes_text}\n"
                     )
-                text = await self._call_model_chat(
+                text = await self._call_longform_chat_with_repairs(
                     model_id=model_id,
-                    prompt_text=final_prompt,
+                    prompt_text=final_prompt.strip(),
                     temperature=0.2,
-                    max_tokens=8000,
+                    max_tokens=stage1_max_tokens,
+                    end_sentinel=end_sentinel,
+                    required_headings=None,
                 )
+                enforce_complete = stage1_require_complete and not (
+                    isinstance(model_id, str) and model_id.startswith("mock-")
+                )
+                if enforce_complete and not self._is_longform_complete(
+                    text,
+                    end_sentinel=end_sentinel,
+                    required_headings=None,
+                ):
+                    raise RuntimeError(
+                        "Stage 1 analysis remained incomplete after repair attempts. "
+                        f"End sentinel present: {end_sentinel in (text or '')}"
+                    )
                 return model_id, text
             except Exception:
                 return None
@@ -477,7 +642,9 @@ class _StagesMixin:
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
                 f"{vision_transcript_block}"
-                f"ORIGINAL qEEG REPORT (for verification - cross-reference all claims against this):\n\n{report_text}\n\n---\n\n"
+                "ORIGINAL qEEG REPORT OCR TEXT (tertiary verification/context only; if numeric conflicts exist, "
+                "STRUCTURED DATA PACK values are authoritative):\n\n"
+                f"{report_text}\n\n---\n\n"
                 f"Reviewer Model ID: {reviewer_model_id}\n"
                 f"Your own analysis label (do not review yourself): {reviewer_label}\n\n"
                 f"ANALYSES TO REVIEW:\n\n{filtered_text}\n"
@@ -520,6 +687,17 @@ class _StagesMixin:
     ) -> None:
         stage = STAGES[2]
         prompt = _load_prompt("stage3_revision.md")
+        required_headings = [
+            "# Dataset and Sessions",
+            "# Key Empirical Findings",
+            "# Performance Assessments",
+            "# Auditory ERP: P300 and N100",
+            "# Background EEG Metrics",
+            "# Speculative Commentary and Interpretive Hypotheses",
+            "# Measurement Recommendations",
+            "# Uncertainties and Limits",
+        ]
+        end_sentinel = "<!-- END STAGE3 REVISION -->"
 
         with session_scope() as session:
             s1 = _stage_artifacts(session, run_id, 1, kind="analysis")
@@ -576,6 +754,10 @@ class _StagesMixin:
             raise RuntimeError("No Stage 1 analyses available for revision")
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        stage3_max_tokens = self._int_env("QEEG_STAGE3_MAX_TOKENS", 12000)
+        if stage3_max_tokens <= 0:
+            stage3_max_tokens = 12000
+        stage3_require_complete = _truthy_env("QEEG_STAGE3_REQUIRE_COMPLETE", True)
 
         async def one(model_id: str) -> tuple[str, str] | None:
             analysis = analyses_by_model.get(model_id)
@@ -584,20 +766,44 @@ class _StagesMixin:
             my_label = next((lbl for lbl, mid in label_map.items() if mid == model_id), None)
             pr_text = "\n\n".join([f"Peer review by {mid}:\n{txt}" for mid, txt in peer_reviews]).strip()
             prompt_text = (
-                f"{prompt}\n\n---\n\n"
+                f"{prompt}\n\n"
+                "IMPORTANT:\n"
+                f"- After finishing the full revision, add a final line exactly: {end_sentinel}\n\n"
+                "---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
                 f"{vision_transcript_block}"
-                f"ORIGINAL qEEG REPORT (for fact-checking your revision):\n\n{report_text}\n\n---\n\n"
+                "ORIGINAL qEEG REPORT OCR TEXT (tertiary fact-checking/context only; if numeric conflicts exist, "
+                "STRUCTURED DATA PACK values are authoritative):\n\n"
+                f"{report_text}\n\n---\n\n"
                 f"Your Model ID: {model_id}\n"
                 f"Your analysis label (if present): {my_label}\n\n"
                 f"Your original analysis:\n\n{analysis}\n\n"
                 f"Peer review JSON artifacts:\n\n{pr_text}\n"
             )
             try:
-                text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=8000
+                text = await self._call_longform_chat_with_repairs(
+                    model_id=model_id,
+                    prompt_text=prompt_text.strip(),
+                    temperature=0.2,
+                    max_tokens=stage3_max_tokens,
+                    end_sentinel=end_sentinel,
+                    required_headings=required_headings,
                 )
+                enforce_complete = stage3_require_complete and not (
+                    isinstance(model_id, str) and model_id.startswith("mock-")
+                )
+                if enforce_complete and not self._is_longform_complete(
+                    text,
+                    end_sentinel=end_sentinel,
+                    required_headings=required_headings,
+                ):
+                    missing = [h for h in required_headings if not self._has_heading(text, h)]
+                    raise RuntimeError(
+                        "Stage 3 revision remained incomplete after repair attempts. "
+                        f"Missing headings: {missing if missing else '(none)'}; "
+                        f"end sentinel present: {end_sentinel in (text or '')}"
+                    )
                 return model_id, text
             except Exception:
                 return None
@@ -643,7 +849,23 @@ class _StagesMixin:
         def has_heading(text: str, heading: str) -> bool:
             import re
 
-            return bool(re.search(rf"(?m)^{re.escape(heading)}\\s*$", text or ""))
+            return bool(re.search(rf"(?m)^{re.escape(heading)}\s*$", text or ""))
+
+        def heading_positions(text: str) -> list[tuple[str, int]]:
+            import re
+
+            positions: list[tuple[str, int]] = []
+            for h in required_headings:
+                m = re.search(rf"(?m)^{re.escape(h)}\s*$", text or "")
+                if m:
+                    positions.append((h, m.start()))
+            return sorted(positions, key=lambda x: x[1])
+
+        def first_missing_heading(text: str) -> str | None:
+            for h in required_headings:
+                if not has_heading(text, h):
+                    return h
+            return None
 
         def is_complete(text: str) -> bool:
             if end_sentinel not in (text or ""):
@@ -651,13 +873,7 @@ class _StagesMixin:
             return all(has_heading(text, h) for h in required_headings)
 
         def last_heading_present(text: str) -> tuple[str, int] | tuple[None, None]:
-            import re
-
-            positions: list[tuple[str, int]] = []
-            for h in required_headings:
-                m = re.search(rf"(?m)^{re.escape(h)}\\s*$", text or "")
-                if m:
-                    positions.append((h, m.start()))
+            positions = heading_positions(text)
             if not positions:
                 return (None, None)
             return max(positions, key=lambda x: x[1])
@@ -727,11 +943,26 @@ class _StagesMixin:
             f"REVISED ANALYSES TO CONSOLIDATE:\n\n{revision_text}\n"
         )
         try:
-            max_tokens = int(os.getenv("QEEG_STAGE4_MAX_TOKENS", "8000") or "8000")
+            max_tokens = int(os.getenv("QEEG_STAGE4_MAX_TOKENS", "12000") or "12000")
         except Exception:
-            max_tokens = 8000
+            max_tokens = 12000
         if max_tokens <= 0:
-            max_tokens = 8000
+            max_tokens = 12000
+        try:
+            repair_calls = int(os.getenv("QEEG_STAGE4_REPAIR_CALLS", "6") or "6")
+        except Exception:
+            repair_calls = 6
+        if repair_calls < 0:
+            repair_calls = 0
+        try:
+            continuation_context_chars = int(os.getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000") or "12000")
+        except Exception:
+            continuation_context_chars = 12000
+        if continuation_context_chars <= 0:
+            continuation_context_chars = 12000
+        require_complete = _truthy_env("QEEG_STAGE4_REQUIRE_COMPLETE", True)
+        if isinstance(consolidator, str) and consolidator.startswith("mock-"):
+            require_complete = False
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
         text = await self._call_model_chat(
@@ -739,17 +970,28 @@ class _StagesMixin:
         )
 
         # Claude-style message APIs frequently clamp output tokens below the requested max, which can truncate
-        # long consolidations. Repair by regenerating from the last fully-started required section onward.
+        # long consolidations. Repair by regenerating from the next missing (or last present) required section onward.
         if not is_complete(text):
             repaired = text
-            for _ in range(2):  # total up to 3 calls
-                start_heading, start_idx = last_heading_present(repaired)
-                if start_heading is None or start_idx is None:
+            for _ in range(repair_calls):
+                # Prefer resuming from the first missing section. If all required sections are present but the
+                # sentinel is missing, resume from the last heading and ask for a clean ending.
+                start_heading = first_missing_heading(repaired)
+                positions = heading_positions(repaired)
+                pos_map = {h: idx for h, idx in positions}
+                start_idx = pos_map.get(start_heading) if start_heading else None
+                if start_heading is None:
+                    start_heading, start_idx = last_heading_present(repaired)
+                if start_heading is None:
                     start_heading = required_headings[0]
-                    prefix = ""
+                    start_idx = None
+
+                if start_idx is None:
+                    prefix = (repaired or "").rstrip()
                 else:
                     prefix = (repaired[:start_idx] or "").rstrip()
 
+                partial_tail = (repaired or "")[-continuation_context_chars:]
                 continuation_instruction = (
                     "Your previous output was cut off.\n"
                     "Output ONLY the remaining portion of the consolidated report.\n"
@@ -757,7 +999,12 @@ class _StagesMixin:
                     f"- Continue through: {required_headings[-1]}\n"
                     f"- End with a final line exactly: {end_sentinel}\n"
                 )
-                cont_prompt = f"{base_prompt_text}\n\n---\n\n{continuation_instruction}"
+                cont_prompt = (
+                    f"{base_prompt_text}\n\n---\n\n"
+                    "CURRENT PARTIAL CONSOLIDATION (tail; continue from this context, do not restart):\n\n"
+                    f"{partial_tail}\n\n---\n\n"
+                    f"{continuation_instruction}"
+                )
                 cont = await self._call_model_chat(
                     model_id=consolidator, prompt_text=cont_prompt, temperature=0.2, max_tokens=max_tokens
                 )
@@ -767,7 +1014,7 @@ class _StagesMixin:
                 try:
                     import re
 
-                    m = re.search(rf"(?m)^{re.escape(start_heading)}\\s*$", cont or "")
+                    m = re.search(rf"(?m)^{re.escape(start_heading)}\s*$", cont or "")
                     if m:
                         clean = cont[m.start() :]
                 except Exception:
@@ -777,6 +1024,17 @@ class _StagesMixin:
                 if is_complete(repaired):
                     break
             text = repaired
+
+        if not is_complete(text):
+            missing = [h for h in required_headings if not has_heading(text, h)]
+            detail = (
+                "Stage 4 consolidation remained incomplete after repair attempts.\n"
+                f"Missing headings: {missing if missing else '(none)'}\n"
+                f"End sentinel present: {end_sentinel in (text or '')}\n"
+                "Increase QEEG_STAGE4_MAX_TOKENS and/or QEEG_STAGE4_REPAIR_CALLS, then retry."
+            )
+            if require_complete:
+                raise RuntimeError(detail)
 
         await self._write_artifact(run_id=run_id, stage=stage, model_id=consolidator, text=text)
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "complete"})
@@ -884,6 +1142,17 @@ class _StagesMixin:
     ) -> None:
         stage = STAGES[5]
         prompt = _load_prompt("stage6_final_draft.md")
+        required_headings = [
+            "# Dataset and Sessions",
+            "# Key Empirical Findings",
+            "# Performance Assessments",
+            "# Auditory ERP: P300 and N100",
+            "# Background EEG Metrics",
+            "# Speculative Commentary and Interpretive Hypotheses",
+            "# Measurement Recommendations",
+            "# Uncertainties and Limits",
+        ]
+        end_sentinel = "<!-- END STAGE6 FINAL DRAFT -->"
 
         with session_scope() as session:
             s4 = _stage_artifacts(session, run_id, 4, kind="consolidation")
@@ -934,11 +1203,18 @@ class _StagesMixin:
         required_changes = _aggregate_required_changes(s5)
 
         await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        stage6_max_tokens = self._int_env("QEEG_STAGE6_MAX_TOKENS", 12000)
+        if stage6_max_tokens <= 0:
+            stage6_max_tokens = 12000
+        stage6_require_complete = _truthy_env("QEEG_STAGE6_REQUIRE_COMPLETE", True)
 
         async def one(model_id: str) -> tuple[str, str] | None:
             changes = "\n".join([f"- {c}" for c in required_changes]) if required_changes else "(none)"
             prompt_text = (
-                f"{prompt}\n\n---\n\n"
+                f"{prompt}\n\n"
+                "IMPORTANT:\n"
+                f"- After finishing the full final draft, add a final line exactly: {end_sentinel}\n\n"
+                "---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
                 f"{vision_transcript_block}"
@@ -947,9 +1223,28 @@ class _StagesMixin:
                 f"CONSOLIDATED REPORT:\n\n{consolidated}\n"
             )
             try:
-                text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.2, max_tokens=8000
+                text = await self._call_longform_chat_with_repairs(
+                    model_id=model_id,
+                    prompt_text=prompt_text.strip(),
+                    temperature=0.2,
+                    max_tokens=stage6_max_tokens,
+                    end_sentinel=end_sentinel,
+                    required_headings=required_headings,
                 )
+                enforce_complete = stage6_require_complete and not (
+                    isinstance(model_id, str) and model_id.startswith("mock-")
+                )
+                if enforce_complete and not self._is_longform_complete(
+                    text,
+                    end_sentinel=end_sentinel,
+                    required_headings=required_headings,
+                ):
+                    missing = [h for h in required_headings if not self._has_heading(text, h)]
+                    raise RuntimeError(
+                        "Stage 6 final draft remained incomplete after repair attempts. "
+                        f"Missing headings: {missing if missing else '(none)'}; "
+                        f"end sentinel present: {end_sentinel in (text or '')}"
+                    )
                 return model_id, text
             except Exception:
                 return None

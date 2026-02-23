@@ -18,6 +18,7 @@ def _default_config_candidates() -> list[str]:
     candidates = [
         os.getenv("CLIPROXY_CONFIG", ""),
         str(_repo_root() / ".cli-proxy-api" / "cliproxyapi.conf"),
+        str(_repo_root() / ".cli-proxy-api" / "config.yaml"),
         "/opt/homebrew/etc/cliproxyapi.conf",
         str(home / ".cli-proxy-api" / "config.yaml"),
         str(home / ".config" / "cli-proxy-api" / "config.yaml"),
@@ -44,15 +45,32 @@ def _classify_error(err: Exception) -> tuple[str, bool]:
     return "unknown", False
 
 
+def _find_proxy_binary() -> str | None:
+    candidates = [
+        shutil.which("cli-proxy-api-plus"),
+        str(Path.home() / ".local" / "bin" / "cli-proxy-api-plus"),
+        "/opt/homebrew/bin/cli-proxy-api-plus",
+        shutil.which("cliproxyapi"),
+        str(Path.home() / ".local" / "bin" / "cliproxyapi"),
+        "/opt/homebrew/bin/cliproxyapi",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return None
+
+
 def suggested_commands(*, base_url: str) -> list[str]:
     cfg = os.getenv("CLIPROXY_CONFIG", str(_repo_root() / ".cli-proxy-api" / "cliproxyapi.conf"))
+    proxy_cmd = _find_proxy_binary() or "cli-proxy-api-plus"
     return [
-        "brew install cliproxyapi  # macOS Homebrew",
-        f"cliproxyapi -config {cfg}",
-        "cliproxyapi -login",
-        "cliproxyapi -claude-login",
-        "cliproxyapi -codex-login",
-        "cliproxyapi -login -project_id YOUR_PROJECT_ID  # Gemini (optional)",
+        "Install CLIProxyAPI Plus releases: https://github.com/router-for-me/CLIProxyAPIPlus/releases",
+        "brew install cliproxyapi  # fallback mainline (Homebrew)",
+        f"{proxy_cmd} -config {cfg}",
+        f"{proxy_cmd} -login",
+        f"{proxy_cmd} -claude-login",
+        f"{proxy_cmd} -codex-login",
+        f"{proxy_cmd} -login -project_id YOUR_PROJECT_ID  # Gemini (optional)",
     ]
 
 
@@ -63,8 +81,8 @@ def status_payload(
     reachable: bool,
     error: Exception | None = None,
 ) -> dict[str, Any]:
-    binary_found = shutil.which("cliproxyapi") is not None
-    binary_path = shutil.which("cliproxyapi")
+    binary_path = _find_proxy_binary()
+    binary_found = binary_path is not None
     brew_found = shutil.which("brew") is not None
     config_candidates = _default_config_candidates()
     existing_configs = [c for c in config_candidates if Path(os.path.expanduser(c)).exists()]

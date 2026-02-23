@@ -4,6 +4,13 @@ You will be shown:
 1. The ORIGINAL qEEG REPORT TEXT (for verification of claims)
 2. Multiple analyses labeled "Analysis A", "Analysis B", etc.
 
+## Data Precedence (Critical)
+
+- The STRUCTURED DATA PACK is the authoritative numeric source.
+- The MULTIMODAL VISION TRANSCRIPT is secondary support.
+- Raw OCR report text is tertiary/context only and may contain OCR artifacts.
+- If OCR text conflicts with Structured Data Pack values (for example decimal-drop artifacts like `1.1` vs `11`), treat the Structured Data Pack as correct and do not flag this as an analysis hallucination by itself.
+
 Do not attempt to infer which model wrote which analysis.
 
 ## Your Task

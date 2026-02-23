@@ -25,6 +25,34 @@ from ..vision import _save_debug_images, _try_build_p300_cp_site_crops, _try_bui
 
 class _DataPackMixin:
     @staticmethod
+    def _filter_shadowed_facts(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Drop facts from `secondary` that have the same fact-key as any fact in `primary`.
+
+        Used to prefer deterministic PDF-text facts over redundant (and sometimes noisy) vision facts for the
+        same page-grounded metric.
+        """
+        primary_keys: set[str] = set()
+        for f in primary:
+            if not isinstance(f, dict):
+                continue
+            k = _DataPackMixin._fact_key(f)
+            if k:
+                primary_keys.add(k)
+        if not primary_keys:
+            return secondary
+
+        kept: list[dict[str, Any]] = []
+        for f in secondary:
+            if not isinstance(f, dict):
+                continue
+            k = _DataPackMixin._fact_key(f)
+            if k and k in primary_keys:
+                continue
+            kept.append(f)
+        return kept
+
+    @staticmethod
     def _dedupe_facts(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deduped: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -203,14 +231,16 @@ class _DataPackMixin:
                     for f in base_facts:
                         if isinstance(f, dict):
                             f.setdefault("extraction_method", f.get("extraction_method") or "vision_llm")
-                    conflicts = self._find_fact_conflicts(add_facts + base_facts)
+                    # Prefer deterministic facts and ignore redundant vision duplicates when checking conflicts.
+                    base_facts_filtered = self._filter_shadowed_facts(add_facts, base_facts)
+                    conflicts = self._find_fact_conflicts(add_facts + base_facts_filtered)
                     if conflicts and strict:
                         # Cached pack is inconsistent; rebuild from scratch so strict runs are never silently
                         # grounded in conflicting numbers.
                         existing = None
                     else:
                         # Deterministic facts come first so they override duplicates from older model output.
-                        existing["facts"] = self._dedupe_facts(add_facts + base_facts)
+                        existing["facts"] = self._dedupe_facts(add_facts + base_facts_filtered)
 
             if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
                 existing["derived"] = self._derive_data_pack_views(existing, expected_sessions=expected_sessions)
@@ -267,7 +297,9 @@ class _DataPackMixin:
                 if isinstance(f, dict):
                     f.setdefault("extraction_method", "deterministic_report_text")
 
-            combined = add_facts + model_facts
+            # Prefer deterministic facts; keep vision facts only when deterministic is absent for that key.
+            model_facts_filtered = self._filter_shadowed_facts(add_facts, model_facts)
+            combined = add_facts + model_facts_filtered
             if combined:
                 # Deterministic facts come first so they override duplicates from model output.
                 merged["facts"] = self._dedupe_facts(combined)
@@ -890,8 +922,14 @@ class _DataPackMixin:
 
         def has_values_or_na(f: dict[str, Any], *, fields: tuple[str, ...]) -> bool:
             shown_as = f.get("shown_as")
-            if isinstance(shown_as, str) and shown_as.strip().upper() == "N/A":
-                return True
+            if isinstance(shown_as, str):
+                s = shown_as.strip().upper()
+                if s == "N/A":
+                    return True
+                # WAVi sometimes shows placeholders like "UV <0, MS N/A" instead of a plain "N/A".
+                # Treat these as acceptable missing-at-source values (only when the numeric fields are absent).
+                if ("N/A" in s or "<0" in s) and any(f.get(field) is None for field in fields):
+                    return True
             return all(f.get(field) is not None for field in fields)
 
         def has_fact(predicate) -> bool:
@@ -1089,7 +1127,8 @@ class _DataPackMixin:
             except Exception:
                 pass
 
-        merged2 = self._merge_data_pack_parts([merged, part], meta={k: v for k, v in merged.items() if k != "derived"})
+        # Prefer retry facts over earlier broad-pass facts when keys collide (retry is more focused/accurate).
+        merged2 = self._merge_data_pack_parts([part, merged], meta={k: v for k, v in merged.items() if k != "derived"})
         merged2["derived"] = self._derive_data_pack_views(merged2, expected_sessions=expected_sessions)
         return merged2
 
@@ -1176,7 +1215,8 @@ class _DataPackMixin:
             except Exception:
                 pass
 
-        merged2 = self._merge_data_pack_parts([merged, part], meta={k: v for k, v in merged.items() if k != "derived"})
+        # Prefer retry facts over earlier broad-pass facts when keys collide (retry is more focused/accurate).
+        merged2 = self._merge_data_pack_parts([part, merged], meta={k: v for k, v in merged.items() if k != "derived"})
         merged2["derived"] = self._derive_data_pack_views(merged2, expected_sessions=expected_sessions)
         return merged2
 

@@ -9,6 +9,13 @@ You will be shown:
 
 Incorporate relevant critiques, correct overreach, and clarify uncertainties.
 
+## Data Precedence (Critical)
+
+- The STRUCTURED DATA PACK is the authoritative numeric source.
+- The MULTIMODAL VISION TRANSCRIPT is secondary support.
+- Raw OCR report text is tertiary/context only and may contain OCR artifacts.
+- If OCR text conflicts with Structured Data Pack values (for example decimal-drop artifacts like `1.1` vs `11`), use Structured Data Pack values in the revision and do not spend substantive space on OCR artifact debate.
+
 **Critical**: Use the original report text to verify all claims. Do not add new facts that are not present in the report text.
 
 ## Output Requirements
