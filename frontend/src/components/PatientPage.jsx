@@ -155,7 +155,7 @@ function PatientPage({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [videoModalFile]);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     if (!patientId) return;
     const [p, r, ru, pf] = await Promise.all([
       api.getPatient(patientId),
@@ -170,7 +170,7 @@ function PatientPage({
     setRuns(ru);
     setPatientFiles(pf);
     if (r.length && !selectedReportId) setSelectedReportId(r[0].id);
-  }
+  }, [patientId, selectedReportId]);
 
   useEffect(() => {
     setPatient(null);
@@ -186,10 +186,10 @@ function PatientPage({
       try {
         await refresh();
       } catch (e) {
-        onError(String(e?.message || e));
+        onError(e, { action: 'load_patient', patientId });
       }
     })();
-  }, [patientId]);
+  }, [onError, patientId, refresh]);
 
   useEffect(() => {
     if (!selectedConsolidator) setSelectedConsolidator(defaultConsolidator || '');
@@ -257,7 +257,7 @@ function PatientPage({
                 await refresh();
                 await onRefreshGlobal();
               } catch (e) {
-                onError(String(e?.message || e));
+                onError(e, { action: 'update_patient', patientId });
               }
             }}
           >
@@ -295,7 +295,7 @@ function PatientPage({
                   setUploadPreview(res.preview || '');
                   await refresh();
                 } catch (err) {
-                  onError(String(err?.message || err));
+                  onError(err, { action: 'upload_report', patientId });
                 } finally {
                   setUploading(false);
                   e.target.value = '';
@@ -316,11 +316,15 @@ function PatientPage({
                   onClick={async () => {
                     try {
                       await api.reextractReport(selectedReportId);
-                      onError('Re-extracted report text (OCR if available). Refreshing models…');
+                      onError('Re-extracted report text (OCR if available). Refreshing models…', {
+                        action: 'reextract_report',
+                        patientId,
+                        reportId: selectedReportId,
+                      });
                       await refresh();
                       await onRefreshGlobal();
                     } catch (e) {
-                      onError(String(e?.message || e));
+                      onError(e, { action: 'reextract_report', patientId, reportId: selectedReportId });
                     }
                   }}
                 >
@@ -375,7 +379,7 @@ function PatientPage({
                   await refresh();
                   await onRefreshGlobal?.();
                 } catch (err) {
-                  onError(String(err?.message || err));
+                  onError(err, { action: 'upload_patient_file', patientId });
                 } finally {
                   setFileUploading(false);
                   e.target.value = '';
@@ -412,7 +416,7 @@ function PatientPage({
                       await refresh();
                       await onRefreshGlobal?.();
                     } catch (err) {
-                      onError(String(err?.message || err));
+                      onError(err, { action: 'delete_patient_file', patientId, fileId: f.id });
                     }
                   }}
                 >
@@ -513,7 +517,7 @@ function PatientPage({
                 await refresh();
                 onSelectRun(run.id);
               } catch (e) {
-                onError(String(e?.message || e));
+                onError(e, { action: 'create_and_start_run', patientId, reportId: selectedReportId });
               } finally {
                 setStarting(false);
               }
@@ -540,10 +544,11 @@ function PatientPage({
                     project_id: geminiProjectId.trim() || null,
                   });
                   onError(
-                    'Gemini login launched. Complete it in the opened browser window, then click Refresh.'
+                    'Gemini login launched. Complete it in the opened browser window, then click Refresh.',
+                    { action: 'gemini_login_launch', patientId }
                   );
                 } catch (e) {
-                  onError(String(e?.message || e));
+                  onError(e, { action: 'gemini_login_launch', patientId });
                 }
               }}
             >
@@ -562,7 +567,7 @@ function PatientPage({
                   await onRefreshGlobal();
                   await refresh();
                 } catch (e) {
-                  onError(String(e?.message || e));
+                  onError(e, { action: 'patient_refresh', patientId });
                 }
               }}
             >

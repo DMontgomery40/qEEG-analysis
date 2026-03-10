@@ -106,7 +106,7 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
                 setResult(res);
                 await onRefreshPatients?.();
               } catch (e) {
-                onError(String(e?.message || e));
+                onError(e, { action: 'bulk_upload_patients', fileCount: selectedFiles.length });
               } finally {
                 setUploading(false);
               }
@@ -245,4 +245,3 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
 }
 
 export default BulkUploadPage;
-

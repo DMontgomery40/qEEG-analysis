@@ -4,24 +4,81 @@ import re
 from typing import Any
 
 
+_PAGE_HEADER_RE = re.compile(r"(?m)^=== PAGE (\d+) / (\d+) ===\s*$")
+_SESSION_ALIAS_RE = re.compile(
+    r"(?m)^\[\[QEEG_SESSION_ALIAS\s+local=(\d+)\s+global=(\d+)(?:\s+date=([0-9]{4}-[0-9]{2}-[0-9]{2}))?\s*\]\]\s*$"
+)
+
+
+def _iter_page_sections(report_text: str) -> list[tuple[int, str]]:
+    text = report_text or ""
+    matches = list(_PAGE_HEADER_RE.finditer(text))
+    if not matches:
+        return [(1, text)]
+
+    sections: list[tuple[int, str]] = []
+    for idx, match in enumerate(matches):
+        try:
+            page_num = int(match.group(1))
+        except Exception:
+            continue
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        sections.append((page_num, text[match.start() : end]))
+    return sections
+
+
+def _page_section_body(section_text: str) -> str:
+    lines = (section_text or "").splitlines()
+    if lines and lines[0].startswith("=== PAGE "):
+        return "\n".join(lines[1:]).lstrip()
+    return section_text or ""
+
+
+def _page_session_alias_map(report_text: str) -> dict[int, dict[int, int]]:
+    out: dict[int, dict[int, int]] = {}
+    for page_num, section_text in _iter_page_sections(report_text):
+        body = _page_section_body(section_text)
+        aliases: dict[int, int] = {}
+        for match in _SESSION_ALIAS_RE.finditer(body):
+            try:
+                local_idx = int(match.group(1))
+                global_idx = int(match.group(2))
+            except Exception:
+                continue
+            aliases[local_idx] = global_idx
+        if aliases:
+            out[page_num] = aliases
+    return out
+
+
 def _expected_session_indices(report_text: str) -> list[int]:
+    alias_map = _page_session_alias_map(report_text)
+    aliased = sorted(
+        {
+            global_idx
+            for mapping in alias_map.values()
+            for global_idx in mapping.values()
+        }
+    )
+    if aliased:
+        return aliased
+
     # Prefer explicit "Session N (" markers, fall back to any "Session N".
-    indices = {int(m.group(1)) for m in re.finditer(r"Session\s+(\d+)\s*\(", report_text)}
+    indices = {
+        int(m.group(1)) for m in re.finditer(r"Session\s+(\d+)\s*\(", report_text)
+    }
     if not indices:
-        indices = {int(m.group(1)) for m in re.finditer(r"\bSession\s+(\d+)\b", report_text)}
+        indices = {
+            int(m.group(1)) for m in re.finditer(r"\bSession\s+(\d+)\b", report_text)
+        }
     return sorted(indices) if indices else [1]
 
 
 def _page_section(report_text: str, *, page_num: int) -> str:
-    marker = f"=== PAGE {page_num} /"
-    start = report_text.find(marker)
-    if start == -1:
-        return report_text
-    next_marker = f"=== PAGE {page_num + 1} /"
-    end = report_text.find(next_marker, start)
-    if end == -1:
-        end = len(report_text)
-    return report_text[start:end]
+    for num, section_text in _iter_page_sections(report_text):
+        if num == page_num:
+            return section_text
+    return report_text
 
 
 def _page_count_from_markers(report_text: str) -> int | None:
@@ -32,6 +89,32 @@ def _page_count_from_markers(report_text: str) -> int | None:
         return int(m.group(1))
     except Exception:
         return None
+
+
+def _find_summary_pages(report_text: str, *, page_count: int) -> list[int]:
+    matches: list[int] = []
+    needles = (
+        "physical reaction time",
+        "assessment scores",
+        "audio p300 delay",
+        "trail making test a",
+        "trail making test b",
+    )
+    for page, section in _iter_page_sections(report_text):
+        if page_count > 0 and page > page_count:
+            continue
+        body = _page_section_body(section).lower()
+        if any(needle in body for needle in needles):
+            matches.append(page)
+
+    seen: set[int] = set()
+    out: list[int] = []
+    for page in matches:
+        if page in seen:
+            continue
+        seen.add(page)
+        out.append(page)
+    return out
 
 
 def _find_p300_rare_comparison_pages(report_text: str, *, page_count: int) -> list[int]:
@@ -99,7 +182,9 @@ def _parse_simple_range(text: str | None) -> tuple[float, float] | None:
     return lo, hi
 
 
-def _normalize_ratio_value_token(token: str, *, value: float, target_range: str | None) -> float | None:
+def _normalize_ratio_value_token(
+    token: str, *, value: float, target_range: str | None
+) -> float | None:
     """
     Normalize obvious OCR artifacts for ratio rows (for example "11" where "1.1" is expected).
 
@@ -138,7 +223,9 @@ def _normalize_ratio_value_token(token: str, *, value: float, target_range: str 
     return min(candidates, key=lambda c: abs(c - 1.0))
 
 
-def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list[int]) -> list[dict[str, Any]]:
+def _facts_from_report_text_summary(
+    report_text: str, *, expected_sessions: list[int]
+) -> list[dict[str, Any]]:
     """
     Deterministically extract key summary metrics from the OCR text (usually PAGE 1).
 
@@ -215,7 +302,10 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
                     )
 
     # Trail Making Test A/B.
-    for label, metric in (("Trail Making Test A", "trail_making_test_a"), ("Trail Making Test B", "trail_making_test_b")):
+    for label, metric in (
+        ("Trail Making Test A", "trail_making_test_a"),
+        ("Trail Making Test B", "trail_making_test_b"),
+    ):
         line = find_line_contains(label)
         if not line:
             continue
@@ -325,14 +415,16 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
             continue
         # Avoid pulling digits from the label itself (e.g., "F3/F4" -> 3, 4).
         value_part = tail_after(line, needle)
-        
+
         # Extract target range first (at the end of the line).
         target = None
-        m_range = re.search(r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*$", value_part)
+        m_range = re.search(
+            r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*$", value_part
+        )
         if m_range:
             target = f"{m_range.group(1)}-{m_range.group(2)}"
             value_part = value_part[: m_range.start()].strip()
-        
+
         # Match numbers OR N/A (including OCR artifacts like "mN/A" where ■ is misread as "m").
         tokens = re.findall(r"(?i)(?:-?\d+(?:\.\d+)?|[m■]?N/?A)\b", value_part)
         if len(tokens) < len(expected_sessions):
@@ -340,7 +432,7 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
             tokens = _number_tokens(value_part)
         if len(tokens) < len(expected_sessions):
             continue
-        
+
         row_facts: list[dict[str, Any]] = []
         row_had_repair = False
         for sess, tok in zip(expected_sessions, tokens[: len(expected_sessions)]):
@@ -360,7 +452,7 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
                     }
                 )
                 continue
-            
+
             raw_val = _safe_float(t)
             if raw_val is None:
                 continue
@@ -403,12 +495,16 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
 
         target = None
         value_part = line
-        m_range = re.search(r"(?i)(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*Hz\b", line)
+        m_range = re.search(
+            r"(?i)(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)\s*Hz\b", line
+        )
         if m_range:
             target = f"{m_range.group(1)}-{m_range.group(2)} Hz"
             value_part = line[: m_range.start()].strip()
 
-        value_part = re.sub(rf"(?im)^{re.escape(label)}\b", "", value_part, count=1).strip()
+        value_part = re.sub(
+            rf"(?im)^{re.escape(label)}\b", "", value_part, count=1
+        ).strip()
         tokens = re.findall(r"(?i)(?:-?\d+(?:\.\d+)?|N/?A)\b", value_part)
         if len(tokens) < len(expected_sessions):
             tokens = _number_tokens(value_part)
@@ -451,7 +547,9 @@ def _facts_from_report_text_summary(report_text: str, *, expected_sessions: list
     return out
 
 
-def _facts_from_report_text_n100_central_frontal(report_text: str, *, expected_sessions: list[int]) -> list[dict[str, Any]]:
+def _facts_from_report_text_n100_central_frontal(
+    report_text: str, *, expected_sessions: list[int]
+) -> list[dict[str, Any]]:
     """
     Deterministically extract CENTRAL-FRONTAL AVERAGE N100 values from OCR text (typically PAGE 2).
 
@@ -468,14 +566,22 @@ def _facts_from_report_text_n100_central_frontal(report_text: str, *, expected_s
         return []
 
     start_idx = next(
-        (i for i, ln in enumerate(lines) if re.search(r"(?i)central\s*[- ]\s*frontal\s+average", ln)),
+        (
+            i
+            for i, ln in enumerate(lines)
+            if re.search(r"(?i)central\s*[- ]\s*frontal\s+average", ln)
+        ),
         None,
     )
     if start_idx is None:
         return []
 
     n100_idx = next(
-        (i for i in range(start_idx, min(len(lines), start_idx + 40)) if re.search(r"(?i)\bN100\b", lines[i])),
+        (
+            i
+            for i in range(start_idx, min(len(lines), start_idx + 40))
+            if re.search(r"(?i)\bN100\b", lines[i])
+        ),
         None,
     )
     if n100_idx is None:
@@ -553,7 +659,11 @@ def _facts_from_report_text_n100_central_frontal(report_text: str, *, expected_s
             )
             continue
 
-        m = re.match(r"^(?P<yield>\d+)\s+(?P<na>N/?A)\b(?:\s+(?P<ms>\d+)\b)?", ln, flags=re.IGNORECASE)
+        m = re.match(
+            r"^(?P<yield>\d+)\s+(?P<na>N/?A)\b(?:\s+(?P<ms>\d+)\b)?",
+            ln,
+            flags=re.IGNORECASE,
+        )
         if m:
             out.append(
                 {

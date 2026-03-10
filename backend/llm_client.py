@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,8 +74,17 @@ def _chat_unsupported(err: UpstreamError) -> bool:
         "responses" in text
         or "response endpoint" in text
         or "not support chat" in text
-        or "chat completions" in text and "not supported" in text
+        or "chat completions" in text
+        and "not supported" in text
     )
+
+
+def _is_openai_gpt5_model(model_id: str) -> bool:
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return False
+    mid = mid.removeprefix("openai/")
+    return mid.startswith("gpt-5")
 
 
 def _openai_reasoning_effort(model_id: str) -> str | None:
@@ -82,6 +92,11 @@ def _openai_reasoning_effort(model_id: str) -> str | None:
 
     Defaults to medium for GPT-5.* ids when no explicit tier is encoded.
     """
+    for env_name in ("QEEG_OPENAI_REASONING_EFFORT", "OPENAI_REASONING_EFFORT"):
+        override = (os.getenv(env_name) or "").strip().lower()
+        if override in {"minimal", "low", "medium", "high", "xhigh"}:
+            return override
+
     mid = (model_id or "").strip().lower()
     if not mid:
         return None
@@ -91,10 +106,7 @@ def _openai_reasoning_effort(model_id: str) -> str | None:
 
     # Prefer explicit effort suffix when present (e.g. "...-high", "...-xhigh").
     for token in reversed([t for t in mid.split("-") if t]):
-        if token == "xhigh":
-            # OpenAI APIs accept up to "high"; map xhigh to highest compatible tier.
-            return "high"
-        if token in {"high", "medium"}:
+        if token in {"minimal", "low", "medium", "high", "xhigh"}:
             return token
 
     return "medium"
@@ -150,7 +162,9 @@ class AsyncOpenAICompatClient:
         try:
             payload = resp.json()
         except Exception as e:
-            raise UpstreamError(f"CLIProxyAPI /v1/models returned invalid JSON: {e}") from e
+            raise UpstreamError(
+                f"CLIProxyAPI /v1/models returned invalid JSON: {e}"
+            ) from e
 
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
@@ -173,13 +187,25 @@ class AsyncOpenAICompatClient:
     ) -> str:
         client = self._get_client()
         reasoning_effort = _openai_reasoning_effort(model_id)
+        if _is_openai_gpt5_model(model_id):
+            return await self.responses(
+                model_id=model_id,
+                input_data=self._messages_to_responses_input(messages),
+                stream=stream,
+                reasoning_effort=reasoning_effort,
+                max_output_tokens=max_tokens,
+            )
+
         payload = {
             "model": model_id,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "stream": stream,
         }
+        if _is_openai_gpt5_model(model_id):
+            payload["max_completion_tokens"] = max_tokens
+        else:
+            payload["max_tokens"] = max_tokens
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
 
@@ -195,12 +221,12 @@ class AsyncOpenAICompatClient:
                 fallback_message=f"HTTP {resp.status_code}",
             )
             if _chat_unsupported(err):
-                input_text = self._messages_to_input_text(messages)
                 return await self.responses(
                     model_id=model_id,
-                    input_text=input_text,
+                    input_data=self._messages_to_responses_input(messages),
                     stream=stream,
                     reasoning_effort=reasoning_effort,
+                    max_output_tokens=max_tokens,
                 )
             raise err
 
@@ -219,21 +245,26 @@ class AsyncOpenAICompatClient:
             ) from e
 
         if not isinstance(content, str):
-            raise UpstreamError("CLIProxyAPI /v1/chat/completions returned non-text content")
+            raise UpstreamError(
+                "CLIProxyAPI /v1/chat/completions returned non-text content"
+            )
         return content
 
     async def responses(
         self,
         *,
         model_id: str,
-        input_text: str,
+        input_data: Any,
         stream: bool = False,
         reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> str:
         client = self._get_client()
-        payload = {"model": model_id, "input": input_text, "stream": stream}
+        payload = {"model": model_id, "input": input_data, "stream": stream}
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
+        if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+            payload["max_output_tokens"] = max_output_tokens
 
         try:
             resp = await client.post("/v1/responses", json=payload)
@@ -291,3 +322,46 @@ class AsyncOpenAICompatClient:
                     content = str(content)
             lines.append(f"{role.upper()}:\n{content}".strip())
         return "\n\n".join(lines).strip()
+
+    @staticmethod
+    def _messages_to_responses_input(messages: list[dict]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role", "user")
+            if not isinstance(role, str):
+                role = "user"
+            content = message.get("content", "")
+            blocks: list[dict[str, Any]] = []
+
+            if isinstance(content, str):
+                blocks.append({"type": "input_text", "text": content})
+            elif isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        blocks.append({"type": "input_text", "text": str(item)})
+                        continue
+                    item_type = item.get("type")
+                    if item_type == "text" and isinstance(item.get("text"), str):
+                        blocks.append({"type": "input_text", "text": item["text"]})
+                        continue
+                    if item_type == "image_url":
+                        image_url = item.get("image_url")
+                        if isinstance(image_url, dict) and isinstance(
+                            image_url.get("url"), str
+                        ):
+                            blocks.append(
+                                {"type": "input_image", "image_url": image_url["url"]}
+                            )
+                        continue
+                    try:
+                        blocks.append({"type": "input_text", "text": json.dumps(item)})
+                    except Exception:
+                        blocks.append({"type": "input_text", "text": str(item)})
+            else:
+                try:
+                    blocks.append({"type": "input_text", "text": json.dumps(content)})
+                except Exception:
+                    blocks.append({"type": "input_text", "text": str(content)})
+
+            out.append({"role": role, "content": blocks})
+        return out

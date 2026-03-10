@@ -1,0 +1,22 @@
+{
+  "reviews": [
+    {
+      "analysis_label": "A",
+      "strengths": [
+        "The core findings are summarized well."
+      ],
+      "weaknesses": [
+        "The review omits one of the analyses."
+      ],
+      "missing_or_unclear": [
+        "Coverage for the second analysis is missing."
+      ],
+      "accuracy_issues": [],
+      "risk_of_overreach": "Low"
+    }
+  ],
+  "ranking_best_to_worst": [
+    "A"
+  ],
+  "overall_notes": "Only one analysis was reviewed."
+}

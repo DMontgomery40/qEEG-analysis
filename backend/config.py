@@ -72,8 +72,8 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     # These IDs are examples only; runtime model discovery is the source of truth.
     CouncilModelConfig(
-        id="gpt-5.3",
-        name="GPT-5.3 (example)",
+        id="gpt-5.4",
+        name="GPT-5.4 (example)",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
@@ -97,16 +97,20 @@ VISION_CAPABLE_MODELS: set[str] = {
     "gpt-4-turbo",
     "gpt-5.2",
     "gpt-5.3",
+    "gpt-5.4",
     "gpt-5.2-codex",
     "gpt-5.3-codex",
+    "gpt-5.4-codex",
     "openai/gpt-4o",
     "openai/gpt-4o-mini",
     "openai/gpt-4-vision-preview",
     "openai/gpt-4-turbo",
     "openai/gpt-5.2",
     "openai/gpt-5.3",
+    "openai/gpt-5.4",
     "openai/gpt-5.2-codex",
     "openai/gpt-5.3-codex",
+    "openai/gpt-5.4-codex",
     # Anthropic Claude models (all Claude 3+ support vision)
     "claude-3-opus",
     "claude-3-sonnet",

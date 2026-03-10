@@ -248,6 +248,18 @@ def _portal_markdown_sources(portal_patient_dir: Path) -> list[tuple[str, str]]:
     return out
 
 
+def _explicit_markdown_sources(paths: list[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for raw_path in paths:
+        p = Path(raw_path).expanduser()
+        if not p.is_absolute():
+            p = (_REPO_ROOT / p).resolve()
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"Explicit source markdown not found: {p}")
+        out.append((f"explicit:{p.name}", p.read_text(encoding="utf-8", errors="replace")))
+    return out
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Generate patient-facing qEEG writeups (Opus 4.6) into portal folders.")
     ap.add_argument("--portal-dir", default="data/portal_patients", help="Portal share dir (default: data/portal_patients)")
@@ -257,6 +269,12 @@ async def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.2, help="LLM temperature (default: 0.2)")
     ap.add_argument("--version", default="v1", help="Version tag for output filenames (default: v1)")
     ap.add_argument("--date", default="", help="Override date YYYY-MM-DD (default: today)")
+    ap.add_argument(
+        "--source-markdown",
+        action="append",
+        default=[],
+        help="Explicit markdown source file to synthesize from (repeatable). When set, bypasses DB/portal source discovery.",
+    )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     ap.add_argument("--dry-run", action="store_true", help="Do everything except call the LLM / write outputs")
     args = ap.parse_args()
@@ -268,6 +286,12 @@ async def main() -> int:
     labels = args.patient_label or _discover_portal_patient_labels(portal_dir)
     if not labels:
         print(f"ERROR: no patients found in {portal_dir}", file=sys.stderr)
+        return 2
+    if args.source_markdown and len(labels) != 1:
+        print(
+            "ERROR: --source-markdown requires exactly one --patient-label",
+            file=sys.stderr,
+        )
         return 2
 
     example = _example_writeup_text()
@@ -291,12 +315,20 @@ async def main() -> int:
         print(f"Using model: {model_id}")
 
     for label in labels:
-        bundle = _best_source_bundle_for_label(label)
+        bundle = None if args.source_markdown else _best_source_bundle_for_label(label)
 
-        # Read 2–3 council final reports (markdown). Prefer DB Stage 6 artifacts; fallback to portal markdowns.
+        # Read 2–3 council final reports (markdown). Prefer explicit sources when provided,
+        # otherwise DB Stage 6 artifacts, then fallback to portal markdowns.
         sources: list[tuple[str, str]] = []
         source_meta: dict[str, Any] = {}
-        if bundle is not None:
+        if args.source_markdown:
+            sources = _explicit_markdown_sources(args.source_markdown)
+            source_meta = {
+                "patient_id": None,
+                "run_id": None,
+                "explicit_source_markdown_paths": [str(Path(p).expanduser()) for p in args.source_markdown],
+            }
+        elif bundle is not None:
             for a in bundle.artifacts:
                 name = f"stage-{a.stage_num}:{a.kind}:{a.model_id}"
                 sources.append((name, _read_text(a.content_path)))
@@ -377,4 +409,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-

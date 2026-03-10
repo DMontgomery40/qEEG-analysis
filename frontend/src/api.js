@@ -1,14 +1,87 @@
+import { childLogger, errorMessage, newRequestId, serializeError } from './logger';
+
 const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:8000';
+const apiLogger = childLogger({ area: 'api' });
+
+export class ApiError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = details.status ?? null;
+    this.path = details.path ?? '';
+    this.method = details.method ?? 'GET';
+    this.requestId = details.requestId ?? '';
+    this.serverRequestId = details.serverRequestId ?? '';
+    this.responseBody = details.responseBody ?? '';
+    this.cause = details.cause;
+  }
+}
 
 async function request(path, options = {}) {
-  const res = await fetch(`${API_BASE}${path}`, options);
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(text || `Request failed: ${res.status}`);
+  const method = String(options.method || 'GET').toUpperCase();
+  const requestId = newRequestId();
+  const startedAt = performance.now();
+  const headers = new Headers(options.headers || {});
+  headers.set('X-Request-ID', requestId);
+  const log = apiLogger.child({ method, path, requestId });
+
+  try {
+    const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+    const serverRequestId = res.headers.get('x-request-id') || requestId;
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      const err = new ApiError(text || `Request failed: ${res.status}`, {
+        status: res.status,
+        path,
+        method,
+        requestId,
+        serverRequestId,
+        responseBody: text,
+      });
+      log.warn(
+        {
+          statusCode: res.status,
+          durationMs,
+          serverRequestId,
+          responseBodyPreview: text.slice(0, 500),
+        },
+        'api_request_failed'
+      );
+      throw err;
+    }
+
+    log.debug(
+      {
+        statusCode: res.status,
+        durationMs,
+        serverRequestId,
+      },
+      'api_request_succeeded'
+    );
+
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) return res.json();
+    return res.text();
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+
+    const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+    log.error(
+      {
+        durationMs,
+        err: serializeError(error),
+      },
+      'api_request_threw'
+    );
+    throw new ApiError(errorMessage(error), {
+      path,
+      method,
+      requestId,
+      cause: error,
+    });
   }
-  const ct = res.headers.get('content-type') || '';
-  if (ct.includes('application/json')) return res.json();
-  return res.text();
 }
 
 export const api = {
@@ -76,22 +149,15 @@ export const api = {
     return request(`/api/reports/${reportId}/reextract`, { method: 'POST' });
   },
 
-  // Original PDF URL (for inline viewing)
   reportOriginalUrl(reportId) {
     return `${API_BASE}/api/reports/${reportId}/original`;
   },
-
-  // List extracted page images
   reportPages(reportId) {
     return request(`/api/reports/${reportId}/pages`);
   },
-
-  // Single page image URL
   reportPageUrl(reportId, pageNum) {
     return `${API_BASE}/api/reports/${reportId}/pages/${pageNum}`;
   },
-
-  // Get extraction metadata
   reportMetadata(reportId) {
     return request(`/api/reports/${reportId}/metadata`);
   },
@@ -99,7 +165,6 @@ export const api = {
   listRuns(patientId) {
     return request(`/api/patients/${patientId}/runs`);
   },
-
   async bulkUploadPatients(files) {
     const form = new FormData();
     for (const f of files || []) form.append('files', f);
@@ -154,7 +219,9 @@ export const api = {
   finalPdfUrl(runId) {
     return `${API_BASE}/api/runs/${runId}/export/final.pdf`;
   },
-  streamUrl(runId) {
-    return `${API_BASE}/api/runs/${runId}/stream`;
+  streamUrl(runId, requestId) {
+    const url = new URL(`${API_BASE}/api/runs/${runId}/stream`);
+    if (requestId) url.searchParams.set('request_id', requestId);
+    return url.toString();
   },
 };

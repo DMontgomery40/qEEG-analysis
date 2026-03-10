@@ -22,14 +22,14 @@ function SourceDataView({ reportId, onError }) {
         setPages(pagesData.pages || []);
         setMetadata(metaData);
       } catch (e) {
-        onError?.(String(e?.message || e));
+        onError?.(e, { action: 'load_source_data', reportId });
       } finally {
         setLoading(false);
       }
     }
 
     load();
-  }, [reportId]);
+  }, [onError, reportId]);
 
   if (!reportId) {
     return <div className="source-data-view">No report selected.</div>;
@@ -170,7 +170,7 @@ function Lightbox({ reportId, pages, currentPage, onClose, onNavigate }) {
 
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [currentPage, pages, hasPrev, hasNext, onClose, onNavigate]);
+  }, [currentIndex, currentPage, pages, hasPrev, hasNext, onClose, onNavigate]);
 
   return (
     <div className="lightbox-overlay" onClick={onClose}>

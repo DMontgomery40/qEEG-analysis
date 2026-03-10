@@ -2,30 +2,39 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import re
 from pathlib import Path
 from typing import Any
 
-from ...storage import Artifact, Report, create_artifact
+from ...storage import Report, create_artifact
 from ...storage import session_scope
 from ..constants import DATA_PACK_SCHEMA_VERSION, STAGES
 from ..json_utils import _json_loads_loose
 from ..paths import _data_pack_path, _stage_dir, _vision_transcript_path
 from ..prompts import _data_pack_prompt
+from ..report_assets import _derive_report_dir
 from ..report_text import (
     _expected_session_indices,
     _facts_from_report_text_n100_central_frontal,
     _facts_from_report_text_summary,
     _find_p300_rare_comparison_pages,
+    _find_summary_pages,
+    _page_session_alias_map,
 )
-from ..utils import _chunked
-from ..vision import _save_debug_images, _try_build_p300_cp_site_crops, _try_build_summary_table_crops
+from ..types import PageImage
+from ..utils import _chunked, _truthy_env
+from ..vision import (
+    _save_debug_images,
+    _try_build_p300_cp_site_crops,
+    _try_build_summary_table_crops,
+)
 
 
 class _DataPackMixin:
     @staticmethod
-    def _filter_shadowed_facts(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _filter_shadowed_facts(
+        primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         """
         Drop facts from `secondary` that have the same fact-key as any fact in `primary`.
 
@@ -75,6 +84,62 @@ class _DataPackMixin:
         return deduped
 
     @staticmethod
+    def _fact_semantic_key(fact: dict[str, Any]) -> str | None:
+        ftype = fact.get("fact_type")
+        if not isinstance(ftype, str):
+            return None
+        key_parts = [ftype]
+        for k in ("metric", "site", "region", "session_index"):
+            v = fact.get(k)
+            if v is None:
+                continue
+            key_parts.append(f"{k}={v}")
+        return "|".join(key_parts)
+
+    @classmethod
+    def _dedupe_facts_semantic(
+        cls, facts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for fact in facts:
+            key = cls._fact_semantic_key(fact)
+            if not key:
+                deduped.append(fact)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(fact)
+        return deduped
+
+    @classmethod
+    def _normalize_facts_for_page_session_aliases(
+        cls,
+        facts: list[dict[str, Any]],
+        *,
+        page_session_aliases: dict[int, dict[int, int]],
+    ) -> list[dict[str, Any]]:
+        if not page_session_aliases:
+            return facts
+
+        normalized: list[dict[str, Any]] = []
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            new_fact = dict(fact)
+            page = new_fact.get("source_page")
+            session_index = new_fact.get("session_index")
+            if isinstance(page, int) and isinstance(session_index, int):
+                mapped = page_session_aliases.get(page, {}).get(session_index)
+                if isinstance(mapped, int):
+                    if mapped != session_index:
+                        new_fact.setdefault("local_session_index", session_index)
+                    new_fact["session_index"] = mapped
+            normalized.append(new_fact)
+        return cls._dedupe_facts_semantic(normalized)
+
+    @staticmethod
     def _fact_key(fact: dict[str, Any]) -> str | None:
         ftype = fact.get("fact_type")
         if not isinstance(ftype, str):
@@ -95,6 +160,7 @@ class _DataPackMixin:
 
         We intentionally ignore incidental fields (e.g., labels, units, target ranges) and focus on required numbers.
         """
+
         def coerce(val: Any) -> Any:
             if isinstance(val, bool):
                 return val
@@ -116,7 +182,12 @@ class _DataPackMixin:
         if isinstance(shown_as, str) and shown_as.strip().upper() == "N/A":
             return ("NA",)
         ftype = fact.get("fact_type")
-        if ftype in {"performance_metric", "evoked_potential", "state_metric", "peak_frequency"}:
+        if ftype in {
+            "performance_metric",
+            "evoked_potential",
+            "state_metric",
+            "peak_frequency",
+        }:
             val = coerce(fact.get("value"))
             if val is None:
                 return None
@@ -195,7 +266,30 @@ class _DataPackMixin:
         """
         out_path = _data_pack_path(run_id)
         expected_sessions = _expected_session_indices(report_text)
-        expected_pages = sorted({img.page for img in page_images if isinstance(img.page, int)})
+        expected_pages = sorted(
+            {img.page for img in page_images if isinstance(img.page, int)}
+        )
+        page_session_aliases = _page_session_alias_map(report_text)
+        candidate_summary_pages = _find_summary_pages(
+            report_text, page_count=len(page_images)
+        )
+
+        def apply_page_session_aliases(merged: dict[str, Any]) -> None:
+            if not page_session_aliases:
+                return
+            facts = merged.get("facts")
+            if not isinstance(facts, list):
+                return
+            merged["facts"] = self._normalize_facts_for_page_session_aliases(
+                [f for f in facts if isinstance(f, dict)],
+                page_session_aliases=page_session_aliases,
+            )
+            merged["page_session_aliases"] = {
+                str(page): {
+                    str(local): global_idx for local, global_idx in mapping.items()
+                }
+                for page, mapping in sorted(page_session_aliases.items())
+            }
 
         # If an existing data pack is present, upgrade it in-place with deterministic facts and derived views.
         if out_path.exists():
@@ -204,51 +298,98 @@ class _DataPackMixin:
             except Exception:
                 existing = None
 
-            if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
+            if (
+                isinstance(existing, dict)
+                and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION
+            ):
                 # If the report was re-extracted or page images changed, ensure the cached data pack actually
                 # covers the current pages (older runs could have partial page coverage).
                 try:
-                    existing_pages = existing.get("pages_processed") or existing.get("pages_seen") or []
-                    existing_pages_set = {p for p in existing_pages if isinstance(p, int)}
+                    existing_pages = (
+                        existing.get("pages_processed")
+                        or existing.get("pages_seen")
+                        or []
+                    )
+                    existing_pages_set = {
+                        p for p in existing_pages if isinstance(p, int)
+                    }
                 except Exception:
                     existing_pages_set = set()
                 existing_page_count = existing.get("page_count")
                 if expected_pages and (
-                    existing_page_count != len(expected_pages) or not existing_pages_set.issuperset(set(expected_pages))
+                    existing_page_count != len(expected_pages)
+                    or not existing_pages_set.issuperset(set(expected_pages))
                 ):
                     existing = None
 
-            if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
+            if (
+                isinstance(existing, dict)
+                and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION
+            ):
                 facts = existing.get("facts")
                 if isinstance(facts, list):
                     base_facts = [f for f in facts if isinstance(f, dict)]
+                    base_facts = self._normalize_facts_for_page_session_aliases(
+                        base_facts,
+                        page_session_aliases=page_session_aliases,
+                    )
                     add_facts: list[dict[str, Any]] = []
-                    add_facts.extend(_facts_from_report_text_summary(report_text, expected_sessions=expected_sessions))
-                    add_facts.extend(_facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions))
+                    add_facts.extend(
+                        _facts_from_report_text_summary(
+                            report_text, expected_sessions=expected_sessions
+                        )
+                    )
+                    add_facts.extend(
+                        _facts_from_report_text_n100_central_frontal(
+                            report_text, expected_sessions=expected_sessions
+                        )
+                    )
                     for f in add_facts:
                         if isinstance(f, dict):
-                            f.setdefault("extraction_method", "deterministic_report_text")
+                            f.setdefault(
+                                "extraction_method", "deterministic_report_text"
+                            )
                     for f in base_facts:
                         if isinstance(f, dict):
-                            f.setdefault("extraction_method", f.get("extraction_method") or "vision_llm")
+                            f.setdefault(
+                                "extraction_method",
+                                f.get("extraction_method") or "vision_llm",
+                            )
                     # Prefer deterministic facts and ignore redundant vision duplicates when checking conflicts.
-                    base_facts_filtered = self._filter_shadowed_facts(add_facts, base_facts)
-                    conflicts = self._find_fact_conflicts(add_facts + base_facts_filtered)
+                    base_facts_filtered = self._filter_shadowed_facts(
+                        add_facts, base_facts
+                    )
+                    conflicts = self._find_fact_conflicts(
+                        add_facts + base_facts_filtered
+                    )
                     if conflicts and strict:
                         # Cached pack is inconsistent; rebuild from scratch so strict runs are never silently
                         # grounded in conflicting numbers.
                         existing = None
                     else:
                         # Deterministic facts come first so they override duplicates from older model output.
-                        existing["facts"] = self._dedupe_facts(add_facts + base_facts_filtered)
+                        existing["facts"] = self._dedupe_facts(
+                            add_facts + base_facts_filtered
+                        )
 
-            if isinstance(existing, dict) and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION:
-                existing["derived"] = self._derive_data_pack_views(existing, expected_sessions=expected_sessions)
-                missing = self._missing_required_fields(existing, expected_sessions=expected_sessions)
+            if (
+                isinstance(existing, dict)
+                and existing.get("schema_version") == DATA_PACK_SCHEMA_VERSION
+            ):
+                apply_page_session_aliases(existing)
+                existing["derived"] = self._derive_data_pack_views(
+                    existing, expected_sessions=expected_sessions
+                )
+                missing = self._missing_required_fields(
+                    existing, expected_sessions=expected_sessions
+                )
                 if not (missing and strict):
                     try:
                         out_path.parent.mkdir(parents=True, exist_ok=True)
-                        out_path.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
+                        out_path.write_text(
+                            json.dumps(existing, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
                     except Exception:
                         pass
                     return existing
@@ -286,13 +427,23 @@ class _DataPackMixin:
             merged_facts = merged.get("facts")
             if not isinstance(merged_facts, list):
                 return []
-            model_facts: list[dict[str, Any]] = [f for f in merged_facts if isinstance(f, dict)]
+            model_facts: list[dict[str, Any]] = [
+                f for f in merged_facts if isinstance(f, dict)
+            ]
             for f in model_facts:
                 f.setdefault("extraction_method", "vision_llm")
 
             add_facts: list[dict[str, Any]] = []
-            add_facts.extend(_facts_from_report_text_summary(report_text, expected_sessions=expected_sessions))
-            add_facts.extend(_facts_from_report_text_n100_central_frontal(report_text, expected_sessions=expected_sessions))
+            add_facts.extend(
+                _facts_from_report_text_summary(
+                    report_text, expected_sessions=expected_sessions
+                )
+            )
+            add_facts.extend(
+                _facts_from_report_text_n100_central_frontal(
+                    report_text, expected_sessions=expected_sessions
+                )
+            )
             for f in add_facts:
                 if isinstance(f, dict):
                     f.setdefault("extraction_method", "deterministic_report_text")
@@ -310,7 +461,9 @@ class _DataPackMixin:
         for extractor_model_id in candidate_extractor_model_ids:
             try:
                 parts: list[dict[str, Any]] = []
-                for chunk_index, chunk in enumerate(_chunked(page_images, chunk_size), start=1):
+                for chunk_index, chunk in enumerate(
+                    _chunked(page_images, chunk_size), start=1
+                ):
                     pages = [img.page for img in chunk]
                     prompt_text = _data_pack_prompt(
                         pages=pages,
@@ -329,16 +482,26 @@ class _DataPackMixin:
                     )
                     if debug_dir is not None:
                         try:
-                            safe_model = "".join(
-                                c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id
-                            ) or "model"
+                            safe_model = (
+                                "".join(
+                                    c if c.isalnum() or c in {"-", "_", "."} else "_"
+                                    for c in extractor_model_id
+                                )
+                                or "model"
+                            )
                             model_dir = debug_dir / safe_model
                             model_dir.mkdir(parents=True, exist_ok=True)
                             pages_key = "-".join(str(p) for p in pages)
                             stem = f"pass-{chunk_index:02d}-pages-{pages_key}"
-                            (model_dir / f"{stem}.prompt.txt").write_text(prompt_text, encoding="utf-8")
-                            (model_dir / f"{stem}.raw.txt").write_text(raw, encoding="utf-8")
-                            image_paths = _save_debug_images(model_dir=model_dir, stem=stem, images=chunk)
+                            (model_dir / f"{stem}.prompt.txt").write_text(
+                                prompt_text, encoding="utf-8"
+                            )
+                            (model_dir / f"{stem}.raw.txt").write_text(
+                                raw, encoding="utf-8"
+                            )
+                            image_paths = _save_debug_images(
+                                model_dir=model_dir, stem=stem, images=chunk
+                            )
                             attempt_log.append(
                                 {
                                     "kind": "chunk",
@@ -358,14 +521,19 @@ class _DataPackMixin:
                         raise ValueError("Data pack schema_version mismatch")
                     if debug_dir is not None:
                         try:
-                            safe_model = "".join(
-                                c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id
-                            ) or "model"
+                            safe_model = (
+                                "".join(
+                                    c if c.isalnum() or c in {"-", "_", "."} else "_"
+                                    for c in extractor_model_id
+                                )
+                                or "model"
+                            )
                             model_dir = debug_dir / safe_model
                             pages_key = "-".join(str(p) for p in pages)
                             stem = f"pass-{chunk_index:02d}-pages-{pages_key}"
                             (model_dir / f"{stem}.parsed.json").write_text(
-                                json.dumps(part, indent=2, sort_keys=True), encoding="utf-8"
+                                json.dumps(part, indent=2, sort_keys=True),
+                                encoding="utf-8",
                             )
                         except Exception:
                             pass
@@ -385,16 +553,23 @@ class _DataPackMixin:
                         "pages_per_call": chunk_size,
                     },
                 )
+                apply_page_session_aliases(merged)
 
                 # Fill in deterministic facts from OCR/PDF text (page-grounded markers) to reduce flakiness.
                 fact_conflicts = apply_deterministic_facts(merged)
 
-                merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
+                merged["derived"] = self._derive_data_pack_views(
+                    merged, expected_sessions=expected_sessions
+                )
 
-                missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
+                missing = self._missing_required_fields(
+                    merged, expected_sessions=expected_sessions
+                )
                 if missing:
                     # Targeted retry for the most common failure mode: CP per-site P300 values.
-                    candidate_pages = _find_p300_rare_comparison_pages(report_text, page_count=len(page_images))
+                    candidate_pages = _find_p300_rare_comparison_pages(
+                        report_text, page_count=len(page_images)
+                    )
                     merged = await self._targeted_retry_missing(
                         extractor_model_id=extractor_model_id,
                         page_images=page_images,
@@ -405,9 +580,14 @@ class _DataPackMixin:
                         debug_dir=debug_dir,
                         attempt_log=attempt_log,
                     )
+                    apply_page_session_aliases(merged)
                     fact_conflicts = apply_deterministic_facts(merged)
-                    merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
-                    missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
+                    merged["derived"] = self._derive_data_pack_views(
+                        merged, expected_sessions=expected_sessions
+                    )
+                    missing = self._missing_required_fields(
+                        merged, expected_sessions=expected_sessions
+                    )
 
                 if missing:
                     merged = await self._targeted_retry_summary_missing(
@@ -416,12 +596,18 @@ class _DataPackMixin:
                         merged=merged,
                         expected_sessions=expected_sessions,
                         missing=missing,
+                        candidate_pages=candidate_summary_pages,
                         debug_dir=debug_dir,
                         attempt_log=attempt_log,
                     )
+                    apply_page_session_aliases(merged)
                     fact_conflicts = apply_deterministic_facts(merged)
-                    merged["derived"] = self._derive_data_pack_views(merged, expected_sessions=expected_sessions)
-                    missing = self._missing_required_fields(merged, expected_sessions=expected_sessions)
+                    merged["derived"] = self._derive_data_pack_views(
+                        merged, expected_sessions=expected_sessions
+                    )
+                    missing = self._missing_required_fields(
+                        merged, expected_sessions=expected_sessions
+                    )
 
                 if strict and (missing or fact_conflicts):
                     failure_path = _stage_dir(run_id, 1) / "_data_pack_failure.json"
@@ -436,26 +622,40 @@ class _DataPackMixin:
                             "pages_per_call": chunk_size,
                             "missing_fields": sorted(missing),
                             "conflicts": fact_conflicts,
-                            "debug_dir": str(debug_dir) if debug_dir is not None else None,
+                            "debug_dir": str(debug_dir)
+                            if debug_dir is not None
+                            else None,
                             "attempt_log": attempt_log,
                             "partial_data_pack": merged,
                         }
-                        failure_path.write_text(json.dumps(failure_payload, indent=2, sort_keys=True), encoding="utf-8")
+                        failure_path.write_text(
+                            json.dumps(failure_payload, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
                     except Exception:
                         pass
 
-                    chunk_pages = [pages for pages in _chunked([img.page for img in page_images], chunk_size)]
+                    chunk_pages = [
+                        pages
+                        for pages in _chunked(
+                            [img.page for img in page_images], chunk_size
+                        )
+                    ]
                     retry_kinds = sorted(
                         {
                             a.get("kind")
                             for a in attempt_log
-                            if isinstance(a, dict) and isinstance(a.get("kind"), str) and a.get("kind") != "chunk"
+                            if isinstance(a, dict)
+                            and isinstance(a.get("kind"), str)
+                            and a.get("kind") != "chunk"
                         }
                     )
                     msg_lines = [
                         "Required data could not be extracted from the PDF images.",
                         f"Missing fields: {', '.join(sorted(missing)) if missing else '(none)'}",
-                        f"Conflicts: {len(fact_conflicts)}" if fact_conflicts else "Conflicts: (none)",
+                        f"Conflicts: {len(fact_conflicts)}"
+                        if fact_conflicts
+                        else "Conflicts: (none)",
                         f"Expected sessions: {expected_sessions}",
                         f"Pages processed: {[img.page for img in page_images]}",
                         f"Multimodal passes (pages_per_call={chunk_size}): {chunk_pages}",
@@ -465,11 +665,15 @@ class _DataPackMixin:
                     ]
                     if debug_dir is not None:
                         msg_lines.append(f"Debug artifacts: {debug_dir}")
-                    msg_lines.append("If report assets look incomplete, re-run: POST /api/reports/{report_id}/reextract")
+                    msg_lines.append(
+                        "If report assets look incomplete, re-run: POST /api/reports/{report_id}/reextract"
+                    )
                     raise RuntimeError("\n".join(msg_lines))
 
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
+                out_path.write_text(
+                    json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8"
+                )
 
                 # Store as an artifact for traceability/debugging.
                 with session_scope() as session:
@@ -519,13 +723,17 @@ class _DataPackMixin:
                 existing = out_path.read_text(encoding="utf-8", errors="replace")
                 if existing.strip():
                     # Ensure cached transcripts cover all current pages (older runs could have partial coverage).
-                    expected_pages = sorted({img.page for img in page_images if isinstance(img.page, int)})
+                    expected_pages = sorted(
+                        {img.page for img in page_images if isinstance(img.page, int)}
+                    )
                     found_pages = {
                         int(m.group(1))
                         for m in re.finditer(r"(?m)^##\\s*Page\\s+(\\d+)\\b", existing)
                         if m.group(1).isdigit()
                     }
-                    if not expected_pages or found_pages.issuperset(set(expected_pages)):
+                    if not expected_pages or found_pages.issuperset(
+                        set(expected_pages)
+                    ):
                         return existing
             except Exception:
                 pass
@@ -550,7 +758,9 @@ class _DataPackMixin:
         if len(page_images) > 10 and chunk_size > 10:
             chunk_size = 10
 
-        max_tokens = int(os.getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000")
+        max_tokens = int(
+            os.getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000"
+        )
         if max_tokens <= 0:
             max_tokens = 4000
 
@@ -567,7 +777,7 @@ class _DataPackMixin:
                 "Rules:\n"
                 "- Do NOT interpret or summarize. Do NOT diagnose.\n"
                 "- Do NOT invent numbers. Transcribe only what is visible.\n"
-                "- For each page, start a section with: \"## Page <n>\".\n"
+                '- For each page, start a section with: "## Page <n>".\n'
                 "- Under each page, transcribe every table/figure caption and any clearly printed numeric values.\n"
                 "- When a page contains a table, reproduce it as a markdown table (keep row/column labels).\n"
                 "- Preserve units, target ranges, N/A markings, and any symbols (e.g., *, #) when shown.\n"
@@ -642,7 +852,9 @@ class _DataPackMixin:
         return transcript
 
     @staticmethod
-    def _merge_data_pack_parts(parts: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
+    def _merge_data_pack_parts(
+        parts: list[dict[str, Any]], meta: dict[str, Any]
+    ) -> dict[str, Any]:
         pages_seen: set[int] = set()
         page_inventory: list[dict[str, Any]] = []
         facts: list[dict[str, Any]] = []
@@ -673,7 +885,9 @@ class _DataPackMixin:
         }
 
     @staticmethod
-    def _derive_data_pack_views(data_pack: dict[str, Any], *, expected_sessions: list[int]) -> dict[str, Any]:
+    def _derive_data_pack_views(
+        data_pack: dict[str, Any], *, expected_sessions: list[int]
+    ) -> dict[str, Any]:
         facts = data_pack.get("facts")
         if not isinstance(facts, list):
             return {}
@@ -692,7 +906,9 @@ class _DataPackMixin:
                 return shown_as.strip()
             return None
 
-        def get_fact(*, fact_type: str, metric: str, session_index: int) -> dict[str, Any] | None:
+        def get_fact(
+            *, fact_type: str, metric: str, session_index: int
+        ) -> dict[str, Any] | None:
             for f in facts:
                 if not isinstance(f, dict):
                     continue
@@ -711,7 +927,9 @@ class _DataPackMixin:
                 return None
             if shown.strip().upper() == "N/A":
                 return "N/A"
-            if re.match(r"^[<>≥≤]?\s*-?\d+(?:\.\d+)?\s*(?:ms|µV|uV|Hz|sec|s|ratio)?\s*$", shown):
+            if re.match(
+                r"^[<>≥≤]?\s*-?\d+(?:\.\d+)?\s*(?:ms|µV|uV|Hz|sec|s|ratio)?\s*$", shown
+            ):
                 return shown
             return None
 
@@ -721,13 +939,20 @@ class _DataPackMixin:
             ("Trail Making Test A", "trail_making_test_a"),
             ("Trail Making Test B", "trail_making_test_b"),
         ]
-        perf_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
-        perf_rows = ["| " + " | ".join(perf_headers) + " |", "|" + "|".join(["---"] * len(perf_headers)) + "|"]
+        perf_headers = (
+            ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        )
+        perf_rows = [
+            "| " + " | ".join(perf_headers) + " |",
+            "|" + "|".join(["---"] * len(perf_headers)) + "|",
+        ]
         for label, metric in perf_specs:
             target = ""
             cells: list[str] = [label]
             for sess in expected_sessions:
-                f = get_fact(fact_type="performance_metric", metric=metric, session_index=sess)
+                f = get_fact(
+                    fact_type="performance_metric", metric=metric, session_index=sess
+                )
                 if not f:
                     cells.append("MISSING")
                     continue
@@ -755,13 +980,20 @@ class _DataPackMixin:
             ("Audio P300 Delay", "audio_p300_delay"),
             ("Audio P300 Voltage", "audio_p300_voltage"),
         ]
-        evoked_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
-        evoked_rows = ["| " + " | ".join(evoked_headers) + " |", "|" + "|".join(["---"] * len(evoked_headers)) + "|"]
+        evoked_headers = (
+            ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        )
+        evoked_rows = [
+            "| " + " | ".join(evoked_headers) + " |",
+            "|" + "|".join(["---"] * len(evoked_headers)) + "|",
+        ]
         for label, metric in evoked_specs:
             target = ""
             cells = [label]
             for sess in expected_sessions:
-                f = get_fact(fact_type="evoked_potential", metric=metric, session_index=sess)
+                f = get_fact(
+                    fact_type="evoked_potential", metric=metric, session_index=sess
+                )
                 if not f:
                     cells.append("MISSING")
                     continue
@@ -785,13 +1017,20 @@ class _DataPackMixin:
             ("CZ Eyes Closed Theta/Beta (Power)", "cz_theta_beta_ratio_ec"),
             ("F3/F4 Eyes Closed Alpha (Power)", "f3_f4_alpha_ratio_ec"),
         ]
-        state_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
-        state_rows = ["| " + " | ".join(state_headers) + " |", "|" + "|".join(["---"] * len(state_headers)) + "|"]
+        state_headers = (
+            ["Metric"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        )
+        state_rows = [
+            "| " + " | ".join(state_headers) + " |",
+            "|" + "|".join(["---"] * len(state_headers)) + "|",
+        ]
         for label, metric in state_specs:
             target = ""
             cells = [label]
             for sess in expected_sessions:
-                f = get_fact(fact_type="state_metric", metric=metric, session_index=sess)
+                f = get_fact(
+                    fact_type="state_metric", metric=metric, session_index=sess
+                )
                 if not f:
                     cells.append("MISSING")
                     continue
@@ -802,7 +1041,9 @@ class _DataPackMixin:
                     cells.append(shown)
                     continue
                 val = f.get("value")
-                cells.append(fmt_num(val) if val is not None else (shown_as_or_na(f) or "N/A"))
+                cells.append(
+                    fmt_num(val) if val is not None else (shown_as_or_na(f) or "N/A")
+                )
             cells.append(target)
             state_rows.append("| " + " | ".join(cells) + " |")
         state_table = "\n".join(state_rows)
@@ -812,13 +1053,20 @@ class _DataPackMixin:
             ("Central-Parietal", "central_parietal_peak_frequency_ec"),
             ("Occipital", "occipital_peak_frequency_ec"),
         ]
-        peak_headers = ["Region"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
-        peak_rows = ["| " + " | ".join(peak_headers) + " |", "|" + "|".join(["---"] * len(peak_headers)) + "|"]
+        peak_headers = (
+            ["Region"] + [f"Session {i}" for i in expected_sessions] + ["Target"]
+        )
+        peak_rows = [
+            "| " + " | ".join(peak_headers) + " |",
+            "|" + "|".join(["---"] * len(peak_headers)) + "|",
+        ]
         for label, metric in peak_specs:
             target = ""
             cells = [label]
             for sess in expected_sessions:
-                f = get_fact(fact_type="peak_frequency", metric=metric, session_index=sess)
+                f = get_fact(
+                    fact_type="peak_frequency", metric=metric, session_index=sess
+                )
                 if not f:
                     cells.append("MISSING")
                     continue
@@ -848,10 +1096,14 @@ class _DataPackMixin:
             sess = f.get("session_index")
             if site not in cp_map or not isinstance(sess, int):
                 continue
-            cp_map[site][sess] = f
+            if sess not in cp_map[site]:
+                cp_map[site][sess] = f
 
         headers = ["Site"] + [f"Session {i} (µV / ms)" for i in expected_sessions]
-        rows = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
+        rows = [
+            "| " + " | ".join(headers) + " |",
+            "|" + "|".join(["---"] * len(headers)) + "|",
+        ]
         for site in cp_sites:
             cells: list[str] = [site]
             for sess in expected_sessions:
@@ -876,10 +1128,14 @@ class _DataPackMixin:
             sess = f.get("session_index")
             if not isinstance(sess, int):
                 continue
-            n100_by_sess[sess] = f
+            if sess not in n100_by_sess:
+                n100_by_sess[sess] = f
 
         n100_headers = ["Metric"] + [f"Session {i}" for i in expected_sessions]
-        n100_rows = ["| " + " | ".join(n100_headers) + " |", "|" + "|".join(["---"] * len(n100_headers)) + "|"]
+        n100_rows = [
+            "| " + " | ".join(n100_headers) + " |",
+            "|" + "|".join(["---"] * len(n100_headers)) + "|",
+        ]
         cells = ["Central-frontal N100 (yield, µV, ms)"]
         for sess in expected_sessions:
             f = n100_by_sess.get(sess)
@@ -913,7 +1169,9 @@ class _DataPackMixin:
         }
 
     @staticmethod
-    def _missing_required_fields(data_pack: dict[str, Any], *, expected_sessions: list[int]) -> set[str]:
+    def _missing_required_fields(
+        data_pack: dict[str, Any], *, expected_sessions: list[int]
+    ) -> set[str]:
         facts = data_pack.get("facts")
         if not isinstance(facts, list):
             return {"facts"}
@@ -928,7 +1186,9 @@ class _DataPackMixin:
                     return True
                 # WAVi sometimes shows placeholders like "UV <0, MS N/A" instead of a plain "N/A".
                 # Treat these as acceptable missing-at-source values (only when the numeric fields are absent).
-                if ("N/A" in s or "<0" in s) and any(f.get(field) is None for field in fields):
+                if ("N/A" in s or "<0" in s) and any(
+                    f.get(field) is None for field in fields
+                ):
                     return True
             return all(f.get(field) is not None for field in fields)
 
@@ -949,7 +1209,8 @@ class _DataPackMixin:
         for _, metric in perf_metrics:
             for sess in expected_sessions:
                 if not has_fact(
-                    lambda f, m=metric, s=sess: f.get("fact_type") == "performance_metric"
+                    lambda f, m=metric, s=sess: f.get("fact_type")
+                    == "performance_metric"
                     and f.get("metric") == m
                     and f.get("session_index") == s
                     and has_values_or_na(f, fields=("value",))
@@ -1049,7 +1310,11 @@ class _DataPackMixin:
                         continue
                     title = item.get("title")
                     page = item.get("page")
-                    if isinstance(title, str) and "p300" in title.lower() and isinstance(page, int):
+                    if (
+                        isinstance(title, str)
+                        and "p300" in title.lower()
+                        and isinstance(page, int)
+                    ):
                         pages.append(page)
                 if pages:
                     pages_to_try = sorted(set(pages))
@@ -1073,11 +1338,13 @@ class _DataPackMixin:
             "- If images are cropped panels (labels like C3_panel), each panel corresponds to ONE site.\n"
             "- Use the legend crop (if provided) to map Session 1/2/3 to colors.\n"
             "- For each site+session, extract yield (#), uv (µV), and ms.\n"
-            "- If a value is shown as N/A, set uv/ms to null and shown_as=\"N/A\".\n"
+            '- If a value is shown as N/A, set uv/ms to null and shown_as="N/A".\n'
             "Also extract CENTRAL-FRONTAL AVERAGE N100 (yield, uv, ms) if present (look for a crop labeled "
             "central_frontal_avg if provided)."
         )
-        prompt_text = _data_pack_prompt(pages=[img.page for img in retry_images], focus=focus)
+        prompt_text = _data_pack_prompt(
+            pages=[img.page for img in retry_images], focus=focus
+        )
 
         raw = await self._call_model_multimodal(
             model_id=extractor_model_id,
@@ -1090,14 +1357,26 @@ class _DataPackMixin:
 
         if debug_dir is not None:
             try:
-                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                safe_model = (
+                    "".join(
+                        c if c.isalnum() or c in {"-", "_", "."} else "_"
+                        for c in extractor_model_id
+                    )
+                    or "model"
+                )
                 model_dir = debug_dir / safe_model
                 model_dir.mkdir(parents=True, exist_ok=True)
-                pages_key = "-".join(str(p) for p in sorted({img.page for img in retry_images}))
+                pages_key = "-".join(
+                    str(p) for p in sorted({img.page for img in retry_images})
+                )
                 stem = f"retry-p300-{pages_key}"
-                (model_dir / f"{stem}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+                (model_dir / f"{stem}.prompt.txt").write_text(
+                    prompt_text, encoding="utf-8"
+                )
                 (model_dir / f"{stem}.raw.txt").write_text(raw, encoding="utf-8")
-                image_paths = _save_debug_images(model_dir=model_dir, stem=stem, images=retry_images)
+                image_paths = _save_debug_images(
+                    model_dir=model_dir, stem=stem, images=retry_images
+                )
                 if attempt_log is not None:
                     attempt_log.append(
                         {
@@ -1112,14 +1391,25 @@ class _DataPackMixin:
             except Exception:
                 pass
         part = _json_loads_loose(raw)
-        if not isinstance(part, dict) or part.get("schema_version") != DATA_PACK_SCHEMA_VERSION:
+        if (
+            not isinstance(part, dict)
+            or part.get("schema_version") != DATA_PACK_SCHEMA_VERSION
+        ):
             return merged
 
         if debug_dir is not None:
             try:
-                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                safe_model = (
+                    "".join(
+                        c if c.isalnum() or c in {"-", "_", "."} else "_"
+                        for c in extractor_model_id
+                    )
+                    or "model"
+                )
                 model_dir = debug_dir / safe_model
-                pages_key = "-".join(str(p) for p in sorted({img.page for img in retry_images}))
+                pages_key = "-".join(
+                    str(p) for p in sorted({img.page for img in retry_images})
+                )
                 stem = f"retry-p300-{pages_key}"
                 (model_dir / f"{stem}.parsed.json").write_text(
                     json.dumps(part, indent=2, sort_keys=True), encoding="utf-8"
@@ -1128,8 +1418,12 @@ class _DataPackMixin:
                 pass
 
         # Prefer retry facts over earlier broad-pass facts when keys collide (retry is more focused/accurate).
-        merged2 = self._merge_data_pack_parts([part, merged], meta={k: v for k, v in merged.items() if k != "derived"})
-        merged2["derived"] = self._derive_data_pack_views(merged2, expected_sessions=expected_sessions)
+        merged2 = self._merge_data_pack_parts(
+            [part, merged], meta={k: v for k, v in merged.items() if k != "derived"}
+        )
+        merged2["derived"] = self._derive_data_pack_views(
+            merged2, expected_sessions=expected_sessions
+        )
         return merged2
 
     async def _targeted_retry_summary_missing(
@@ -1140,6 +1434,7 @@ class _DataPackMixin:
         merged: dict[str, Any],
         expected_sessions: list[int],
         missing: set[str],
+        candidate_pages: list[int] | None = None,
         debug_dir: Path | None = None,
         attempt_log: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -1154,20 +1449,37 @@ class _DataPackMixin:
             return merged
 
         img_by_page = {img.page: img for img in page_images}
-        page1 = img_by_page.get(1)
-        if page1 is None:
+        pages_to_try = [p for p in (candidate_pages or []) if isinstance(p, int)]
+        if not pages_to_try:
+            pages_to_try = [1]
+
+        source_images = [img_by_page[p] for p in pages_to_try if p in img_by_page]
+        if not source_images:
             return merged
 
-        retry_images = _try_build_summary_table_crops(page1) or [page1]
+        retry_images: list[PageImage] = []
+        seen_page_labels: set[tuple[int, str | None]] = set()
+        for source_image in source_images:
+            for retry_image in _try_build_summary_table_crops(source_image) or [
+                source_image
+            ]:
+                key = (retry_image.page, retry_image.label)
+                if key in seen_page_labels:
+                    continue
+                seen_page_labels.add(key)
+                retry_images.append(retry_image)
+
         focus = (
-            "RETRY: Extract PAGE-1 SUMMARY metrics for every session shown:\n"
+            "RETRY: Extract SUMMARY metrics for every session shown on the provided summary-table images:\n"
             "- Performance: Physical Reaction Time (ms), Trail Making Test A (sec), Trail Making Test B (sec)\n"
             "- Evoked: Audio P300 Delay (ms), Audio P300 Voltage (µV)\n"
             "- State: CZ Eyes Closed Theta/Beta (Power), F3/F4 Eyes Closed Alpha (Power)\n"
             "- Peak Frequency: Frontal, Central-Parietal, Occipital (Hz)\n"
             "Use the canonical identifiers and include target ranges when shown."
         )
-        prompt_text = _data_pack_prompt(pages=[img.page for img in retry_images], focus=focus)
+        prompt_text = _data_pack_prompt(
+            pages=[img.page for img in retry_images], focus=focus
+        )
 
         raw = await self._call_model_multimodal(
             model_id=extractor_model_id,
@@ -1180,17 +1492,29 @@ class _DataPackMixin:
 
         if debug_dir is not None:
             try:
-                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                safe_model = (
+                    "".join(
+                        c if c.isalnum() or c in {"-", "_", "."} else "_"
+                        for c in extractor_model_id
+                    )
+                    or "model"
+                )
                 model_dir = debug_dir / safe_model
                 model_dir.mkdir(parents=True, exist_ok=True)
-                stem = "retry-summary-page-1"
-                (model_dir / f"{stem}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+                stem = "retry-summary-pages-" + "-".join(
+                    str(p) for p in sorted({img.page for img in retry_images})
+                )
+                (model_dir / f"{stem}.prompt.txt").write_text(
+                    prompt_text, encoding="utf-8"
+                )
                 (model_dir / f"{stem}.raw.txt").write_text(raw, encoding="utf-8")
-                image_paths = _save_debug_images(model_dir=model_dir, stem=stem, images=retry_images)
+                image_paths = _save_debug_images(
+                    model_dir=model_dir, stem=stem, images=retry_images
+                )
                 if attempt_log is not None:
                     attempt_log.append(
                         {
-                            "kind": "retry_summary_page_1",
+                            "kind": "retry_summary_pages",
                             "model_id": extractor_model_id,
                             "pages": sorted({img.page for img in retry_images}),
                             "labels_sample": [img.label for img in retry_images[:12]],
@@ -1202,22 +1526,36 @@ class _DataPackMixin:
                 pass
 
         part = _json_loads_loose(raw)
-        if not isinstance(part, dict) or part.get("schema_version") != DATA_PACK_SCHEMA_VERSION:
+        if (
+            not isinstance(part, dict)
+            or part.get("schema_version") != DATA_PACK_SCHEMA_VERSION
+        ):
             return merged
 
         if debug_dir is not None:
             try:
-                safe_model = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in extractor_model_id) or "model"
+                safe_model = (
+                    "".join(
+                        c if c.isalnum() or c in {"-", "_", "."} else "_"
+                        for c in extractor_model_id
+                    )
+                    or "model"
+                )
                 model_dir = debug_dir / safe_model
-                (model_dir / "retry-summary-page-1.parsed.json").write_text(
+                stem = "retry-summary-pages-" + "-".join(
+                    str(p) for p in sorted({img.page for img in retry_images})
+                )
+                (model_dir / f"{stem}.parsed.json").write_text(
                     json.dumps(part, indent=2, sort_keys=True), encoding="utf-8"
                 )
             except Exception:
                 pass
 
         # Prefer retry facts over earlier broad-pass facts when keys collide (retry is more focused/accurate).
-        merged2 = self._merge_data_pack_parts([part, merged], meta={k: v for k, v in merged.items() if k != "derived"})
-        merged2["derived"] = self._derive_data_pack_views(merged2, expected_sessions=expected_sessions)
+        merged2 = self._merge_data_pack_parts(
+            [part, merged], meta={k: v for k, v in merged.items() if k != "derived"}
+        )
+        merged2["derived"] = self._derive_data_pack_views(
+            merged2, expected_sessions=expected_sessions
+        )
         return merged2
-
-
