@@ -11,12 +11,17 @@ from ...config import DISCOVERED_MODEL_IDS, is_vision_capable
 from ...reports import extract_pdf_full
 from ...storage import Report, get_report, get_run, set_run_label_map
 from ...storage import session_scope
+from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
 from ..constants import STAGES
 from ..db_utils import _aggregate_required_changes, _stage_artifacts, _validate_stage5
-from ..json_utils import _json_loads_loose, _strip_to_json
+from ..json_utils import _json_loads_loose
 from ..paths import _data_pack_path, _stable_label_map, _vision_transcript_path
 from ..prompts import _load_prompt, _workflow_context_block
-from ..report_assets import _derive_report_dir, _load_best_report_text, _load_page_images
+from ..report_assets import (
+    _derive_report_dir,
+    _load_best_report_text,
+    _load_page_images,
+)
 from ..report_text import _page_count_from_markers
 from ..types import PageImage
 from ..utils import _chunked, _truthy_env
@@ -58,7 +63,9 @@ class _StagesMixin:
         return bool(re.search(rf"(?m)^{re.escape(heading)}\s*$", text or ""))
 
     @classmethod
-    def _heading_positions(cls, text: str, required_headings: list[str]) -> list[tuple[str, int]]:
+    def _heading_positions(
+        cls, text: str, required_headings: list[str]
+    ) -> list[tuple[str, int]]:
         import re
 
         positions: list[tuple[str, int]] = []
@@ -69,7 +76,9 @@ class _StagesMixin:
         return sorted(positions, key=lambda x: x[1])
 
     @classmethod
-    def _first_missing_heading(cls, text: str, required_headings: list[str]) -> str | None:
+    def _first_missing_heading(
+        cls, text: str, required_headings: list[str]
+    ) -> str | None:
         for h in required_headings:
             if not cls._has_heading(text, h):
                 return h
@@ -121,13 +130,17 @@ class _StagesMixin:
         if not require_complete:
             return text
 
-        if self._is_longform_complete(text, end_sentinel=end_sentinel, required_headings=required_headings):
+        if self._is_longform_complete(
+            text, end_sentinel=end_sentinel, required_headings=required_headings
+        ):
             return text
 
         repair_calls = self._int_env("QEEG_LONGFORM_REPAIR_CALLS", 6)
         if repair_calls < 0:
             repair_calls = 0
-        continuation_context_chars = self._int_env("QEEG_LONGFORM_CONTINUATION_CONTEXT_CHARS", 12000)
+        continuation_context_chars = self._int_env(
+            "QEEG_LONGFORM_CONTINUATION_CONTEXT_CHARS", 12000
+        )
         if continuation_context_chars <= 0:
             continuation_context_chars = 12000
 
@@ -146,16 +159,22 @@ class _StagesMixin:
                     start_heading = pos[-1][0] if pos else headings[0]
                     start_idx = pos_map.get(start_heading)
 
-            prefix = (repaired[:start_idx] if isinstance(start_idx, int) else repaired).rstrip()
+            prefix = (
+                repaired[:start_idx] if isinstance(start_idx, int) else repaired
+            ).rstrip()
             partial_tail = (repaired or "")[-continuation_context_chars:]
             instruction_lines = [
                 "Your previous output was cut off.",
                 "Output ONLY the remaining portion of the report.",
             ]
             if start_heading:
-                instruction_lines.append(f"- Start with this exact heading (no text before it): {start_heading}")
+                instruction_lines.append(
+                    f"- Start with this exact heading (no text before it): {start_heading}"
+                )
             else:
-                instruction_lines.append("- Continue directly from where the text ended (do not restart).")
+                instruction_lines.append(
+                    "- Continue directly from where the text ended (do not restart)."
+                )
             if headings:
                 instruction_lines.append(f"- Continue through: {headings[-1]}")
             instruction_lines.append(f"- End with a final line exactly: {end_sentinel}")
@@ -188,7 +207,9 @@ class _StagesMixin:
             else:
                 repaired = f"{prefix}\n\n{clean}\n"
 
-            if self._is_longform_complete(repaired, end_sentinel=end_sentinel, required_headings=required_headings):
+            if self._is_longform_complete(
+                repaired, end_sentinel=end_sentinel, required_headings=required_headings
+            ):
                 return repaired
 
         # Return best-effort text; caller can decide whether to hard-fail.
@@ -210,7 +231,9 @@ class _StagesMixin:
         # Prefer a single "checker" vision model for multimodal extraction + verification.
         # This is intentionally independent from the selected council model set, so the council can use
         # text-only models while still getting page-grounded structured data + transcript.
-        vision_checker_pref = os.getenv("QEEG_VISION_CHECKER_MODEL", "gemini-pro-vision")
+        vision_checker_pref = os.getenv(
+            "QEEG_VISION_CHECKER_MODEL", "gemini-pro-vision"
+        )
         vision_checker_id = self._select_discovered_model_id(vision_checker_pref)
         if vision_checker_id and not is_vision_capable(vision_checker_id):
             vision_checker_id = None
@@ -218,25 +241,37 @@ class _StagesMixin:
         # Load images from the report folder (preferred), then fallback lookup.
         page_images = _load_page_images(report, report_dir)
 
-        needs_images = bool(vision_checker_id) or any(is_vision_capable(m) for m in council_model_ids)
+        needs_images = bool(vision_checker_id) or any(
+            is_vision_capable(m) for m in council_model_ids
+        )
         expected_page_count = _page_count_from_markers(report_text)
         pages_present = {img.page for img in page_images}
         missing_pages: list[int] = []
         if expected_page_count:
-            missing_pages = [p for p in range(1, expected_page_count + 1) if p not in pages_present]
+            missing_pages = [
+                p for p in range(1, expected_page_count + 1) if p not in pages_present
+            ]
 
         # If a vision-capable model is selected but images are missing/incomplete, generate on the fly.
-        if needs_images and Path(report.stored_path).suffix.lower() == ".pdf" and (not page_images or missing_pages):
+        if (
+            needs_images
+            and Path(report.stored_path).suffix.lower() == ".pdf"
+            and (not page_images or missing_pages)
+        ):
             try:
                 full = extract_pdf_full(Path(report.stored_path))
                 enhanced_text = full.enhanced_text
                 if enhanced_text and enhanced_text.strip():
                     report_text = enhanced_text
                     try:
-                        (report_dir / "extracted_enhanced.txt").write_text(enhanced_text, encoding="utf-8")
+                        (report_dir / "extracted_enhanced.txt").write_text(
+                            enhanced_text, encoding="utf-8"
+                        )
                         # Keep extracted.txt aligned so the UI preview and any verification tooling never
                         # shows only a single OCR engine.
-                        (report_dir / "extracted.txt").write_text(enhanced_text, encoding="utf-8")
+                        (report_dir / "extracted.txt").write_text(
+                            enhanced_text, encoding="utf-8"
+                        )
                     except Exception:
                         pass
 
@@ -267,10 +302,18 @@ class _StagesMixin:
                         page_num = p.get("page")
                         if not isinstance(page_num, int):
                             continue
-                        (sources_dir / f"page-{page_num}.pypdf.txt").write_text(p.get("pypdf_text", ""), encoding="utf-8")
-                        (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(p.get("pymupdf_text", ""), encoding="utf-8")
-                        (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(p.get("vision_ocr_text", ""), encoding="utf-8")
-                        (sources_dir / f"page-{page_num}.tesseract.txt").write_text(p.get("tesseract_ocr_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.pypdf.txt").write_text(
+                            p.get("pypdf_text", ""), encoding="utf-8"
+                        )
+                        (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(
+                            p.get("pymupdf_text", ""), encoding="utf-8"
+                        )
+                        (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(
+                            p.get("vision_ocr_text", ""), encoding="utf-8"
+                        )
+                        (sources_dir / f"page-{page_num}.tesseract.txt").write_text(
+                            p.get("tesseract_ocr_text", ""), encoding="utf-8"
+                        )
 
                     meta = dict(full.metadata)
                     meta.update(
@@ -281,7 +324,9 @@ class _StagesMixin:
                             "sources_dir": "sources",
                         }
                     )
-                    (report_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                    (report_dir / "metadata.json").write_text(
+                        json.dumps(meta, indent=2), encoding="utf-8"
+                    )
                 except Exception:
                     pass
             except Exception:
@@ -293,7 +338,11 @@ class _StagesMixin:
         if not is_pdf:
             strict_data = False
         # Prevent accidental non-strict PDF runs unless explicitly allowed.
-        if is_pdf and not strict_data and not _truthy_env("QEEG_ALLOW_NONSTRICT_DATA_AVAILABILITY", False):
+        if (
+            is_pdf
+            and not strict_data
+            and not _truthy_env("QEEG_ALLOW_NONSTRICT_DATA_AVAILABILITY", False)
+        ):
             strict_data = True
         # Tests/mocks: don't hard-fail on missing multimodal extraction.
         if all(mid.startswith("mock-") for mid in council_model_ids):
@@ -313,7 +362,11 @@ class _StagesMixin:
                     meta = None
 
             engines: dict[str, Any] = {}
-            if isinstance(meta, dict) and meta.get("schema_version") == 2 and isinstance(meta.get("engines"), dict):
+            if (
+                isinstance(meta, dict)
+                and meta.get("schema_version") == 2
+                and isinstance(meta.get("engines"), dict)
+            ):
                 engines = meta["engines"]
 
             if not engines:
@@ -324,8 +377,12 @@ class _StagesMixin:
                     enhanced_text = full.enhanced_text
                     if enhanced_text and enhanced_text.strip():
                         report_text = enhanced_text
-                        (report_dir / "extracted_enhanced.txt").write_text(enhanced_text, encoding="utf-8")
-                        (report_dir / "extracted.txt").write_text(enhanced_text, encoding="utf-8")
+                        (report_dir / "extracted_enhanced.txt").write_text(
+                            enhanced_text, encoding="utf-8"
+                        )
+                        (report_dir / "extracted.txt").write_text(
+                            enhanced_text, encoding="utf-8"
+                        )
 
                     page_images = []
                     for img in full.page_images:
@@ -337,7 +394,9 @@ class _StagesMixin:
                     pages_dir = report_dir / "pages"
                     pages_dir.mkdir(parents=True, exist_ok=True)
                     for img in page_images:
-                        (pages_dir / f"page-{img.page}.png").write_bytes(base64.b64decode(img.base64_png))
+                        (pages_dir / f"page-{img.page}.png").write_bytes(
+                            base64.b64decode(img.base64_png)
+                        )
 
                     sources_dir = report_dir / "sources"
                     sources_dir.mkdir(parents=True, exist_ok=True)
@@ -345,10 +404,18 @@ class _StagesMixin:
                         page_num = p.get("page")
                         if not isinstance(page_num, int):
                             continue
-                        (sources_dir / f"page-{page_num}.pypdf.txt").write_text(p.get("pypdf_text", ""), encoding="utf-8")
-                        (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(p.get("pymupdf_text", ""), encoding="utf-8")
-                        (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(p.get("vision_ocr_text", ""), encoding="utf-8")
-                        (sources_dir / f"page-{page_num}.tesseract.txt").write_text(p.get("tesseract_ocr_text", ""), encoding="utf-8")
+                        (sources_dir / f"page-{page_num}.pypdf.txt").write_text(
+                            p.get("pypdf_text", ""), encoding="utf-8"
+                        )
+                        (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(
+                            p.get("pymupdf_text", ""), encoding="utf-8"
+                        )
+                        (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(
+                            p.get("vision_ocr_text", ""), encoding="utf-8"
+                        )
+                        (sources_dir / f"page-{page_num}.tesseract.txt").write_text(
+                            p.get("tesseract_ocr_text", ""), encoding="utf-8"
+                        )
 
                     meta2 = dict(full.metadata)
                     meta2.update(
@@ -360,7 +427,11 @@ class _StagesMixin:
                         }
                     )
                     meta_path.write_text(json.dumps(meta2, indent=2), encoding="utf-8")
-                    engines = meta2.get("engines") if isinstance(meta2.get("engines"), dict) else {}
+                    engines = (
+                        meta2.get("engines")
+                        if isinstance(meta2.get("engines"), dict)
+                        else {}
+                    )
                 except Exception:
                     engines = engines or {}
 
@@ -377,7 +448,9 @@ class _StagesMixin:
 
         extractor_models = [m for m in council_model_ids if is_vision_capable(m)]
         if vision_checker_id:
-            extractor_models = [vision_checker_id] + [m for m in extractor_models if m != vision_checker_id]
+            extractor_models = [vision_checker_id] + [
+                m for m in extractor_models if m != vision_checker_id
+            ]
         if strict_data and not extractor_models:
             raise RuntimeError(
                 "Strict data availability requested, but no vision-capable models were selected.\n"
@@ -397,7 +470,9 @@ class _StagesMixin:
         )
 
         transcript_model_id: str | None = None
-        if isinstance(data_pack, dict) and isinstance(data_pack.get("extraction_model_id"), str):
+        if isinstance(data_pack, dict) and isinstance(
+            data_pack.get("extraction_model_id"), str
+        ):
             transcript_model_id = data_pack["extraction_model_id"]
         elif extractor_models:
             transcript_model_id = extractor_models[0]
@@ -442,7 +517,9 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
-        workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
+        workflow_context = _workflow_context_block(
+            stage_num=stage.num, stage_name=stage.name
+        )
 
         base_prompt_text = (
             f"{prompt}\n\n"
@@ -456,7 +533,14 @@ class _StagesMixin:
             f"{report_text}\n"
         )
 
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "start",
+            }
+        )
         stage1_max_tokens = self._int_env("QEEG_STAGE1_MAX_TOKENS", 12000)
         if stage1_max_tokens <= 0:
             stage1_max_tokens = 12000
@@ -467,9 +551,17 @@ class _StagesMixin:
                 # Multi-pass multimodal ingestion for vision models: build page-grounded notes in chunks, then write
                 # the final long-form report using the notes + full OCR + data pack.
                 notes_text = ""
-                per_model_notes = _truthy_env("QEEG_STAGE1_PER_MODEL_VISION_NOTES", False)
-                if is_vision_capable(model_id) and page_images and (per_model_notes or not vision_transcript_block):
-                    chunk_size = int(os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
+                per_model_notes = _truthy_env(
+                    "QEEG_STAGE1_PER_MODEL_VISION_NOTES", False
+                )
+                if (
+                    is_vision_capable(model_id)
+                    and page_images
+                    and (per_model_notes or not vision_transcript_block)
+                ):
+                    chunk_size = int(
+                        os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8"
+                    )
                     if chunk_size <= 0:
                         chunk_size = 8
                     # Hard requirement: PDFs >10 pages must be ingested in 2+ multimodal passes.
@@ -483,7 +575,7 @@ class _StagesMixin:
                             f"Pages in this pass: {', '.join(str(p) for p in pages)}\n\n"
                             "Task:\n"
                             "- For each provided page image, produce a page-by-page markdown transcript with headings "
-                            "\"## Page <n>\".\n"
+                            '"## Page <n>".\n'
                             "- Enumerate every table/figure/metric visible on that page and transcribe any clearly "
                             "printed numeric values that are likely clinically relevant.\n"
                             "- Do not interpret or diagnose. Do not invent numbers.\n"
@@ -534,7 +626,9 @@ class _StagesMixin:
         successes = [r for r in results if r is not None]
 
         for model_id, text in successes:
-            await self._write_artifact(run_id=run_id, stage=stage, model_id=model_id, text=text)
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=model_id, text=text
+            )
 
         await emit(
             {
@@ -578,11 +672,15 @@ class _StagesMixin:
         vt_path = _vision_transcript_path(run_id)
         if vt_path.exists():
             try:
-                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+                vision_transcript_text = vt_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
             except Exception:
                 vision_transcript_text = ""
 
-        workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
+        workflow_context = _workflow_context_block(
+            stage_num=stage.num, stage_name=stage.name
+        )
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
@@ -599,7 +697,9 @@ class _StagesMixin:
 
         analyses_by_model: dict[str, str] = {}
         for a in artifacts:
-            analyses_by_model[a.model_id] = Path(a.content_path).read_text(encoding="utf-8", errors="replace")
+            analyses_by_model[a.model_id] = Path(a.content_path).read_text(
+                encoding="utf-8", errors="replace"
+            )
 
         available_models = [m for m in council_model_ids if m in analyses_by_model]
         if len(available_models) < 2:
@@ -619,16 +719,21 @@ class _StagesMixin:
         with session_scope() as session:
             set_run_label_map(session, run_id, label_map)
 
-        analysis_blocks: list[str] = []
-        for label, model_id in label_map.items():
-            analysis_blocks.append(f"Analysis {label}:\n{analyses_by_model[model_id]}".strip())
-        all_analyses_text = "\n\n".join(analysis_blocks)
-
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "start",
+            }
+        )
 
         async def one(reviewer_model_id: str) -> tuple[str, str] | None:
             # Reviewer sees all analyses except its own, still labeled A/B/C...
-            reviewer_label = next((lbl for lbl, mid in label_map.items() if mid == reviewer_model_id), None)
+            reviewer_label = next(
+                (lbl for lbl, mid in label_map.items() if mid == reviewer_model_id),
+                None,
+            )
             filtered: list[str] = []
             for label, mid in label_map.items():
                 if mid == reviewer_model_id:
@@ -650,14 +755,18 @@ class _StagesMixin:
                 f"ANALYSES TO REVIEW:\n\n{filtered_text}\n"
             )
             try:
-                text = await self._call_model_chat(
+                expected_labels = [
+                    label
+                    for label, mid in label_map.items()
+                    if mid != reviewer_model_id
+                ]
+                text = await run_stage2_peer_review_json(
+                    llm_client=self._llm,
                     model_id=reviewer_model_id,
                     prompt_text=prompt_text,
-                    temperature=0.1,
-                    max_tokens=4000,
+                    expected_labels=expected_labels,
                 )
-                _json_loads_loose(text)  # sanity
-                return reviewer_model_id, _strip_to_json(text)
+                return reviewer_model_id, text
             except Exception:
                 return None
 
@@ -665,7 +774,9 @@ class _StagesMixin:
         successes = [r for r in results if r is not None]
 
         for model_id, text in successes:
-            await self._write_artifact(run_id=run_id, stage=stage, model_id=model_id, text=text)
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=model_id, text=text
+            )
 
         await emit(
             {
@@ -703,7 +814,9 @@ class _StagesMixin:
             s1 = _stage_artifacts(session, run_id, 1, kind="analysis")
             s2 = _stage_artifacts(session, run_id, 2, kind="peer_review")
             run = get_run(session, run_id)
-            label_map = json.loads(run.label_map_json or "{}") if run is not None else {}
+            label_map = (
+                json.loads(run.label_map_json or "{}") if run is not None else {}
+            )
             report = get_report(session, run.report_id) if run else None
 
         report_text = ""
@@ -723,11 +836,15 @@ class _StagesMixin:
         vt_path = _vision_transcript_path(run_id)
         if vt_path.exists():
             try:
-                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+                vision_transcript_text = vt_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
             except Exception:
                 vision_transcript_text = ""
 
-        workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
+        workflow_context = _workflow_context_block(
+            stage_num=stage.num, stage_name=stage.name
+        )
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
@@ -743,17 +860,31 @@ class _StagesMixin:
             )
 
         analyses_by_model = {
-            a.model_id: Path(a.content_path).read_text(encoding="utf-8", errors="replace") for a in s1
+            a.model_id: Path(a.content_path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            for a in s1
         }
         peer_reviews = [
-            (a.model_id, Path(a.content_path).read_text(encoding="utf-8", errors="replace")) for a in s2
+            (
+                a.model_id,
+                Path(a.content_path).read_text(encoding="utf-8", errors="replace"),
+            )
+            for a in s2
         ]
 
         available_models = [m for m in council_model_ids if m in analyses_by_model]
         if not available_models:
             raise RuntimeError("No Stage 1 analyses available for revision")
 
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "start",
+            }
+        )
         stage3_max_tokens = self._int_env("QEEG_STAGE3_MAX_TOKENS", 12000)
         if stage3_max_tokens <= 0:
             stage3_max_tokens = 12000
@@ -763,8 +894,12 @@ class _StagesMixin:
             analysis = analyses_by_model.get(model_id)
             if not analysis:
                 return None
-            my_label = next((lbl for lbl, mid in label_map.items() if mid == model_id), None)
-            pr_text = "\n\n".join([f"Peer review by {mid}:\n{txt}" for mid, txt in peer_reviews]).strip()
+            my_label = next(
+                (lbl for lbl, mid in label_map.items() if mid == model_id), None
+            )
+            pr_text = "\n\n".join(
+                [f"Peer review by {mid}:\n{txt}" for mid, txt in peer_reviews]
+            ).strip()
             prompt_text = (
                 f"{prompt}\n\n"
                 "IMPORTANT:\n"
@@ -798,7 +933,9 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    missing = [h for h in required_headings if not self._has_heading(text, h)]
+                    missing = [
+                        h for h in required_headings if not self._has_heading(text, h)
+                    ]
                     raise RuntimeError(
                         "Stage 3 revision remained incomplete after repair attempts. "
                         f"Missing headings: {missing if missing else '(none)'}; "
@@ -814,7 +951,9 @@ class _StagesMixin:
             raise RuntimeError("All models failed during Stage 3 revision")
 
         for model_id, text in successes:
-            await self._write_artifact(run_id=run_id, stage=stage, model_id=model_id, text=text)
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=model_id, text=text
+            )
 
         await emit(
             {
@@ -903,11 +1042,15 @@ class _StagesMixin:
         vt_path = _vision_transcript_path(run_id)
         if vt_path.exists():
             try:
-                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+                vision_transcript_text = vt_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
             except Exception:
                 vision_transcript_text = ""
 
-        workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
+        workflow_context = _workflow_context_block(
+            stage_num=stage.num, stage_name=stage.name
+        )
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
@@ -955,7 +1098,9 @@ class _StagesMixin:
         if repair_calls < 0:
             repair_calls = 0
         try:
-            continuation_context_chars = int(os.getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000") or "12000")
+            continuation_context_chars = int(
+                os.getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000") or "12000"
+            )
         except Exception:
             continuation_context_chars = 12000
         if continuation_context_chars <= 0:
@@ -964,9 +1109,19 @@ class _StagesMixin:
         if isinstance(consolidator, str) and consolidator.startswith("mock-"):
             require_complete = False
 
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "start",
+            }
+        )
         text = await self._call_model_chat(
-            model_id=consolidator, prompt_text=base_prompt_text, temperature=0.2, max_tokens=max_tokens
+            model_id=consolidator,
+            prompt_text=base_prompt_text,
+            temperature=0.2,
+            max_tokens=max_tokens,
         )
 
         # Claude-style message APIs frequently clamp output tokens below the requested max, which can truncate
@@ -1006,7 +1161,10 @@ class _StagesMixin:
                     f"{continuation_instruction}"
                 )
                 cont = await self._call_model_chat(
-                    model_id=consolidator, prompt_text=cont_prompt, temperature=0.2, max_tokens=max_tokens
+                    model_id=consolidator,
+                    prompt_text=cont_prompt,
+                    temperature=0.2,
+                    max_tokens=max_tokens,
                 )
 
                 # Trim any preamble before the requested start heading.
@@ -1036,8 +1194,17 @@ class _StagesMixin:
             if require_complete:
                 raise RuntimeError(detail)
 
-        await self._write_artifact(run_id=run_id, stage=stage, model_id=consolidator, text=text)
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "complete"})
+        await self._write_artifact(
+            run_id=run_id, stage=stage, model_id=consolidator, text=text
+        )
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "complete",
+            }
+        )
 
     async def _stage5(
         self,
@@ -1070,11 +1237,15 @@ class _StagesMixin:
         vt_path = _vision_transcript_path(run_id)
         if vt_path.exists():
             try:
-                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+                vision_transcript_text = vt_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
             except Exception:
                 vision_transcript_text = ""
 
-        workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
+        workflow_context = _workflow_context_block(
+            stage_num=stage.num, stage_name=stage.name
+        )
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
@@ -1092,9 +1263,18 @@ class _StagesMixin:
         if not s4:
             raise RuntimeError("Stage 5 requires Stage 4 consolidation artifact")
 
-        consolidated = Path(s4[0].content_path).read_text(encoding="utf-8", errors="replace")
+        consolidated = Path(s4[0].content_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
 
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "start",
+            }
+        )
 
         async def one(model_id: str) -> tuple[str, str] | None:
             prompt_text = (
@@ -1106,8 +1286,10 @@ class _StagesMixin:
                 f"CONSOLIDATED REPORT TO REVIEW:\n\n{consolidated}\n"
             )
             try:
-                text = await self._call_model_chat(
-                    model_id=model_id, prompt_text=prompt_text, temperature=0.1, max_tokens=2500
+                text = await run_stage5_final_review_json(
+                    llm_client=self._llm,
+                    model_id=model_id,
+                    prompt_text=prompt_text,
                 )
                 payload = _json_loads_loose(text)
                 _validate_stage5(payload)
@@ -1121,7 +1303,9 @@ class _StagesMixin:
             raise RuntimeError("All models failed during Stage 5 final review")
 
         for model_id, text in successes:
-            await self._write_artifact(run_id=run_id, stage=stage, model_id=model_id, text=text)
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=model_id, text=text
+            )
 
         await emit(
             {
@@ -1177,11 +1361,15 @@ class _StagesMixin:
         vt_path = _vision_transcript_path(run_id)
         if vt_path.exists():
             try:
-                vision_transcript_text = vt_path.read_text(encoding="utf-8", errors="replace")
+                vision_transcript_text = vt_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
             except Exception:
                 vision_transcript_text = ""
 
-        workflow_context = _workflow_context_block(stage_num=stage.num, stage_name=stage.name)
+        workflow_context = _workflow_context_block(
+            stage_num=stage.num, stage_name=stage.name
+        )
         data_pack_block = ""
         if data_pack_text.strip():
             data_pack_block = (
@@ -1198,18 +1386,31 @@ class _StagesMixin:
 
         if not s4:
             raise RuntimeError("Stage 6 requires Stage 4 consolidation artifact")
-        consolidated = Path(s4[0].content_path).read_text(encoding="utf-8", errors="replace")
+        consolidated = Path(s4[0].content_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
 
         required_changes = _aggregate_required_changes(s5)
 
-        await emit({"run_id": run_id, "stage_num": stage.num, "stage_name": stage.name, "status": "start"})
+        await emit(
+            {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "status": "start",
+            }
+        )
         stage6_max_tokens = self._int_env("QEEG_STAGE6_MAX_TOKENS", 12000)
         if stage6_max_tokens <= 0:
             stage6_max_tokens = 12000
         stage6_require_complete = _truthy_env("QEEG_STAGE6_REQUIRE_COMPLETE", True)
 
         async def one(model_id: str) -> tuple[str, str] | None:
-            changes = "\n".join([f"- {c}" for c in required_changes]) if required_changes else "(none)"
+            changes = (
+                "\n".join([f"- {c}" for c in required_changes])
+                if required_changes
+                else "(none)"
+            )
             prompt_text = (
                 f"{prompt}\n\n"
                 "IMPORTANT:\n"
@@ -1239,7 +1440,9 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    missing = [h for h in required_headings if not self._has_heading(text, h)]
+                    missing = [
+                        h for h in required_headings if not self._has_heading(text, h)
+                    ]
                     raise RuntimeError(
                         "Stage 6 final draft remained incomplete after repair attempts. "
                         f"Missing headings: {missing if missing else '(none)'}; "
@@ -1255,7 +1458,9 @@ class _StagesMixin:
             raise RuntimeError("All models failed during Stage 6 final draft")
 
         for model_id, text in successes:
-            await self._write_artifact(run_id=run_id, stage=stage, model_id=model_id, text=text)
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=model_id, text=text
+            )
 
         await emit(
             {

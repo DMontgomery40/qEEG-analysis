@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
+import { childLogger, serializeError, newRequestId } from '../logger';
 import Tabs from './Tabs';
 import ModelBadge from './ModelBadge';
 import SourceDataView from './SourceDataView';
@@ -14,6 +15,7 @@ const STAGES = [
   { num: 5, name: 'final_review', kind: 'final_review', type: 'json' },
   { num: 6, name: 'final_draft', kind: 'final_draft', type: 'md' },
 ];
+const runPageLogger = childLogger({ area: 'run_page' });
 
 function groupByStage(artifacts) {
   const by = new Map();
@@ -42,11 +44,11 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
   const esRef = useRef(null);
   const initializedStageRef = useRef(false);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     const [r, a] = await Promise.all([api.getRun(runId), api.getArtifacts(runId)]);
     setRun(r);
     setArtifacts(a);
-  }
+  }, [runId]);
 
   useEffect(() => {
     setRun(null);
@@ -58,31 +60,44 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
       try {
         await refresh();
       } catch (e) {
-        onError(String(e?.message || e));
+        onError(e, { action: 'load_run', runId });
       }
     })();
-  }, [runId]);
+  }, [onError, refresh, runId]);
 
   useEffect(() => {
     if (!runId) return;
-    const es = new EventSource(api.streamUrl(runId));
+    const streamRequestId = newRequestId();
+    const log = runPageLogger.child({ runId, streamRequestId });
+    log.info('sse_connecting');
+    const es = new EventSource(api.streamUrl(runId, streamRequestId));
     esRef.current = es;
+    es.onopen = () => {
+      log.info('sse_connected');
+    };
     es.onmessage = async (evt) => {
       try {
         JSON.parse(evt.data);
         await refresh();
-      } catch {
-        // ignore
+      } catch (error) {
+        log.warn(
+          {
+            err: serializeError(error),
+            payloadPreview: String(evt?.data || '').slice(0, 500),
+          },
+          'sse_message_failed'
+        );
       }
     };
     es.onerror = () => {
-      // keep UI usable without killing it; user can refresh.
+      log.warn('sse_error');
     };
     return () => {
+      log.info('sse_closed');
       es.close();
       esRef.current = null;
     };
-  }, [runId]);
+  }, [refresh, runId]);
 
   const byStage = useMemo(() => groupByStage(artifacts), [artifacts]);
   const labelMap = run?.label_map || {};
@@ -198,7 +213,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
               await api.selectFinal(runId, { artifact_id: artifactId });
               await refresh();
             } catch (e) {
-              onError(String(e?.message || e));
+              onError(e, { action: 'select_consolidation', runId, artifactId });
             }
           }}
         />
@@ -223,7 +238,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
               await api.selectFinal(runId, { artifact_id: artifactId });
               await refresh();
             } catch (e) {
-              onError(String(e?.message || e));
+              onError(e, { action: 'select_final_draft', runId, artifactId });
             }
           }}
         />
@@ -244,7 +259,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
                 window.open(api.finalMdUrl(runId), '_blank');
                 window.open(api.finalPdfUrl(runId), '_blank');
               } catch (e) {
-                onError(String(e?.message || e));
+                onError(e, { action: 'export_run', runId });
               } finally {
                 setExporting(false);
               }

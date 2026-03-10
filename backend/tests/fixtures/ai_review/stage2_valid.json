@@ -1,0 +1,38 @@
+{
+  "reviews": [
+    {
+      "analysis_label": "A",
+      "strengths": [
+        "Per-site tables are present and clearly labeled.",
+        "Speculative commentary stays grounded in the report."
+      ],
+      "weaknesses": [
+        "The coherence discussion could be more explicit."
+      ],
+      "missing_or_unclear": [
+        "Electrode impedance context is not discussed."
+      ],
+      "accuracy_issues": [],
+      "risk_of_overreach": "Low risk. The analysis stays cautious and avoids unsupported claims."
+    },
+    {
+      "analysis_label": "B",
+      "strengths": [
+        "Key numeric progressions are summarized clearly."
+      ],
+      "weaknesses": [
+        "The speculative commentary section is too brief."
+      ],
+      "missing_or_unclear": [
+        "The alpha lateralization interpretation is underdeveloped."
+      ],
+      "accuracy_issues": [],
+      "risk_of_overreach": "Low risk. The framing is mostly conservative."
+    }
+  ],
+  "ranking_best_to_worst": [
+    "A",
+    "B"
+  ],
+  "overall_notes": "Analysis A is slightly stronger because it is more complete and preserves competing hypotheses more clearly."
+}

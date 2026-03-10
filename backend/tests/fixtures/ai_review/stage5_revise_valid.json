@@ -1,0 +1,11 @@
+{
+  "vote": "REVISE",
+  "required_changes": [
+    "Add the missing per-site P300 table.",
+    "Restore the Speculative Commentary section."
+  ],
+  "optional_changes": [
+    "Clarify the Session 3 TMT validity caveat."
+  ],
+  "quality_score_1to10": 6
+}

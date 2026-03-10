@@ -6,7 +6,7 @@ from __future__ import annotations
 def test_model_visible_in_ui_filters_legacy_provider_versions(temp_data_dir):
     from backend.main import _model_visible_in_ui
 
-    # OpenAI: keep only 5.2 / 5.3 families (+codex, allowed effort tiers).
+    # OpenAI: keep only 5.2 / 5.3 / 5.4 families (+codex, allowed effort tiers).
     assert _model_visible_in_ui("gpt-5") is False
     assert _model_visible_in_ui("gpt-5.1") is False
     assert _model_visible_in_ui("gpt-5-codex") is False
@@ -15,6 +15,8 @@ def test_model_visible_in_ui_filters_legacy_provider_versions(temp_data_dir):
     assert _model_visible_in_ui("openai/gpt-5.2-codex") is True
     assert _model_visible_in_ui("gpt-5.3-codex-high") is True
     assert _model_visible_in_ui("gpt-5.3-xhigh") is True
+    assert _model_visible_in_ui("gpt-5.4") is True
+    assert _model_visible_in_ui("gpt-5.4-pro") is True
     assert _model_visible_in_ui("gpt-5.3-low") is False
     assert _model_visible_in_ui("gpt-5.2-codex-mini") is False
 

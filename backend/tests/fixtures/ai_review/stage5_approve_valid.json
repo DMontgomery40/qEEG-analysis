@@ -1,0 +1,8 @@
+{
+  "vote": "APPROVE",
+  "required_changes": [],
+  "optional_changes": [
+    "Tighten one of the summary bullets for readability."
+  ],
+  "quality_score_1to10": 8
+}

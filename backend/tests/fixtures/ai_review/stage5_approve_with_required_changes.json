@@ -1,0 +1,8 @@
+{
+  "vote": "APPROVE",
+  "required_changes": [
+    "Add the missing per-site P300 table."
+  ],
+  "optional_changes": [],
+  "quality_score_1to10": 6
+}

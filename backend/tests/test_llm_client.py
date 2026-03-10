@@ -29,7 +29,11 @@ async def test_chat_completions_falls_back_to_responses():
         if request.url.path == "/v1/chat/completions":
             return httpx.Response(
                 400,
-                json={"error": {"message": "chat completions not supported; use /v1/responses"}},
+                json={
+                    "error": {
+                        "message": "chat completions not supported; use /v1/responses"
+                    }
+                },
             )
         if request.url.path == "/v1/responses":
             return httpx.Response(200, json={"output_text": "ok"})
@@ -53,18 +57,17 @@ async def test_chat_completions_falls_back_to_responses():
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_sets_default_reasoning_effort_for_gpt5():
+async def test_chat_completions_prefers_responses_for_gpt5_and_sets_max_output_tokens():
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/chat/completions":
+        if request.url.path == "/v1/responses":
             body = json.loads(request.content)
             assert body.get("model") == "gpt-5.2"
-            assert body.get("reasoning_effort") == "medium"
-            return httpx.Response(
-                200,
-                json={
-                    "choices": [{"message": {"content": "ok"}}],
-                },
-            )
+            assert body.get("max_output_tokens") == 20
+            assert body.get("reasoning") == {"effort": "medium"}
+            assert body.get("input") == [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+            return httpx.Response(200, json={"output_text": "ok"})
         raise AssertionError(f"Unexpected request path: {request.url.path}")
 
     transport = httpx.MockTransport(handler)
@@ -85,19 +88,13 @@ async def test_chat_completions_sets_default_reasoning_effort_for_gpt5():
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_maps_xhigh_reasoning_for_responses_fallback():
+async def test_chat_completions_maps_xhigh_reasoning_for_responses():
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/chat/completions":
-            body = json.loads(request.content)
-            assert body.get("model") == "gpt-5.3-codex-xhigh"
-            assert body.get("reasoning_effort") == "high"
-            return httpx.Response(
-                400,
-                json={"error": {"message": "chat completions not supported; use /v1/responses"}},
-            )
         if request.url.path == "/v1/responses":
             body = json.loads(request.content)
-            assert body.get("reasoning") == {"effort": "high"}
+            assert body.get("model") == "gpt-5.3-codex-xhigh"
+            assert body.get("reasoning") == {"effort": "xhigh"}
+            assert body.get("max_output_tokens") == 20
             return httpx.Response(200, json={"output_text": "ok"})
         raise AssertionError(f"Unexpected request path: {request.url.path}")
 
@@ -116,3 +113,64 @@ async def test_chat_completions_maps_xhigh_reasoning_for_responses_fallback():
     finally:
         await client.aclose()
     assert out == "ok"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_honors_reasoning_override_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_OPENAI_REASONING_EFFORT", "xhigh")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/responses":
+            body = json.loads(request.content)
+            assert body.get("model") == "gpt-5.4"
+            assert body.get("reasoning") == {"effort": "xhigh"}
+            return httpx.Response(200, json={"output_text": "ok"})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.2,
+            max_tokens=20,
+            stream=False,
+        )
+    finally:
+        await client.aclose()
+    assert out == "ok"
+
+
+def test_messages_to_responses_input_preserves_multimodal_blocks():
+    converted = AsyncOpenAICompatClient._messages_to_responses_input(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,abc",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert converted == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "look at this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+            ],
+        }
+    ]

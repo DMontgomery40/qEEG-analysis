@@ -9,14 +9,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 
@@ -26,7 +26,6 @@ from .config import (
     CLIPROXY_API_KEY,
     CLIPROXY_BASE_URL,
     COUNCIL_MODELS,
-    DEFAULT_CONSOLIDATOR,
     DISCOVERED_MODEL_IDS,
     EXPORTS_DIR,
     ensure_data_dirs,
@@ -35,10 +34,19 @@ from .config import (
 from .council import QEEGCouncilWorkflow
 from .cliproxy_status import status_payload
 from .exports import render_markdown_to_pdf
-from .llm_client import AsyncOpenAICompatClient, UpstreamError
+from .llm_client import AsyncOpenAICompatClient
+from .logging_utils import configure_logging, get_logger, log_context, new_request_id
 from .patient_files import save_patient_file_upload
-from .reports import extract_pdf_full, extract_text_from_pdf, report_dir as report_storage_dir, save_report_upload
+from .reports import (
+    extract_pdf_full,
+    extract_text_from_pdf,
+    report_dir as report_storage_dir,
+    save_report_upload,
+)
 
+
+configure_logging()
+LOGGER = get_logger(__name__)
 
 app = FastAPI(title="qEEG Council API")
 
@@ -50,6 +58,61 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _slow_request_threshold_ms() -> float:
+    try:
+        value = float(os.getenv("QEEG_SLOW_REQUEST_MS", "2000") or "2000")
+    except Exception:
+        value = 2000.0
+    return max(value, 0.0)
+
+
+@app.middleware("http")
+async def _request_context_middleware(request: Request, call_next):
+    request_id = (
+        (request.headers.get("x-request-id") or "").strip()
+        or (request.query_params.get("request_id") or "").strip()
+        or new_request_id()
+    )
+    start = time.perf_counter()
+
+    with log_context(
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+    ):
+        request.state.request_id = request_id
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            LOGGER.exception("request_failed", duration_ms=duration_ms)
+            raise
+
+        response.headers["X-Request-ID"] = request_id
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        status_code = response.status_code
+        slow_request_ms = _slow_request_threshold_ms()
+
+        if status_code >= 500:
+            LOGGER.error(
+                "request_completed_with_server_error",
+                status_code=status_code,
+                duration_ms=duration_ms,
+            )
+        elif status_code >= 400:
+            LOGGER.warning(
+                "request_completed_with_client_error",
+                status_code=status_code,
+                duration_ms=duration_ms,
+            )
+        elif request.url.path != "/api/health" and duration_ms >= slow_request_ms:
+            LOGGER.info(
+                "slow_request", status_code=status_code, duration_ms=duration_ms
+            )
+
+        return response
 
 
 class PatientCreate(BaseModel):
@@ -88,7 +151,12 @@ class _EventBroker:
             try:
                 q.put_nowait(payload)
             except Exception:
-                pass
+                LOGGER.debug(
+                    "broker_publish_failed",
+                    run_id=run_id,
+                    subscriber_count=len(queues),
+                    exc_info=True,
+                )
 
     async def subscribe(self, run_id: str) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -127,7 +195,9 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-_PORTAL_PATIENT_ID_RE = re.compile(r"^(?P<mm>\d{2})-(?P<dd>\d{2})-(?P<yyyy>\d{4})-(?P<n>\d+)$")
+_PORTAL_PATIENT_ID_RE = re.compile(
+    r"^(?P<mm>\d{2})-(?P<dd>\d{2})-(?P<yyyy>\d{4})-(?P<n>\d+)$"
+)
 
 
 def _normalize_portal_patient_id(value: str) -> str | None:
@@ -178,7 +248,9 @@ def _safe_portal_filename(value: str, *, fallback: str = "upload.bin") -> str:
     return cleaned or fallback
 
 
-def _publish_file_to_portal_folder(*, patient_label: str, src_path: Path, filename: str) -> Path | None:
+def _publish_file_to_portal_folder(
+    *, patient_label: str, src_path: Path, filename: str
+) -> Path | None:
     patient_id = _normalize_portal_patient_id(patient_label)
     if patient_id is None:
         return None
@@ -231,7 +303,9 @@ def _truthy_env(name: str, default: bool) -> bool:
     return default
 
 
-async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroker) -> None:
+async def _auto_generate_patient_facing_for_run(
+    run_id: str, broker: _EventBroker
+) -> None:
     """Best-effort post-run patient-facing generation into portal folder."""
     if not _truthy_env("QEEG_AUTO_PATIENT_FACING", True):
         return
@@ -249,8 +323,12 @@ async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroke
     if normalized_patient_id is None:
         return
 
-    preferred_model = (os.getenv("QEEG_PATIENT_FACING_MODEL", "claude-opus-4-6") or "claude-opus-4-6").strip()
-    version_prefix = (os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto").strip() or "auto"
+    preferred_model = (
+        os.getenv("QEEG_PATIENT_FACING_MODEL", "claude-opus-4-6") or "claude-opus-4-6"
+    ).strip()
+    version_prefix = (
+        os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto"
+    ).strip() or "auto"
     version = f"{version_prefix}-{run_id.split('-')[0]}"
 
     cmd = [
@@ -268,6 +346,13 @@ async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroke
     if configured_portal_dir:
         cmd.extend(["--portal-dir", configured_portal_dir])
 
+    LOGGER.info(
+        "patient_facing_generation_started",
+        run_id=run_id,
+        patient_label=normalized_patient_id,
+        model_id=preferred_model,
+        version=version,
+    )
     await broker.publish(
         run_id,
         {
@@ -290,6 +375,14 @@ async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroke
         out_text = (stdout or b"").decode("utf-8", errors="replace")
         err_text = (stderr or b"").decode("utf-8", errors="replace")
         if proc.returncode == 0:
+            LOGGER.info(
+                "patient_facing_generation_completed",
+                run_id=run_id,
+                patient_label=normalized_patient_id,
+                model_id=preferred_model,
+                version=version,
+                returncode=proc.returncode,
+            )
             await broker.publish(
                 run_id,
                 {
@@ -302,6 +395,14 @@ async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroke
                 },
             )
         else:
+            LOGGER.error(
+                "patient_facing_generation_failed",
+                run_id=run_id,
+                patient_label=normalized_patient_id,
+                model_id=preferred_model,
+                version=version,
+                returncode=proc.returncode,
+            )
             await broker.publish(
                 run_id,
                 {
@@ -314,6 +415,13 @@ async def _auto_generate_patient_facing_for_run(run_id: str, broker: _EventBroke
                 },
             )
     except Exception as e:
+        LOGGER.exception(
+            "patient_facing_generation_crashed",
+            run_id=run_id,
+            patient_label=normalized_patient_id,
+            model_id=preferred_model,
+            version=version,
+        )
         await broker.publish(
             run_id,
             {
@@ -445,7 +553,9 @@ def _kill_cliproxy_listener(port: int) -> list[int]:
             continue
     for pid in pids:
         try:
-            cmd = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True).strip()
+            cmd = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "comm="], text=True
+            ).strip()
             if "cliproxyapi" not in cmd and "cli-proxy-api-plus" not in cmd:
                 continue
             os.kill(pid, 15)
@@ -462,29 +572,45 @@ def _run_detached_proxy_install(log_path: Path, *, tap_router_for_me: bool) -> i
     script_lines.append("echo '[install] trying CLIProxyAPI Plus release install'")
     script_lines.append("OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')")
     script_lines.append("ARCH_NAME=$(uname -m)")
-    script_lines.append("case \"$ARCH_NAME\" in arm64|aarch64) ARCH_NAME=arm64 ;; x86_64|amd64) ARCH_NAME=amd64 ;; esac")
+    script_lines.append(
+        'case "$ARCH_NAME" in arm64|aarch64) ARCH_NAME=arm64 ;; x86_64|amd64) ARCH_NAME=amd64 ;; esac'
+    )
     script_lines.append(
         "ASSET_URL=$(curl -fsSL https://api.github.com/repos/router-for-me/CLIProxyAPIPlus/releases/latest "
         "| grep -Eo 'https://[^\\\"]*CLIProxyAPIPlus_[^\\\"]*_'\"$OS_NAME\"'_'\"$ARCH_NAME\"'\\.tar\\.gz' "
         "| head -n 1 || true)"
     )
-    script_lines.append("if [ -n \"$ASSET_URL\" ]; then")
+    script_lines.append('if [ -n "$ASSET_URL" ]; then')
     script_lines.append("  TMP_DIR=$(mktemp -d)")
-    script_lines.append("  if curl -fsSL \"$ASSET_URL\" -o \"$TMP_DIR/cliproxy-plus.tar.gz\"; then")
-    script_lines.append("    if tar -xzf \"$TMP_DIR/cliproxy-plus.tar.gz\" -C \"$TMP_DIR\"; then")
-    script_lines.append("      mkdir -p \"$HOME/.local/bin\"")
-    script_lines.append("      if [ -f \"$TMP_DIR/cli-proxy-api-plus\" ]; then")
-    script_lines.append("        install -m 0755 \"$TMP_DIR/cli-proxy-api-plus\" \"$HOME/.local/bin/cli-proxy-api-plus\"")
-    script_lines.append("        ln -sf \"$HOME/.local/bin/cli-proxy-api-plus\" \"$HOME/.local/bin/cliproxyapi\" || true")
-    script_lines.append("        echo '[install] CLIProxyAPI Plus installed to $HOME/.local/bin/cli-proxy-api-plus'")
+    script_lines.append(
+        '  if curl -fsSL "$ASSET_URL" -o "$TMP_DIR/cliproxy-plus.tar.gz"; then'
+    )
+    script_lines.append(
+        '    if tar -xzf "$TMP_DIR/cliproxy-plus.tar.gz" -C "$TMP_DIR"; then'
+    )
+    script_lines.append('      mkdir -p "$HOME/.local/bin"')
+    script_lines.append('      if [ -f "$TMP_DIR/cli-proxy-api-plus" ]; then')
+    script_lines.append(
+        '        install -m 0755 "$TMP_DIR/cli-proxy-api-plus" "$HOME/.local/bin/cli-proxy-api-plus"'
+    )
+    script_lines.append(
+        '        ln -sf "$HOME/.local/bin/cli-proxy-api-plus" "$HOME/.local/bin/cliproxyapi" || true'
+    )
+    script_lines.append(
+        "        echo '[install] CLIProxyAPI Plus installed to $HOME/.local/bin/cli-proxy-api-plus'"
+    )
     script_lines.append("        exit 0")
     script_lines.append("      fi")
     script_lines.append("    fi")
     script_lines.append("  fi")
     script_lines.append("fi")
-    script_lines.append("echo '[install] CLIProxyAPI Plus release install failed; trying Homebrew fallback'")
+    script_lines.append(
+        "echo '[install] CLIProxyAPI Plus release install failed; trying Homebrew fallback'"
+    )
     script_lines.append("if ! command -v brew >/dev/null 2>&1; then")
-    script_lines.append("  echo '[install] brew not found; cannot run Homebrew fallback'")
+    script_lines.append(
+        "  echo '[install] brew not found; cannot run Homebrew fallback'"
+    )
     script_lines.append("  exit 1")
     script_lines.append("fi")
     if tap_router_for_me:
@@ -510,7 +636,10 @@ def _get_mock_llm_client() -> AsyncOpenAICompatClient | None:
         return None
 
     try:
-        from backend.tests.fixtures.mock_llm import create_mock_transport, MOCK_MODEL_IDS
+        from backend.tests.fixtures.mock_llm import (
+            create_mock_transport,
+            MOCK_MODEL_IDS,
+        )
     except ImportError:
         # Tests not available (e.g., production deployment)
         return None
@@ -535,11 +664,15 @@ async def _refresh_discovered_models(*, llm: AsyncOpenAICompatClient) -> None:
     try:
         discovered = await llm.list_models()
     except Exception:
+        LOGGER.warning("model_refresh_failed", exc_info=True)
         return
     set_discovered_model_ids(discovered)
+    LOGGER.info("model_refresh_completed", discovered_model_count=len(discovered))
 
 
-async def _model_refresh_loop(*, llm: AsyncOpenAICompatClient, interval_s: float) -> None:
+async def _model_refresh_loop(
+    *, llm: AsyncOpenAICompatClient, interval_s: float
+) -> None:
     # Default: weekly refresh to pick up CLIProxyAPI model catalog updates.
     if interval_s <= 0:
         return
@@ -553,7 +686,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     Reduce clutter in the frontend model picker by hiding older provider versions.
 
     Policy (as requested):
-    - OpenAI: show only GPT-5.2 / GPT-5.3 families (codex + non-codex), hide 5.1 and older
+    - OpenAI: show only GPT-5.2 / GPT-5.3 / GPT-5.4 families (codex + non-codex), hide 5.1 and older
     - Anthropic: hide claude-* models older than 4.6
     - Gemini: hide gemini-* models older than 2.5
 
@@ -567,11 +700,14 @@ def _model_visible_in_ui(model_id: str) -> bool:
 
     # OpenAI (gpt-*)
     openai_id = lower.removeprefix("openai/")
-    m = re.match(r"^gpt-(?P<major>\d+)\.(?P<minor>\d+)(?P<suffix>(?:-[a-z0-9][a-z0-9.]*)*)$", openai_id)
+    m = re.match(
+        r"^gpt-(?P<major>\d+)\.(?P<minor>\d+)(?P<suffix>(?:-[a-z0-9][a-z0-9.]*)*)$",
+        openai_id,
+    )
     if m:
         major = int(m.group("major"))
         minor = int(m.group("minor"))
-        if major != 5 or minor not in {2, 3}:
+        if major != 5 or minor not in {2, 3, 4}:
             return False
         suffix = m.group("suffix") or ""
         tokens = [t for t in suffix.split("-") if t]
@@ -579,7 +715,9 @@ def _model_visible_in_ui(model_id: str) -> bool:
         # the list focused on the requested reasoning tiers.
         if any(t in {"mini", "max"} for t in tokens):
             return False
-        efforts = [t for t in tokens if t in {"minimal", "low", "medium", "high", "xhigh"}]
+        efforts = [
+            t for t in tokens if t in {"minimal", "low", "medium", "high", "xhigh"}
+        ]
         if efforts and any(t not in {"medium", "high", "xhigh"} for t in efforts):
             return False
         return True
@@ -590,7 +728,10 @@ def _model_visible_in_ui(model_id: str) -> bool:
     anthropic_id = lower.removeprefix("anthropic/")
     if anthropic_id.startswith("claude-"):
         # Dot format: claude-<family>-4.6
-        m = re.match(r"^claude-(?:opus|sonnet|haiku)-(?P<major>\d+)\.(?P<minor>\d+)", anthropic_id)
+        m = re.match(
+            r"^claude-(?:opus|sonnet|haiku)-(?P<major>\d+)\.(?P<minor>\d+)",
+            anthropic_id,
+        )
         if m:
             major = int(m.group("major"))
             minor = int(m.group("minor"))
@@ -640,6 +781,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    LOGGER.info("backend_startup_begin")
     ensure_data_dirs()
     storage.init_db()
     _ensure_project_clipr_config()
@@ -670,16 +812,25 @@ async def _startup() -> None:
     if not app.state.mock_mode:
         await _refresh_discovered_models(llm=app.state.llm)
         try:
-            interval_s = float(os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0")
+            interval_s = float(
+                os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0"
+            )
         except Exception:
             interval_s = 7 * 24 * 60 * 60
         if interval_s < 0:
             interval_s = 0
-        app.state.model_refresh_task = asyncio.create_task(_model_refresh_loop(llm=app.state.llm, interval_s=interval_s))
+        app.state.model_refresh_task = asyncio.create_task(
+            _model_refresh_loop(llm=app.state.llm, interval_s=interval_s)
+        )
+    LOGGER.info(
+        "backend_startup_complete",
+        mock_mode=bool(app.state.mock_mode),
+    )
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    LOGGER.info("backend_shutdown_begin")
     task = getattr(app.state, "model_refresh_task", None)
     if task is not None:
         task.cancel()
@@ -688,6 +839,7 @@ async def _shutdown() -> None:
     llm: AsyncOpenAICompatClient | None = getattr(app.state, "llm", None)
     if llm is not None:
         await llm.aclose()
+    LOGGER.info("backend_shutdown_complete")
 
 
 @app.get("/api/health")
@@ -698,6 +850,7 @@ async def health() -> dict[str, Any]:
     # In mock mode, always return healthy
     if mock_mode:
         from backend.tests.fixtures.mock_llm import MOCK_MODEL_IDS
+
         return {
             **status_payload(
                 base_url="http://mock-cliproxy",
@@ -835,7 +988,9 @@ async def models() -> dict[str, Any]:
                 "name": m.name,
                 "source": m.source,
                 "endpoint_preference": m.endpoint_preference,
-                "available": m.id in DISCOVERED_MODEL_IDS if DISCOVERED_MODEL_IDS else False,
+                "available": m.id in DISCOVERED_MODEL_IDS
+                if DISCOVERED_MODEL_IDS
+                else False,
             }
         )
     return {
@@ -862,7 +1017,10 @@ async def list_patients() -> list[dict[str, Any]]:
             )
             patient_ids_with_video = set(session.scalars(q).all())
 
-        return [_patient_out(p, has_explainer_video=(p.id in patient_ids_with_video)) for p in pts]
+        return [
+            _patient_out(p, has_explainer_video=(p.id in patient_ids_with_video))
+            for p in pts
+        ]
 
 
 @app.post("/api/patients")
@@ -889,7 +1047,12 @@ async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str,
         filename = (file.filename or "upload").strip() or "upload"
         patient_label = Path(filename).stem.strip()
         if not patient_label:
-            errors.append({"filename": filename, "error": "Empty filename stem (cannot derive patient label)"})
+            errors.append(
+                {
+                    "filename": filename,
+                    "error": "Empty filename stem (cannot derive patient label)",
+                }
+            )
             continue
 
         label_key = patient_label.lower()
@@ -967,13 +1130,19 @@ async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str,
                     shutil.rmtree(report_folder, ignore_errors=True)
                 except Exception:
                     pass
-            errors.append({"filename": filename, "patient_label": patient_label, "error": str(e)})
+            errors.append(
+                {"filename": filename, "patient_label": patient_label, "error": str(e)}
+            )
 
     return {
         "created": created,
         "skipped": skipped,
         "errors": errors,
-        "counts": {"created": len(created), "skipped": len(skipped), "errors": len(errors)},
+        "counts": {
+            "created": len(created),
+            "skipped": len(skipped),
+            "errors": len(errors),
+        },
     }
 
 
@@ -985,7 +1154,10 @@ async def get_patient(patient_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Patient not found")
         q = (
             sa_select(storage.PatientFile.id)
-            .where(storage.PatientFile.patient_id == patient_id, storage.PatientFile.mime_type == "video/mp4")
+            .where(
+                storage.PatientFile.patient_id == patient_id,
+                storage.PatientFile.mime_type == "video/mp4",
+            )
             .limit(1)
         )
         has_video = session.scalars(q).first() is not None
@@ -995,13 +1167,18 @@ async def get_patient(patient_id: str) -> dict[str, Any]:
 @app.put("/api/patients/{patient_id}")
 async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        p = storage.update_patient(session, patient_id, label=req.label, notes=req.notes)
+        p = storage.update_patient(
+            session, patient_id, label=req.label, notes=req.notes
+        )
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
         _ensure_portal_patient_folder(p.label)
         q = (
             sa_select(storage.PatientFile.id)
-            .where(storage.PatientFile.patient_id == patient_id, storage.PatientFile.mime_type == "video/mp4")
+            .where(
+                storage.PatientFile.patient_id == patient_id,
+                storage.PatientFile.mime_type == "video/mp4",
+            )
             .limit(1)
         )
         has_video = session.scalars(q).first() is not None
@@ -1009,7 +1186,9 @@ async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
 
 
 @app.post("/api/patients/{patient_id}/reports")
-async def upload_report(patient_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_report(
+    patient_id: str, file: UploadFile = File(...)
+) -> dict[str, Any]:
     with storage.session_scope() as session:
         p = storage.get_patient(session, patient_id)
         if p is None:
@@ -1035,7 +1214,11 @@ async def upload_report(patient_id: str, file: UploadFile = File(...)) -> dict[s
             stored_path=original_path,
             extracted_text_path=extracted_path,
         )
-        return {"report_id": report.id, "preview": preview, "report": _report_out(report)}
+        return {
+            "report_id": report.id,
+            "preview": preview,
+            "report": _report_out(report),
+        }
 
 
 @app.get("/api/patients/{patient_id}/reports")
@@ -1059,7 +1242,9 @@ async def list_patient_files(patient_id: str) -> list[dict[str, Any]]:
 
 
 @app.post("/api/patients/{patient_id}/files")
-async def upload_patient_file(patient_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_patient_file(
+    patient_id: str, file: UploadFile = File(...)
+) -> dict[str, Any]:
     with storage.session_scope() as session:
         p = storage.get_patient(session, patient_id)
         if p is None:
@@ -1091,7 +1276,10 @@ async def upload_patient_file(patient_id: str, file: UploadFile = File(...)) -> 
             src_path=Path(pf.stored_path),
             filename=pf.filename,
         )
-        return {"file": _patient_file_out(pf), "portal_published_path": str(portal_path) if portal_path else None}
+        return {
+            "file": _patient_file_out(pf),
+            "portal_published_path": str(portal_path) if portal_path else None,
+        }
 
 
 @app.get("/api/patient_files/{file_id}")
@@ -1145,7 +1333,11 @@ async def get_report_extracted(report_id: str):
         # Prefer the enhanced multi-source extraction when present so the UI preview never shows only a
         # single (potentially noisy) OCR engine.
         enhanced_path = report_dir / "extracted_enhanced.txt"
-        path = enhanced_path if enhanced_path.exists() and enhanced_path.stat().st_size > 0 else extracted_path
+        path = (
+            enhanced_path
+            if enhanced_path.exists() and enhanced_path.stat().st_size > 0
+            else extracted_path
+        )
         if not path.exists():
             raise HTTPException(status_code=404, detail="Extracted text not found")
         if path == enhanced_path:
@@ -1162,7 +1354,9 @@ async def get_report_extracted(report_id: str):
                     return PlainTextResponse(normalized)
             except Exception:
                 pass
-        return FileResponse(str(path), media_type="text/plain", filename="extracted.txt")
+        return FileResponse(
+            str(path), media_type="text/plain", filename="extracted.txt"
+        )
 
 
 @app.post("/api/reports/{report_id}/reextract")
@@ -1175,7 +1369,9 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
         extracted_path = Path(report.extracted_text_path)
 
     if original_path.suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Re-extract only supported for PDFs")
+        raise HTTPException(
+            status_code=400, detail="Re-extract only supported for PDFs"
+        )
 
     # Best-effort: also regenerate enhanced OCR text + page images for multimodal Stage 1.
     # IMPORTANT: write into the same folder as extracted_path (some older reports used a
@@ -1183,6 +1379,11 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
     report_dir = extracted_path.parent
     enhanced_chars: int | None = None
     page_images_written = 0
+    LOGGER.info(
+        "report_reextract_started",
+        report_id=report_id,
+        stored_path=str(original_path),
+    )
     try:
         full = extract_pdf_full(original_path)
         enhanced_text = full.enhanced_text
@@ -1217,10 +1418,18 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
             if not isinstance(page_num, int):
                 continue
             try:
-                (sources_dir / f"page-{page_num}.pypdf.txt").write_text(p.get("pypdf_text", ""), encoding="utf-8")
-                (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(p.get("pymupdf_text", ""), encoding="utf-8")
-                (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(p.get("vision_ocr_text", ""), encoding="utf-8")
-                (sources_dir / f"page-{page_num}.tesseract.txt").write_text(p.get("tesseract_ocr_text", ""), encoding="utf-8")
+                (sources_dir / f"page-{page_num}.pypdf.txt").write_text(
+                    p.get("pypdf_text", ""), encoding="utf-8"
+                )
+                (sources_dir / f"page-{page_num}.pymupdf.txt").write_text(
+                    p.get("pymupdf_text", ""), encoding="utf-8"
+                )
+                (sources_dir / f"page-{page_num}.apple_vision.txt").write_text(
+                    p.get("vision_ocr_text", ""), encoding="utf-8"
+                )
+                (sources_dir / f"page-{page_num}.tesseract.txt").write_text(
+                    p.get("tesseract_ocr_text", ""), encoding="utf-8"
+                )
             except Exception:
                 continue
 
@@ -1233,8 +1442,16 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
                 "sources_dir": "sources",
             }
         )
-        (report_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        (report_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
     except Exception:
+        LOGGER.warning(
+            "report_reextract_fallback_to_basic_extraction",
+            report_id=report_id,
+            stored_path=str(original_path),
+            exc_info=True,
+        )
         # Fallback: regenerate extracted.txt with basic extraction (no multimodal assets).
         text = extract_text_from_pdf(original_path)
         extracted_path.write_text(text, encoding="utf-8")
@@ -1245,7 +1462,18 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
             "page_images_written": 0,
         }
 
-    return {"ok": True, "chars": enhanced_chars or 0, "enhanced_chars": enhanced_chars, "page_images_written": page_images_written}
+    LOGGER.info(
+        "report_reextract_completed",
+        report_id=report_id,
+        enhanced_chars=enhanced_chars,
+        page_images_written=page_images_written,
+    )
+    return {
+        "ok": True,
+        "chars": enhanced_chars or 0,
+        "enhanced_chars": enhanced_chars,
+        "page_images_written": page_images_written,
+    }
 
 
 @app.get("/api/reports/{report_id}/original")
@@ -1293,10 +1521,12 @@ async def list_report_pages(report_id: str) -> dict[str, Any]:
         # Extract page number from filename like "page-0.png"
         try:
             page_num = int(png_file.stem.split("-")[1])
-            pages.append({
-                "page": page_num,
-                "url": f"/api/reports/{report_id}/pages/{page_num}",
-            })
+            pages.append(
+                {
+                    "page": page_num,
+                    "url": f"/api/reports/{report_id}/pages/{page_num}",
+                }
+            )
         except (IndexError, ValueError):
             continue
 
@@ -1369,7 +1599,9 @@ async def list_runs(patient_id: str) -> list[dict[str, Any]]:
 @app.post("/api/runs")
 async def create_run(req: RunCreate) -> dict[str, Any]:
     if not req.council_model_ids:
-        raise HTTPException(status_code=400, detail="council_model_ids must be non-empty")
+        raise HTTPException(
+            status_code=400, detail="council_model_ids must be non-empty"
+        )
     if not req.consolidator_model_id:
         raise HTTPException(status_code=400, detail="consolidator_model_id is required")
 
@@ -1396,18 +1628,34 @@ async def start_run(run_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status == "running":
             return _run_out(run)
+        patient_id = run.patient_id
+        report_id = run.report_id
 
     broker: _EventBroker = app.state.broker
     workflow: QEEGCouncilWorkflow = app.state.workflow
 
     async def _runner() -> None:
-        async def on_event(payload: dict[str, Any]) -> None:
-            await broker.publish(run_id, payload)
+        with log_context(run_id=run_id, patient_id=patient_id, report_id=report_id):
+            LOGGER.info("run_task_started")
 
-        await workflow.run_pipeline(run_id, on_event=on_event)
-        await _auto_generate_patient_facing_for_run(run_id, broker)
+            async def on_event(payload: dict[str, Any]) -> None:
+                await broker.publish(run_id, payload)
 
-    asyncio.create_task(_runner())
+            try:
+                await workflow.run_pipeline(run_id, on_event=on_event)
+                await _auto_generate_patient_facing_for_run(run_id, broker)
+            except Exception:
+                LOGGER.exception("run_task_crashed")
+                raise
+            LOGGER.info("run_task_completed")
+
+    LOGGER.info(
+        "run_task_scheduled",
+        run_id=run_id,
+        patient_id=patient_id,
+        report_id=report_id,
+    )
+    asyncio.create_task(_runner(), name=f"qeeg-run-{run_id}")
     return {"ok": True}
 
 
@@ -1458,7 +1706,9 @@ async def stream(run_id: str):
             with storage.session_scope() as session:
                 run = storage.get_run(session, run_id)
                 if run is not None:
-                    yield _sse({"run_id": run_id, "type": "snapshot", "run": _run_out(run)})
+                    yield _sse(
+                        {"run_id": run_id, "type": "snapshot", "run": _run_out(run)}
+                    )
 
             while True:
                 try:
@@ -1486,9 +1736,16 @@ async def select(run_id: str, req: SelectRequest) -> dict[str, Any]:
         artifact_id = req.artifact_id
         if artifact_id is None:
             if req.stage_num is None or req.model_id is None or req.kind is None:
-                raise HTTPException(status_code=400, detail="Provide artifact_id or (stage_num, model_id, kind)")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide artifact_id or (stage_num, model_id, kind)",
+                )
             art = storage.find_artifact(
-                session, run_id=run_id, stage_num=req.stage_num, model_id=req.model_id, kind=req.kind
+                session,
+                run_id=run_id,
+                stage_num=req.stage_num,
+                model_id=req.model_id,
+                kind=req.kind,
             )
             if art is None:
                 raise HTTPException(status_code=404, detail="Artifact not found")
@@ -1562,7 +1819,9 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _patient_out(p: storage.Patient, *, has_explainer_video: bool = False) -> dict[str, Any]:
+def _patient_out(
+    p: storage.Patient, *, has_explainer_video: bool = False
+) -> dict[str, Any]:
     return {
         "id": p.id,
         "label": p.label,

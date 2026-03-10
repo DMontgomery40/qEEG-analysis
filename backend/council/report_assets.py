@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 
 from ..reports import get_enhanced_text, get_page_images_base64
@@ -41,7 +42,10 @@ def _load_best_report_text(report: Report, report_dir: Path) -> str:
 
     # Never re-extract on the fly here: to avoid widening the error surface in later stages, we require
     # extraction artifacts to already be present and well-formed.
-    if "=== PAGE 1 /" not in report_text and Path(report.stored_path).suffix.lower() == ".pdf":
+    if (
+        "=== PAGE 1 /" not in report_text
+        and Path(report.stored_path).suffix.lower() == ".pdf"
+    ):
         raise RuntimeError(
             "Report text is missing page markers (expected '=== PAGE 1 /').\n"
             f"Report: {report.filename} ({report.id})\n"
@@ -53,11 +57,33 @@ def _load_best_report_text(report: Report, report_dir: Path) -> str:
 
 
 def _load_page_images(report: Report, report_dir: Path) -> list[PageImage]:
+    labels_by_page: dict[int, str] = {}
+    meta_path = report_dir / "metadata.json"
+    if meta_path.exists():
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = None
+        if isinstance(metadata, dict):
+            synthetic = metadata.get("synthetic_combined")
+            if isinstance(synthetic, dict):
+                raw_labels = synthetic.get("page_labels")
+                if isinstance(raw_labels, dict):
+                    for key, value in raw_labels.items():
+                        try:
+                            page_num = int(key)
+                        except Exception:
+                            continue
+                        if isinstance(value, str) and value.strip():
+                            labels_by_page[page_num] = value.strip()
+
     pages_dir = report_dir / "pages"
     if pages_dir.exists():
         page_files = sorted(
             pages_dir.glob("page-*.png"),
-            key=lambda p: int(p.stem.split("-")[1]) if "-" in p.stem and p.stem.split("-")[1].isdigit() else 0,
+            key=lambda p: int(p.stem.split("-")[1])
+            if "-" in p.stem and p.stem.split("-")[1].isdigit()
+            else 0,
         )
         out: list[PageImage] = []
         for p in page_files:
@@ -66,7 +92,13 @@ def _load_page_images(report: Report, report_dir: Path) -> list[PageImage]:
             except Exception:
                 continue
             try:
-                out.append(PageImage(page=page_num, base64_png=base64.b64encode(p.read_bytes()).decode("utf-8")))
+                out.append(
+                    PageImage(
+                        page=page_num,
+                        base64_png=base64.b64encode(p.read_bytes()).decode("utf-8"),
+                        label=labels_by_page.get(page_num),
+                    )
+                )
             except Exception:
                 continue
         if out:
@@ -77,5 +109,8 @@ def _load_page_images(report: Report, report_dir: Path) -> list[PageImage]:
         images = get_page_images_base64(report.patient_id, report.id)
     except Exception:
         images = []
-    return [PageImage(page=i + 1, base64_png=b64) for i, b64 in enumerate(images) if isinstance(b64, str)]
-
+    return [
+        PageImage(page=i + 1, base64_png=b64, label=labels_by_page.get(i + 1))
+        for i, b64 in enumerate(images)
+        if isinstance(b64, str)
+    ]

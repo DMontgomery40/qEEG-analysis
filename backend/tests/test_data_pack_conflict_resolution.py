@@ -35,3 +35,67 @@ def test_filter_shadowed_facts_prefers_deterministic_and_avoids_conflicts():
     assert _DataPackMixin._find_fact_conflicts(det + filtered_vision) == []
 
 
+def test_page_session_aliases_remap_and_drop_restarted_series_duplicates():
+    facts = [
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 1,
+            "source_page": 1,
+            "value": 283,
+        },
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 2,
+            "source_page": 1,
+            "value": 280,
+        },
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 1,
+            "source_page": 18,
+            "value": 280,
+        },
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 2,
+            "source_page": 18,
+            "value": 275,
+        },
+    ]
+
+    normalized = _DataPackMixin._normalize_facts_for_page_session_aliases(
+        facts,
+        page_session_aliases={
+            1: {1: 1, 2: 2},
+            18: {1: 2, 2: 3},
+        },
+    )
+
+    assert normalized == [
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 1,
+            "source_page": 1,
+            "value": 283,
+        },
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 2,
+            "source_page": 1,
+            "value": 280,
+        },
+        {
+            "fact_type": "performance_metric",
+            "metric": "physical_reaction_time",
+            "session_index": 3,
+            "local_session_index": 2,
+            "source_page": 18,
+            "value": 275,
+        },
+    ]

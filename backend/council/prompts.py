@@ -78,97 +78,98 @@ def _data_pack_prompt(*, pages: list[int], focus: str) -> str:
         "- n100_central_frontal_average.fact_type: n100_central_frontal_average\n\n"
         "JSON schema:\n"
         "{\n"
-        f'  \"schema_version\": {DATA_PACK_SCHEMA_VERSION},\n'
-        "  \"pages_seen\": [1, 2],\n"
-        "  \"page_inventory\": [\n"
-        "    {\"page\": 1, \"title\": \"...\", \"contains\": [\"summary_table\"], \"notes\": \"...\"}\n"
+        f'  "schema_version": {DATA_PACK_SCHEMA_VERSION},\n'
+        '  "pages_seen": [1, 2],\n'
+        '  "page_inventory": [\n'
+        '    {"page": 1, "title": "...", "contains": ["summary_table"], "notes": "..."}\n'
         "  ],\n"
-        "  \"facts\": [\n"
+        '  "facts": [\n'
         "    {\n"
-        "      \"fact_type\": \"performance_metric\",\n"
-        "      \"metric\": \"physical_reaction_time\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"value\": 283,\n"
-        "      \"unit\": \"ms\",\n"
-        "      \"sd_plus_minus\": 38,\n"
-        "      \"target_range\": \"255-367 ms\",\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 1\n"
+        '      "fact_type": "performance_metric",\n'
+        '      "metric": "physical_reaction_time",\n'
+        '      "session_index": 1,\n'
+        '      "value": 283,\n'
+        '      "unit": "ms",\n'
+        '      "sd_plus_minus": 38,\n'
+        '      "target_range": "255-367 ms",\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 1\n'
         "    },\n"
         "    {\n"
-        "      \"fact_type\": \"performance_metric\",\n"
-        "      \"metric\": \"trail_making_test_a\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"value\": 56,\n"
-        "      \"unit\": \"sec\",\n"
-        "      \"target_range\": \"37-63 sec\",\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 1\n"
+        '      "fact_type": "performance_metric",\n'
+        '      "metric": "trail_making_test_a",\n'
+        '      "session_index": 1,\n'
+        '      "value": 56,\n'
+        '      "unit": "sec",\n'
+        '      "target_range": "37-63 sec",\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 1\n'
         "    },\n"
         "    {\n"
-        "      \"fact_type\": \"evoked_potential\",\n"
-        "      \"metric\": \"audio_p300_delay\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"value\": 304,\n"
-        "      \"unit\": \"ms\",\n"
-        "      \"target_range\": \"247-321 ms\",\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 1\n"
+        '      "fact_type": "evoked_potential",\n'
+        '      "metric": "audio_p300_delay",\n'
+        '      "session_index": 1,\n'
+        '      "value": 304,\n'
+        '      "unit": "ms",\n'
+        '      "target_range": "247-321 ms",\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 1\n'
         "    },\n"
         "    {\n"
-        "      \"fact_type\": \"state_metric\",\n"
-        "      \"metric\": \"cz_theta_beta_ratio_ec\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"value\": 3.1,\n"
-        "      \"unit\": \"ratio\",\n"
-        "      \"target_range\": \"0.9-2.3\",\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 1\n"
+        '      "fact_type": "state_metric",\n'
+        '      "metric": "cz_theta_beta_ratio_ec",\n'
+        '      "session_index": 1,\n'
+        '      "value": 3.1,\n'
+        '      "unit": "ratio",\n'
+        '      "target_range": "0.9-2.3",\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 1\n'
         "    },\n"
         "    {\n"
-        "      \"fact_type\": \"peak_frequency\",\n"
-        "      \"metric\": \"frontal_peak_frequency_ec\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"value\": 8.5,\n"
-        "      \"unit\": \"Hz\",\n"
-        "      \"target_range\": \"9.0-11.0 Hz\",\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 1\n"
+        '      "fact_type": "peak_frequency",\n'
+        '      "metric": "frontal_peak_frequency_ec",\n'
+        '      "session_index": 1,\n'
+        '      "value": 8.5,\n'
+        '      "unit": "Hz",\n'
+        '      "target_range": "9.0-11.0 Hz",\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 1\n'
         "    },\n"
         "    {\n"
-        "      \"fact_type\": \"p300_cp_site\",\n"
-        "      \"site\": \"C3\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"yield\": 38,\n"
-        "      \"uv\": 11.9,\n"
-        "      \"ms\": 308,\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 2\n"
+        '      "fact_type": "p300_cp_site",\n'
+        '      "site": "C3",\n'
+        '      "session_index": 1,\n'
+        '      "yield": 38,\n'
+        '      "uv": 11.9,\n'
+        '      "ms": 308,\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 2\n'
         "    },\n"
         "    {\n"
-        "      \"fact_type\": \"n100_central_frontal_average\",\n"
-        "      \"session_index\": 1,\n"
-        "      \"yield\": 36,\n"
-        "      \"uv\": -4.4,\n"
-        "      \"ms\": 120,\n"
-        "      \"shown_as\": null,\n"
-        "      \"source_page\": 2\n"
+        '      "fact_type": "n100_central_frontal_average",\n'
+        '      "session_index": 1,\n'
+        '      "yield": 36,\n'
+        '      "uv": -4.4,\n'
+        '      "ms": 120,\n'
+        '      "shown_as": null,\n'
+        '      "source_page": 2\n'
         "    }\n"
         "  ],\n"
-        "  \"unparsed_required\": [\n"
-        "    {\"field\": \"p300_cp_site\", \"page\": 2, \"reason\": \"...\"}\n"
+        '  "unparsed_required": [\n'
+        '    {"field": "p300_cp_site", "page": 2, "reason": "..."}\n'
         "  ]\n"
         "}\n\n"
         "Rules:\n"
         "- Transcribe only what you can read confidently from the images. Do not infer or normalize.\n"
         "- Use JSON numbers (not strings) whenever possible.\n"
-        "- If the report shows N/A, set the numeric field to null and set \"shown_as\" to \"N/A\".\n"
-        "- Always include \"source_page\" for each fact.\n"
-        "- Maintain session_index mapping exactly as shown in the legend (Session 1/2/3 color key).\n"
+        '- If the report shows N/A, set the numeric field to null and set "shown_as" to "N/A".\n'
+        '- Always include "source_page" for each fact.\n'
+        "- Maintain session_index mapping exactly as shown in the legend (Session 1/2/3 color key), unless the PAGE "
+        "tag provides an explicit local-to-global session alias; when such an alias is present, output the GLOBAL "
+        "session index.\n"
         "- When Peak Frequency is shown, extract it for Frontal, Central-Parietal, and Occipital for every session.\n"
         "- Critical: When the page includes P300 Rare Comparison, extract central-parietal per-site values for "
         "C3, CZ, C4, P3, PZ, P4 for EVERY session shown. Capture yield (#), uv (µV), and ms.\n"
         "- Also extract CENTRAL-FRONTAL AVERAGE N100 values (yield, µV, ms) if present on the page.\n"
         "- Ignore large coherence matrices unless they contain the required facts above.\n"
     )
-

@@ -6,12 +6,14 @@ import BulkUploadPage from './components/BulkUploadPage';
 import PatientPage from './components/PatientPage';
 import RunPage from './components/RunPage';
 import ResizeHandle from './components/ResizeHandle';
+import { childLogger, errorMessage, serializeError } from './logger';
 
 // Panel size persistence
 const STORAGE_KEY = 'qeeg-panel-sizes';
 const DEFAULT_SIDEBAR_WIDTH = 300;
 const MIN_SIDEBAR_WIDTH = 200;
 const MAX_SIDEBAR_WIDTH = 500;
+const appLogger = childLogger({ area: 'app' });
 
 function loadPanelSizes() {
   try {
@@ -66,12 +68,25 @@ function App() {
     return map;
   }, [models]);
 
-  async function refreshModels() {
+  const handleError = useCallback((error, context = {}) => {
+    const message = errorMessage(error);
+    appLogger.warn(
+      {
+        ...context,
+        uiMessage: message,
+        err: serializeError(error),
+      },
+      'ui_error'
+    );
+    setError(message);
+  }, []);
+
+  const refreshModels = useCallback(async () => {
     const m = await api.models();
     setModels(m);
-  }
+  }, []);
 
-  async function refreshHealth() {
+  const refreshHealth = useCallback(async () => {
     const h = await api.health();
     setHealth(h);
 
@@ -96,13 +111,13 @@ function App() {
         // ignore; user can use manual buttons
       }
     }
-  }
+  }, []);
 
-  async function refreshPatients() {
+  const refreshPatients = useCallback(async () => {
     const p = await api.listPatients();
     setPatients(p);
     if (p.length && !selectedPatientId) setSelectedPatientId(p[0].id);
-  }
+  }, [selectedPatientId]);
 
   useEffect(() => {
     (async () => {
@@ -111,10 +126,10 @@ function App() {
         await refreshModels();
         await refreshPatients();
       } catch (e) {
-        setError(String(e?.message || e));
+        handleError(e, { action: 'initial_load' });
       }
     })();
-  }, []);
+  }, [handleError, refreshHealth, refreshModels, refreshPatients]);
 
   const showRun = selectedRunId != null;
 
@@ -138,7 +153,7 @@ function App() {
             await refreshPatients();
             setSelectedPatientId(p.id);
           } catch (e) {
-            setError(String(e?.message || e));
+            handleError(e, { action: 'create_patient' });
           }
         }}
         style={{ width: sidebarWidth }}
@@ -165,7 +180,7 @@ function App() {
                   await refreshModels();
                   await refreshPatients();
                 } catch (e) {
-                  setError(String(e?.message || e));
+                  handleError(e, { action: 'retry_health_refresh' });
                 }
               }}
             >
@@ -179,7 +194,10 @@ function App() {
                   try {
                     if (!health.cliproxyapi_installed && health.brew_installed) {
                       await api.cliproxyInstall({});
-                      setError('Installing CLIProxyAPI… check data/cliproxy_install.log then retry.');
+                      handleError(
+                        'Installing CLIProxyAPI… check data/cliproxy_install.log then retry.',
+                        { action: 'cliproxy_install' }
+                      );
                       return;
                     }
                     const cfg = health.cliproxy_config_found?.[0];
@@ -188,7 +206,7 @@ function App() {
                     await refreshModels();
                     await refreshPatients();
                   } catch (e) {
-                    setError(String(e?.message || e));
+                    handleError(e, { action: 'cliproxy_start_or_install' });
                   }
                 }}
               >
@@ -203,7 +221,7 @@ function App() {
                     try {
                       await api.cliproxyLogin({ mode: 'login' });
                     } catch (e) {
-                      setError(String(e?.message || e));
+                      handleError(e, { action: 'cliproxy_login_all' });
                     }
                   }}
                 >
@@ -216,7 +234,7 @@ function App() {
                     try {
                       await api.cliproxyLogin({ mode: 'claude' });
                     } catch (e) {
-                      setError(String(e?.message || e));
+                      handleError(e, { action: 'cliproxy_login_claude' });
                     }
                   }}
                 >
@@ -229,7 +247,7 @@ function App() {
                     try {
                       await api.cliproxyLogin({ mode: 'codex' });
                     } catch (e) {
-                      setError(String(e?.message || e));
+                      handleError(e, { action: 'cliproxy_login_codex' });
                     }
                   }}
                 >
@@ -245,7 +263,7 @@ function App() {
                         project_id: geminiProjectId.trim() || null,
                       });
                     } catch (e) {
-                      setError(String(e?.message || e));
+                      handleError(e, { action: 'cliproxy_login_gemini' });
                     }
                   }}
                 >
@@ -282,7 +300,7 @@ function App() {
               setSelectedPatientId(id);
             }}
             onClose={() => setShowBulkUpload(false)}
-            onError={(msg) => setError(msg)}
+            onError={handleError}
             onRefreshPatients={refreshPatients}
           />
         ) : showRun ? (
@@ -290,7 +308,7 @@ function App() {
             runId={selectedRunId}
             modelMetaById={modelMetaById}
             onBack={() => setSelectedRunId(null)}
-            onError={(msg) => setError(msg)}
+            onError={handleError}
           />
         ) : (
           <PatientPage
@@ -306,10 +324,10 @@ function App() {
                 await refreshModels();
                 await refreshPatients();
               } catch (e) {
-                setError(String(e?.message || e));
+                handleError(e, { action: 'refresh_global' });
               }
             }}
-            onError={(msg) => setError(msg)}
+            onError={handleError}
           />
         )}
       </div>
