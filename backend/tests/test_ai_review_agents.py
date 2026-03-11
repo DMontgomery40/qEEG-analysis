@@ -89,6 +89,26 @@ async def test_stage5_final_review_accepts_valid_fixture():
 
 
 @pytest.mark.asyncio
+async def test_stage5_final_review_allows_revise_with_empty_required_changes():
+    payload = await run_stage5_final_review(
+        llm_client=None,
+        model_id="mock-council-a",
+        prompt_text="Review this consolidated report.",
+        model_override=TestModel(
+            custom_output_args={
+                "vote": "REVISE",
+                "required_changes": [],
+                "optional_changes": ["Clarify the summary wording."],
+                "quality_score_1to10": 6,
+            }
+        ),
+    )
+
+    assert payload.vote == "REVISE"
+    assert payload.required_changes == []
+
+
+@pytest.mark.asyncio
 async def test_stage5_final_review_retries_when_vote_conflicts_with_required_changes():
     attempts = {"count": 0}
     invalid = _fixture("stage5_approve_with_required_changes.json")

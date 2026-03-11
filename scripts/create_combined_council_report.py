@@ -40,6 +40,7 @@ from backend.storage import (  # noqa: E402
     create_run,
     find_patients_by_label,
     get_patient,
+    get_run,
     init_db,
     list_runs,
     session_scope,
@@ -504,6 +505,15 @@ async def _maybe_create_and_run(
         await workflow.run_pipeline(run_id)
     finally:
         await llm.aclose()
+
+    with session_scope() as session:
+        run = get_run(session, run_id)
+        if run is None:
+            raise RuntimeError(f"Run {run_id} not found after execution")
+        if run.status != "complete":
+            raise RuntimeError(
+                f"Run {run_id} finished with status={run.status}: {run.error_message or run.status}"
+            )
 
     return (run_id, run_id)
 

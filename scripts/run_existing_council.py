@@ -14,6 +14,7 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, set_discovered_model_ids  # noqa: E402
 from backend.council import QEEGCouncilWorkflow  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient  # noqa: E402
+from backend.storage import get_run, session_scope  # noqa: E402
 
 
 async def _main(run_id: str) -> int:
@@ -33,6 +34,18 @@ async def _main(run_id: str) -> int:
         await workflow.run_pipeline(run_id, on_event=on_event)
     finally:
         await llm.aclose()
+
+    with session_scope() as session:
+        run = get_run(session, run_id)
+        if run is None:
+            print(f"Run not found after execution: {run_id}", file=sys.stderr)
+            return 1
+        if run.status != "complete":
+            print(
+                f"Run {run_id} finished with status={run.status}: {run.error_message or run.status}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

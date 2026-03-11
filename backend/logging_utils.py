@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import sys
 import uuid
 from typing import Any, Iterator
 
@@ -27,13 +26,13 @@ def configure_logging() -> structlog.stdlib.BoundLogger:
 
     level_name = _level_name()
     level = getattr(logging, level_name, logging.INFO)
-
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=level,
-        force=True,
-    )
+    backend_logger = logging.getLogger("backend")
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    backend_logger.handlers.clear()
+    backend_logger.addHandler(handler)
+    backend_logger.setLevel(level)
+    backend_logger.propagate = False
 
     structlog.configure(
         processors=[

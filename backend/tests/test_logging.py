@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+import io
+import logging
 import re
 from pathlib import Path
 
@@ -39,3 +42,29 @@ def test_request_id_header_is_generated_when_missing(temp_data_dir, monkeypatch)
     assert response.status_code == 200
     assert generated is not None
     assert re.fullmatch(r"[0-9a-f]{32}", generated)
+
+
+def test_configure_logging_does_not_reset_root_handlers():
+    import backend.logging_utils as logging_utils
+
+    logging_utils = importlib.reload(logging_utils)
+    root = logging.getLogger()
+    backend_logger = logging.getLogger("backend")
+
+    original_root_handlers = list(root.handlers)
+    original_backend_handlers = list(backend_logger.handlers)
+    original_backend_level = backend_logger.level
+    original_backend_propagate = backend_logger.propagate
+
+    sentinel = logging.StreamHandler(io.StringIO())
+    root.handlers = [sentinel]
+
+    try:
+        logging_utils.configure_logging()
+        assert root.handlers == [sentinel]
+    finally:
+        root.handlers = original_root_handlers
+        backend_logger.handlers = original_backend_handlers
+        backend_logger.setLevel(original_backend_level)
+        backend_logger.propagate = original_backend_propagate
+        setattr(logging_utils.configure_logging, "_configured", False)

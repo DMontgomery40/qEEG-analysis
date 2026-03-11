@@ -22,11 +22,12 @@ async function request(path, options = {}) {
   const requestId = newRequestId();
   const startedAt = performance.now();
   const headers = new Headers(options.headers || {});
-  headers.set('X-Request-ID', requestId);
+  const url = new URL(`${API_BASE}${path}`);
+  url.searchParams.set('request_id', requestId);
   const log = apiLogger.child({ method, path, requestId });
 
   try {
-    const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    const res = await fetch(url.toString(), { ...options, headers });
     const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
     const serverRequestId = res.headers.get('x-request-id') || requestId;
 
@@ -62,8 +63,8 @@ async function request(path, options = {}) {
     );
 
     const ct = res.headers.get('content-type') || '';
-    if (ct.includes('application/json')) return res.json();
-    return res.text();
+    if (ct.includes('application/json')) return await res.json();
+    return await res.text();
   } catch (error) {
     if (error instanceof ApiError) throw error;
 
