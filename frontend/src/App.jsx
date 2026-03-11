@@ -116,8 +116,10 @@ function App() {
   const refreshPatients = useCallback(async () => {
     const p = await api.listPatients();
     setPatients(p);
-    if (p.length && !selectedPatientId) setSelectedPatientId(p[0].id);
-  }, [selectedPatientId]);
+    if (p.length) {
+      setSelectedPatientId((current) => current || p[0].id);
+    }
+  }, []);
 
   useEffect(() => {
     (async () => {

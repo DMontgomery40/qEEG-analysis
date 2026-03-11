@@ -122,8 +122,6 @@ class Stage5FinalReviewPayload(BaseModel):
     def _check_vote_consistency(self) -> "Stage5FinalReviewPayload":
         if self.vote == "APPROVE" and self.required_changes:
             raise ValueError("APPROVE outputs must not include required_changes")
-        if self.vote == "REVISE" and not self.required_changes:
-            raise ValueError("REVISE outputs must include at least one required change")
         return self
 
 

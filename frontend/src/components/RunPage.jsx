@@ -76,17 +76,31 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
       log.info('sse_connected');
     };
     es.onmessage = async (evt) => {
+      let payload = null;
       try {
-        JSON.parse(evt.data);
-        await refresh();
+        payload = JSON.parse(evt.data);
       } catch (error) {
         log.warn(
           {
             err: serializeError(error),
             payloadPreview: String(evt?.data || '').slice(0, 500),
           },
-          'sse_message_failed'
+          'sse_message_parse_failed'
         );
+        return;
+      }
+
+      try {
+        await refresh();
+      } catch (error) {
+        log.error(
+          {
+            err: serializeError(error),
+            payloadPreview: JSON.stringify(payload).slice(0, 500),
+          },
+          'sse_refresh_failed'
+        );
+        onError(error, { action: 'refresh_run_from_sse', runId });
       }
     };
     es.onerror = () => {
@@ -97,7 +111,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
       es.close();
       esRef.current = null;
     };
-  }, [refresh, runId]);
+  }, [onError, refresh, runId]);
 
   const byStage = useMemo(() => groupByStage(artifacts), [artifacts]);
   const labelMap = run?.label_map || {};

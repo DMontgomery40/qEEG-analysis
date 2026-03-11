@@ -169,8 +169,10 @@ function PatientPage({
     setReports(r);
     setRuns(ru);
     setPatientFiles(pf);
-    if (r.length && !selectedReportId) setSelectedReportId(r[0].id);
-  }, [patientId, selectedReportId]);
+    if (r.length) {
+      setSelectedReportId((current) => current || r[0].id);
+    }
+  }, [patientId]);
 
   useEffect(() => {
     setPatient(null);
