@@ -68,6 +68,22 @@ def _slow_request_threshold_ms() -> float:
     return max(value, 0.0)
 
 
+def _request_operator_hint(method: str, path: str) -> str:
+    if path == "/api/patients" and method == "GET":
+        return "FastAPI bootstrap path loads health, models, and patients together; verify this route is returning JSON instead of an HTML or proxy fallback."
+    if path == "/api/patients" and method == "POST":
+        return "create_patient_route depends on a case-insensitive unique patient label before storage.create_patient commits the row."
+    if re.fullmatch(r"/api/reports/[^/]+/metadata", path):
+        return "get_report_metadata reads metadata.json next to the extracted report; verify the file exists and still parses as JSON."
+    if re.fullmatch(r"/api/runs/[^/]+/start", path):
+        return "start_run claims the run before scheduling the background task; inspect claim_run_start or workflow initialization if this boundary raises."
+    if re.fullmatch(r"/api/runs/[^/]+/export", path):
+        return "export_run expects run.selected_artifact_id to point at a Stage 6 final_draft markdown artifact on the same run."
+    if re.fullmatch(r"/api/runs/[^/]+/stream", path):
+        return "stream subscribes the request to app.state.broker for this run_id; verify broker startup and run existence before the first heartbeat."
+    return f"{method} {path} crossed the FastAPI route boundary and raised after dispatch; inspect the route handler for a missing guard or file read inside that boundary."
+
+
 @app.middleware("http")
 async def _request_context_middleware(request: Request, call_next):
     request_id = (
@@ -87,7 +103,11 @@ async def _request_context_middleware(request: Request, call_next):
             response = await call_next(request)
         except Exception:
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
-            LOGGER.exception("request_failed", duration_ms=duration_ms)
+            LOGGER.exception(
+                "request_failed",
+                duration_ms=duration_ms,
+                operatorHint=_request_operator_hint(request.method, request.url.path),
+            )
             raise
 
         response.headers["X-Request-ID"] = request_id
@@ -100,12 +120,14 @@ async def _request_context_middleware(request: Request, call_next):
                 "request_completed_with_server_error",
                 status_code=status_code,
                 duration_ms=duration_ms,
+                operatorHint=_request_operator_hint(request.method, request.url.path),
             )
         elif status_code >= 400:
             LOGGER.warning(
                 "request_completed_with_client_error",
                 status_code=status_code,
                 duration_ms=duration_ms,
+                operatorHint=_request_operator_hint(request.method, request.url.path),
             )
         elif request.url.path != "/api/health" and duration_ms >= slow_request_ms:
             LOGGER.info(
@@ -155,6 +177,7 @@ class _EventBroker:
                     "broker_publish_failed",
                     run_id=run_id,
                     subscriber_count=len(queues),
+                    operatorHint="Event broker publish fanout hit a dead subscriber queue; verify SSE clients unsubscribe before publish() retries.",
                     exc_info=True,
                 )
 
@@ -291,6 +314,23 @@ def _publish_file_to_portal_folder(
         return None
 
 
+def _portal_file_path(*, patient_label: str, filename: str) -> Path | None:
+    patient_id = _normalize_portal_patient_id(patient_label)
+    if patient_id is None:
+        return None
+    return _portal_patients_dir() / patient_id / _safe_portal_filename(filename)
+
+
+def _delete_portal_file(*, patient_label: str, filename: str) -> None:
+    portal_path = _portal_file_path(patient_label=patient_label, filename=filename)
+    if portal_path is None:
+        return
+    try:
+        portal_path.unlink(missing_ok=True)
+    except Exception:
+        return
+
+
 def _truthy_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -402,6 +442,7 @@ async def _auto_generate_patient_facing_for_run(
                 model_id=preferred_model,
                 version=version,
                 returncode=proc.returncode,
+                operatorHint="generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
             )
             await broker.publish(
                 run_id,
@@ -412,6 +453,7 @@ async def _auto_generate_patient_facing_for_run(
                     "patient_label": normalized_patient_id,
                     "version": version,
                     "error": (err_text or out_text)[-2000:],
+                    "operatorHint": "generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
                 },
             )
     except Exception as e:
@@ -421,6 +463,7 @@ async def _auto_generate_patient_facing_for_run(
             patient_label=normalized_patient_id,
             model_id=preferred_model,
             version=version,
+            operatorHint="auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
         )
         await broker.publish(
             run_id,
@@ -431,6 +474,7 @@ async def _auto_generate_patient_facing_for_run(
                 "patient_label": normalized_patient_id,
                 "version": version,
                 "error": str(e),
+                "operatorHint": "auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
             },
         )
 
@@ -663,8 +707,16 @@ def _get_mock_llm_client() -> AsyncOpenAICompatClient | None:
 async def _refresh_discovered_models(*, llm: AsyncOpenAICompatClient) -> None:
     try:
         discovered = await llm.list_models()
-    except Exception:
-        LOGGER.warning("model_refresh_failed", exc_info=True)
+    except Exception as e:
+        LOGGER.warning(
+            "model_refresh_failed",
+            operatorHint=getattr(
+                e,
+                "operator_hint",
+                "model_refresh_loop depends on AsyncOpenAICompatClient.list_models; inspect CLIProxy /v1/models reachability or the OpenAI-compatible response shape.",
+            ),
+            exc_info=True,
+        )
         return
     set_discovered_model_ids(discovered)
     LOGGER.info("model_refresh_completed", discovered_model_count=len(discovered))
@@ -1026,6 +1078,8 @@ async def list_patients() -> list[dict[str, Any]]:
 @app.post("/api/patients")
 async def create_patient(req: PatientCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
+        if storage.find_patients_by_label(session, req.label):
+            raise HTTPException(status_code=409, detail="Patient label already exists")
         p = storage.create_patient(session, label=req.label, notes=req.notes)
         _ensure_portal_patient_folder(p.label)
         return _patient_out(p)
@@ -1167,6 +1221,9 @@ async def get_patient(patient_id: str) -> dict[str, Any]:
 @app.put("/api/patients/{patient_id}")
 async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
     with storage.session_scope() as session:
+        existing = storage.find_patients_by_label(session, req.label)
+        if any(p.id != patient_id for p in existing):
+            raise HTTPException(status_code=409, detail="Patient label already exists")
         p = storage.update_patient(
             session, patient_id, label=req.label, notes=req.notes
         )
@@ -1306,6 +1363,9 @@ async def delete_patient_file(file_id: str) -> dict[str, Any]:
         if pf is None:
             raise HTTPException(status_code=404, detail="File not found")
         stored_path = Path(pf.stored_path)
+        patient = storage.get_patient(session, pf.patient_id)
+        patient_label = patient.label if patient is not None else ""
+        filename = pf.filename
 
     with storage.session_scope() as session:
         deleted = storage.delete_patient_file(session, file_id)
@@ -1317,6 +1377,7 @@ async def delete_patient_file(file_id: str) -> dict[str, Any]:
         shutil.rmtree(stored_path.parent, ignore_errors=True)
     except Exception:
         pass
+    _delete_portal_file(patient_label=patient_label, filename=filename)
 
     return {"ok": True}
 
@@ -1608,8 +1669,13 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
         if storage.get_patient(session, req.patient_id) is None:
             raise HTTPException(status_code=404, detail="Patient not found")
-        if storage.get_report(session, req.report_id) is None:
+        report = storage.get_report(session, req.report_id)
+        if report is None:
             raise HTTPException(status_code=404, detail="Report not found")
+        if report.patient_id != req.patient_id:
+            raise HTTPException(
+                status_code=400, detail="Report does not belong to patient"
+            )
         run = storage.create_run(
             session,
             patient_id=req.patient_id,
@@ -1626,7 +1692,13 @@ async def start_run(run_id: str) -> dict[str, Any]:
         run = storage.get_run(session, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        if run.status == "running":
+        started = storage.claim_run_start(session, run_id)
+
+    with storage.session_scope() as session:
+        run = storage.get_run(session, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if not started:
             return _run_out(run)
         patient_id = run.patient_id
         report_id = run.report_id
@@ -1645,7 +1717,10 @@ async def start_run(run_id: str) -> dict[str, Any]:
                 await workflow.run_pipeline(run_id, on_event=on_event)
                 await _auto_generate_patient_facing_for_run(run_id, broker)
             except Exception:
-                LOGGER.exception("run_task_crashed")
+                LOGGER.exception(
+                    "run_task_crashed",
+                    operatorHint="run_task wraps workflow.run_pipeline and _auto_generate_patient_facing_for_run; inspect the first failed workflow stage or patient-facing subprocess for this run.",
+                )
                 raise
             LOGGER.info("run_task_completed")
 
@@ -1750,10 +1825,16 @@ async def select(run_id: str, req: SelectRequest) -> dict[str, Any]:
             if art is None:
                 raise HTTPException(status_code=404, detail="Artifact not found")
             artifact_id = art.id
+        else:
+            art = storage.get_artifact(session, artifact_id)
+            if art is None or art.run_id != run_id:
+                raise HTTPException(
+                    status_code=404, detail="Artifact not found for run"
+                )
 
         run2 = storage.select_artifact(session, run_id, artifact_id)
         if run2 is None:
-            raise HTTPException(status_code=404, detail="Run not found")
+            raise HTTPException(status_code=404, detail="Artifact not found for run")
         return _run_out(run2)
 
 
@@ -1767,9 +1848,22 @@ async def export(run_id: str) -> dict[str, Any]:
         patient_label = patient.label if patient is not None else ""
         if not run.selected_artifact_id:
             raise HTTPException(status_code=400, detail="No selected artifact for run")
-        art = session.get(storage.Artifact, run.selected_artifact_id)
+        art = storage.get_artifact(session, run.selected_artifact_id)
         if art is None:
             raise HTTPException(status_code=400, detail="Selected artifact not found")
+        if art.run_id != run_id:
+            raise HTTPException(
+                status_code=400, detail="Selected artifact does not belong to run"
+            )
+        if (
+            art.stage_num != 6
+            or art.kind != "final_draft"
+            or art.content_type != "text/markdown"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Selected artifact is not a final markdown draft",
+            )
         md = Path(art.content_path).read_text(encoding="utf-8", errors="replace")
 
     export_dir = EXPORTS_DIR / run_id

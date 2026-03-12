@@ -27,12 +27,16 @@ def configure_logging() -> structlog.stdlib.BoundLogger:
     level_name = _level_name()
     level = getattr(logging, level_name, logging.INFO)
     backend_logger = logging.getLogger("backend")
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    backend_logger.handlers.clear()
-    backend_logger.addHandler(handler)
     backend_logger.setLevel(level)
-    backend_logger.propagate = False
+    root_logger = logging.getLogger()
+
+    if not backend_logger.handlers and not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        backend_logger.addHandler(handler)
+        backend_logger.propagate = False
+    elif not backend_logger.handlers and root_logger.handlers:
+        backend_logger.propagate = True
 
     structlog.configure(
         processors=[

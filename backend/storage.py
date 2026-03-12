@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, func, select
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    create_engine,
+    func,
+    select,
+    update,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from .config import DATA_DIR, ensure_data_dirs
@@ -304,6 +312,24 @@ def create_run(
     return run
 
 
+def claim_run_start(session: Session, run_id: str) -> bool:
+    result = session.execute(
+        update(Run)
+        .where(
+            Run.id == run_id,
+            Run.status.in_(("created", "failed", "needs_auth")),
+        )
+        .values(
+            status="running",
+            error_message="",
+            started_at=_utcnow(),
+            completed_at=None,
+        )
+    )
+    session.commit()
+    return bool(result.rowcount)
+
+
 def update_run_status(
     session: Session, run_id: str, *, status: RunStatus, error_message: str = ""
 ) -> Run | None:
@@ -332,6 +358,9 @@ def set_run_label_map(session: Session, run_id: str, label_map: dict[str, str]) 
 def select_artifact(session: Session, run_id: str, artifact_id: str) -> Run | None:
     run = session.get(Run, run_id)
     if run is None:
+        return None
+    artifact = session.get(Artifact, artifact_id)
+    if artifact is None or artifact.run_id != run_id:
         return None
     run.selected_artifact_id = artifact_id
     session.commit()
@@ -373,6 +402,10 @@ def list_artifacts(session: Session, run_id: str) -> list[Artifact]:
             .order_by(Artifact.stage_num.asc(), Artifact.created_at.asc())
         )
     )
+
+
+def get_artifact(session: Session, artifact_id: str) -> Artifact | None:
+    return session.get(Artifact, artifact_id)
 
 
 def find_artifact(

@@ -624,6 +624,8 @@ class _StagesMixin:
 
         results = await asyncio.gather(*(one(m) for m in council_model_ids))
         successes = [r for r in results if r is not None]
+        if not successes:
+            raise RuntimeError("All models failed during Stage 1 analysis")
 
         for model_id, text in successes:
             await self._write_artifact(

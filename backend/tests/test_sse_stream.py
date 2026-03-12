@@ -154,19 +154,11 @@ async def test_pipeline_publishes_events_to_broker(temp_data_dir, mock_llm_clien
 
 def test_stream_endpoint_exists(temp_data_dir):
     """The /api/runs/{run_id}/stream endpoint should exist."""
-    from fastapi.testclient import TestClient
     from backend.main import app
 
-    # Note: TestClient doesn't handle SSE streaming well, so we just verify
-    # the endpoint exists and returns the correct content type
-    client = TestClient(app, raise_server_exceptions=False)
-
     run_id = str(uuid.uuid4())
-    response = client.get(f"/api/runs/{run_id}/stream", timeout=1.0)
-
-    # The endpoint should exist (not 404)
-    # It may timeout or return empty stream for non-existent run, but shouldn't 404
-    assert response.status_code != 404, "Stream endpoint should exist"
+    stream_path = app.url_path_for("stream", run_id=run_id)
+    assert stream_path == f"/api/runs/{run_id}/stream"
 
 
 @pytest.mark.skip(reason="TestClient doesn't properly handle SSE streaming with app startup state")

@@ -53,24 +53,23 @@ def _page_session_alias_map(report_text: str) -> dict[int, dict[int, int]]:
 
 def _expected_session_indices(report_text: str) -> list[int]:
     alias_map = _page_session_alias_map(report_text)
-    aliased = sorted(
-        {
-            global_idx
-            for mapping in alias_map.values()
-            for global_idx in mapping.values()
-        }
-    )
-    if aliased:
-        return aliased
-
-    # Prefer explicit "Session N (" markers, fall back to any "Session N".
     indices = {
-        int(m.group(1)) for m in re.finditer(r"Session\s+(\d+)\s*\(", report_text)
+        global_idx for mapping in alias_map.values() for global_idx in mapping.values()
     }
-    if not indices:
-        indices = {
-            int(m.group(1)) for m in re.finditer(r"\bSession\s+(\d+)\b", report_text)
+
+    for page_num, section_text in _iter_page_sections(report_text):
+        if alias_map.get(page_num):
+            continue
+        body = _page_section_body(section_text)
+        plain = {
+            int(m.group(1)) for m in re.finditer(r"Session\s+(\d+)\s*\(", body)
         }
+        if not plain:
+            plain = {
+                int(m.group(1)) for m in re.finditer(r"\bSession\s+(\d+)\b", body)
+            }
+        indices.update(plain)
+
     return sorted(indices) if indices else [1]
 
 

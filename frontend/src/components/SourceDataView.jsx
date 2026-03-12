@@ -10,25 +10,44 @@ function SourceDataView({ reportId, onError }) {
   const [lightboxPage, setLightboxPage] = useState(null);
 
   useEffect(() => {
-    if (!reportId) return;
+    setPages([]);
+    setMetadata(null);
+    setLightboxPage(null);
+    setActiveTab((current) => (current === 'meta' ? 'pdf' : current));
+  }, [reportId]);
+
+  useEffect(() => {
+    if (!reportId) {
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
 
     async function load() {
       setLoading(true);
       try {
         const [pagesData, metaData] = await Promise.all([
           api.reportPages(reportId),
-          api.reportMetadata(reportId).catch(() => null),
+          api.reportMetadata(reportId),
         ]);
+        if (cancelled) return;
         setPages(pagesData.pages || []);
-        setMetadata(metaData);
+        setMetadata(metaData?.has_metadata_file ? metaData : null);
       } catch (e) {
+        if (cancelled) return;
         onError?.(e, { action: 'load_source_data', reportId });
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     }
 
     load();
+    return () => {
+      cancelled = true;
+    };
   }, [onError, reportId]);
 
   if (!reportId) {

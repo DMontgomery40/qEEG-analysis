@@ -151,8 +151,8 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
               </div>
             ) : null}
             <div className="list bulk-file-list">
-              {selectionPreview.map((item) => (
-                <div key={`${item.name}-${item.patientLabel}`} className="bulk-file-row">
+              {selectionPreview.map((item, idx) => (
+                <div key={`${item.name}-${item.patientLabel}-${idx}`} className="bulk-file-row">
                   <div className="bulk-file-name">{item.name}</div>
                   <div className="bulk-file-meta">
                     <span className="muted">{item.size}</span>

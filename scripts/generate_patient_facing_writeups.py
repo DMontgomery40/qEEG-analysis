@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,10 +15,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs
-from backend.llm_client import AsyncOpenAICompatClient, UpstreamError
-from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf
-from backend.storage import Artifact, Patient, Run, find_patients_by_label, init_db, list_artifacts, list_runs, session_scope
+from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs  # noqa: E402
+from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
+from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
+from backend.storage import (  # noqa: E402
+    Artifact,
+    Patient,
+    Run,
+    find_patients_by_label,
+    init_db,
+    list_artifacts,
+    list_runs,
+    session_scope,
+)
 
 
 @dataclass(frozen=True)
@@ -372,7 +382,9 @@ async def main() -> int:
         pdf_path = out_dir / f"{stem}.pdf"
         meta_path = out_dir / f"{stem}__meta.json"
 
-        if not args.overwrite and (md_path.exists() or pdf_path.exists()):
+        if not args.overwrite and (
+            md_path.exists() or pdf_path.exists() or meta_path.exists()
+        ):
             print(f"SKIP {label}: outputs exist (use --overwrite): {md_path.name}")
             continue
 
@@ -397,9 +409,40 @@ async def main() -> int:
         )
         md = (md or "").strip()
 
-        md_path.write_text(md + "\n", encoding="utf-8")
-        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        render_patient_facing_markdown_to_pdf(md, pdf_path, patient_label=label)
+        with tempfile.TemporaryDirectory(dir=out_dir, prefix=f".{stem}.") as temp_dir_raw:
+            temp_dir = Path(temp_dir_raw)
+            temp_md_path = temp_dir / md_path.name
+            temp_pdf_path = temp_dir / pdf_path.name
+            temp_meta_path = temp_dir / meta_path.name
+
+            temp_md_path.write_text(md + "\n", encoding="utf-8")
+            temp_meta_path.write_text(
+                json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            render_patient_facing_markdown_to_pdf(md, temp_pdf_path, patient_label=label)
+
+            if not args.overwrite and (
+                md_path.exists() or pdf_path.exists() or meta_path.exists()
+            ):
+                print(f"SKIP {label}: outputs exist (use --overwrite): {md_path.name}")
+                continue
+
+            moved_paths: list[Path] = []
+            try:
+                for src, dst in (
+                    (temp_md_path, md_path),
+                    (temp_pdf_path, pdf_path),
+                    (temp_meta_path, meta_path),
+                ):
+                    src.replace(dst)
+                    moved_paths.append(dst)
+            except Exception:
+                for path in moved_paths:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                raise
 
     if llm is not None:
         await llm.aclose()

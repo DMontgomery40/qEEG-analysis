@@ -25,6 +25,7 @@ export function serializeError(error) {
     return {
       name: error.name,
       message: error.message,
+      operatorHint: typeof error.operatorHint === 'string' ? error.operatorHint : undefined,
       stack: error.stack,
       cause: error.cause ? serializeError(error.cause) : undefined,
     };
@@ -32,7 +33,16 @@ export function serializeError(error) {
   if (typeof error === 'string') return { message: error };
   if (error == null) return undefined;
   try {
-    return JSON.parse(JSON.stringify(error));
+    const serialized = JSON.parse(JSON.stringify(error));
+    if (
+      serialized &&
+      typeof serialized === 'object' &&
+      typeof error.operatorHint === 'string' &&
+      !serialized.operatorHint
+    ) {
+      serialized.operatorHint = error.operatorHint;
+    }
+    return serialized;
   } catch {
     return { message: String(error) };
   }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
 import { childLogger, serializeError, newRequestId } from '../logger';
+import { requestOperatorHint } from '../operatorHints';
 import Tabs from './Tabs';
 import ModelBadge from './ModelBadge';
 import SourceDataView from './SourceDataView';
@@ -83,6 +84,10 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         log.warn(
           {
             err: serializeError(error),
+            operatorHint: requestOperatorHint(`/api/runs/${runId}/stream`, {
+              method: 'GET',
+              phase: 'parse',
+            }),
             payloadPreview: String(evt?.data || '').slice(0, 500),
           },
           'sse_message_parse_failed'
@@ -96,6 +101,13 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
         log.error(
           {
             err: serializeError(error),
+            operatorHint:
+              typeof error?.operatorHint === 'string'
+                ? error.operatorHint
+                : requestOperatorHint(`/api/runs/${runId}/stream`, {
+                    method: 'GET',
+                    phase: 'response',
+                  }),
             payloadPreview: JSON.stringify(payload).slice(0, 500),
           },
           'sse_refresh_failed'
