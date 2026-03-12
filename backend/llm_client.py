@@ -9,9 +9,50 @@ import httpx
 
 
 class UpstreamError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        operator_hint: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.operator_hint = operator_hint
+
+
+def _operator_hint(endpoint: str, issue: str) -> str:
+    if endpoint == "/v1/models":
+        if issue == "request_failed":
+            return "AsyncOpenAICompatClient.list_models calls CLIProxyAPI /v1/models before model refresh; inspect CLIProxy reachability or auth at that endpoint."
+        if issue == "invalid_json":
+            return "list_models expects /v1/models to return JSON with a top-level data array; HTML or truncated proxy output usually means CLIProxy failed before serialization."
+        if issue == "unexpected_shape":
+            return "list_models expects /v1/models -> {data:[{id: ...}]}; inspect CLIProxy model listing output for a shape drift at that boundary."
+
+    if endpoint == "/v1/chat/completions":
+        if issue == "request_failed":
+            return "chat_completions posts to CLIProxyAPI /v1/chat/completions for non-GPT-5 models; inspect provider auth or upstream reachability for the selected model."
+        if issue == "invalid_json":
+            return "chat_completions expects JSON choices[0].message.content from /v1/chat/completions; inspect CLIProxy output for HTML, truncation, or gateway error pages."
+        if issue == "unexpected_shape":
+            return "chat_completions expects /v1/chat/completions -> choices[0].message.content as a string; inspect the provider response shape before the OpenAI-compat projection."
+        if issue == "non_text":
+            return "chat_completions expects /v1/chat/completions to yield text content after the OpenAI-compat projection; inspect whether the provider returned tool or multimodal blocks instead of plain text."
+        if issue == "http_error":
+            return "chat_completions reached CLIProxyAPI but got an HTTP error; inspect provider auth, model availability, or endpoint compatibility for the requested model."
+
+    if endpoint == "/v1/responses":
+        if issue == "request_failed":
+            return "responses posts to CLIProxyAPI /v1/responses for GPT-5-style calls; inspect provider auth or upstream reachability for the selected model."
+        if issue == "invalid_json":
+            return "responses expects JSON with output_text or output blocks; inspect CLIProxy output for HTML, truncation, or gateway error pages."
+        if issue == "unexpected_shape":
+            return "responses expects /v1/responses to return output_text or an output array with output_text blocks; inspect the OpenAI Responses projection before text reconstruction."
+        if issue == "http_error":
+            return "responses reached CLIProxyAPI but got an HTTP error; inspect provider auth, model availability, or endpoint compatibility for the requested model."
+
+    return f"AsyncOpenAICompatClient hit {endpoint} and failed during {issue}; inspect the CLIProxy boundary and the expected OpenAI-compatible response contract."
 
 
 @dataclass(frozen=True)
@@ -38,7 +79,7 @@ def _parse_openai_error(payload: Any) -> _OpenAICompatError | None:
 
 
 def _format_http_error(
-    response: httpx.Response, *, prefix: str, fallback_message: str
+    response: httpx.Response, *, endpoint: str, prefix: str, fallback_message: str
 ) -> UpstreamError:
     try:
         payload = response.json()
@@ -48,7 +89,11 @@ def _format_http_error(
     parsed = _parse_openai_error(payload)
     if parsed is not None:
         msg = f"{prefix}: {parsed.message}"
-        return UpstreamError(msg, status_code=response.status_code)
+        return UpstreamError(
+            msg,
+            status_code=response.status_code,
+            operator_hint=_operator_hint(endpoint, "http_error"),
+        )
 
     body_preview: str | None = None
     try:
@@ -61,7 +106,11 @@ def _format_http_error(
     msg = f"{prefix}: {fallback_message}"
     if body_preview:
         msg = f"{msg}\n\nUpstream response body:\n{body_preview}"
-    return UpstreamError(msg, status_code=response.status_code)
+    return UpstreamError(
+        msg,
+        status_code=response.status_code,
+        operator_hint=_operator_hint(endpoint, "http_error"),
+    )
 
 
 def _chat_unsupported(err: UpstreamError) -> bool:
@@ -150,11 +199,15 @@ class AsyncOpenAICompatClient:
         try:
             resp = await client.get("/v1/models")
         except Exception as e:
-            raise UpstreamError(f"CLIProxyAPI request failed: {e}") from e
+            raise UpstreamError(
+                f"CLIProxyAPI request failed: {e}",
+                operator_hint=_operator_hint("/v1/models", "request_failed"),
+            ) from e
 
         if resp.status_code >= 400:
             raise _format_http_error(
                 resp,
+                endpoint="/v1/models",
                 prefix="CLIProxyAPI /v1/models failed",
                 fallback_message=f"HTTP {resp.status_code}",
             )
@@ -163,12 +216,16 @@ class AsyncOpenAICompatClient:
             payload = resp.json()
         except Exception as e:
             raise UpstreamError(
-                f"CLIProxyAPI /v1/models returned invalid JSON: {e}"
+                f"CLIProxyAPI /v1/models returned invalid JSON: {e}",
+                operator_hint=_operator_hint("/v1/models", "invalid_json"),
             ) from e
 
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
-            raise UpstreamError("CLIProxyAPI /v1/models returned unexpected shape")
+            raise UpstreamError(
+                "CLIProxyAPI /v1/models returned unexpected shape",
+                operator_hint=_operator_hint("/v1/models", "unexpected_shape"),
+            )
 
         ids: list[str] = []
         for item in data:
@@ -212,11 +269,17 @@ class AsyncOpenAICompatClient:
         try:
             resp = await client.post("/v1/chat/completions", json=payload)
         except Exception as e:
-            raise UpstreamError(f"CLIProxyAPI request failed: {e}") from e
+            raise UpstreamError(
+                f"CLIProxyAPI request failed: {e}",
+                operator_hint=_operator_hint(
+                    "/v1/chat/completions", "request_failed"
+                ),
+            ) from e
 
         if resp.status_code >= 400:
             err = _format_http_error(
                 resp,
+                endpoint="/v1/chat/completions",
                 prefix="CLIProxyAPI /v1/chat/completions failed",
                 fallback_message=f"HTTP {resp.status_code}",
             )
@@ -234,19 +297,26 @@ class AsyncOpenAICompatClient:
             data = resp.json()
         except Exception as e:
             raise UpstreamError(
-                f"CLIProxyAPI /v1/chat/completions returned invalid JSON: {e}"
+                f"CLIProxyAPI /v1/chat/completions returned invalid JSON: {e}",
+                operator_hint=_operator_hint(
+                    "/v1/chat/completions", "invalid_json"
+                ),
             ) from e
 
         try:
             content = data["choices"][0]["message"]["content"]
         except Exception as e:
             raise UpstreamError(
-                f"CLIProxyAPI /v1/chat/completions returned unexpected shape: {e}"
+                f"CLIProxyAPI /v1/chat/completions returned unexpected shape: {e}",
+                operator_hint=_operator_hint(
+                    "/v1/chat/completions", "unexpected_shape"
+                ),
             ) from e
 
         if not isinstance(content, str):
             raise UpstreamError(
-                "CLIProxyAPI /v1/chat/completions returned non-text content"
+                "CLIProxyAPI /v1/chat/completions returned non-text content",
+                operator_hint=_operator_hint("/v1/chat/completions", "non_text"),
             )
         return content
 
@@ -269,11 +339,15 @@ class AsyncOpenAICompatClient:
         try:
             resp = await client.post("/v1/responses", json=payload)
         except Exception as e:
-            raise UpstreamError(f"CLIProxyAPI request failed: {e}") from e
+            raise UpstreamError(
+                f"CLIProxyAPI request failed: {e}",
+                operator_hint=_operator_hint("/v1/responses", "request_failed"),
+            ) from e
 
         if resp.status_code >= 400:
             raise _format_http_error(
                 resp,
+                endpoint="/v1/responses",
                 prefix="CLIProxyAPI /v1/responses failed",
                 fallback_message=f"HTTP {resp.status_code}",
             )
@@ -282,7 +356,8 @@ class AsyncOpenAICompatClient:
             data = resp.json()
         except Exception as e:
             raise UpstreamError(
-                f"CLIProxyAPI /v1/responses returned invalid JSON: {e}"
+                f"CLIProxyAPI /v1/responses returned invalid JSON: {e}",
+                operator_hint=_operator_hint("/v1/responses", "invalid_json"),
             ) from e
 
         # OpenAI Responses API: output_text may be present; otherwise reconstruct from output blocks.
@@ -291,7 +366,10 @@ class AsyncOpenAICompatClient:
             return output_text
 
         if not isinstance(data, dict) or not isinstance(data.get("output"), list):
-            raise UpstreamError("CLIProxyAPI /v1/responses returned unexpected shape")
+            raise UpstreamError(
+                "CLIProxyAPI /v1/responses returned unexpected shape",
+                operator_hint=_operator_hint("/v1/responses", "unexpected_shape"),
+            )
 
         chunks: list[str] = []
         for item in data["output"]:

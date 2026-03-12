@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import base64
 import json
+import shutil
 import sys
 import uuid
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from backend.storage import (  # noqa: E402
     create_run,
     find_patients_by_label,
     get_patient,
+    get_report,
     get_run,
     init_db,
     list_runs,
@@ -146,13 +148,11 @@ def _patient_id_for_label(label: str) -> str:
         patients = find_patients_by_label(session, label)
         if not patients:
             raise RuntimeError(f"No patient found for label {label!r}")
-        patients = sorted(
-            patients,
-            key=lambda patient: patient.created_at.isoformat()
-            if patient.created_at
-            else "",
-            reverse=True,
-        )
+        if len(patients) > 1:
+            raise RuntimeError(
+                f"Multiple patients found for label {label!r}: "
+                + ", ".join(patient.id for patient in patients)
+            )
         patient = patients[0]
         if get_patient(session, patient.id) is None:
             raise RuntimeError(
@@ -560,6 +560,10 @@ async def main() -> int:
     patient_id = _patient_id_for_label(manifest.patient_label)
     report_id = args.report_id.strip() or str(uuid.uuid4())
 
+    with session_scope() as session:
+        if get_report(session, report_id) is not None:
+            raise RuntimeError(f"Report id already exists: {report_id}")
+
     extracted_sources = [
         _extract_source(source_spec) for source_spec in manifest.sources
     ]
@@ -586,14 +590,19 @@ async def main() -> int:
         )
         return 0
 
-    _write_combined_report(
-        patient_id=patient_id,
-        report_id=report_id,
-        manifest=manifest,
-        manifest_path=manifest_path,
-        extracted_sources=extracted_sources,
-    )
-    _register_report(patient_id=patient_id, report_id=report_id, manifest=manifest)
+    out_dir = report_dir(patient_id, report_id)
+    try:
+        _write_combined_report(
+            patient_id=patient_id,
+            report_id=report_id,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            extracted_sources=extracted_sources,
+        )
+        _register_report(patient_id=patient_id, report_id=report_id, manifest=manifest)
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
 
     created_run_id, started_run_id = await _maybe_create_and_run(
         patient_id=patient_id,

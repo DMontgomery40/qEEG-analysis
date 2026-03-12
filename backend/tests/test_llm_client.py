@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from backend.llm_client import AsyncOpenAICompatClient
+from backend.llm_client import AsyncOpenAICompatClient, UpstreamError
 
 
 @pytest.mark.asyncio
@@ -174,3 +174,49 @@ def test_messages_to_responses_input_preserves_multimodal_blocks():
             ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_models_request_failure_sets_operator_hint():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        with pytest.raises(UpstreamError) as exc_info:
+            await client.list_models()
+    finally:
+        await client.aclose()
+
+    assert "CLIProxyAPI request failed" in str(exc_info.value)
+    assert exc_info.value.operator_hint is not None
+    assert "/v1/models" in exc_info.value.operator_hint
+
+
+@pytest.mark.asyncio
+async def test_responses_unexpected_shape_sets_operator_hint():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/responses"
+        return httpx.Response(200, json={"wrong": "shape"})
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        with pytest.raises(UpstreamError) as exc_info:
+            await client.responses(
+                model_id="gpt-5.4",
+                input_data=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                stream=False,
+                max_output_tokens=20,
+            )
+    finally:
+        await client.aclose()
+
+    assert "unexpected shape" in str(exc_info.value)
+    assert exc_info.value.operator_hint is not None
+    assert "/v1/responses" in exc_info.value.operator_hint

@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,10 +16,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs
-from backend.council.report_text import _find_summary_pages, _page_session_alias_map
-from backend.llm_client import AsyncOpenAICompatClient, UpstreamError
-from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf
+from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs  # noqa: E402
+from backend.council.report_text import (  # noqa: E402
+    _find_summary_pages,
+    _page_session_alias_map,
+)
+from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
+from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -697,6 +701,7 @@ def _meta_payload(
     analysis_path: Path,
     patient_md_path: Path,
     patient_pdf_path: Path,
+    outputs_written: bool = False,
 ) -> dict[str, Any]:
     return {
         "generated_at": _utcnow().isoformat(),
@@ -739,46 +744,98 @@ def _meta_payload(
             "session_4_date": sessions[4].date_iso,
             "session_5_date": sessions[5].date_iso,
             "session_4_duplicate_checks": len(duplicate_checks),
-            "analysis_exists": analysis_path.exists(),
-            "patient_markdown_exists": patient_md_path.exists(),
-            "patient_pdf_exists": patient_pdf_path.exists(),
+            "analysis_exists": outputs_written or analysis_path.exists(),
+            "patient_markdown_exists": outputs_written or patient_md_path.exists(),
+            "patient_pdf_exists": outputs_written or patient_pdf_path.exists(),
         },
     }
+
+
+def _resolved_manifest_source_paths(
+    *, manifest: dict[str, Any], manifest_path: Path
+) -> list[Path]:
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError(
+            "Manifest requires a non-empty sources array for auto-discovery"
+        )
+
+    resolved: list[Path] = []
+    for item in raw_sources:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise ValueError("Manifest sources must contain path strings")
+        source_path = Path(item["path"]).expanduser()
+        if not source_path.is_absolute():
+            repo_relative = (_REPO_ROOT / source_path).resolve()
+            manifest_relative = (manifest_path.parent / source_path).resolve()
+            source_path = repo_relative if repo_relative.exists() else manifest_relative
+        resolved.append(source_path.resolve())
+    return resolved
 
 
 def _find_combined_report_dir(
     *,
     manifest: dict[str, Any],
+    manifest_path: Path,
     reports_root: Path,
 ) -> Path:
-    expected_sources = {
-        Path(item["path"]).name
-        for item in manifest.get("sources", [])
-        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    expected_source_paths = {
+        str(path) for path in _resolved_manifest_source_paths(
+            manifest=manifest, manifest_path=manifest_path
+        )
     }
-    candidates: list[tuple[int, float, Path]] = []
+    expected_source_names = {Path(path).name for path in expected_source_paths}
+    manifest_path_resolved = str(manifest_path.resolve())
+
+    candidates: list[tuple[int, Path]] = []
     for meta_path in reports_root.glob("*/*/metadata.json"):
         try:
             metadata = json.loads(_read_text(meta_path))
         except Exception:
             continue
-        page_entries = metadata.get("pages")
-        if not isinstance(page_entries, list):
-            continue
-        source_files = {
-            item.get("source_file")
-            for item in page_entries
-            if isinstance(item, dict) and isinstance(item.get("source_file"), str)
+
+        synthetic = metadata.get("synthetic_combined")
+        synthetic = synthetic if isinstance(synthetic, dict) else {}
+
+        metadata_source_paths = {
+            str(Path(item["path"]).expanduser().resolve())
+            for item in synthetic.get("source_files", [])
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
         }
-        if not expected_sources.issubset(source_files):
+        score = 0
+        if synthetic.get("manifest_path") == manifest_path_resolved:
+            score = 3
+        elif metadata_source_paths == expected_source_paths:
+            score = 2
+        elif metadata_source_paths:
             continue
-        page_count = int(metadata.get("page_count") or len(page_entries))
-        candidates.append((page_count, meta_path.stat().st_mtime, meta_path.parent))
+        else:
+            page_entries = metadata.get("pages")
+            if not isinstance(page_entries, list):
+                continue
+            source_files = {
+                item.get("source_file")
+                for item in page_entries
+                if isinstance(item, dict) and isinstance(item.get("source_file"), str)
+            }
+            if source_files == expected_source_names:
+                score = 1
+
+        if score:
+            candidates.append((score, meta_path.parent))
+
     if not candidates:
         raise FileNotFoundError(
             "Could not locate a combined report directory matching the manifest sources"
         )
-    return sorted(candidates, reverse=True)[0][2]
+    best_score = max(score for score, _path in candidates)
+    best = sorted(path for score, path in candidates if score == best_score)
+    if len(best) > 1:
+        raise RuntimeError(
+            "Multiple combined report directories match the manifest sources: "
+            + ", ".join(str(path) for path in best)
+        )
+    return best[0]
 
 
 async def main() -> int:
@@ -848,6 +905,7 @@ async def main() -> int:
     else:
         report_dir = _find_combined_report_dir(
             manifest=manifest,
+            manifest_path=manifest_path,
             reports_root=Path(args.reports_root).expanduser(),
         )
 
@@ -935,7 +993,6 @@ async def main() -> int:
             notes=notes,
             manifest=manifest,
         )
-        analysis_path.write_text(analysis_md, encoding="utf-8")
 
         patient_narrative = await _generate_markdown(
             llm,
@@ -952,28 +1009,72 @@ async def main() -> int:
             sessions=sessions,
             metrics=metrics,
         )
-        patient_md_path.write_text(patient_md, encoding="utf-8")
-        render_patient_facing_markdown_to_pdf(
-            patient_md,
-            patient_pdf_path,
-            patient_label=patient_label,
-        )
     finally:
         await llm.aclose()
 
-    meta = _meta_payload(
-        manifest_path=manifest_path,
-        report_dir=report_dir,
-        model_id=model_id,
-        sessions=sessions,
-        metrics=metrics,
-        duplicate_checks=duplicate_checks,
-        notes=notes,
-        analysis_path=analysis_path,
-        patient_md_path=patient_md_path,
-        patient_pdf_path=patient_pdf_path,
-    )
-    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with tempfile.TemporaryDirectory(
+        dir=output_dir, prefix=f".{patient_stem}."
+    ) as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        temp_analysis_path = temp_dir / analysis_path.name
+        temp_patient_md_path = temp_dir / patient_md_path.name
+        temp_patient_pdf_path = temp_dir / patient_pdf_path.name
+        temp_meta_path = temp_dir / meta_path.name
+
+        temp_analysis_path.write_text(analysis_md, encoding="utf-8")
+        temp_patient_md_path.write_text(patient_md, encoding="utf-8")
+        render_patient_facing_markdown_to_pdf(
+            patient_md,
+            temp_patient_pdf_path,
+            patient_label=patient_label,
+        )
+
+        meta = _meta_payload(
+            manifest_path=manifest_path,
+            report_dir=report_dir,
+            model_id=model_id,
+            sessions=sessions,
+            metrics=metrics,
+            duplicate_checks=duplicate_checks,
+            notes=notes,
+            analysis_path=analysis_path,
+            patient_md_path=patient_md_path,
+            patient_pdf_path=patient_pdf_path,
+            outputs_written=True,
+        )
+        temp_meta_path.write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        if not args.overwrite:
+            existing = [
+                path
+                for path in (analysis_path, patient_md_path, patient_pdf_path, meta_path)
+                if path.exists()
+            ]
+            if existing:
+                raise FileExistsError(
+                    "Output files already exist (use --overwrite): "
+                    + ", ".join(path.name for path in existing)
+                )
+
+        moved_paths: list[Path] = []
+        try:
+            for src, dst in (
+                (temp_analysis_path, analysis_path),
+                (temp_patient_md_path, patient_md_path),
+                (temp_patient_pdf_path, patient_pdf_path),
+                (temp_meta_path, meta_path),
+            ):
+                src.replace(dst)
+                moved_paths.append(dst)
+        except Exception:
+            for path in moved_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
 
     print(f"Wrote analysis markdown: {analysis_path}", flush=True)
     print(f"Wrote patient markdown: {patient_md_path}", flush=True)

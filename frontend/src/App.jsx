@@ -40,6 +40,7 @@ function App() {
   const [selectedRunId, setSelectedRunId] = useState(null);
   const [showBulkUpload, setShowBulkUpload] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const autoStartTriedRef = useRef(false);
   const [geminiProjectId, setGeminiProjectId] = useState('');
 
@@ -70,15 +71,31 @@ function App() {
 
   const handleError = useCallback((error, context = {}) => {
     const message = errorMessage(error);
+    const operatorHint = typeof error?.operatorHint === 'string' ? error.operatorHint : undefined;
+    setNotice('');
     appLogger.warn(
       {
         ...context,
         uiMessage: message,
+        operatorHint,
         err: serializeError(error),
       },
       'ui_error'
     );
     setError(message);
+  }, []);
+
+  const handleNotice = useCallback((message, context = {}) => {
+    const uiMessage = errorMessage(message);
+    setError('');
+    appLogger.info(
+      {
+        ...context,
+        uiMessage,
+      },
+      'ui_notice'
+    );
+    setNotice(uiMessage);
   }, []);
 
   const refreshModels = useCallback(async () => {
@@ -169,6 +186,7 @@ function App() {
 
       <div className="main">
         {error ? <div className="error-banner">{error}</div> : null}
+        {!error && notice ? <div className="warn-banner">{notice}</div> : null}
         {health && !health.cliproxy_reachable ? (
           <div className="warn-banner">
             CLIProxyAPI not ready at {health.cliproxy_base_url}
@@ -177,6 +195,7 @@ function App() {
               style={{ marginLeft: 10 }}
               onClick={async () => {
                 setError('');
+                setNotice('');
                 try {
                   await refreshHealth();
                   await refreshModels();
@@ -193,10 +212,11 @@ function App() {
                 style={{ marginLeft: 10 }}
                 onClick={async () => {
                   setError('');
+                  setNotice('');
                   try {
                     if (!health.cliproxyapi_installed && health.brew_installed) {
                       await api.cliproxyInstall({});
-                      handleError(
+                      handleNotice(
                         'Installing CLIProxyAPI… check data/cliproxy_install.log then retry.',
                         { action: 'cliproxy_install' }
                       );
@@ -220,6 +240,7 @@ function App() {
                   style={{ marginLeft: 10 }}
                   onClick={async () => {
                     setError('');
+                    setNotice('');
                     try {
                       await api.cliproxyLogin({ mode: 'login' });
                     } catch (e) {
@@ -233,6 +254,7 @@ function App() {
                   style={{ marginLeft: 10 }}
                   onClick={async () => {
                     setError('');
+                    setNotice('');
                     try {
                       await api.cliproxyLogin({ mode: 'claude' });
                     } catch (e) {
@@ -246,6 +268,7 @@ function App() {
                   style={{ marginLeft: 10 }}
                   onClick={async () => {
                     setError('');
+                    setNotice('');
                     try {
                       await api.cliproxyLogin({ mode: 'codex' });
                     } catch (e) {
@@ -259,6 +282,7 @@ function App() {
                   style={{ marginLeft: 10 }}
                   onClick={async () => {
                     setError('');
+                    setNotice('');
                     try {
                       await api.cliproxyLogin({
                         mode: 'gemini',
@@ -330,6 +354,7 @@ function App() {
               }
             }}
             onError={handleError}
+            onNotice={handleNotice}
           />
         )}
       </div>

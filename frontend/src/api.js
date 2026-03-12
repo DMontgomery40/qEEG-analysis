@@ -1,7 +1,41 @@
 import { childLogger, errorMessage, newRequestId, serializeError } from './logger';
+import { requestOperatorHint } from './operatorHints';
 
-const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:8000';
+const RAW_API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:8000';
 const apiLogger = childLogger({ area: 'api' });
+
+function resolveApiBase(base) {
+  const raw = String(base || '').trim();
+  if (!raw) {
+    return typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8000';
+  }
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(raw)) {
+    return raw;
+  }
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8000';
+  return new URL(raw.startsWith('/') ? raw : `/${raw}`, origin).toString();
+}
+
+const API_BASE = resolveApiBase(RAW_API_BASE);
+
+function buildApiUrl(path, { requestId } = {}) {
+  const base = new URL(API_BASE.endsWith('/') ? API_BASE : `${API_BASE}/`);
+  let relativePath = String(path || '');
+  if (!relativePath.startsWith('/')) {
+    relativePath = `/${relativePath}`;
+  }
+
+  const basePath = base.pathname.replace(/\/$/, '');
+  if (basePath && basePath !== '/' && relativePath.startsWith(`${basePath}/`)) {
+    relativePath = relativePath.slice(basePath.length);
+  }
+
+  const url = new URL(relativePath.replace(/^\//, ''), base);
+  if (requestId) {
+    url.searchParams.set('request_id', requestId);
+  }
+  return url;
+}
 
 export class ApiError extends Error {
   constructor(message, details = {}) {
@@ -13,6 +47,7 @@ export class ApiError extends Error {
     this.requestId = details.requestId ?? '';
     this.serverRequestId = details.serverRequestId ?? '';
     this.responseBody = details.responseBody ?? '';
+    this.operatorHint = details.operatorHint ?? '';
     this.cause = details.cause;
   }
 }
@@ -22,8 +57,7 @@ async function request(path, options = {}) {
   const requestId = newRequestId();
   const startedAt = performance.now();
   const headers = new Headers(options.headers || {});
-  const url = new URL(`${API_BASE}${path}`);
-  url.searchParams.set('request_id', requestId);
+  const url = buildApiUrl(path, { requestId });
   const log = apiLogger.child({ method, path, requestId });
 
   try {
@@ -33,6 +67,7 @@ async function request(path, options = {}) {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
+      const operatorHint = requestOperatorHint(path, { method, phase: 'response' });
       const err = new ApiError(text || `Request failed: ${res.status}`, {
         status: res.status,
         path,
@@ -40,6 +75,7 @@ async function request(path, options = {}) {
         requestId,
         serverRequestId,
         responseBody: text,
+        operatorHint,
       });
       log.warn(
         {
@@ -47,6 +83,7 @@ async function request(path, options = {}) {
           durationMs,
           serverRequestId,
           responseBodyPreview: text.slice(0, 500),
+          operatorHint,
         },
         'api_request_failed'
       );
@@ -69,9 +106,14 @@ async function request(path, options = {}) {
     if (error instanceof ApiError) throw error;
 
     const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+    const operatorHint = requestOperatorHint(path, {
+      method,
+      phase: error instanceof SyntaxError ? 'parse' : 'transport',
+    });
     log.error(
       {
         durationMs,
+        operatorHint,
         err: serializeError(error),
       },
       'api_request_threw'
@@ -80,6 +122,7 @@ async function request(path, options = {}) {
       path,
       method,
       requestId,
+      operatorHint,
       cause: error,
     });
   }
@@ -144,20 +187,20 @@ export const api = {
     return request(`/api/patients/${patientId}/reports`, { method: 'POST', body: form });
   },
   reportExtractedUrl(reportId) {
-    return `${API_BASE}/api/reports/${reportId}/extracted`;
+    return buildApiUrl(`/api/reports/${reportId}/extracted`).toString();
   },
   reextractReport(reportId) {
     return request(`/api/reports/${reportId}/reextract`, { method: 'POST' });
   },
 
   reportOriginalUrl(reportId) {
-    return `${API_BASE}/api/reports/${reportId}/original`;
+    return buildApiUrl(`/api/reports/${reportId}/original`).toString();
   },
   reportPages(reportId) {
     return request(`/api/reports/${reportId}/pages`);
   },
   reportPageUrl(reportId, pageNum) {
-    return `${API_BASE}/api/reports/${reportId}/pages/${pageNum}`;
+    return buildApiUrl(`/api/reports/${reportId}/pages/${pageNum}`).toString();
   },
   reportMetadata(reportId) {
     return request(`/api/reports/${reportId}/metadata`);
@@ -181,7 +224,7 @@ export const api = {
     return request(`/api/patients/${patientId}/files`, { method: 'POST', body: form });
   },
   patientFileUrl(fileId) {
-    return `${API_BASE}/api/patient_files/${fileId}`;
+    return buildApiUrl(`/api/patient_files/${fileId}`).toString();
   },
   deletePatientFile(fileId) {
     return request(`/api/patient_files/${fileId}`, { method: 'DELETE' });
@@ -215,14 +258,12 @@ export const api = {
     return request(`/api/runs/${runId}/export`, { method: 'POST' });
   },
   finalMdUrl(runId) {
-    return `${API_BASE}/api/runs/${runId}/export/final.md`;
+    return buildApiUrl(`/api/runs/${runId}/export/final.md`).toString();
   },
   finalPdfUrl(runId) {
-    return `${API_BASE}/api/runs/${runId}/export/final.pdf`;
+    return buildApiUrl(`/api/runs/${runId}/export/final.pdf`).toString();
   },
   streamUrl(runId, requestId) {
-    const url = new URL(`${API_BASE}/api/runs/${runId}/stream`);
-    if (requestId) url.searchParams.set('request_id', requestId);
-    return url.toString();
+    return buildApiUrl(`/api/runs/${runId}/stream`, { requestId }).toString();
   },
 };

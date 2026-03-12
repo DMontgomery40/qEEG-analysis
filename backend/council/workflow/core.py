@@ -17,6 +17,10 @@ from .stages import _StagesMixin
 LOGGER = get_logger(__name__)
 
 
+def _pipeline_failure_operator_hint() -> str:
+    return "run_pipeline advances Stages 1-6 sequentially; inspect the first stage after the last completed emit for a missing artifact, malformed JSON, or strict data guard failure."
+
+
 class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
     def __init__(self, *, llm: AsyncOpenAICompatClient):
         self._llm = llm
@@ -70,16 +74,38 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                     update_run_status(
                         session, run_id, status="needs_auth", error_message=str(e)
                     )
-                LOGGER.warning("pipeline_needs_auth", error=str(e))
-                await emit({"run_id": run_id, "status": "needs_auth", "error": str(e)})
+                operator_hint = (
+                    "run_pipeline surfaced _NeedsAuth from a model call; refresh CLIProxy login for the provider used by this run before retrying."
+                )
+                LOGGER.warning(
+                    "pipeline_needs_auth",
+                    error=str(e),
+                    operatorHint=operator_hint,
+                )
+                await emit(
+                    {
+                        "run_id": run_id,
+                        "status": "needs_auth",
+                        "error": str(e),
+                        "operatorHint": operator_hint,
+                    }
+                )
                 return
             except Exception as e:
                 with session_scope() as session:
                     update_run_status(
                         session, run_id, status="failed", error_message=str(e)
                     )
-                LOGGER.exception("pipeline_failed")
-                await emit({"run_id": run_id, "status": "failed", "error": str(e)})
+                operator_hint = _pipeline_failure_operator_hint()
+                LOGGER.exception("pipeline_failed", operatorHint=operator_hint)
+                await emit(
+                    {
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error": str(e),
+                        "operatorHint": operator_hint,
+                    }
+                )
                 return
 
             with session_scope() as session:

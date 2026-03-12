@@ -38,6 +38,7 @@ function PatientPage({
   onSelectRun,
   onRefreshGlobal,
   onError,
+  onNotice,
 }) {
   const [patient, setPatient] = useState(null);
   const [reports, setReports] = useState([]);
@@ -318,7 +319,7 @@ function PatientPage({
                   onClick={async () => {
                     try {
                       await api.reextractReport(selectedReportId);
-                      onError('Re-extracted report text (OCR if available). Refreshing models…', {
+                      onNotice?.('Re-extracted report text (OCR if available). Refreshing models…', {
                         action: 'reextract_report',
                         patientId,
                         reportId: selectedReportId,
@@ -545,7 +546,7 @@ function PatientPage({
                     mode: 'gemini',
                     project_id: geminiProjectId.trim() || null,
                   });
-                  onError(
+                  onNotice?.(
                     'Gemini login launched. Complete it in the opened browser window, then click Refresh.',
                     { action: 'gemini_login_launch', patientId }
                   );
