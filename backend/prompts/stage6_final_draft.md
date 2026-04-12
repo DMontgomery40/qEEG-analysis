@@ -7,15 +7,11 @@ You will be shown:
 
 ## Your Task
 
-Apply ALL required changes and produce a publication-ready clinical document.
+Apply ALL required changes and produce the final auditable council draft.
 
 ## Output Requirements
 
-**Length**: Maintain 3000-4000 words. Do not shorten the report.
-
-**Quality**: Professional, comprehensive, clinically useful. This is the final deliverable.
-
-**Format**: Markdown with these exact top-level headings (in this order):
+Use markdown with these exact top-level headings (in this order) to preserve downstream compatibility and repair behavior:
 
 # Dataset and Sessions
 # Key Empirical Findings
@@ -24,24 +20,26 @@ Apply ALL required changes and produce a publication-ready clinical document.
 # Background EEG Metrics
 # Speculative Commentary and Interpretive Hypotheses
 
+Write only as much as needed to make the draft evidence-complete and useful. Do NOT pad for word count or force clinician-monograph tone.
+
 ## Final Polish Guidelines
 
 ### Apply Required Changes
 - Address every item in the required_changes list
-- If a change conflicts with the original data, note why you did not apply it
+- If a change would conflict with the original data or introduce unsupported detail, keep the evidence-grounded version instead
 
 ### Maintain Structure
 Ensure all sections are present and substantive:
-- Dataset and Sessions: Complete source identification
-- Key Empirical Findings: 5-7 bullet points with quantitative trends
-- Performance Assessments: All behavioral metrics with target ranges
-- Auditory ERP: Per-site P300 table MUST be present and complete
-- Background EEG: Theta/beta, alpha lateralization, peak frequency, coherence
-- Speculative Commentary: 3-4 competing hypotheses, NOT collapsed
+- Dataset and Sessions: only sourced patient, session, and intervention facts; keep LUMIT framing only when explicit in the source
+- Key Empirical Findings: strongest verified trends, ratios, asymmetries, gradients, and uncommon connections
+- Performance Assessments: behavioral or task metrics only when present, with validity or state caveats preserved
+- Auditory ERP: include a compact per-site P300 table when the source data supports it and it materially anchors interpretation
+- Background EEG: ratio, alpha, coherence, and cross-metric findings kept tightly evidence-linked
+- Speculative Commentary: competing hypotheses preserved, proportionate to the data, with clear caveats
 
-### Per-Site P300 Table (Required)
+### Per-Site P300 Table (When Source Data Supports It)
 
-| Site | Session 1 (µV / ms) | Session 2 (µV / ms) | Session 3 (µV / ms) |
+| Site | Session 1 (uV / ms) | Session 2 (uV / ms) | Session 3 (uV / ms) |
 |------|---------------------|---------------------|---------------------|
 | C3   | ... | ... | ... |
 | CZ   | ... | ... | ... |
@@ -54,20 +52,18 @@ Ensure all sections are present and substantive:
 - Clear, professional clinical language
 - Empirical framing (no diagnosis, no causal claims)
 - Conservative interpretation with appropriate caveats
-- Use arrows (→) for progressions
-- Include target ranges in parentheses
+- Keep the draft useful to the neuro team and easy to translate into patient or family explanation
+- Use quantitative progressions and target ranges where they materially help
 
 ### Preserve Key Elements
 - All competing hypotheses in Speculative Commentary
-- All per-site/per-electrode data
+- All per-site or per-electrode data that materially matters
 - All validity concerns and caveats
 
 ## Rules
 
-1. **Apply ALL required changes** from the council review
+1. **Apply ALL evidence-grounded required changes** from the council review
 2. **Do not introduce new facts** beyond what's in the consolidated report and original data
-3. **Maintain word count** - do not shorten
-4. **Keep language clear and professional**
-5. **Ensure per-site tables are complete and accurate**
-
-This is the final clinical document. Quality and completeness are paramount.
+3. **Do not pad for word count**
+4. **Keep sections concise where the evidence is thin**
+5. **Ensure any included tables remain accurate**

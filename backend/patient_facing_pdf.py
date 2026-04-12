@@ -8,11 +8,36 @@ from __future__ import annotations
 import base64
 import os
 import re
-from datetime import datetime
 from pathlib import Path
 
 import markdown
-from weasyprint import HTML, CSS
+
+
+def _ensure_macos_weasyprint_libs_visible() -> None:
+    if os.name != "posix":
+        return
+    if "darwin" not in os.uname().sysname.lower():
+        return
+
+    candidates = ["/opt/homebrew/lib", "/usr/local/lib"]
+    existing = [
+        path
+        for path in (os.getenv("DYLD_FALLBACK_LIBRARY_PATH", "") or "").split(":")
+        if path
+    ]
+    merged = []
+    for path in [*candidates, *existing]:
+        if path and path not in merged and Path(path).exists():
+            merged.append(path)
+    if merged:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(merged)
+
+
+def _import_weasyprint():
+    _ensure_macos_weasyprint_libs_visible()
+    from weasyprint import CSS, HTML
+
+    return HTML, CSS
 
 # Markdown extensions for tables
 MD_EXTENSIONS = ["tables", "smarty"]
@@ -70,6 +95,7 @@ def render_patient_facing_markdown_to_pdf(
     )
 
     # Render to PDF
+    HTML, CSS = _import_weasyprint()
     HTML(string=html).write_pdf(str(output_path), stylesheets=[CSS(string=_get_css())])
 
 

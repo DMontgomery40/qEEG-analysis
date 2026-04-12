@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,7 +28,9 @@ from .config import (
     CLIPROXY_BASE_URL,
     COUNCIL_MODELS,
     DISCOVERED_MODEL_IDS,
+    DEFAULT_CONSOLIDATOR,
     EXPORTS_DIR,
+    MODEL_ROLE_DEFAULTS,
     ensure_data_dirs,
     set_discovered_model_ids,
 )
@@ -36,6 +39,17 @@ from .cliproxy_status import status_payload
 from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient
 from .logging_utils import configure_logging, get_logger, log_context, new_request_id
+from .model_selection import resolve_model_preference
+from .orchestration import (
+    build_patient_orchestration_detail,
+    build_patient_orchestration_summary,
+    cathode_handoff_meta_path,
+    cathode_handoff_payload_path,
+    cathode_handoff_source_path,
+    cathode_project_dir,
+    choose_cathode_source_artifact,
+    summarize_run_progress,
+)
 from .patient_files import save_patient_file_upload
 from .portal_sync import (
     spawn_portal_sync,
@@ -164,6 +178,10 @@ class SelectRequest(BaseModel):
     stage_num: int | None = None
     model_id: str | None = None
     kind: str | None = None
+
+
+class PatientActionRequest(BaseModel):
+    run_id: str | None = None
 
 
 class _EventBroker:
@@ -377,6 +395,90 @@ async def _cancel_task_if_possible(task: object | None) -> None:
             await task
 
 
+def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.partial")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _latest_complete_run_for_patient(
+    session, patient_id: str, *, preferred_run_id: str | None = None
+) -> storage.Run | None:
+    runs = storage.list_runs(session, patient_id)
+    complete_runs = [run for run in runs if (run.status or "") == "complete"]
+    if preferred_run_id:
+        complete_runs = [
+            run for run in complete_runs if run.id == preferred_run_id
+        ] + [run for run in complete_runs if run.id != preferred_run_id]
+    return complete_runs[0] if complete_runs else None
+
+
+def _prepare_cathode_handoff_for_patient(
+    *, patient_label: str, source_run: storage.Run, source_artifact: storage.Artifact
+) -> dict[str, Any]:
+    project_dir = cathode_project_dir(patient_label)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    source_text = Path(source_artifact.content_path).read_text(
+        encoding="utf-8", errors="replace"
+    )
+    source_path = cathode_handoff_source_path(patient_label)
+    source_path.write_text(source_text, encoding="utf-8")
+
+    handoff_payload = {
+        "intent": "patient-friendly qEEG explainer video",
+        "workspace_path": str(_repo_root()),
+        "source_paths": [str(source_path.resolve())],
+        "audience": "the patient and their family",
+        "target_length_minutes": 6.5,
+        "tone": "clear, warm, grounded, scientifically honest",
+        "visual_style": "patient-friendly clinical explainer",
+        "must_include": (
+            "verified progress over time, practical caveats, and a clear explanation "
+            "of what improved, what remains uncertain, and what deserves follow-up"
+        ),
+        "must_avoid": (
+            "invented certainty, hallucinated diagnoses, and filler about sync blinks, "
+            "bad nodes, or spacing/session artifacts unless they materially affect an empirical conclusion"
+        ),
+        "run_until": "render",
+        "ready_for_handoff": True,
+        "review_decision": "accept",
+        "qeeg_source": {
+            "patient_label": patient_label,
+            "run_id": source_run.id,
+            "artifact_id": source_artifact.id,
+            "artifact_kind": source_artifact.kind,
+            "artifact_stage_num": source_artifact.stage_num,
+            "artifact_model_id": source_artifact.model_id,
+            "artifact_path": source_artifact.content_path,
+        },
+    }
+    _write_json_atomically(cathode_handoff_payload_path(patient_label), handoff_payload)
+
+    handoff_meta = {
+        "patient_label": patient_label,
+        "project_dir": str(project_dir),
+        "prepared_at": datetime.now(timezone.utc).isoformat(),
+        "source_run_id": source_run.id,
+        "source_artifact_id": source_artifact.id,
+        "source_artifact_kind": source_artifact.kind,
+        "source_artifact_stage_num": source_artifact.stage_num,
+        "source_artifact_model_id": source_artifact.model_id,
+        "source_markdown_path": str(source_path),
+        "payload_path": str(cathode_handoff_payload_path(patient_label)),
+        "status": "handoff_prepared",
+    }
+    _write_json_atomically(cathode_handoff_meta_path(patient_label), handoff_meta)
+    return {
+        "project_dir": str(project_dir),
+        "source_markdown_path": str(source_path),
+        "payload_path": str(cathode_handoff_payload_path(patient_label)),
+        "meta_path": str(cathode_handoff_meta_path(patient_label)),
+    }
+
+
 async def _auto_generate_patient_facing_for_run(
     run_id: str, broker: _EventBroker
 ) -> None:
@@ -398,7 +500,8 @@ async def _auto_generate_patient_facing_for_run(
         return
 
     preferred_model = (
-        os.getenv("QEEG_PATIENT_FACING_MODEL", "gpt-5.4") or "gpt-5.4"
+        os.getenv("QEEG_PATIENT_FACING_MODEL", MODEL_ROLE_DEFAULTS.patient_facing_rewrite)
+        or MODEL_ROLE_DEFAULTS.patient_facing_rewrite
     ).strip()
     version_prefix = (
         os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto"
@@ -1070,21 +1173,34 @@ async def models() -> dict[str, Any]:
     ui_models = [mid for mid in discovered if _model_visible_in_ui(mid)]
     configured = []
     for m in COUNCIL_MODELS:
+        resolved_id = resolve_model_preference(m.id, discovered)
         configured.append(
             {
                 "id": m.id,
                 "name": m.name,
                 "source": m.source,
                 "endpoint_preference": m.endpoint_preference,
-                "available": m.id in DISCOVERED_MODEL_IDS
-                if DISCOVERED_MODEL_IDS
-                else False,
+                "available": resolved_id is not None,
+                "resolved_discovered_id": resolved_id,
             }
         )
     return {
         "discovered_models": discovered,
         "ui_models": ui_models,
         "configured_models": configured,
+        "default_consolidator": DEFAULT_CONSOLIDATOR,
+        "role_defaults": {
+            "consolidator": DEFAULT_CONSOLIDATOR,
+            "patient_facing": MODEL_ROLE_DEFAULTS.patient_facing_rewrite,
+            "vision_checker": (
+                os.getenv(
+                    "QEEG_VISION_CHECKER_MODEL", MODEL_ROLE_DEFAULTS.stage1_vision
+                )
+                or MODEL_ROLE_DEFAULTS.stage1_vision
+            ).strip(),
+            "review": MODEL_ROLE_DEFAULTS.stage5_final_review,
+            "final_draft": MODEL_ROLE_DEFAULTS.stage6_final_draft,
+        },
     }
 
 
@@ -1106,7 +1222,11 @@ async def list_patients() -> list[dict[str, Any]]:
             patient_ids_with_video = set(session.scalars(q).all())
 
         return [
-            _patient_out(p, has_explainer_video=(p.id in patient_ids_with_video))
+            _patient_out(
+                p,
+                has_explainer_video=(p.id in patient_ids_with_video),
+                orchestration_summary=build_patient_orchestration_summary(session, p),
+            )
             for p in pts
         ]
 
@@ -1251,7 +1371,143 @@ async def get_patient(patient_id: str) -> dict[str, Any]:
             .limit(1)
         )
         has_video = session.scalars(q).first() is not None
-        return _patient_out(p, has_explainer_video=has_video)
+        return _patient_out(
+            p,
+            has_explainer_video=has_video,
+            orchestration_summary=build_patient_orchestration_summary(session, p),
+        )
+
+
+@app.get("/api/patients/{patient_id}/orchestration")
+async def get_patient_orchestration(patient_id: str) -> dict[str, Any]:
+    with storage.session_scope() as session:
+        patient = storage.get_patient(session, patient_id)
+        if patient is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        return build_patient_orchestration_detail(session, patient)
+
+
+@app.post("/api/patients/{patient_id}/actions/{action}")
+async def run_patient_action(
+    patient_id: str, action: str, req: PatientActionRequest | None = None
+) -> dict[str, Any]:
+    req = req or PatientActionRequest()
+    with storage.session_scope() as session:
+        patient = storage.get_patient(session, patient_id)
+        if patient is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        patient_label = (patient.label or "").strip()
+        preferred_run = _latest_complete_run_for_patient(
+            session, patient_id, preferred_run_id=req.run_id
+        )
+
+    normalized_patient_label = _normalize_portal_patient_id(patient_label)
+
+    if action == "refresh":
+        return {"ok": True, "action": action, "patient_id": patient_id}
+
+    if action == "sync_portal":
+        if normalized_patient_label is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient label is not a canonical portal patient id",
+            )
+        _schedule_portal_sync(normalized_patient_label, source="api_patient_action")
+        return {
+            "ok": True,
+            "action": action,
+            "patient_label": normalized_patient_label,
+            "scheduled": True,
+        }
+
+    if action == "rerun_pipeline":
+        if normalized_patient_label is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient label is not a canonical portal patient id",
+            )
+        log_path = cfg.DATA_DIR / "pipeline_jobs" / f"{normalized_patient_label}.manual.log"
+        cmd = [
+            sys.executable,
+            str(_repo_root() / "scripts" / "portal_pipeline_worker.py"),
+            "--once",
+            "--include-label",
+            normalized_patient_label,
+        ]
+        pid = _start_detached(cmd, log_path)
+        return {
+            "ok": True,
+            "action": action,
+            "patient_label": normalized_patient_label,
+            "pid": pid,
+            "log_path": str(log_path),
+        }
+
+    if action == "regenerate_patient_facing":
+        if preferred_run is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No complete run is available for patient-facing generation",
+            )
+        broker: _EventBroker = app.state.broker
+        _spawn_task(
+            _auto_generate_patient_facing_for_run(preferred_run.id, broker),
+            name=f"patient-facing-{preferred_run.id}",
+        )
+        return {
+            "ok": True,
+            "action": action,
+            "run_id": preferred_run.id,
+            "patient_label": patient_label,
+            "scheduled": True,
+        }
+
+    if action == "prepare_cathode_handoff":
+        if normalized_patient_label is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient label is not a canonical portal patient id",
+            )
+        with storage.session_scope() as session:
+            choice = choose_cathode_source_artifact(
+                session, patient_id=patient_id, preferred_run_id=req.run_id
+            )
+            if choice is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="No complete council markdown artifact is available for Cathode handoff",
+                )
+            source_run, source_artifact = choice
+        handoff_paths = _prepare_cathode_handoff_for_patient(
+            patient_label=normalized_patient_label,
+            source_run=source_run,
+            source_artifact=source_artifact,
+        )
+        return {
+            "ok": True,
+            "action": action,
+            "patient_label": normalized_patient_label,
+            "run_id": source_run.id,
+            "artifact_id": source_artifact.id,
+            **handoff_paths,
+        }
+
+    if action == "export_council_artifacts":
+        if preferred_run is None:
+            raise HTTPException(
+                status_code=409,
+                detail="No complete run is available for export",
+            )
+        export_result = await export(preferred_run.id)
+        return {
+            "ok": True,
+            "action": action,
+            "run_id": preferred_run.id,
+            "patient_label": patient_label,
+            **export_result,
+        }
+
+    raise HTTPException(status_code=404, detail=f"Unknown patient action: {action}")
 
 
 @app.put("/api/patients/{patient_id}")
@@ -1960,13 +2216,17 @@ def _sse(payload: dict[str, Any]) -> str:
 
 
 def _patient_out(
-    p: storage.Patient, *, has_explainer_video: bool = False
+    p: storage.Patient,
+    *,
+    has_explainer_video: bool = False,
+    orchestration_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": p.id,
         "label": p.label,
         "notes": p.notes,
         "has_explainer_video": bool(has_explainer_video),
+        "orchestration_summary": orchestration_summary,
         "created_at": p.created_at.isoformat(),
         "updated_at": p.updated_at.isoformat(),
     }
@@ -2015,6 +2275,7 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "started_at": r.started_at.isoformat() if r.started_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
         "selected_artifact_id": r.selected_artifact_id,
+        "progress": summarize_run_progress(r),
         "created_at": r.created_at.isoformat(),
     }
 

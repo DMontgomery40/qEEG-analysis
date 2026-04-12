@@ -43,6 +43,35 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def _chat_with_retries(
+    llm: AsyncOpenAICompatClient,
+    *,
+    model_id: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    attempts = 5
+    last_error: UpstreamError | None = None
+    for attempt in range(attempts):
+        try:
+            return await llm.chat_completions(
+                model_id=model_id,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+            )
+        except UpstreamError as exc:
+            last_error = exc
+            retryable = exc.status_code in {429, 500, 502, 503, 504, None}
+            if not retryable or attempt == attempts - 1:
+                raise
+            await asyncio.sleep(min(10.0, 1.0 + attempt * 2.0))
+    assert last_error is not None
+    raise last_error
+
+
 def _discover_portal_patient_labels(portal_dir: Path) -> list[str]:
     if not portal_dir.exists():
         return []
@@ -276,8 +305,8 @@ async def main() -> int:
     )
     ap.add_argument(
         "--model",
-        default="gpt-5.4",
-        help="Preferred model id (default: gpt-5.4)",
+        default="claude-sonnet-4-6",
+        help="Preferred model id (default: claude-sonnet-4-6)",
     )
     ap.add_argument(
         "--max-tokens", type=int, default=4000, help="Max output tokens (default: 4000)"
@@ -429,12 +458,12 @@ async def main() -> int:
             continue
 
         assert llm is not None
-        md = await llm.chat_completions(
+        md = await _chat_with_retries(
+            llm,
             model_id=model_id,
-            messages=[{"role": "user", "content": prompt}],
+            prompt=prompt,
             temperature=float(args.temperature),
             max_tokens=int(args.max_tokens),
-            stream=False,
         )
         md = (md or "").strip()
 

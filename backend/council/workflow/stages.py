@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from ...config import DISCOVERED_MODEL_IDS, is_vision_capable
+from ...config import DISCOVERED_MODEL_IDS, MODEL_ROLE_DEFAULTS, is_vision_capable
+from ...model_selection import resolve_model_preference
 from ...reports import extract_pdf_full
 from ...storage import Report, get_report, get_run, set_run_label_map
 from ...storage import session_scope
@@ -64,31 +65,7 @@ class _StagesMixin:
 
     @staticmethod
     def _select_discovered_model_id(preferred: str) -> str | None:
-        pref = (preferred or "").strip()
-        if not pref:
-            return None
-
-        # Exact match first.
-        if pref in DISCOVERED_MODEL_IDS:
-            return pref
-
-        # Case-insensitive exact match.
-        pref_lower = pref.lower()
-        for mid in DISCOVERED_MODEL_IDS:
-            if mid.lower() == pref_lower:
-                return mid
-
-        # Substring match (prefer non-preview variants if both exist).
-        matches = [mid for mid in DISCOVERED_MODEL_IDS if pref_lower in mid.lower()]
-        if not matches:
-            return None
-
-        def rank(mid: str) -> tuple[int, int, str]:
-            lower = mid.lower()
-            preview_penalty = 1 if "preview" in lower else 0
-            return (preview_penalty, len(mid), mid)
-
-        return sorted(matches, key=rank)[0]
+        return resolve_model_preference(preferred, sorted(DISCOVERED_MODEL_IDS))
 
     @staticmethod
     def _has_heading(text: str, heading: str) -> bool:
@@ -266,7 +243,7 @@ class _StagesMixin:
         # This is intentionally independent from the selected council model set, so the council can use
         # text-only models while still getting page-grounded structured data + transcript.
         vision_checker_pref = os.getenv(
-            "QEEG_VISION_CHECKER_MODEL", "gemini-pro-vision"
+            "QEEG_VISION_CHECKER_MODEL", MODEL_ROLE_DEFAULTS.stage1_vision
         )
         vision_checker_id = self._select_discovered_model_id(vision_checker_pref)
         if vision_checker_id and not is_vision_capable(vision_checker_id):
@@ -917,14 +894,7 @@ class _StagesMixin:
     ) -> None:
         stage = STAGES[2]
         prompt = _load_prompt("stage3_revision.md")
-        required_headings = [
-            "# Dataset and Sessions",
-            "# Key Empirical Findings",
-            "# Performance Assessments",
-            "# Auditory ERP: P300 and N100",
-            "# Background EEG Metrics",
-            "# Speculative Commentary and Interpretive Hypotheses",
-        ]
+        required_headings = None
         end_sentinel = "<!-- END STAGE3 REVISION -->"
 
         with session_scope() as session:
@@ -1050,12 +1020,8 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    missing = [
-                        h for h in required_headings if not self._has_heading(text, h)
-                    ]
                     raise RuntimeError(
                         "Stage 3 revision remained incomplete after repair attempts. "
-                        f"Missing headings: {missing if missing else '(none)'}; "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
                 return model_id, text
@@ -1098,6 +1064,11 @@ class _StagesMixin:
             "# Background EEG Metrics",
             "# Speculative Commentary and Interpretive Hypotheses",
         ]
+        repair_headings = (
+            required_headings
+            if _truthy_env("QEEG_STAGE4_REQUIRE_HEADINGS", False)
+            else []
+        )
         end_sentinel = "<!-- END CONSOLIDATED REPORT -->"
 
         def has_heading(text: str, heading: str) -> bool:
@@ -1109,14 +1080,14 @@ class _StagesMixin:
             import re
 
             positions: list[tuple[str, int]] = []
-            for h in required_headings:
+            for h in repair_headings:
                 m = re.search(rf"(?m)^{re.escape(h)}\s*$", text or "")
                 if m:
                     positions.append((h, m.start()))
             return sorted(positions, key=lambda x: x[1])
 
         def first_missing_heading(text: str) -> str | None:
-            for h in required_headings:
+            for h in repair_headings:
                 if not has_heading(text, h):
                     return h
             return None
@@ -1124,7 +1095,9 @@ class _StagesMixin:
         def is_complete(text: str) -> bool:
             if end_sentinel not in (text or ""):
                 return False
-            return all(has_heading(text, h) for h in required_headings)
+            if not repair_headings:
+                return True
+            return all(has_heading(text, h) for h in repair_headings)
 
         def last_heading_present(text: str) -> tuple[str, int] | tuple[None, None]:
             positions = heading_positions(text)
@@ -1246,27 +1219,33 @@ class _StagesMixin:
             for _ in range(repair_calls):
                 # Prefer resuming from the first missing section. If all required sections are present but the
                 # sentinel is missing, resume from the last heading and ask for a clean ending.
-                start_heading = first_missing_heading(repaired)
-                positions = heading_positions(repaired)
+                start_heading = first_missing_heading(repaired) if repair_headings else None
+                positions = heading_positions(repaired) if repair_headings else []
                 pos_map = {h: idx for h, idx in positions}
                 start_idx = pos_map.get(start_heading) if start_heading else None
-                if start_heading is None:
+                if repair_headings and start_heading is None:
                     start_heading, start_idx = last_heading_present(repaired)
-                if start_heading is None:
-                    start_heading = required_headings[0]
+                if repair_headings and start_heading is None:
+                    start_heading = repair_headings[0]
                     start_idx = None
 
-                if start_idx is None:
-                    prefix = (repaired or "").rstrip()
-                else:
-                    prefix = (repaired[:start_idx] or "").rstrip()
+                prefix = (
+                    (repaired[:start_idx] or "").rstrip()
+                    if repair_headings and start_idx is not None
+                    else (repaired or "").rstrip()
+                )
 
                 partial_tail = (repaired or "")[-continuation_context_chars:]
                 continuation_instruction = (
                     "Your previous output was cut off.\n"
                     "Output ONLY the remaining portion of the consolidated report.\n"
-                    f"- Start with this exact heading (no text before it): {start_heading}\n"
-                    f"- Continue through: {required_headings[-1]}\n"
+                )
+                if repair_headings and start_heading:
+                    continuation_instruction += (
+                        f"- Start with this exact heading (no text before it): {start_heading}\n"
+                        f"- Continue through: {repair_headings[-1]}\n"
+                    )
+                continuation_instruction += (
                     f"- End with a final line exactly: {end_sentinel}\n"
                 )
                 cont_prompt = (
@@ -1284,14 +1263,15 @@ class _StagesMixin:
 
                 # Trim any preamble before the requested start heading.
                 clean = cont
-                try:
-                    import re
+                if repair_headings and start_heading:
+                    try:
+                        import re
 
-                    m = re.search(rf"(?m)^{re.escape(start_heading)}\s*$", cont or "")
-                    if m:
-                        clean = cont[m.start() :]
-                except Exception:
-                    clean = cont
+                        m = re.search(rf"(?m)^{re.escape(start_heading)}\s*$", cont or "")
+                        if m:
+                            clean = cont[m.start() :]
+                    except Exception:
+                        clean = cont
 
                 repaired = f"{prefix}\n\n{(clean or '').strip()}\n"
                 if is_complete(repaired):
@@ -1299,7 +1279,7 @@ class _StagesMixin:
             text = repaired
 
         if not is_complete(text):
-            missing = [h for h in required_headings if not has_heading(text, h)]
+            missing = [h for h in repair_headings if not has_heading(text, h)]
             detail = (
                 "Stage 4 consolidation remained incomplete after repair attempts.\n"
                 f"Missing headings: {missing if missing else '(none)'}\n"
@@ -1441,14 +1421,7 @@ class _StagesMixin:
     ) -> None:
         stage = STAGES[5]
         prompt = _load_prompt("stage6_final_draft.md")
-        required_headings = [
-            "# Dataset and Sessions",
-            "# Key Empirical Findings",
-            "# Performance Assessments",
-            "# Auditory ERP: P300 and N100",
-            "# Background EEG Metrics",
-            "# Speculative Commentary and Interpretive Hypotheses",
-        ]
+        required_headings = None
         end_sentinel = "<!-- END STAGE6 FINAL DRAFT -->"
 
         with session_scope() as session:
@@ -1553,12 +1526,8 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    missing = [
-                        h for h in required_headings if not self._has_heading(text, h)
-                    ]
                     raise RuntimeError(
                         "Stage 6 final draft remained incomplete after repair attempts. "
-                        f"Missing headings: {missing if missing else '(none)'}; "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
                 return model_id, text

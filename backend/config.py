@@ -33,6 +33,16 @@ class CouncilModelConfig:
     endpoint_preference: EndpointPreference = "chat"
 
 
+@dataclass(frozen=True)
+class ModelRoleDefaults:
+    stage1_vision: str
+    stage2_review: str
+    stage4_consolidator: str
+    stage5_final_review: str
+    stage6_final_draft: str
+    patient_facing_rewrite: str
+
+
 def _load_models_from_env() -> list[CouncilModelConfig] | None:
     raw = os.getenv("COUNCIL_MODELS_JSON")
     if not raw:
@@ -69,28 +79,45 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
     return out
 
 
+MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
+    stage1_vision=os.getenv("DEFAULT_STAGE1_VISION_MODEL", "gemini-3.1-pro-preview"),
+    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "gpt-5.4"),
+    stage4_consolidator=os.getenv(
+        "DEFAULT_STAGE4_CONSOLIDATOR",
+        os.getenv("DEFAULT_CONSOLIDATOR", "claude-sonnet-4-6"),
+    ),
+    stage5_final_review=os.getenv("DEFAULT_STAGE5_REVIEW_MODEL", "gpt-5.4"),
+    stage6_final_draft=os.getenv(
+        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "claude-sonnet-4-6"
+    ),
+    patient_facing_rewrite=os.getenv(
+        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "claude-sonnet-4-6"
+    ),
+)
+
+
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     CouncilModelConfig(
-        id="gpt-5.4",
+        id=MODEL_ROLE_DEFAULTS.stage2_review,
         name="GPT-5.4",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
     CouncilModelConfig(
-        id="claude-sonnet-4-6",
+        id=MODEL_ROLE_DEFAULTS.stage6_final_draft,
         name="Claude Sonnet 4.6",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
     CouncilModelConfig(
-        id="gemini-3-pro-preview",
-        name="Gemini 3 Pro Preview",
+        id=MODEL_ROLE_DEFAULTS.stage1_vision,
+        name="Gemini 3.1 Pro Preview",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
 ]
 
-DEFAULT_CONSOLIDATOR = os.getenv("DEFAULT_CONSOLIDATOR", "gemini-3-pro-preview")
+DEFAULT_CONSOLIDATOR = MODEL_ROLE_DEFAULTS.stage4_consolidator
 
 # Models that support vision/multimodal input (can process images)
 # These will receive page images in addition to text for Stage 1 analysis
@@ -137,26 +164,29 @@ VISION_CAPABLE_MODELS: set[str] = {
     "anthropic/claude-sonnet-4-6",
     "anthropic/claude-opus-4-6",
     # Google Gemini models (2.5/3.x families and compatible historical ids)
-    "gemini-pro-vision",
     "gemini-1.5-pro",
     "gemini-1.5-flash",
     "gemini-2.0-flash",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
+    "gemini-3.1-pro-preview",
     "gemini-3-pro",
     "gemini-3-flash",
     "gemini-3-pro-preview",
     "gemini-3-flash-preview",
-    "google/gemini-pro-vision",
     "google/gemini-1.5-pro",
     "google/gemini-1.5-flash",
     "google/gemini-2.0-flash",
     "google/gemini-2.5-pro",
     "google/gemini-2.5-flash",
     "google/gemini-2.5-flash-lite",
+    "google/gemini-3.1-pro-preview",
     "google/gemini-3-pro-preview",
     "google/gemini-3-flash-preview",
+    # Legacy compatibility ids kept for older live inventories.
+    "gemini-pro-vision",
+    "google/gemini-pro-vision",
 }
 
 

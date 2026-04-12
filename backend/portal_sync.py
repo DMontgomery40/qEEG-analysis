@@ -76,6 +76,10 @@ def _pipeline_watch_state_path(root_dir: Path) -> Path:
     return root_dir / ".qeeg_portal_local_pipeline_state.json"
 
 
+def _sync_watch_state_path(root_dir: Path) -> Path:
+    return root_dir / ".qeeg_portal_sync_watch_state.json"
+
+
 def _load_sync_state(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -531,6 +535,7 @@ async def watch_portal_patients_forever() -> None:
 
     root_dir = portal_patients_dir()
     pipeline_state_path = _pipeline_watch_state_path(root_dir)
+    sync_state_path = _sync_watch_state_path(root_dir)
     LOGGER.info(
         "portal_raw_sync_watcher_started",
         root_dir=str(root_dir),
@@ -541,12 +546,15 @@ async def watch_portal_patients_forever() -> None:
 
     previous_snapshots: dict[str, tuple[int, int, int]] | None = None
     stable_counts: dict[str, int] = {}
-    last_synced_snapshots: dict[str, tuple[int, int, int]] = {}
+    last_synced_snapshots: dict[str, tuple[int, int, int]] = _load_pipeline_watch_state(
+        sync_state_path
+    )
     last_pipeline_snapshots: dict[str, tuple[int, int, int]] = (
         _load_pipeline_watch_state(pipeline_state_path)
         if local_pipeline_watcher
         else {}
     )
+    seed_sync_snapshots = not sync_state_path.exists()
     seed_pipeline_snapshots = local_pipeline_watcher and not pipeline_state_path.exists()
 
     try:
@@ -558,6 +566,12 @@ async def watch_portal_patients_forever() -> None:
             if previous_snapshots is None:
                 previous_snapshots = current_snapshots
                 stable_counts = {patient_id: 1 for patient_id in current_snapshots}
+                if seed_sync_snapshots:
+                    last_synced_snapshots = dict(current_snapshots)
+                    _write_pipeline_watch_state(
+                        sync_state_path, last_synced_snapshots
+                    )
+                    seed_sync_snapshots = False
                 if seed_pipeline_snapshots:
                     last_pipeline_snapshots = dict(current_snapshots)
                     _write_pipeline_watch_state(
@@ -569,9 +583,12 @@ async def watch_portal_patients_forever() -> None:
 
             removed_patient_ids = set(previous_snapshots) - set(current_snapshots)
             pipeline_state_dirty = False
+            sync_state_dirty = False
             for patient_id in removed_patient_ids:
                 stable_counts.pop(patient_id, None)
-                last_synced_snapshots.pop(patient_id, None)
+                if patient_id in last_synced_snapshots:
+                    last_synced_snapshots.pop(patient_id, None)
+                    sync_state_dirty = True
                 if patient_id in last_pipeline_snapshots:
                     last_pipeline_snapshots.pop(patient_id, None)
                     pipeline_state_dirty = True
@@ -593,6 +610,7 @@ async def watch_portal_patients_forever() -> None:
                     )
                     if spawn_portal_sync(patient_id):
                         last_synced_snapshots[patient_id] = fingerprint
+                        sync_state_dirty = True
 
                 if (
                     local_pipeline_watcher
@@ -619,6 +637,8 @@ async def watch_portal_patients_forever() -> None:
                         pipeline_state_dirty = True
 
             previous_snapshots = current_snapshots
+            if sync_state_dirty:
+                _write_pipeline_watch_state(sync_state_path, last_synced_snapshots)
             if local_pipeline_watcher and pipeline_state_dirty:
                 _write_pipeline_watch_state(
                     pipeline_state_path, last_pipeline_snapshots

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass
@@ -136,6 +137,14 @@ def _is_openai_gpt5_model(model_id: str) -> bool:
     return mid.startswith("gpt-5")
 
 
+def _is_anthropic_claude_model(model_id: str) -> bool:
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return False
+    mid = mid.removeprefix("anthropic/")
+    return mid.startswith("claude-")
+
+
 def _openai_reasoning_effort(model_id: str) -> str | None:
     """Infer a reasoning effort from GPT-5 model ids.
 
@@ -193,6 +202,17 @@ class AsyncOpenAICompatClient:
                 transport=self._transport,
             )
         return self._client
+
+    def _chat_completions_sync(self, payload: dict[str, Any]) -> httpx.Response:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        with httpx.Client(
+            base_url=self._base_url,
+            headers=headers,
+            timeout=httpx.Timeout(self._timeout_s),
+        ) as client:
+            return client.post("/v1/chat/completions", json=payload)
 
     async def list_models(self) -> list[str]:
         client = self._get_client()
@@ -256,9 +276,10 @@ class AsyncOpenAICompatClient:
         payload = {
             "model": model_id,
             "messages": messages,
-            "temperature": temperature,
             "stream": stream,
         }
+        if not _is_anthropic_claude_model(model_id):
+            payload["temperature"] = temperature
         if _is_openai_gpt5_model(model_id):
             payload["max_completion_tokens"] = max_tokens
         else:
@@ -267,7 +288,10 @@ class AsyncOpenAICompatClient:
             payload["reasoning_effort"] = reasoning_effort
 
         try:
-            resp = await client.post("/v1/chat/completions", json=payload)
+            if _is_anthropic_claude_model(model_id) and self._transport is None:
+                resp = await asyncio.to_thread(self._chat_completions_sync, payload)
+            else:
+                resp = await client.post("/v1/chat/completions", json=payload)
         except Exception as e:
             raise UpstreamError(
                 f"CLIProxyAPI request failed: {e}",
@@ -318,6 +342,14 @@ class AsyncOpenAICompatClient:
                 "CLIProxyAPI /v1/chat/completions returned non-text content",
                 operator_hint=_operator_hint("/v1/chat/completions", "non_text"),
             )
+        if not content.strip():
+            await self.aclose()
+            raise UpstreamError(
+                "CLIProxyAPI /v1/chat/completions returned empty text content",
+                operator_hint=_operator_hint(
+                    "/v1/chat/completions", "unexpected_shape"
+                ),
+            )
         return content
 
     async def responses(
@@ -362,7 +394,7 @@ class AsyncOpenAICompatClient:
 
         # OpenAI Responses API: output_text may be present; otherwise reconstruct from output blocks.
         output_text = data.get("output_text") if isinstance(data, dict) else None
-        if isinstance(output_text, str):
+        if isinstance(output_text, str) and output_text.strip():
             return output_text
 
         if not isinstance(data, dict) or not isinstance(data.get("output"), list):
@@ -383,7 +415,14 @@ class AsyncOpenAICompatClient:
                     text = block.get("text")
                     if isinstance(text, str):
                         chunks.append(text)
-        return "".join(chunks).strip()
+        text = "".join(chunks).strip()
+        if not text:
+            await self.aclose()
+            raise UpstreamError(
+                "CLIProxyAPI /v1/responses returned empty text content",
+                operator_hint=_operator_hint("/v1/responses", "unexpected_shape"),
+            )
+        return text
 
     @staticmethod
     def _messages_to_input_text(messages: list[dict]) -> str:

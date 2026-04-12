@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import './Sidebar.css';
+import { getPatientSidebarSummary } from '../orchestration';
 
 // EEG Wave Icon Component
 function EEGWaveIcon({ className }) {
@@ -82,25 +83,55 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
 
       <div className="sidebar-list">
         {filtered.map((p) => (
-          <button
+          <SidebarPatientItem
             key={p.id}
-            className={`sidebar-item ${p.id === selectedPatientId ? 'active' : ''}`}
-            onClick={() => onSelectPatient(p.id)}
-          >
-            <div className="sidebar-item-main">
-              <div className="sidebar-item-title">{p.label}</div>
-              <div className="sidebar-item-sub">{p.id.slice(0, 8)}</div>
-            </div>
-            {p.has_explainer_video ? (
-              <div className="sidebar-badge sidebar-badge-mp4" title="Explainer video uploaded">
-                MP4
-              </div>
-            ) : null}
-          </button>
+            patient={p}
+            active={p.id === selectedPatientId}
+            onSelectPatient={onSelectPatient}
+          />
         ))}
         {!filtered.length ? <div className="sidebar-empty">No patients</div> : null}
       </div>
     </div>
+  );
+}
+
+function SidebarPatientItem({ patient, active, onSelectPatient }) {
+  const summary = getPatientSidebarSummary(patient);
+
+  return (
+    <button
+      className={`sidebar-item ${active ? 'active' : ''}`}
+      onClick={() => onSelectPatient(patient.id)}
+    >
+      <div className="sidebar-item-main">
+        <div className="sidebar-item-title">{patient.label}</div>
+        <div className="sidebar-item-sub">{patient.id.slice(0, 8)}</div>
+        {summary ? (
+          <div className="sidebar-item-status">
+            <div className="sidebar-item-status-row">
+              <span className={`sidebar-status-dot ${summary.tone}`} />
+              <span className="sidebar-item-status-label">{summary.label}</span>
+              {summary.percent != null ? (
+                <span className="sidebar-item-status-percent">{summary.percent}%</span>
+              ) : null}
+            </div>
+            {summary.percent != null ? (
+              <div className="sidebar-mini-progress" aria-hidden="true">
+                <div className="sidebar-mini-progress-fill" style={{ width: `${summary.percent}%` }} />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <div className="sidebar-item-badges">
+        {patient.has_explainer_video ? (
+          <div className="sidebar-badge sidebar-badge-mp4" title="Explainer video uploaded">
+            MP4
+          </div>
+        ) : null}
+      </div>
+    </button>
   );
 }
 

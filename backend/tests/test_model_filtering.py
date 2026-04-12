@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 
 def test_model_visible_in_ui_filters_legacy_provider_versions(temp_data_dir):
     from backend.main import _model_visible_in_ui
@@ -37,3 +39,27 @@ def test_model_visible_in_ui_filters_legacy_provider_versions(temp_data_dir):
 
     # Unknown ids: keep visible
     assert _model_visible_in_ui("some-custom-model") is True
+
+
+def test_models_endpoint_reports_configured_availability_from_real_discovery(monkeypatch):
+    from backend.config import CouncilModelConfig, set_discovered_model_ids
+    import backend.main as main
+
+    monkeypatch.setattr(
+        main,
+        "COUNCIL_MODELS",
+        [
+            CouncilModelConfig(id="gpt-5.4", name="GPT-5.4", source="test"),
+            CouncilModelConfig(id="gemini-3.1-pro-preview", name="Gemini", source="test"),
+        ],
+    )
+    set_discovered_model_ids(["openai/gpt-5.4", "google/gemini-3-pro-preview"])
+
+    payload = asyncio.run(main.models())
+    configured = {item["id"]: item for item in payload["configured_models"]}
+
+    assert payload["discovered_models"] == ["google/gemini-3-pro-preview", "openai/gpt-5.4"]
+    assert configured["gpt-5.4"]["available"] is True
+    assert configured["gpt-5.4"]["resolved_discovered_id"] == "openai/gpt-5.4"
+    assert configured["gemini-3.1-pro-preview"]["available"] is True
+    assert configured["gemini-3.1-pro-preview"]["resolved_discovered_id"] == "google/gemini-3-pro-preview"

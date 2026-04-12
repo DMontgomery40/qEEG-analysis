@@ -1,0 +1,226 @@
+.orchestration-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.orchestration-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.orchestration-subtitle {
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.orchestration-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.orchestration-percent {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.orchestration-updated {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-default);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-badge-neutral {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+}
+
+.status-badge-active {
+  background: rgba(0, 206, 209, 0.12);
+  border-color: rgba(0, 206, 209, 0.35);
+  color: var(--accent-teal-bright);
+}
+
+.status-badge-success {
+  background: rgba(77, 214, 155, 0.12);
+  border-color: rgba(77, 214, 155, 0.35);
+  color: var(--accent-green-bright);
+}
+
+.status-badge-warning {
+  background: rgba(255, 179, 71, 0.14);
+  border-color: rgba(255, 179, 71, 0.35);
+  color: var(--accent-gold);
+}
+
+.status-badge-error {
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.35);
+  color: #ff8d8d;
+}
+
+.status-progress {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.status-progress.compact {
+  height: 6px;
+}
+
+.status-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(0, 206, 209, 0.85) 0%, rgba(147, 112, 219, 0.8) 100%);
+}
+
+.orchestration-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.orchestration-muted,
+.orchestration-warning {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.orchestration-warning {
+  color: #ffb66e;
+}
+
+.orchestration-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.orchestration-section {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.orchestration-section.empty {
+  opacity: 0.86;
+}
+
+.orchestration-section-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.orchestration-section-title {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.orchestration-section-summary {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin-top: 4px;
+}
+
+.orchestration-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.orchestration-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.orchestration-detail span {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.orchestration-detail strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.orchestration-error {
+  color: #ff9c9c;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.orchestration-open-run {
+  align-self: flex-start;
+}
+
+.orchestration-report-lifecycle {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.orchestration-report-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.orchestration-report-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.orchestration-report-row {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.orchestration-report-name {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.orchestration-report-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

@@ -177,6 +177,16 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
+  getPatientOrchestration(patientId) {
+    return request(`/api/patients/${patientId}/orchestration`);
+  },
+  runPatientAction(patientId, action, payload = {}) {
+    return request(`/api/patients/${patientId}/actions/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  },
 
   listReports(patientId) {
     return request(`/api/patients/${patientId}/reports`);
