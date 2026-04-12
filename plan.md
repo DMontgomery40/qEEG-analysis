@@ -9,6 +9,23 @@ Date: 2026-04-12
 - Immediate remediation started by downloading the two source PDFs from Netlify Blobs into `data/portal_patients/03-05-2010-0/` and launching:
   - `uv run python scripts/run_portal_council_batch.py --include-label 03-05-2010-0`
 
+## Patient-Facing PDF Backfill
+
+- A later portal audit found missing patient-facing PDFs for `02-28-1978-0`, `09-23-1982-0`, `10-31-2008-0`, and `12-02-1985-0`.
+- Operator explicitly excluded `09-23-1982-0` because it is another wrong-birthdate patient.
+- Completed and verified patient-facing PDFs:
+  - `data/portal_patients/02-28-1978-0/02-28-1978-0__patient-facing__auto-8d7e6f2c__2026-04-12.pdf`
+  - `data/portal_patients/10-31-2008-0/10-31-2008-0__patient-facing__auto-7513a2d6__2026-04-12.pdf`
+  - `data/portal_patients/12-02-1985-0/12-02-1985-0__patient-facing__auto-b2620384__2026-04-12.pdf`
+- Current audit result: all portal patients have patient-facing PDFs except the intentionally excluded `09-23-1982-0`.
+- New reliability fixes from this backfill:
+  - `--force` must create a fresh run and bypass interrupted resume candidates.
+  - Empty LLM text responses are retryable failures, not parseable content.
+  - OpenAI Responses output blocks must be reconstructed when `output_text` is empty.
+  - Claude chat calls omit `temperature`; live Claude chat calls use sync HTTP because the async path returned empty multimodal responses through CLIProxyAPI.
+  - Patient-facing auto generation defaults to Sonnet and retries transient/empty upstream failures.
+  - Portal batch fallback selection excludes Opus unless `QEEG_ALLOW_OPUS_MODELS` is explicitly truthy.
+
 ## Non-Negotiable Outcome
 
 Every clinic-uploaded qEEG report PDF must become a durable pipeline job. A new portal patient or new report upload may not depend on a human noticing a missing local folder.
@@ -107,3 +124,95 @@ Every clinic-uploaded qEEG report PDF must become a durable pipeline job. A new 
 - Full automation depends on local machine services: Netlify CLI auth, CLIProxyAPI auth, and real model availability.
 - Netlify functions cannot run the local qEEG Council workflow themselves, so the durable job marker plus local worker is the real reliability boundary.
 - Existing worktrees contain many uncommitted changes; all integration must preserve and incorporate them rather than reverting.
+
+## Audit and Orchestration Plan (2026-04-12)
+
+### Summary
+
+- Perform a repo-wide audit and remediation pass across backend workflow, prompt contract, model policy, patient-facing generation, frontend observability, and downstream orchestration with `../thrylen/qeeg` and `../cathode`.
+- Preserve the dual-track product: auditable council deliberation remains, with separate patient/family and neuro-team value in separate sections/artifacts rather than forcing everything into a clinician-monograph template.
+- Make evidence-first quality the default: hard-fail on factual errors, unsupported claims, contradictory logic, broken orchestration, and missing sourced essentials; treat word counts, rigid heading inventories, and ornamental table rules as soft guidance unless truly required.
+- Append this full approved plan verbatim into `plan.md` as a new dated audit/remediation section, preserving the existing portal reliability content.
+
+### Core Remediation Changes
+
+- **Model policy by role**
+  - Re-evaluate each role separately: strict extraction/data-pack, Stage 1 narrative analysis, consolidation, final review, and patient-facing rewrite.
+  - Use live CLIProxy inventory plus official vendor docs to choose defaults; quality-first by role, Opus excluded by default for cost.
+  - Replace stale/default vision assumptions such as `gemini-pro-vision`; prefer the strongest currently available Gemini multimodal model for shared extraction work, with explicit fallback order.
+  - Surface role defaults and actual live availability in config and `/api/models`.
+
+- **Prompt and workflow contract cleanup**
+  - Remove fixed diagnosis/session assumptions except retained LUMIT framing; diagnosis/session/treatment specifics must come from report data or explicit metadata.
+  - Rewrite Stage 1/2/4/5/6 prompts so they stop forcing literature-heavy filler, overblown uncertainty theater, and clinician-only template bloat.
+  - Keep deliberation auditable, but focus outputs on verified trends, ratios, uncommon connections, practical caveats, and concise neuro-team gap-filling.
+  - Relax Stage 2/5 and downstream repair logic so exact headings, exact word counts, and hardcoded table shapes no longer create false fails when the content is evidence-sound.
+  - Add controlled fallback rules for downstream use: prefer Stage 4 consolidation for Cathode input; if Stage 4 is unavailable but Stage 3 is sound, allow Stage 3 fallback.
+
+- **Stage 1/runtime reliability**
+  - Audit the full Stage 1/data-pack path for hour-scale regressions: extraction, chunking, shared data-pack work, vision transcript, per-model multimodal notes, retries, and repair loops.
+  - Remove hidden duplicate work where possible and make progress accounting truthful.
+  - Persist structured progress for extraction/data-pack/transcript/model subtasks so UI progress can reflect real denominators and current subtask state.
+  - Treat partial success honestly in run state and UI instead of burying it in logs or job JSON.
+
+### Frontend and Orchestration Changes
+
+- **Observability**
+  - Add a patient orchestration/status surface backed by DB run state, `progress.jsonl`, `data/pipeline_jobs/*.json`, portal sync state, published portal artifacts, and Cathode handoff state.
+  - Add a sidebar mini-indicator per patient showing latest pipeline/sync/downstream state at a glance.
+  - Add a detailed patient-page orchestration panel showing report-level lifecycle: uploaded, extracted, council running, patient-facing generated, synced to `thrylen`, Cathode-ready / Cathode-synced, plus errors, elapsed time, and last update.
+  - Upgrade run-page SSE rendering from coarse status to real stage/task/model/chunk progress; use percent only when the denominator is real, otherwise show phase + elapsed + current unit of work.
+
+- **Sync/orchestration gap**
+  - Treat the frontend as the control plane for the workflow that currently spans qEEG-analysis, `thrylen`, and Cathode.
+  - Add backend endpoints for patient-scoped orchestration state and actions rather than leaving status trapped in scripts/files.
+  - Add frontend actions for full orchestration through backend APIs: refresh state, retry portal sync, rerun patient-facing generation, rerun/export council artifacts, and trigger Cathode handoff.
+
+### Public Interfaces
+
+- Add a patient orchestration status shape that includes:
+  - sidebar summary state
+  - report-level pipeline states
+  - current/last run progress with stage/task/model/chunk timing
+  - portal sync status and last error
+  - patient-facing generation status
+  - Cathode handoff status and chosen source artifact
+- Add patient-scoped orchestration actions:
+  - refresh/recompute orchestration status
+  - retry portal sync
+  - retry patient-facing generation
+  - trigger Cathode handoff using the approved council source artifact
+- Extend run/event payloads to include enough structured progress for truthful UI progress bars/phase indicators.
+
+### Validation and Completion Gate
+
+- Add backend tests for:
+  - role-based model resolution
+  - evidence-first Stage 2/5 acceptance criteria
+  - Stage 4 / Stage 3 Cathode fallback selection
+  - patient orchestration aggregation from DB + file-backed state
+  - real progress accounting across extraction/data-pack/transcript/model subtasks
+- Add frontend tests for:
+  - sidebar mini status
+  - patient-page orchestration panel
+  - truthful progress rendering from SSE/status payloads
+  - retry/trigger actions and error states
+  - stale/failed sync visibility
+- Keep existing focused verification for `llm_client`, AI review agents, portal batch runner, and auto patient-facing generation, then extend with orchestration/status coverage.
+- Completion is not done until:
+  - the full approved plan has been appended into `plan.md`,
+  - implementation has been verified on the changed surfaces,
+  - and a low-context subagent review has been run at the end.
+- **Required final subagent gate**
+  - Spawn a reviewer subagent with minimal prior context.
+  - Give it the appended `plan.md` audit section plus the recent code changes/diff only.
+  - Ask it to report: plan drift, missed requirements, incorrect assumptions, overreach, and anything implemented that does not match the plan.
+  - The main implementation pass must either fix the reported drift or explicitly document unresolved drift before closing.
+
+### Assumptions and Defaults
+
+- Dual-track remains the product direction.
+- LUMIT framing stays, but hardcoded diagnosis/session assumptions are removed unless sourced.
+- Evidence-first gates are the new default.
+- Cathode continues consuming council markdown, with fallback preference `Stage 4 consolidation -> best Stage 3 revision`.
+- `plan.md` remains the repo’s running plan file; this audit/remediation plan is appended as a new dated section rather than replacing the current portal reliability plan.

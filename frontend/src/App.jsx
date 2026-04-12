@@ -68,6 +68,23 @@ function App() {
     for (const m of models?.configured_models || []) map.set(m.id, m);
     return map;
   }, [models]);
+  const defaultConsolidator = useMemo(() => {
+    const configuredDefault = models?.default_consolidator || '';
+    if (!configuredDefault) return discoveredModels[0] || '';
+
+    const configured = (models?.configured_models || []).find((m) => m.id === configuredDefault);
+    const resolved = configured?.available ? configured?.resolved_discovered_id || configuredDefault : '';
+    if (resolved && (allDiscoveredModels.includes(resolved) || discoveredModels.includes(resolved))) {
+      return resolved;
+    }
+    if (
+      allDiscoveredModels.includes(configuredDefault) ||
+      discoveredModels.includes(configuredDefault)
+    ) {
+      return configuredDefault;
+    }
+    return discoveredModels[0] || '';
+  }, [allDiscoveredModels, discoveredModels, models]);
 
   const handleError = useCallback((error, context = {}) => {
     const message = errorMessage(error);
@@ -342,7 +359,7 @@ function App() {
             discoveredModels={discoveredModels}
             allDiscoveredModels={allDiscoveredModels}
             modelMetaById={modelMetaById}
-            defaultConsolidator={discoveredModels[0] || ''}
+            defaultConsolidator={defaultConsolidator}
             onSelectRun={(runId) => setSelectedRunId(runId)}
             onRefreshGlobal={async () => {
               try {

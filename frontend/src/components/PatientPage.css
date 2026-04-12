@@ -17,6 +17,7 @@
 
 .grid-row > .card {
   overflow: auto;
+  min-height: 0;
 }
 
 .card {
@@ -124,6 +125,10 @@
 .list-item-sub {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.run-history-progress {
+  margin-top: 4px;
 }
 
 .muted {

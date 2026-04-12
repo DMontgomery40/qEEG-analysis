@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import './PatientPage.css';
 import ResizeHandle from './ResizeHandle';
+import OrchestrationPanel from './OrchestrationPanel';
+import { getLatestRunProgress } from '../orchestration';
 
 // Panel size persistence
 const STORAGE_KEY = 'qeeg-patient-panel-sizes';
@@ -44,6 +46,9 @@ function PatientPage({
   const [reports, setReports] = useState([]);
   const [runs, setRuns] = useState([]);
   const [patientFiles, setPatientFiles] = useState([]);
+  const [orchestration, setOrchestration] = useState(null);
+  const [orchestrationLoading, setOrchestrationLoading] = useState(false);
+  const [orchestrationError, setOrchestrationError] = useState('');
   const [uploadPreview, setUploadPreview] = useState('');
   const [uploading, setUploading] = useState(false);
   const [fileUploading, setFileUploading] = useState(false);
@@ -158,20 +163,40 @@ function PatientPage({
 
   const refresh = useCallback(async () => {
     if (!patientId) return;
-    const [p, r, ru, pf] = await Promise.all([
-      api.getPatient(patientId),
-      api.listReports(patientId),
-      api.listRuns(patientId),
-      api.listPatientFiles(patientId),
-    ]);
-    setPatient(p);
-    setEditLabel(p.label || '');
-    setEditNotes(p.notes || '');
-    setReports(r);
-    setRuns(ru);
-    setPatientFiles(pf);
-    if (r.length) {
-      setSelectedReportId((current) => current || r[0].id);
+    setOrchestrationLoading(true);
+    try {
+      const [coreResult, orchestrationResult] = await Promise.allSettled([
+        Promise.all([
+          api.getPatient(patientId),
+          api.listReports(patientId),
+          api.listRuns(patientId),
+          api.listPatientFiles(patientId),
+        ]),
+        api.getPatientOrchestration(patientId),
+      ]);
+
+      if (coreResult.status !== 'fulfilled') throw coreResult.reason;
+
+      const [p, r, ru, pf] = coreResult.value;
+      setPatient(p);
+      setEditLabel(p.label || '');
+      setEditNotes(p.notes || '');
+      setReports(r);
+      setRuns(ru);
+      setPatientFiles(pf);
+      if (r.length) {
+        setSelectedReportId((current) => current || r[0].id);
+      }
+
+      if (orchestrationResult.status === 'fulfilled') {
+        setOrchestration(orchestrationResult.value);
+        setOrchestrationError('');
+      } else {
+        setOrchestration(null);
+        setOrchestrationError('Unable to load orchestration details.');
+      }
+    } finally {
+      setOrchestrationLoading(false);
     }
   }, [patientId]);
 
@@ -180,6 +205,8 @@ function PatientPage({
     setReports([]);
     setRuns([]);
     setPatientFiles([]);
+    setOrchestration(null);
+    setOrchestrationError('');
     setUploadPreview('');
     setSelectedReportId('');
     setSelectedCouncilIds([]);
@@ -272,6 +299,20 @@ function PatientPage({
           <textarea value={editNotes} onChange={(e) => setEditNotes(e.target.value)} />
         </label>
       </div>
+
+      <OrchestrationPanel
+        patientId={patientId}
+        patient={patient}
+        orchestration={orchestration}
+        orchestrationLoading={orchestrationLoading}
+        orchestrationError={orchestrationError}
+        runs={runs}
+        onSelectRun={onSelectRun}
+        onRefresh={refresh}
+        onRefreshGlobal={onRefreshGlobal}
+        onError={onError}
+        onNotice={onNotice}
+      />
 
       <div className="grid-row" ref={gridContainerRef}>
         <div className="card" style={{ width: `${leftColPercent}%`, flexShrink: 0 }}>
@@ -590,17 +631,29 @@ function PatientPage({
         <div className="card-title">Run History</div>
         <div className="list run-history-list">
           {runs.map((r) => (
-            <button key={r.id} className="list-item" onClick={() => onSelectRun(r.id)}>
-              <div className="list-item-title">
-                {r.id.slice(0, 8)} — {r.status}
-              </div>
-              <div className="list-item-sub">{new Date(r.created_at).toLocaleString()}</div>
-            </button>
+            <RunHistoryItem key={r.id} run={r} onSelectRun={onSelectRun} />
           ))}
           {!runs.length ? <div className="muted">No runs yet.</div> : null}
         </div>
       </div>
     </div>
+  );
+}
+
+function RunHistoryItem({ run, onSelectRun }) {
+  const progress = getLatestRunProgress(run);
+  const progressLabel = [progress.phase && progress.phase.replace(/[_-]+/g, ' '), progress.task]
+    .filter(Boolean)
+    .join(' • ');
+
+  return (
+    <button className="list-item" onClick={() => onSelectRun(run.id)}>
+      <div className="list-item-title">
+        {run.id.slice(0, 8)} — {run.status}
+      </div>
+      <div className="list-item-sub">{new Date(run.created_at).toLocaleString()}</div>
+      {progressLabel ? <div className="list-item-sub run-history-progress">{progressLabel}</div> : null}
+    </button>
   );
 }
 

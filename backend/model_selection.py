@@ -23,12 +23,18 @@ def _alias_candidates(preferred: str) -> list[str]:
         add(pref.replace(".", "-"))
 
     lower = pref.lower()
-    if lower == "gpt-5.4":
-        add("gpt-5")
-    if lower == "openai/gpt-5.4":
-        add("openai/gpt-5")
-        add("gpt-5.4")
-        add("gpt-5")
+    if lower == "gemini-3.1-pro-preview":
+        add("gemini-3-pro-preview")
+    if lower == "google/gemini-3.1-pro-preview":
+        add("google/gemini-3-pro-preview")
+        add("gemini-3.1-pro-preview")
+        add("gemini-3-pro-preview")
+    if lower == "gemini-3-pro-preview":
+        add("gemini-3.1-pro-preview")
+    if lower == "google/gemini-3-pro-preview":
+        add("google/gemini-3.1-pro-preview")
+        add("gemini-3-pro-preview")
+        add("gemini-3.1-pro-preview")
 
     return out
 

@@ -14,17 +14,41 @@ const MOCK_PATIENT_ID = 'patient-123';
 const MOCK_REPORT_ID = 'report-456';
 const MOCK_RUN_ID = 'run-789';
 const MOCK_ARTIFACT_ID = 'artifact-001';
+const MOCK_PROGRESS = {
+  stage_num: 2,
+  stage_name: 'peer_review',
+  phase: 'peer_review',
+  task: 'Reviewing model notes',
+  model_id: 'mock-model-a',
+  completed_chunks: 1,
+  total_chunks: 4,
+  elapsed_seconds: 96,
+};
 
 const MOCK_PATIENTS = [
-  { id: MOCK_PATIENT_ID, label: 'Test Patient', notes: 'Test notes', created_at: '2024-01-01T00:00:00Z' },
+  {
+    id: MOCK_PATIENT_ID,
+    label: 'Test Patient',
+    notes: 'Test notes',
+    created_at: '2024-01-01T00:00:00Z',
+    orchestration_summary: {
+      status: 'running',
+      label: 'Council running',
+      progress: {
+        completed_chunks: 1,
+        total_chunks: 4,
+      },
+    },
+  },
 ];
 
 const MOCK_MODELS = {
   discovered_models: ['mock-model-a', 'mock-model-b', 'mock-consolidator'],
+  default_consolidator: 'mock-consolidator',
   configured_models: [
-    { id: 'mock-model-a', name: 'Mock Model A', source: 'test' },
-    { id: 'mock-model-b', name: 'Mock Model B', source: 'test' },
-    { id: 'mock-consolidator', name: 'Mock Consolidator', source: 'test' },
+    { id: 'mock-model-a', name: 'Mock Model A', source: 'test', available: true, resolved_discovered_id: 'mock-model-a' },
+    { id: 'mock-model-b', name: 'Mock Model B', source: 'test', available: true, resolved_discovered_id: 'mock-model-b' },
+    { id: 'mock-consolidator', name: 'Mock Consolidator', source: 'test', available: true, resolved_discovered_id: 'mock-consolidator' },
   ],
 };
 
@@ -54,13 +78,53 @@ const MOCK_RUNS = [
     id: MOCK_RUN_ID,
     patient_id: MOCK_PATIENT_ID,
     report_id: MOCK_REPORT_ID,
-    status: 'pending',
+    status: 'running',
     council_model_ids: ['mock-model-a', 'mock-model-b'],
     consolidator_model_id: 'mock-consolidator',
     created_at: '2024-01-01T00:00:00Z',
     label_map: {},
+    progress: { ...MOCK_PROGRESS },
   },
 ];
+
+const MOCK_ORCHESTRATION = {
+  updated_at: '2024-01-01T00:05:00Z',
+  council: {
+    status: 'running',
+    run_id: MOCK_RUN_ID,
+    progress: { ...MOCK_PROGRESS },
+  },
+  portal_sync: {
+    status: 'synced',
+    message: 'Portal files match local patient folder',
+    synced_at: '2024-01-01T00:04:00Z',
+  },
+  patient_facing: {
+    status: 'queued',
+    message: 'Waiting for council selection before regeneration',
+  },
+  worker: {
+    status: 'running',
+    task: 'Watching portal upload queue',
+    updated_at: '2024-01-01T00:05:00Z',
+  },
+  cathode: {
+    status: 'ready',
+    message: 'Stage 4 consolidation is ready for Cathode handoff',
+    prepared_at: '2024-01-01T00:03:00Z',
+  },
+  actions: {
+    refresh: { enabled: true },
+    sync_portal: { enabled: true },
+    rerun_pipeline: { enabled: true },
+    regenerate_patient_facing: { enabled: true },
+    prepare_cathode_handoff: { enabled: true },
+  },
+};
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
 
 const MOCK_ARTIFACTS = [
   {
@@ -81,25 +145,31 @@ async function setupMockApi(page, options = {}) {
   const {
     health = MOCK_HEALTH,
     models = MOCK_MODELS,
-    patients = [...MOCK_PATIENTS],
-    reports = [...MOCK_REPORTS],
-    patientFiles = [...MOCK_PATIENT_FILES],
-    runs = [...MOCK_RUNS],
-    artifacts = [...MOCK_ARTIFACTS],
+    patients = cloneJson(MOCK_PATIENTS),
+    reports = cloneJson(MOCK_REPORTS),
+    patientFiles = cloneJson(MOCK_PATIENT_FILES),
+    runs = cloneJson(MOCK_RUNS),
+    artifacts = cloneJson(MOCK_ARTIFACTS),
+    orchestration = cloneJson(MOCK_ORCHESTRATION),
   } = options;
 
+  await page.addInitScript(() => {
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+  });
+
   // GET /api/health
-  await page.route('**/api/health', async (route) => {
+  await page.route(/\/api\/health(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: health });
   });
 
   // GET /api/models
-  await page.route('**/api/models', async (route) => {
+  await page.route(/\/api\/models(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: models });
   });
 
   // GET /api/patients (list)
-  await page.route('**/api/patients', async (route, request) => {
+  await page.route(/\/api\/patients(?:\?.*)?$/, async (route, request) => {
     if (request.method() === 'GET') {
       await route.fulfill({ json: patients });
     } else if (request.method() === 'POST') {
@@ -116,12 +186,9 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/patients/:id
-  await page.route('**/api/patients/*', async (route, request) => {
+  await page.route(/\/api\/patients\/[^/?]+(?:\?.*)?$/, async (route, request) => {
     const url = request.url();
-    if (url.includes('/reports') || url.includes('/runs')) {
-      return route.continue();
-    }
-    const patientId = url.split('/api/patients/')[1]?.split('/')[0];
+    const patientId = url.split('/api/patients/')[1]?.split('/')[0]?.split('?')[0];
     const patient = patients.find((p) => p.id === patientId);
 
     if (request.method() === 'GET') {
@@ -136,10 +203,36 @@ async function setupMockApi(page, options = {}) {
     }
   });
 
+  // GET /api/patients/:id/orchestration
+  await page.route(/\/api\/patients\/[^/]+\/orchestration(?:\?.*)?$/, async (route) => {
+    await route.fulfill({ json: orchestration });
+  });
+
+  // POST /api/patients/:id/actions/:action
+  await page.route(/\/api\/patients\/[^/]+\/actions\/[^/]+(?:\?.*)?$/, async (route, request) => {
+    const action = request.url().split('/actions/')[1]?.split('?')[0];
+    if (action === 'sync_portal') {
+      orchestration.portal_sync = {
+        ...orchestration.portal_sync,
+        status: 'running',
+        message: 'Portal sync requested from frontend',
+      };
+    }
+    if (action === 'refresh') {
+      orchestration.updated_at = '2024-01-01T00:06:00Z';
+    }
+    await route.fulfill({
+      json: {
+        ok: true,
+        message: `${action} requested`,
+      },
+    });
+  });
+
   // GET /api/patients/:id/reports
-  await page.route('**/api/patients/*/reports', async (route, request) => {
+  await page.route(/\/api\/patients\/[^/]+\/reports(?:\?.*)?$/, async (route, request) => {
     const url = request.url();
-    const patientId = url.split('/api/patients/')[1]?.split('/')[0];
+    const patientId = url.split('/api/patients/')[1]?.split('/')[0]?.split('?')[0];
 
     if (request.method() === 'GET') {
       const patientReports = reports.filter((r) => r.patient_id === patientId);
@@ -159,9 +252,9 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/patients/:id/files
-  await page.route('**/api/patients/*/files', async (route, request) => {
+  await page.route(/\/api\/patients\/[^/]+\/files(?:\?.*)?$/, async (route, request) => {
     const url = request.url();
-    const patientId = url.split('/api/patients/')[1]?.split('/')[0];
+    const patientId = url.split('/api/patients/')[1]?.split('/')[0]?.split('?')[0];
 
     if (request.method() === 'GET') {
       const files = patientFiles.filter((f) => f.patient_id === patientId);
@@ -181,7 +274,7 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET/DELETE /api/patient_files/:id
-  await page.route('**/api/patient_files/*', async (route, request) => {
+  await page.route(/\/api\/patient_files\/[^/?]+(?:\?.*)?$/, async (route, request) => {
     if (request.method() === 'DELETE') {
       await route.fulfill({ json: { ok: true } });
       return;
@@ -191,15 +284,15 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/patients/:id/runs
-  await page.route('**/api/patients/*/runs', async (route) => {
+  await page.route(/\/api\/patients\/[^/]+\/runs(?:\?.*)?$/, async (route) => {
     const url = route.request().url();
-    const patientId = url.split('/api/patients/')[1]?.split('/')[0];
+    const patientId = url.split('/api/patients/')[1]?.split('/')[0]?.split('?')[0];
     const patientRuns = runs.filter((r) => r.patient_id === patientId);
     await route.fulfill({ json: patientRuns });
   });
 
   // POST /api/runs (create)
-  await page.route('**/api/runs', async (route, request) => {
+  await page.route(/\/api\/runs(?:\?.*)?$/, async (route, request) => {
     if (request.method() === 'POST') {
       const body = request.postDataJSON();
       const newRun = {
@@ -229,9 +322,9 @@ async function setupMockApi(page, options = {}) {
   });
 
   // POST /api/runs/:id/start
-  await page.route('**/api/runs/*/start', async (route) => {
+  await page.route(/\/api\/runs\/[^/]+\/start(?:\?.*)?$/, async (route) => {
     const url = route.request().url();
-    const runId = url.split('/api/runs/')[1]?.split('/')[0];
+    const runId = url.split('/api/runs/')[1]?.split('/')[0]?.split('?')[0];
     const run = runs.find((r) => r.id === runId);
     if (run) {
       run.status = 'running';
@@ -240,18 +333,18 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/runs/:id/artifacts
-  await page.route('**/api/runs/*/artifacts', async (route) => {
+  await page.route(/\/api\/runs\/[^/]+\/artifacts(?:\?.*)?$/, async (route) => {
     const url = route.request().url();
-    const runId = url.split('/api/runs/')[1]?.split('/')[0];
+    const runId = url.split('/api/runs/')[1]?.split('/')[0]?.split('?')[0];
     const runArtifacts = artifacts.filter((a) => a.run_id === runId);
     await route.fulfill({ json: runArtifacts });
   });
 
   // POST /api/runs/:id/select
-  await page.route('**/api/runs/*/select', async (route, request) => {
+  await page.route(/\/api\/runs\/[^/]+\/select(?:\?.*)?$/, async (route, request) => {
     const body = request.postDataJSON();
     const url = request.url();
-    const runId = url.split('/api/runs/')[1]?.split('/')[0];
+    const runId = url.split('/api/runs/')[1]?.split('/')[0]?.split('?')[0];
     const run = runs.find((r) => r.id === runId);
     if (run) {
       run.selected_artifact_id = body.artifact_id;
@@ -260,7 +353,7 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/runs/:id/stream (SSE) - return empty event
-  await page.route('**/api/runs/*/stream', async (route) => {
+  await page.route(/\/api\/runs\/[^/]+\/stream(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'text/event-stream',
@@ -269,12 +362,12 @@ async function setupMockApi(page, options = {}) {
   });
 
   // POST /api/runs/:id/export
-  await page.route('**/api/runs/*/export', async (route) => {
+  await page.route(/\/api\/runs\/[^/]+\/export(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: { exported: true } });
   });
 
   // GET /api/runs/:id/export/final.md
-  await page.route('**/api/runs/*/export/final.md', async (route) => {
+  await page.route(/\/api\/runs\/[^/]+\/export\/final\.md(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'text/markdown',
@@ -283,7 +376,7 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/runs/:id/export/final.pdf
-  await page.route('**/api/runs/*/export/final.pdf', async (route) => {
+  await page.route(/\/api\/runs\/[^/]+\/export\/final\.pdf(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/pdf',
@@ -292,7 +385,7 @@ async function setupMockApi(page, options = {}) {
   });
 
   // GET /api/reports/:id/extracted
-  await page.route('**/api/reports/*/extracted', async (route) => {
+  await page.route(/\/api\/reports\/[^/]+\/extracted(?:\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'text/plain',
@@ -301,12 +394,12 @@ async function setupMockApi(page, options = {}) {
   });
 
   // POST /api/reports/:id/reextract
-  await page.route('**/api/reports/*/reextract', async (route) => {
+  await page.route(/\/api\/reports\/[^/]+\/reextract(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: { reextracted: true } });
   });
 
   // POST /api/cliproxy/* - just acknowledge
-  await page.route('**/api/cliproxy/*', async (route) => {
+  await page.route(/\/api\/cliproxy\/[^/]+(?:\?.*)?$/, async (route) => {
     await route.fulfill({ json: { success: true } });
   });
 }
@@ -319,6 +412,25 @@ test.describe('App initialization', () => {
     // Wait for sidebar to show patient
     await expect(page.locator('.sidebar')).toBeVisible();
     await expect(page.getByText('Test Patient')).toBeVisible();
+  });
+
+  test('shows sidebar orchestration summary when available', async ({ page }) => {
+    await setupMockApi(page);
+    await page.goto('/');
+
+    await expect(page.locator('.sidebar-item-status-label')).toHaveText('Council running');
+    await expect(page.locator('.sidebar-item-status-percent')).toHaveText('25%');
+  });
+
+  test('degrades gracefully when sidebar orchestration summary is absent', async ({ page }) => {
+    const patients = cloneJson(MOCK_PATIENTS);
+    delete patients[0].orchestration_summary;
+
+    await setupMockApi(page, { patients });
+    await page.goto('/');
+
+    await expect(page.getByText('Test Patient')).toBeVisible();
+    await expect(page.locator('.sidebar-item-status-label')).toHaveCount(0);
   });
 
   test('shows warning banner when CLIProxyAPI not reachable', async ({ page }) => {
@@ -397,6 +509,32 @@ test.describe('Patient management', () => {
   });
 });
 
+test.describe('Patient orchestration', () => {
+  test('renders the orchestration panel and actions', async ({ page }) => {
+    await setupMockApi(page);
+    await page.goto('/');
+
+    await expect(page.getByText('Orchestration + Sync')).toBeVisible();
+    await expect(page.getByText('Council run', { exact: true })).toBeVisible();
+    await expect(page.getByText('Portal sync')).toBeVisible();
+    await expect(page.getByText('Patient-facing', { exact: true })).toBeVisible();
+    await expect(page.getByText('Worker / pipeline')).toBeVisible();
+    await expect(page.getByText('Cathode', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Sync portal' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Prepare Cathode handoff' })).toBeVisible();
+  });
+
+  test('runs patient actions against the orchestration endpoint', async ({ page }) => {
+    await setupMockApi(page);
+    await page.goto('/');
+
+    await page.getByRole('button', { name: 'Sync portal' }).click();
+
+    await expect(page.getByText('sync_portal requested')).toBeVisible();
+    await expect(page.getByText('Portal sync requested from frontend')).toBeVisible();
+  });
+});
+
 test.describe('Reports', () => {
   test('displays reports list', async ({ page }) => {
     await setupMockApi(page);
@@ -419,10 +557,7 @@ test.describe('Reports', () => {
     await setupMockApi(page);
     await page.goto('/');
 
-    // Click on the report in the list to select it
-    await page.locator('.list-item').filter({ hasText: 'test-report.pdf' }).click();
-
-    // Should show view extracted button
+    // The first report is auto-selected on load
     await expect(page.getByRole('button', { name: 'View extracted' })).toBeVisible();
   });
 });
@@ -486,6 +621,24 @@ test.describe('New Run creation', () => {
     // Should navigate to run page (shows run ID and status)
     await expect(page.getByText(/Run.*—/)).toBeVisible();
   });
+
+  test('falls back to an available discovered consolidator when configured default is unavailable', async ({ page }) => {
+    const models = cloneJson(MOCK_MODELS);
+    models.default_consolidator = 'unavailable-model';
+    models.configured_models.push({
+      id: 'unavailable-model',
+      name: 'Unavailable Model',
+      source: 'test',
+      available: false,
+      resolved_discovered_id: null,
+    });
+
+    await setupMockApi(page, { models });
+    await page.goto('/');
+
+    const consolidatorSelect = page.locator('label:has-text("Consolidator") select:not(.multi-select)');
+    await expect(consolidatorSelect).toHaveValue('mock-model-a');
+  });
 });
 
 test.describe('Run History', () => {
@@ -497,7 +650,14 @@ test.describe('Run History', () => {
     await expect(page.getByText('Run History')).toBeVisible();
 
     // Should show the run with truncated ID and status
-    await expect(page.getByText(/run-789.*pending/i)).toBeVisible();
+    await expect(
+      page.locator('.run-history-card .list-item-title').filter({ hasText: /run-789 — running/i })
+    ).toBeVisible();
+    await expect(
+      page.locator('.run-history-card .run-history-progress').filter({
+        hasText: /peer review.*Reviewing model notes/i,
+      })
+    ).toBeVisible();
   });
 
   test('shows "No runs yet" when patient has no runs', async ({ page }) => {
@@ -512,7 +672,7 @@ test.describe('Run History', () => {
     await page.goto('/');
 
     // Click on a run in history
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Should navigate to run page with back button
     await expect(page.getByRole('button', { name: '← Back' })).toBeVisible();
@@ -525,7 +685,7 @@ test.describe('Run Page', () => {
     await page.goto('/');
 
     // Navigate to run page
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Should show Stage Progress
     await expect(page.getByText('Stage Progress')).toBeVisible();
@@ -582,7 +742,7 @@ test.describe('Run Page', () => {
     await page.goto('/');
 
     // Navigate to run page
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Click on Stage 2 pill
     await page.getByText('Stage 2: peer_review').click();
@@ -596,7 +756,7 @@ test.describe('Run Page', () => {
     await page.goto('/');
 
     // Navigate to run page
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Click back button
     await page.getByRole('button', { name: '← Back' }).click();
@@ -610,12 +770,74 @@ test.describe('Run Page', () => {
     await page.goto('/');
 
     // Navigate to run page
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Should show Selection + Export section
     await expect(page.getByText('Selection + Export')).toBeVisible();
     await expect(page.getByText(/Selected artifact:/)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Export MD + PDF' })).toBeVisible();
+  });
+
+  test('renders detailed live progress from run.progress', async ({ page }) => {
+    await setupMockApi(page);
+    await page.goto('/');
+
+    await page.locator('.run-history-card .list-item').first().click();
+
+    await expect(page.getByText('Live Progress')).toBeVisible();
+    await expect(page.locator('.run-progress-percent')).toHaveText('25%');
+    await expect(page.locator('.run-progress-summary')).toHaveText(
+      'Peer Review • Reviewing model notes'
+    );
+    await expect(page.getByText('1 of 4')).toBeVisible();
+    await expect(page.getByText('1m 36s')).toBeVisible();
+  });
+
+  test('does not show a percent when progress lacks a real denominator', async ({ page }) => {
+    const runs = cloneJson(MOCK_RUNS);
+    runs[0].progress = {
+      stage_num: 3,
+      stage_name: 'revision',
+      phase: 'revision',
+      task: 'Rewriting draft',
+      model_id: 'mock-model-b',
+      elapsed_seconds: 45,
+    };
+
+    await setupMockApi(page, { runs });
+    await page.goto('/');
+
+    await page.locator('.run-history-card .list-item').first().click();
+
+    await expect(page.getByText('Live Progress')).toBeVisible();
+    await expect(page.locator('.run-progress-summary')).toHaveText('Revision • Rewriting draft');
+    await expect(page.locator('.run-progress-percent')).toHaveCount(0);
+  });
+
+  test('keeps SSE refresh behavior working for run progress updates', async ({ page }) => {
+    const runs = cloneJson(MOCK_RUNS);
+
+    await setupMockApi(page, { runs });
+    await page.route(/\/api\/runs\/[^/]+\/stream(?:\?.*)?$/, async (route) => {
+      runs[0].status = 'complete';
+      runs[0].progress = {
+        ...runs[0].progress,
+        completed_chunks: 4,
+        total_chunks: 4,
+        task: 'Draft ready',
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'data: {"status":"progress"}\n\n',
+      });
+    });
+
+    await page.goto('/');
+    await page.locator('.run-history-card .list-item').first().click();
+
+    await expect(page.locator('.run-progress-summary')).toHaveText('Peer Review • Draft ready');
+    await expect(page.locator('.muted').filter({ hasText: /Run run-789.*complete/i })).toBeVisible();
   });
 });
 
@@ -643,14 +865,14 @@ test.describe('Stage 5 Final Review', () => {
     await page.goto('/');
 
     // Navigate to run page
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Click on Stage 5
-    await page.getByText('Stage 5: final_review').click();
+    await page.locator('.stage-pill').filter({ hasText: 'Stage 5: final_review' }).click();
 
     // Should show vote counts
-    await expect(page.getByText('Stage 5: Final Review')).toBeVisible();
-    await expect(page.getByText(/Votes:.*APPROVE/)).toBeVisible();
+    await expect(page.locator('.card-title').filter({ hasText: 'Stage 5: Final Review' })).toBeVisible();
+    await expect(page.locator('.muted').filter({ hasText: 'Votes: 1 APPROVE, 0 REVISE' })).toBeVisible();
   });
 });
 
@@ -673,10 +895,10 @@ test.describe('Stage 6 Final Drafts', () => {
     await page.goto('/');
 
     // Navigate to run page
-    await page.getByText(/run-789/).first().click();
+    await page.locator('.run-history-card .list-item').first().click();
 
     // Click on Stage 6
-    await page.getByText('Stage 6: final_draft').click();
+    await page.locator('.stage-pill').filter({ hasText: 'Stage 6: final_draft' }).click();
 
     // Should show Stage 6 content
     await expect(page.getByText('Stage 6: Final Drafts')).toBeVisible();
@@ -689,7 +911,7 @@ test.describe('Error handling', () => {
     await setupMockApi(page);
 
     // Override patients endpoint to fail
-    await page.route('**/api/patients', async (route) => {
+    await page.route(/\/api\/patients(?:\?.*)?$/, async (route) => {
       await route.fulfill({ status: 500, json: { error: 'Internal server error' } });
     });
 

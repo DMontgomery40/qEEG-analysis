@@ -227,6 +227,9 @@ async def test_watch_portal_patients_forever_syncs_stable_raw_changes(
     monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(tmp_path))
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "0.01")
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_STABLE_POLLS", "2")
+    (tmp_path / ".qeeg_portal_sync_watch_state.json").write_text(
+        json.dumps({"patients": {patient_id: [1, 100, 1000]}}), encoding="utf-8"
+    )
     monkeypatch.setattr(
         portal_sync, "_snapshot_portal_patient_fingerprints", fake_snapshot
     )
@@ -237,6 +240,55 @@ async def test_watch_portal_patients_forever_syncs_stable_raw_changes(
         await portal_sync.watch_portal_patients_forever()
 
     assert sync_calls == [patient_id]
+
+
+@pytest.mark.asyncio
+async def test_watch_portal_patients_forever_seeds_sync_state_without_mass_resync(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+
+    patient_id = "01-01-2013-0"
+    snapshots = [
+        {patient_id: (2, 200, 2000)},
+        {patient_id: (2, 200, 2000)},
+    ]
+    sync_calls: list[str] = []
+    sleep_calls = 0
+
+    def fake_snapshot(_root_dir):
+        if snapshots:
+            return snapshots.pop(0)
+        return {patient_id: (2, 200, 2000)}
+
+    def fake_spawn(label: str) -> bool:
+        sync_calls.append(label)
+        return True
+
+    async def fake_sleep(_seconds: float):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "1")
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(tmp_path))
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "0.01")
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_STABLE_POLLS", "2")
+    monkeypatch.setattr(
+        portal_sync, "_snapshot_portal_patient_fingerprints", fake_snapshot
+    )
+    monkeypatch.setattr(portal_sync, "spawn_portal_sync", fake_spawn)
+    monkeypatch.setattr(portal_sync.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await portal_sync.watch_portal_patients_forever()
+
+    seeded = json.loads(
+        (tmp_path / ".qeeg_portal_sync_watch_state.json").read_text(encoding="utf-8")
+    )
+    assert seeded["patients"][patient_id] == [2, 200, 2000]
+    assert sync_calls == []
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from backend.council.report_text import (  # noqa: E402
     _page_session_alias_map,
 )
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
+from backend.model_selection import resolve_model_preference  # noqa: E402
 from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
 from backend.portal_sync import sync_patient_to_thrylen  # noqa: E402
 
@@ -564,27 +565,19 @@ def _patient_prompt(*, fact_pack: str, analysis_summary: str) -> str:
 
 
 def _pick_openai_model(discovered: list[str], preferred: str) -> str:
-    if preferred in discovered:
-        return preferred
+    model_id = resolve_model_preference(preferred, discovered)
+    if model_id is None:
+        raise ValueError(
+            f"Preferred OpenAI model '{preferred}' was not discovered from CLIProxyAPI /v1/models"
+        )
 
-    plain_models = [
-        mid
-        for mid in discovered
-        if mid.startswith("gpt-5") and "codex" not in mid.lower()
-    ]
-    if not plain_models:
-        raise ValueError("No OpenAI GPT-5 model is available from CLIProxyAPI")
+    normalized = model_id.lower().removeprefix("openai/")
+    if normalized != "gpt-5.4":
+        raise ValueError(
+            f"Preferred OpenAI model must resolve to gpt-5.4, got '{model_id}'"
+        )
 
-    def rank(model_id: str) -> tuple[int, int, int, str]:
-        if model_id == "gpt-5":
-            return (5, 0, 0, model_id)
-        match = re.fullmatch(r"gpt-5(?:\.(\d+))?", model_id)
-        if match:
-            minor = int(match.group(1) or 0)
-            return (5, minor, 1, model_id)
-        return (4, 0, 0, model_id)
-
-    return sorted(plain_models, key=rank, reverse=True)[0]
+    return model_id
 
 
 async def _generate_markdown(
@@ -594,7 +587,7 @@ async def _generate_markdown(
     prompt: str,
     max_output_tokens: int,
 ) -> str:
-    if model_id.startswith("gpt-5"):
+    if model_id.lower().removeprefix("openai/") == "gpt-5.4":
         return await llm.responses(
             model_id=model_id,
             input_data=[
@@ -603,7 +596,7 @@ async def _generate_markdown(
                     "content": [{"type": "input_text", "text": prompt}],
                 }
             ],
-            reasoning_effort="xhigh",
+            reasoning_effort="medium",
             max_output_tokens=max_output_tokens,
         )
     return await llm.chat_completions(
@@ -734,7 +727,11 @@ def _meta_payload(
         "manifest_path": str(manifest_path),
         "combined_report_dir": str(report_dir),
         "llm_model_id": model_id,
-        "reasoning_effort": "xhigh" if model_id.startswith("gpt-5") else None,
+        "reasoning_effort": (
+            "medium"
+            if model_id.lower().removeprefix("openai/") == "gpt-5.4"
+            else None
+        ),
         "sessions": {
             str(idx): {
                 "date": info.date_iso,

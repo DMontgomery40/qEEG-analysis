@@ -96,9 +96,14 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
         self._llm = llm
 
     async def run_pipeline(self, run_id: str, on_event: OnEvent = None) -> None:
+        latest_counts: dict[str, Any] = {}
+
         async def emit(payload: dict[str, Any]) -> None:
             payload = dict(payload)
             payload.setdefault("run_id", run_id)
+            for key in ("stage_num", "stage_name", "success_count", "requested_count"):
+                if key in payload and payload.get(key) is not None:
+                    latest_counts[key] = payload.get(key)
             _append_progress_event(run_id, payload)
             if on_event is not None:
                 await on_event(payload)
@@ -184,4 +189,20 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
             with session_scope() as session:
                 update_run_status(session, run_id, status="complete")
             LOGGER.info("pipeline_completed")
-            await emit({"run_id": run_id, "status": "complete"})
+            complete_payload = {
+                "run_id": run_id,
+                "status": "complete",
+            }
+            for key in ("success_count", "requested_count"):
+                if latest_counts.get(key) is not None:
+                    complete_payload[key] = latest_counts[key]
+            if (
+                isinstance(complete_payload.get("success_count"), int)
+                and isinstance(complete_payload.get("requested_count"), int)
+                and complete_payload["requested_count"] > 0
+            ):
+                complete_payload["partial_success"] = (
+                    complete_payload["success_count"]
+                    < complete_payload["requested_count"]
+                )
+            await emit(complete_payload)

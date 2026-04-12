@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
 import { childLogger, serializeError, newRequestId } from '../logger';
 import { requestOperatorHint } from '../operatorHints';
+import { getLatestRunProgress } from '../orchestration';
 import Tabs from './Tabs';
 import ModelBadge from './ModelBadge';
 import SourceDataView from './SourceDataView';
@@ -127,6 +128,17 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
 
   const byStage = useMemo(() => groupByStage(artifacts), [artifacts]);
   const labelMap = run?.label_map || {};
+  const runProgress = useMemo(() => getLatestRunProgress(run || {}), [run]);
+  const currentStageNum = runProgress.stageNum ?? null;
+  const hasDetailedProgress = Boolean(
+    runProgress.determinate ||
+      runProgress.phase ||
+      runProgress.task ||
+      runProgress.model ||
+      runProgress.chunkLabel ||
+      runProgress.elapsed ||
+      currentStageNum
+  );
 
   function stageComplete(stageNum) {
     const arts = byStage.get(String(stageNum)) || [];
@@ -134,6 +146,7 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
   }
 
   function inferDefaultStage() {
+    if (currentStageNum) return Math.round(currentStageNum);
     for (const s of STAGES) {
       if (!stageComplete(s.num)) return s.num;
     }
@@ -142,12 +155,12 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
 
   useEffect(() => {
     if (!run) return;
-    if (!artifacts.length) return;
+    if (!artifacts.length && !currentStageNum) return;
     if (initializedStageRef.current) return;
     initializedStageRef.current = true;
     setActiveStageNum(inferDefaultStage());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run, artifacts]);
+  }, [run, artifacts, currentStageNum]);
 
   if (!run) return <div className="page">Loading run…</div>;
 
@@ -163,6 +176,72 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
 
       {run.error_message ? <div className="error-banner">{run.error_message}</div> : null}
 
+      {hasDetailedProgress ? (
+        <div className="card">
+          <div className="card-title">Live Progress</div>
+          <div className="run-progress-header">
+            <div>
+              <div className="run-progress-summary">{runProgress.headline}</div>
+              <div className="run-progress-subtitle">
+                {run.status}
+                {run.status === 'needs_auth' ? ' • needs auth' : ''}
+              </div>
+            </div>
+            {runProgress.determinate ? (
+              <div className="run-progress-percent">{runProgress.percent}%</div>
+            ) : null}
+          </div>
+
+          {runProgress.determinate ? (
+            <div className="run-progress-track" aria-hidden="true">
+              <div className="run-progress-fill" style={{ width: `${runProgress.percent}%` }} />
+            </div>
+          ) : null}
+
+          <div className="run-progress-meta">
+            {currentStageNum ? (
+              <div className="run-progress-chip">
+                <span>Stage</span>
+                <strong>
+                  {Math.round(currentStageNum)}
+                  {runProgress.stageName ? ` • ${runProgress.stageName.replace(/[_-]+/g, ' ')}` : ''}
+                </strong>
+              </div>
+            ) : null}
+            {runProgress.phase ? (
+              <div className="run-progress-chip">
+                <span>Phase</span>
+                <strong>{runProgress.phase.replace(/[_-]+/g, ' ')}</strong>
+              </div>
+            ) : null}
+            {runProgress.task ? (
+              <div className="run-progress-chip">
+                <span>Task</span>
+                <strong>{runProgress.task}</strong>
+              </div>
+            ) : null}
+            {runProgress.model ? (
+              <div className="run-progress-chip">
+                <span>Model</span>
+                <strong>{runProgress.model}</strong>
+              </div>
+            ) : null}
+            {runProgress.chunkLabel ? (
+              <div className="run-progress-chip">
+                <span>Chunk</span>
+                <strong>{runProgress.chunkLabel}</strong>
+              </div>
+            ) : null}
+            {runProgress.elapsed ? (
+              <div className="run-progress-chip">
+                <span>Elapsed</span>
+                <strong>{runProgress.elapsed}</strong>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       <div className="card">
         <div className="card-title">Stage Progress</div>
         <div className="stage-grid">
@@ -170,6 +249,8 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
             <button
               key={s.num}
               className={`stage-pill ${stageComplete(s.num) ? 'done' : ''} ${
+                currentStageNum === s.num && !stageComplete(s.num) ? 'running' : ''
+              } ${
                 activeStageNum === s.num && !showSourceData ? 'active' : ''
               }`}
               onClick={() => {

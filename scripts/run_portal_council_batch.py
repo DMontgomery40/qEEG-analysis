@@ -261,9 +261,19 @@ def _pick_model_id(preferred: str, discovered: list[str]) -> str | None:
     return resolve_model_preference(preferred, discovered)
 
 
+def _portal_batch_model_allowed(model_id: str) -> bool:
+    if (os.getenv("QEEG_ALLOW_OPUS_MODELS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    return "claude-opus" not in (model_id or "").strip().lower()
+
+
 def _fallback_council_model_ids(discovered: list[str]) -> list[str]:
     preferred_tokens = [
-        "claude-opus",
         "claude-sonnet",
         "gemini-3-pro",
         "gemini-2.5-pro",
@@ -278,12 +288,15 @@ def _fallback_council_model_ids(discovered: list[str]) -> list[str]:
     picked: list[str] = []
     for token in preferred_tokens:
         match = _pick_model_id(token, discovered)
-        if match and match not in picked:
+        if match and match not in picked and _portal_batch_model_allowed(match):
             picked.append(match)
         if len(picked) >= 3:
             break
-    if not picked and discovered:
-        picked.append(discovered[0])
+    if not picked:
+        picked.extend(
+            model_id for model_id in discovered if _portal_batch_model_allowed(model_id)
+        )
+        picked = picked[:1]
     return picked
 
 
@@ -305,9 +318,15 @@ def _resolve_model_selection_for_run(
             if not isinstance(item, str):
                 continue
             matched = _pick_model_id(item, discovered_models)
-            if matched and matched not in mapped:
+            if (
+                matched
+                and matched not in mapped
+                and _portal_batch_model_allowed(matched)
+            ):
                 mapped.append(matched)
         consolidator = _pick_model_id(run.consolidator_model_id, discovered_models)
+        if consolidator is not None and not _portal_batch_model_allowed(consolidator):
+            consolidator = None
         if not mapped:
             return None
         if consolidator is None:
@@ -317,11 +336,17 @@ def _resolve_model_selection_for_run(
     configured: list[str] = []
     for model in COUNCIL_MODELS:
         matched = _pick_model_id(model.id, discovered_models)
-        if matched and matched not in configured:
+        if (
+            matched
+            and matched not in configured
+            and _portal_batch_model_allowed(matched)
+        ):
             configured.append(matched)
 
     if configured:
         consolidator = _pick_model_id(DEFAULT_CONSOLIDATOR, discovered_models)
+        if consolidator is not None and not _portal_batch_model_allowed(consolidator):
+            consolidator = None
         if consolidator is None:
             consolidator = next(
                 (
@@ -358,6 +383,10 @@ def _resolve_model_selection_for_run(
             return resolved
 
     council_model_ids = _fallback_council_model_ids(discovered_models)
+    if not council_model_ids:
+        raise RuntimeError(
+            "No compatible council models were discovered from CLIProxyAPI /v1/models"
+        )
     consolidator = _pick_model_id(DEFAULT_CONSOLIDATOR, discovered_models)
     if consolidator is None:
         consolidator = next(
@@ -565,6 +594,14 @@ def _latest_resume_candidate_run_for_report(report_id: str) -> storage.Run | Non
         return runs[0] if runs else None
 
 
+def _resume_candidate_for_report(
+    report_id: str, *, skip_complete: bool
+) -> storage.Run | None:
+    if skip_complete is False:
+        return None
+    return _latest_resume_candidate_run_for_report(report_id)
+
+
 def _choose_stage6_artifact(session, run: storage.Run) -> storage.Artifact | None:
     artifacts = storage.list_artifacts(session, run.id)
     stage6 = [
@@ -750,7 +787,10 @@ async def _process_task(
         if existing_complete_run is not None:
             note += f" run={existing_complete_run.id}"
         elif report_id is not None:
-            resume_candidate = _latest_resume_candidate_run_for_report(report_id)
+            resume_candidate = _resume_candidate_for_report(
+                report_id,
+                skip_complete=skip_complete,
+            )
             if resume_candidate is not None:
                 status = "would_resume"
                 dry_run_run_id = resume_candidate.id
@@ -812,7 +852,10 @@ async def _process_task(
             note=report_action,
         )
 
-    resume_candidate = _latest_resume_candidate_run_for_report(report_id)
+    resume_candidate = _resume_candidate_for_report(
+        report_id,
+        skip_complete=skip_complete,
+    )
     if resume_candidate is not None:
         run_id = resume_candidate.id
         report_action = f"{report_action}; resumed {resume_candidate.status}"
@@ -820,21 +863,32 @@ async def _process_task(
             with storage.session_scope() as session:
                 storage.claim_run_start(session, run_id)
     else:
-        with storage.session_scope() as session:
-            council_model_ids, consolidator_model_id = _resolve_model_selection_for_run(
-                session,
-                patient_id=patient_id,
-                discovered_models=discovered_models,
-            )
-            run = storage.create_run(
-                session,
+        try:
+            with storage.session_scope() as session:
+                council_model_ids, consolidator_model_id = _resolve_model_selection_for_run(
+                    session,
+                    patient_id=patient_id,
+                    discovered_models=discovered_models,
+                )
+                run = storage.create_run(
+                    session,
+                    patient_id=patient_id,
+                    report_id=report_id,
+                    council_model_ids=council_model_ids,
+                    consolidator_model_id=consolidator_model_id,
+                )
+                run_id = run.id
+                storage.claim_run_start(session, run_id)
+        except Exception as exc:
+            return TaskOutcome(
+                patient_label=task.patient_label,
+                pdf_name=task.pdf_path.name,
+                status="failed",
                 patient_id=patient_id,
                 report_id=report_id,
-                council_model_ids=council_model_ids,
-                consolidator_model_id=consolidator_model_id,
+                run_id=None,
+                note=str(exc),
             )
-            run_id = run.id
-            storage.claim_run_start(session, run_id)
 
     try:
         await _run_pipeline_for_run(workflow=workflow, run_id=run_id)
