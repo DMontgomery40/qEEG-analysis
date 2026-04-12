@@ -113,8 +113,6 @@ async def test_stage6_repairs_truncated_final_draft(temp_data_dir, mock_llm_clie
     tail = (
         "# Background EEG Metrics\nok\n"
         "# Speculative Commentary and Interpretive Hypotheses\nok\n"
-        "# Measurement Recommendations\nok\n"
-        "# Uncertainties and Limits\nok\n"
         "<!-- END STAGE6 FINAL DRAFT -->\n"
     )
 
@@ -138,6 +136,5 @@ async def test_stage6_repairs_truncated_final_draft(temp_data_dir, mock_llm_clie
     assert len(artifacts) == 1
     out_text = Path(artifacts[0].content_path).read_text(encoding="utf-8", errors="replace")
 
-    assert "# Measurement Recommendations" in out_text
-    assert "# Uncertainties and Limits" in out_text
+    assert "# Speculative Commentary and Interpretive Hypotheses" in out_text
     assert "<!-- END STAGE6 FINAL DRAFT -->" in out_text

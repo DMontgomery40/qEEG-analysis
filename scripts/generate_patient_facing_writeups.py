@@ -17,7 +17,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
+from backend.model_selection import resolve_model_preference  # noqa: E402
 from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
+from backend.portal_sync import sync_patient_to_thrylen  # noqa: E402
 from backend.storage import (  # noqa: E402
     Artifact,
     Patient,
@@ -76,7 +78,8 @@ def _best_source_bundle_for_label(label: str) -> SourceBundle | None:
             return None
         patient, run = max(
             complete_runs,
-            key=lambda pr: pr[1].created_at or datetime.min.replace(tzinfo=timezone.utc),
+            key=lambda pr: pr[1].created_at
+            or datetime.min.replace(tzinfo=timezone.utc),
         )
         arts = list_artifacts(session, run.id)
 
@@ -86,7 +89,9 @@ def _best_source_bundle_for_label(label: str) -> SourceBundle | None:
 
         chosen: list[Artifact] = []
         if run.selected_artifact_id:
-            sel = next((a for a in stage6_sorted if a.id == run.selected_artifact_id), None)
+            sel = next(
+                (a for a in stage6_sorted if a.id == run.selected_artifact_id), None
+            )
             if sel is not None:
                 chosen.append(sel)
                 stage6_sorted = [a for a in stage6_sorted if a.id != sel.id]
@@ -100,7 +105,9 @@ def _best_source_bundle_for_label(label: str) -> SourceBundle | None:
         if len(chosen) < 2:
             stage4 = [a for a in arts if a.stage_num == 4 and a.kind == "consolidation"]
             if stage4:
-                chosen.append(sorted(stage4, key=lambda a: a.created_at, reverse=True)[0])
+                chosen.append(
+                    sorted(stage4, key=lambda a: a.created_at, reverse=True)[0]
+                )
         if len(chosen) < 2:
             stage3 = [a for a in arts if a.stage_num == 3 and a.kind == "revision"]
             for a in sorted(stage3, key=lambda a: a.created_at, reverse=True):
@@ -120,7 +127,9 @@ def _read_text(path: str) -> str:
 
 
 def _example_writeup_text() -> str:
-    return Path("examples/final-patient-facing-writeup-example.md").read_text(encoding="utf-8", errors="replace")
+    return Path("examples/final-patient-facing-writeup-example.md").read_text(
+        encoding="utf-8", errors="replace"
+    )
 
 
 def _count_words(text: str) -> int:
@@ -131,33 +140,10 @@ def _pick_model_id(preferred: str, discovered: list[str]) -> str:
     pref = (preferred or "").strip()
     if not pref:
         raise ValueError("Model id is empty")
-
-    # Exact match first.
-    if pref in discovered:
-        return pref
-
-    # Case-insensitive exact match.
-    pref_lower = pref.lower()
-    for mid in discovered:
-        if mid.lower() == pref_lower:
-            return mid
-
-    # Substring match (prefer non-preview variants if both exist).
-    matches = [mid for mid in discovered if pref_lower in mid.lower()]
-    if not matches:
+    model_id = resolve_model_preference(pref, discovered)
+    if model_id is None:
         raise ValueError(f"Model '{pref}' not found in /v1/models")
-
-    def rank(mid: str) -> tuple[int, int, str]:
-        lower = mid.lower()
-        preview_penalty = 1 if "preview" in lower else 0
-        # Prefer newer dated variants if present (YYYYMMDD suffix)
-        date_bonus = 0
-        parts = lower.split("-")
-        if parts and parts[-1].isdigit() and len(parts[-1]) >= 6:
-            date_bonus = -int(parts[-1][-6:])  # reverse sort: larger dates win
-        return (preview_penalty, date_bonus, len(mid), mid)
-
-    return sorted(matches, key=rank)[0]
+    return model_id
 
 
 def _build_prompt(
@@ -170,8 +156,7 @@ def _build_prompt(
     sources_block = []
     for i, (name, text) in enumerate(source_reports, start=1):
         sources_block.append(
-            f"=== COUNCIL SOURCE REPORT {i}: {name} ===\n"
-            f"{text.strip()}\n"
+            f"=== COUNCIL SOURCE REPORT {i}: {name} ===\n" f"{text.strip()}\n"
         )
 
     return (
@@ -254,7 +239,9 @@ def _portal_markdown_sources(portal_patient_dir: Path) -> list[tuple[str, str]]:
     md_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     out: list[tuple[str, str]] = []
     for p in md_files[:3]:
-        out.append((f"portal:{p.name}", p.read_text(encoding="utf-8", errors="replace")))
+        out.append(
+            (f"portal:{p.name}", p.read_text(encoding="utf-8", errors="replace"))
+        )
     return out
 
 
@@ -266,27 +253,58 @@ def _explicit_markdown_sources(paths: list[str]) -> list[tuple[str, str]]:
             p = (_REPO_ROOT / p).resolve()
         if not p.exists() or not p.is_file():
             raise FileNotFoundError(f"Explicit source markdown not found: {p}")
-        out.append((f"explicit:{p.name}", p.read_text(encoding="utf-8", errors="replace")))
+        out.append(
+            (f"explicit:{p.name}", p.read_text(encoding="utf-8", errors="replace"))
+        )
     return out
 
 
 async def main() -> int:
-    ap = argparse.ArgumentParser(description="Generate patient-facing qEEG writeups (Opus 4.6) into portal folders.")
-    ap.add_argument("--portal-dir", default="data/portal_patients", help="Portal share dir (default: data/portal_patients)")
-    ap.add_argument("--patient-label", action="append", default=[], help="Process only this patient label (repeatable)")
-    ap.add_argument("--model", default="claude-opus-4-6", help="Preferred model id (default: claude-opus-4-6)")
-    ap.add_argument("--max-tokens", type=int, default=4000, help="Max output tokens (default: 4000)")
-    ap.add_argument("--temperature", type=float, default=0.2, help="LLM temperature (default: 0.2)")
-    ap.add_argument("--version", default="v1", help="Version tag for output filenames (default: v1)")
-    ap.add_argument("--date", default="", help="Override date YYYY-MM-DD (default: today)")
+    ap = argparse.ArgumentParser(
+        description="Generate patient-facing qEEG writeups into portal folders."
+    )
+    ap.add_argument(
+        "--portal-dir",
+        default="data/portal_patients",
+        help="Portal share dir (default: data/portal_patients)",
+    )
+    ap.add_argument(
+        "--patient-label",
+        action="append",
+        default=[],
+        help="Process only this patient label (repeatable)",
+    )
+    ap.add_argument(
+        "--model",
+        default="gpt-5.4",
+        help="Preferred model id (default: gpt-5.4)",
+    )
+    ap.add_argument(
+        "--max-tokens", type=int, default=4000, help="Max output tokens (default: 4000)"
+    )
+    ap.add_argument(
+        "--temperature", type=float, default=0.2, help="LLM temperature (default: 0.2)"
+    )
+    ap.add_argument(
+        "--version", default="v1", help="Version tag for output filenames (default: v1)"
+    )
+    ap.add_argument(
+        "--date", default="", help="Override date YYYY-MM-DD (default: today)"
+    )
     ap.add_argument(
         "--source-markdown",
         action="append",
         default=[],
         help="Explicit markdown source file to synthesize from (repeatable). When set, bypasses DB/portal source discovery.",
     )
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
-    ap.add_argument("--dry-run", action="store_true", help="Do everything except call the LLM / write outputs")
+    ap.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing outputs"
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do everything except call the LLM / write outputs",
+    )
     args = ap.parse_args()
 
     ensure_data_dirs()
@@ -314,11 +332,16 @@ async def main() -> int:
     discovered: list[str] = []
 
     if not args.dry_run:
-        llm = AsyncOpenAICompatClient(base_url=CLIPROXY_BASE_URL, api_key=CLIPROXY_API_KEY, timeout_s=600.0)
+        llm = AsyncOpenAICompatClient(
+            base_url=CLIPROXY_BASE_URL, api_key=CLIPROXY_API_KEY, timeout_s=600.0
+        )
         try:
             discovered = await llm.list_models()
         except UpstreamError as e:
-            print(f"ERROR: failed to reach CLIProxyAPI at {CLIPROXY_BASE_URL}: {e}", file=sys.stderr)
+            print(
+                f"ERROR: failed to reach CLIProxyAPI at {CLIPROXY_BASE_URL}: {e}",
+                file=sys.stderr,
+            )
             await llm.aclose()
             return 2
         model_id = _pick_model_id(args.model, discovered)
@@ -336,7 +359,9 @@ async def main() -> int:
             source_meta = {
                 "patient_id": None,
                 "run_id": None,
-                "explicit_source_markdown_paths": [str(Path(p).expanduser()) for p in args.source_markdown],
+                "explicit_source_markdown_paths": [
+                    str(Path(p).expanduser()) for p in args.source_markdown
+                ],
             }
         elif bundle is not None:
             for a in bundle.artifacts:
@@ -360,7 +385,9 @@ async def main() -> int:
             out_dir = portal_dir / label
             sources = _portal_markdown_sources(out_dir)
             if not sources:
-                print(f"SKIP {label}: no complete DB run, and no portal markdown sources found")
+                print(
+                    f"SKIP {label}: no complete DB run, and no portal markdown sources found"
+                )
                 continue
             source_meta = {
                 "patient_id": None,
@@ -377,7 +404,9 @@ async def main() -> int:
 
         out_dir = portal_dir / label
         out_dir.mkdir(parents=True, exist_ok=True)
-        stem = _output_stem(patient_label=label, version=args.version, date_str=date_str)
+        stem = _output_stem(
+            patient_label=label, version=args.version, date_str=date_str
+        )
         md_path = out_dir / f"{stem}.md"
         pdf_path = out_dir / f"{stem}.pdf"
         meta_path = out_dir / f"{stem}__meta.json"
@@ -409,7 +438,9 @@ async def main() -> int:
         )
         md = (md or "").strip()
 
-        with tempfile.TemporaryDirectory(dir=out_dir, prefix=f".{stem}.") as temp_dir_raw:
+        with tempfile.TemporaryDirectory(
+            dir=out_dir, prefix=f".{stem}."
+        ) as temp_dir_raw:
             temp_dir = Path(temp_dir_raw)
             temp_md_path = temp_dir / md_path.name
             temp_pdf_path = temp_dir / pdf_path.name
@@ -419,7 +450,9 @@ async def main() -> int:
             temp_meta_path.write_text(
                 json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
-            render_patient_facing_markdown_to_pdf(md, temp_pdf_path, patient_label=label)
+            render_patient_facing_markdown_to_pdf(
+                md, temp_pdf_path, patient_label=label
+            )
 
             if not args.overwrite and (
                 md_path.exists() or pdf_path.exists() or meta_path.exists()
@@ -443,6 +476,12 @@ async def main() -> int:
                     except Exception:
                         pass
                 raise
+
+        synced = sync_patient_to_thrylen(label)
+        print(
+            f"PORTAL SYNC {label}: {'completed' if synced else 'skipped'}",
+            flush=True,
+        )
 
     if llm is not None:
         await llm.aclose()

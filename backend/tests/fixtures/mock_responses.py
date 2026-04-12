@@ -123,27 +123,6 @@ The central-parietal dominance pattern is consistent with attentional processing
 
 The relationship between N100 and P300 changes deserves attention: N100 amplitudes increased while P300 latencies decreased. This could reflect enhanced early sensory gating (N100) freeing up resources for faster stimulus classification (P300).
 
-# Measurement Recommendations
-
-- Standardize time of day for future acquisitions
-- Complete HAM-A and PHQ-9 self-report instruments before each session
-- Document caffeine, sleep, and medication status
-- Consider additional sessions to establish within-subject variability
-- Ensure consistent electrode impedances across sessions
-- Document any interventions between sessions with specific timing
-
-# Uncertainties and Limits
-
-This analysis is limited by:
-
-- Absence of self-report data to correlate with EEG changes
-- Unknown intervention timing and specifics between sessions
-- Potential state effects (alertness, caffeine, etc.) not controlled
-- Device-specific reference ranges that may not generalize
-- The unusual TMT-B < TMT-A pattern in Session 3 raises validity concerns
-- Coherence metrics can be influenced by volume conduction artifacts
-
-The P300 and theta/beta improvements are encouraging but require replication and should not be interpreted as diagnostic or prognostic without additional clinical context.
 """
 
 # Stage 2: Peer Review (JSON format)
@@ -304,25 +283,6 @@ The parallel improvements in P300 latency and theta/beta ratio suggest coordinat
 - What accounts for the unusual TMT pattern in Session 3?
 - Would these patterns replicate with different tasks?
 
-# Measurement Recommendations
-
-1. **Standardize acquisition conditions**: Same time of day, consistent pre-session instructions
-2. **Complete self-report instruments**: HAM-A, PHQ-9 before each session to correlate with EEG changes
-3. **Document state factors**: Caffeine, sleep duration, medications, stress level
-4. **Additional sessions**: At least 2 more sessions to establish within-subject variability bounds
-5. **Investigate TMT validity**: Repeat TMT under standardized conditions with additional practice trials
-6. **Document interventions**: Specific timing and nature of any treatments between sessions
-7. **Electrode preparation**: Record impedance values to ensure consistent data quality
-
-# Uncertainties and Limits
-
-**Data Gaps**:
-- No self-report instruments to correlate EEG changes with subjective experience
-- Unknown specifics of interventions between sessions
-- State factors not controlled or documented
-
-**Validity Concerns**:
-- TMT-B < TMT-A in Session 3 is highly unusual and unexplained
 - Reaction time increases despite P300 improvements are somewhat paradoxical
 
 **Technical Limitations**:
@@ -470,29 +430,6 @@ One analysis emphasized the paradox of P300 improvements alongside reaction time
 - What explains the unusual TMT Session 3 pattern?
 - Would patterns replicate with different tasks?
 
-# Measurement Recommendations
-
-The council consolidated the following recommendations:
-
-1. **Standardize acquisition conditions**: Same time of day, consistent pre-session instructions, controlled environment
-2. **Complete self-report instruments**: HAM-A, PHQ-9 before each session
-3. **Document state factors**: Caffeine intake, sleep duration/quality, medications, stress level, time since last meal
-4. **Additional sessions**: At least 2 more sessions to establish within-subject variability bounds
-5. **Investigate TMT validity**: Repeat TMT under standardized conditions with practice trials and explicit timing
-6. **Document interventions**: Specific timing, dosing, and nature of any treatments between sessions
-7. **Electrode quality**: Record impedance values for each electrode at each session
-
-# Uncertainties and Limits
-
-**Data Limitations** (Council Consensus):
-- Absence of self-report instruments prevents correlation with subjective experience
-- Intervention details between sessions are unknown
-- State factors were not controlled or documented
-
-**Validity Concerns**:
-- TMT-B < TMT-A in Session 3 is unexplained and concerning
-- Reaction time increases despite P300 improvements are paradoxical
-
 **Technical Constraints**:
 - Device-specific reference ranges may not generalize
 - Coherence measures subject to volume conduction artifacts
@@ -629,25 +566,6 @@ Behavioral measures (reaction time, TMT) may be more sensitive to state factors 
 
 Parallel improvements in P300 latency and theta/beta ratio suggest coordinated changes in frontal-parietal attention networks. Enhanced frontal regulation may facilitate faster parietal stimulus classification.
 
-# Measurement Recommendations
-
-1. Standardize acquisition conditions (time of day, environment, instructions)
-2. Complete HAM-A and PHQ-9 self-report instruments before each session
-3. Document state factors (caffeine, sleep, medications, stress level)
-4. Add sessions to establish within-subject variability bounds
-5. Repeat TMT under standardized conditions to investigate validity concern
-6. Document intervention timing and specifics between sessions
-7. Record electrode impedance values for data quality assurance
-
-# Uncertainties and Limits
-
-**Data Limitations**:
-- No self-report instruments to correlate with EEG changes
-- Unknown intervention details between sessions
-- State factors not controlled or documented
-
-**Validity Concerns**:
-- TMT-B < TMT-A in Session 3 remains unexplained
 - Reaction time increases alongside P300 improvements require interpretation
 
 **Technical Constraints**:

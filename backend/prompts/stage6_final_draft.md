@@ -23,8 +23,6 @@ Apply ALL required changes and produce a publication-ready clinical document.
 # Auditory ERP: P300 and N100
 # Background EEG Metrics
 # Speculative Commentary and Interpretive Hypotheses
-# Measurement Recommendations
-# Uncertainties and Limits
 
 ## Final Polish Guidelines
 
@@ -40,8 +38,6 @@ Ensure all sections are present and substantive:
 - Auditory ERP: Per-site P300 table MUST be present and complete
 - Background EEG: Theta/beta, alpha lateralization, peak frequency, coherence
 - Speculative Commentary: 3-4 competing hypotheses, NOT collapsed
-- Recommendations: 5-7 actionable items
-- Uncertainties: Honest acknowledgment of limitations
 
 ### Per-Site P300 Table (Required)
 
@@ -65,7 +61,6 @@ Ensure all sections are present and substantive:
 - All competing hypotheses in Speculative Commentary
 - All per-site/per-electrode data
 - All validity concerns and caveats
-- All measurement recommendations
 
 ## Rules
 
@@ -73,7 +68,6 @@ Ensure all sections are present and substantive:
 2. **Do not introduce new facts** beyond what's in the consolidated report and original data
 3. **Maintain word count** - do not shorten
 4. **Keep language clear and professional**
-5. **Preserve important caveats and limitations**
-6. **Ensure per-site tables are complete and accurate**
+5. **Ensure per-site tables are complete and accurate**
 
 This is the final clinical document. Quality and completeness are paramount.

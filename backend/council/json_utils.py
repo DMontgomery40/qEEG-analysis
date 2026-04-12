@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from json_repair import repair_json
+
 
 def _strip_to_json(text: str) -> str:
     s = text.strip()
@@ -24,7 +26,11 @@ def _strip_to_json(text: str) -> str:
 
 
 def _json_loads_loose(text: str) -> Any:
-    return json.loads(_strip_to_json(text))
+    stripped = _strip_to_json(text)
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return json.loads(repair_json(stripped))
 
 
 def _loads_json_list(text: str) -> list[str]:

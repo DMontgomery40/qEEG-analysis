@@ -146,3 +146,54 @@ async def test_pipeline_failure_emits_operator_hint(temp_data_dir, mock_llm_clie
     assert failed
     assert "operatorHint" in failed[0]
     assert "Stages 1-6 sequentially" in str(failed[0]["operatorHint"])
+
+
+@pytest.mark.asyncio
+async def test_pipeline_events_write_tail_friendly_progress_log(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    from backend import storage
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow.core import _progress_log_paths
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-2"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-2",
+            patient_id=patient.id,
+            filename="original.txt",
+            mime_type="text/plain",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+
+    async def fail_stage1(*_args, **_kwargs):
+        raise RuntimeError("stage 1 exploded")
+
+    monkeypatch.setattr(workflow, "_stage1", fail_stage1)
+
+    await workflow.run_pipeline(run.id)
+
+    progress_log, progress_jsonl = _progress_log_paths(run.id)
+    assert progress_log.exists()
+    assert progress_jsonl.exists()
+
+    progress_text = progress_log.read_text(encoding="utf-8")
+    assert "status=running" in progress_text
+    assert "status=failed" in progress_text

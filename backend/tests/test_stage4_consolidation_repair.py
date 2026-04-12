@@ -90,8 +90,6 @@ async def test_stage4_repairs_truncated_consolidation(temp_data_dir, mock_llm_cl
     )
     tail = (
         "# Speculative Commentary and Interpretive Hypotheses\nok\n"
-        "# Measurement Recommendations\nok\n"
-        "# Uncertainties and Limits\nok\n"
         "<!-- END CONSOLIDATED REPORT -->\n"
     )
 
@@ -115,10 +113,9 @@ async def test_stage4_repairs_truncated_consolidation(temp_data_dir, mock_llm_cl
     out_path = Path(artifacts[0].content_path)
     out_text = out_path.read_text(encoding="utf-8", errors="replace")
 
-    # Should include the sentinel and the missing sections.
+    # Should include the sentinel and the repaired section.
     assert "<!-- END CONSOLIDATED REPORT -->" in out_text
-    assert "# Measurement Recommendations" in out_text
-    assert "# Uncertainties and Limits" in out_text
+    assert "# Speculative Commentary and Interpretive Hypotheses" in out_text
 
 
 @pytest.mark.asyncio
@@ -142,9 +139,11 @@ async def test_stage4_repairs_after_multiple_continuation_calls(temp_data_dir, m
         "# Background EEG Metrics\nok\n"
         "# Speculative Commentary and Interpretive Hypotheses\nok\n"
     )
-    cont_2 = "# Measurement Recommendations\nstill incomplete\n"
-    cont_3 = "# Uncertainties and Limits\nok\n<!-- END CONSOLIDATED REPORT -->\n"
-    responses = [initial, cont_1, cont_2, cont_3]
+    cont_2 = (
+        "# Speculative Commentary and Interpretive Hypotheses\nok\n"
+        "<!-- END CONSOLIDATED REPORT -->\n"
+    )
+    responses = [initial, cont_1, cont_2]
 
     call_count = {"n": 0}
 
@@ -160,14 +159,13 @@ async def test_stage4_repairs_after_multiple_continuation_calls(temp_data_dir, m
         return None
 
     await workflow._stage4(run_id, emit)
-    assert call_count["n"] == 4
+    assert call_count["n"] == 3
 
     with session_scope() as session:
         artifacts = [a for a in list_artifacts(session, run_id) if a.stage_num == 4]
     assert len(artifacts) == 1
     out_text = Path(artifacts[0].content_path).read_text(encoding="utf-8", errors="replace")
-    assert "# Measurement Recommendations" in out_text
-    assert "# Uncertainties and Limits" in out_text
+    assert "# Speculative Commentary and Interpretive Hypotheses" in out_text
     assert "<!-- END CONSOLIDATED REPORT -->" in out_text
 
 

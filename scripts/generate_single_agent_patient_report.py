@@ -23,6 +23,7 @@ from backend.council.report_text import (  # noqa: E402
 )
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
 from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
+from backend.portal_sync import sync_patient_to_thrylen  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -275,14 +276,18 @@ def _parse_summary_metrics(
     report_text: str,
     report_dir: Path,
     metadata: dict[str, Any],
-) -> tuple[dict[int, SessionInfo], dict[str, dict[int, MetricPoint]], list[str], list[str]]:
+) -> tuple[
+    dict[int, SessionInfo], dict[str, dict[int, MetricPoint]], list[str], list[str]
+]:
     page_aliases = _page_session_alias_map(report_text)
     candidate_summary_pages = _find_summary_pages(
         report_text, page_count=int(metadata.get("page_count") or 0)
     )
     summary_pages: list[int] = []
     for page_num in candidate_summary_pages:
-        page_text = _read_text(report_dir / "sources" / f"page-{page_num}.tesseract.txt")
+        page_text = _read_text(
+            report_dir / "sources" / f"page-{page_num}.tesseract.txt"
+        )
         page_text_upper = page_text.upper()
         if (
             "ASSESSMENT SCORES" in page_text_upper
@@ -311,13 +316,20 @@ def _parse_summary_metrics(
     for page_num in summary_pages:
         local_to_global = page_aliases.get(page_num) or {}
         if not local_to_global:
-            raise ValueError(f"Summary page {page_num} is missing session alias markers")
+            raise ValueError(
+                f"Summary page {page_num} is missing session alias markers"
+            )
 
-        page_text = _read_text(report_dir / "sources" / f"page-{page_num}.tesseract.txt")
+        page_text = _read_text(
+            report_dir / "sources" / f"page-{page_num}.tesseract.txt"
+        )
         source_file = source_files_by_page.get(page_num, f"page-{page_num}")
 
         for session_idx, info in _session_rows_from_summary_page(
-            page_text, aliases=local_to_global, page_num=page_num, source_file=source_file
+            page_text,
+            aliases=local_to_global,
+            page_num=page_num,
+            source_file=source_file,
         ).items():
             existing = sessions.get(session_idx)
             if existing is None:
@@ -329,11 +341,17 @@ def _parse_summary_metrics(
                     f"{existing.date_iso} vs {info.date_iso}"
                 )
 
-        if "SYNC BLINKS REPORTED WHICH MAY AFFECT FRONTAL DEPTH VALUES" in page_text.upper():
+        if (
+            "SYNC BLINKS REPORTED WHICH MAY AFFECT FRONTAL DEPTH VALUES"
+            in page_text.upper()
+        ):
             notes.append(
                 f"Summary page {page_num} ({source_file}) notes sync blinks that may affect frontal depth values."
             )
-        if "BLACK Xs INDICATE LOCATIONS WITH LESS THAN 20 CLEAN P300 RARE RESPONSES" in page_text:
+        if (
+            "BLACK Xs INDICATE LOCATIONS WITH LESS THAN 20 CLEAN P300 RARE RESPONSES"
+            in page_text
+        ):
             notes.append(
                 f"Summary page {page_num} ({source_file}) warns that some topographic colors may be affected by low-yield P300 responses."
             )
@@ -370,11 +388,17 @@ def _parse_summary_metrics(
 
     notes.append("HAM-A and PHQ-9 are marked N/A on both source summary pages.")
     if metrics["frontal_peak_frequency"][1].questionable:
-        notes.append("Session 1 frontal peak frequency is explicitly flagged as questionable in the source report.")
+        notes.append(
+            "Session 1 frontal peak frequency is explicitly flagged as questionable in the source report."
+        )
     if metrics["central_parietal_peak_frequency"][1].questionable:
-        notes.append("Session 1 central-parietal peak frequency is explicitly flagged as questionable in the source report.")
+        notes.append(
+            "Session 1 central-parietal peak frequency is explicitly flagged as questionable in the source report."
+        )
     if metrics["occipital_peak_frequency"][1].questionable:
-        notes.append("Session 1 occipital peak frequency is explicitly flagged as questionable in the source report.")
+        notes.append(
+            "Session 1 occipital peak frequency is explicitly flagged as questionable in the source report."
+        )
 
     return sessions, metrics, duplicate_checks, notes
 
@@ -485,7 +509,9 @@ def _analysis_fact_pack(
     sections.append(f"- {manifest.get('notes', '').strip()}")
     sections.append("- The second PDF's local Session 1 maps to global Session 4.")
     sections.append("- The second PDF's local Session 2 maps to global Session 5.")
-    sections.append("- Session 4 appears in both PDFs and should remain distinct from Session 5.")
+    sections.append(
+        "- Session 4 appears in both PDFs and should remain distinct from Session 5."
+    )
     if duplicate_checks:
         sections.append("Duplicate Session 4 Checks:")
         sections.extend(f"- {item}" for item in duplicate_checks)
@@ -780,7 +806,8 @@ def _find_combined_report_dir(
     reports_root: Path,
 ) -> Path:
     expected_source_paths = {
-        str(path) for path in _resolved_manifest_source_paths(
+        str(path)
+        for path in _resolved_manifest_source_paths(
             manifest=manifest, manifest_path=manifest_path
         )
     }
@@ -889,7 +916,9 @@ async def main() -> int:
         default="",
         help="Override output date (YYYY-MM-DD). Defaults to today UTC.",
     )
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
+    ap.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing outputs"
+    )
     args = ap.parse_args()
 
     ensure_data_dirs()
@@ -910,9 +939,7 @@ async def main() -> int:
         )
 
     output_dir = (
-        Path(args.output_dir).expanduser()
-        if args.output_dir
-        else manifest_path.parent
+        Path(args.output_dir).expanduser() if args.output_dir else manifest_path.parent
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -940,7 +967,9 @@ async def main() -> int:
     )
 
     stem_date = args.date.strip() or _utcnow().date().isoformat()
-    analysis_stem = f"{patient_label}__single-agent-5session-analysis__{args.version}__{stem_date}"
+    analysis_stem = (
+        f"{patient_label}__single-agent-5session-analysis__{args.version}__{stem_date}"
+    )
     patient_stem = f"{patient_label}__patient-facing__{args.version}__{stem_date}"
     analysis_path = output_dir / f"{analysis_stem}.md"
     patient_md_path = output_dir / f"{patient_stem}.md"
@@ -1049,7 +1078,12 @@ async def main() -> int:
         if not args.overwrite:
             existing = [
                 path
-                for path in (analysis_path, patient_md_path, patient_pdf_path, meta_path)
+                for path in (
+                    analysis_path,
+                    patient_md_path,
+                    patient_pdf_path,
+                    meta_path,
+                )
                 if path.exists()
             ]
             if existing:
@@ -1080,6 +1114,11 @@ async def main() -> int:
     print(f"Wrote patient markdown: {patient_md_path}", flush=True)
     print(f"Wrote patient PDF: {patient_pdf_path}", flush=True)
     print(f"Wrote metadata: {meta_path}", flush=True)
+    synced = sync_patient_to_thrylen(patient_label)
+    print(
+        f"Portal sync {'completed' if synced else 'skipped'} for {patient_label}",
+        flush=True,
+    )
     return 0
 
 

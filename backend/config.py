@@ -70,22 +70,27 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 
 
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
-    # These IDs are examples only; runtime model discovery is the source of truth.
     CouncilModelConfig(
         id="gpt-5.4",
-        name="GPT-5.4 (example)",
+        name="GPT-5.4",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
     CouncilModelConfig(
-        id="claude-sonnet-4.6",
-        name="Claude Sonnet 4.6 (example)",
+        id="claude-sonnet-4-6",
+        name="Claude Sonnet 4.6",
+        source="Subscription via CLIProxyAPI",
+        endpoint_preference="chat",
+    ),
+    CouncilModelConfig(
+        id="gemini-3-pro-preview",
+        name="Gemini 3 Pro Preview",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
 ]
 
-DEFAULT_CONSOLIDATOR = os.getenv("DEFAULT_CONSOLIDATOR", "")
+DEFAULT_CONSOLIDATOR = os.getenv("DEFAULT_CONSOLIDATOR", "gemini-3-pro-preview")
 
 # Models that support vision/multimodal input (can process images)
 # These will receive page images in addition to text for Stage 1 analysis

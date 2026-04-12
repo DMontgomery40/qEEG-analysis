@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+from ...config import ARTIFACTS_DIR
 from ...llm_client import AsyncOpenAICompatClient
 from ...logging_utils import get_logger, log_context
 from ...storage import get_report, get_run, update_run_status
@@ -21,12 +25,81 @@ def _pipeline_failure_operator_hint() -> str:
     return "run_pipeline advances Stages 1-6 sequentially; inspect the first stage after the last completed emit for a missing artifact, malformed JSON, or strict data guard failure."
 
 
+def _progress_log_paths(run_id: str) -> tuple[Path, Path]:
+    progress_dir = ARTIFACTS_DIR / run_id
+    return progress_dir / "progress.log", progress_dir / "progress.jsonl"
+
+
+def _format_progress_payload(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        parts.append(f"status={status}")
+
+    stage_num = payload.get("stage_num")
+    stage_name = payload.get("stage_name")
+    if stage_num is not None or stage_name:
+        parts.append(f"stage={stage_num}:{stage_name}")
+
+    for key in ("task", "model_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            parts.append(f"{key}={value}")
+
+    if isinstance(payload.get("chunk_index"), int):
+        chunk_total = payload.get("chunk_count")
+        if isinstance(chunk_total, int) and chunk_total > 0:
+            parts.append(f"chunk={payload['chunk_index']}/{chunk_total}")
+        else:
+            parts.append(f"chunk={payload['chunk_index']}")
+
+    pages = payload.get("pages")
+    if isinstance(pages, list) and pages:
+        page_str = ",".join(str(page) for page in pages)
+        parts.append(f"pages={page_str}")
+
+    for key in ("elapsed_s", "heartbeat_count", "success_count", "requested_count"):
+        value = payload.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+
+    if payload.get("skipped"):
+        parts.append("skipped=true")
+
+    for key in ("reason", "error", "operatorHint"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            compact = " ".join(value.strip().split())
+            parts.append(f"{key}={compact}")
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+    return f"{timestamp} {' '.join(parts).strip()}".rstrip()
+
+
+def _append_progress_event(run_id: str, payload: dict[str, Any]) -> None:
+    progress_log_path, progress_jsonl_path = _progress_log_paths(run_id)
+    progress_log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_to_write = dict(payload)
+    payload_to_write.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+
+    with progress_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(_format_progress_payload(payload_to_write) + "\n")
+    with progress_jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload_to_write, sort_keys=True) + "\n")
+
+
 class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
     def __init__(self, *, llm: AsyncOpenAICompatClient):
         self._llm = llm
 
     async def run_pipeline(self, run_id: str, on_event: OnEvent = None) -> None:
         async def emit(payload: dict[str, Any]) -> None:
+            payload = dict(payload)
+            payload.setdefault("run_id", run_id)
+            _append_progress_event(run_id, payload)
             if on_event is not None:
                 await on_event(payload)
 

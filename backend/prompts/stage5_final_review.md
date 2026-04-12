@@ -22,8 +22,6 @@ Before voting, verify:
 - [ ] Auditory ERP: P300 and N100 section
 - [ ] Background EEG Metrics section
 - [ ] Speculative Commentary and Interpretive Hypotheses section
-- [ ] Measurement Recommendations section
-- [ ] Uncertainties and Limits section
 
 ### Tables (critical)
 - [ ] Per-site P300 table with C3, CZ, C4, P3, PZ, P4

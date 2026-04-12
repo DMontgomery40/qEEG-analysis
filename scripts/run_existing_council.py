@@ -14,7 +14,13 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, set_discovered_model_ids  # noqa: E402
 from backend.council import QEEGCouncilWorkflow  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient  # noqa: E402
+from backend.main import _auto_generate_patient_facing_for_run  # noqa: E402
 from backend.storage import get_run, session_scope  # noqa: E402
+
+
+class _NullBroker:
+    async def publish(self, _run_id: str, _payload: dict[str, object]) -> None:
+        return None
 
 
 async def _main(run_id: str) -> int:
@@ -46,6 +52,8 @@ async def _main(run_id: str) -> int:
                 file=sys.stderr,
             )
             return 1
+
+    await _auto_generate_patient_facing_for_run(run_id, _NullBroker())
     return 0
 
 
