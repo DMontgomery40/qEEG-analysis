@@ -51,23 +51,55 @@ def _page_session_alias_map(report_text: str) -> dict[int, dict[int, int]]:
     return out
 
 
+def _plain_session_indices(
+    body: str, *, require_parenthesized_date: bool = False
+) -> set[int]:
+    strict = {
+        int(m.group(1)) for m in re.finditer(r"Session\s+(\d+)\s*\(", body or "")
+    }
+    if strict or require_parenthesized_date:
+        return strict
+    return {int(m.group(1)) for m in re.finditer(r"\bSession\s+(\d+)\b", body or "")}
+
+
 def _expected_session_indices(report_text: str) -> list[int]:
     alias_map = _page_session_alias_map(report_text)
-    indices = {
+    aliased_indices = {
         global_idx for mapping in alias_map.values() for global_idx in mapping.values()
     }
+    page_sections = _iter_page_sections(report_text)
+    page_count = _page_count_from_markers(report_text) or len(page_sections)
+    summary_pages = set(_find_summary_pages(report_text, page_count=page_count))
+    confident_indices = set(aliased_indices)
 
-    for page_num, section_text in _iter_page_sections(report_text):
+    # Summary pages are the highest-confidence source of the canonical session count. When
+    # they exist, ignore loose non-summary OCR markers like "Session 4 PERCENTAGE CHANGE..."
+    # unless another page provides the more reliable date-parenthesized form.
+    for page_num, section_text in page_sections:
+        if alias_map.get(page_num):
+            continue
+        if page_num not in summary_pages:
+            continue
+        body = _page_section_body(section_text)
+        confident_indices.update(_plain_session_indices(body))
+
+    if confident_indices:
+        indices = set(confident_indices)
+        for page_num, section_text in page_sections:
+            if alias_map.get(page_num) or page_num in summary_pages:
+                continue
+            body = _page_section_body(section_text)
+            indices.update(
+                _plain_session_indices(body, require_parenthesized_date=True)
+            )
+        return sorted(indices)
+
+    indices = set(aliased_indices)
+    for page_num, section_text in page_sections:
         if alias_map.get(page_num):
             continue
         body = _page_section_body(section_text)
-        plain = {
-            int(m.group(1)) for m in re.finditer(r"Session\s+(\d+)\s*\(", body)
-        }
-        if not plain:
-            plain = {
-                int(m.group(1)) for m in re.finditer(r"\bSession\s+(\d+)\b", body)
-            }
+        plain = _plain_session_indices(body)
         indices.update(plain)
 
     return sorted(indices) if indices else [1]
@@ -575,14 +607,28 @@ def _facts_from_report_text_n100_central_frontal(
     if start_idx is None:
         return []
 
+    # Look for the N100 data header line (e.g., "# N100-UV MS" or "N100-UV MS").
+    # Avoid matching incidental mentions like "except for N100" by preferring
+    # lines where N100 appears as a header token, not embedded in prose.
     n100_idx = next(
         (
             i
             for i in range(start_idx, min(len(lines), start_idx + 40))
-            if re.search(r"(?i)\bN100\b", lines[i])
+            if re.search(r"(?i)(?:^|\#\s*)N100[\s-]*UV", lines[i])
         ),
         None,
     )
+    if n100_idx is None:
+        # Broader fallback: accept any line with standalone N100, but skip prose sentences.
+        n100_idx = next(
+            (
+                i
+                for i in range(start_idx, min(len(lines), start_idx + 40))
+                if re.search(r"(?i)\bN100\b", lines[i])
+                and not re.search(r"(?i)except|reported|between|depths", lines[i])
+            ),
+            None,
+        )
     if n100_idx is None:
         return []
 
@@ -594,6 +640,7 @@ def _facts_from_report_text_n100_central_frontal(
                 break
         elif value_lines:
             break
+
 
     # Reports typically state the N100 latency window (e.g., "Maximum N100 reported between 30-120 msec.").
     # We use this as a report-defined sanity check to avoid OCR artifacts like "1230" for a "120" latency.

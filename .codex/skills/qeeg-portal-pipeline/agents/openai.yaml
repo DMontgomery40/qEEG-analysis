@@ -1,0 +1,7 @@
+interface:
+  display_name: "qEEG Portal Pipeline"
+  short_description: "Audit and repair clinic upload processing"
+  default_prompt: "Use $qeeg-portal-pipeline to audit a portal patient and run any missing real qEEG pipeline work."
+
+policy:
+  allow_implicit_invocation: true

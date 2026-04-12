@@ -27,6 +27,7 @@ dependencies = [
     "markdown>=3.10.1",
     "pydantic-ai-slim[openai]>=1.67.0",
     "structlog>=25.5.0",
+    "json-repair>=0.58.6",
 ]
 
 [tool.pytest.ini_options]

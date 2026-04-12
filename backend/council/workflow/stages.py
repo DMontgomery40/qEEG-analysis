@@ -28,6 +28,40 @@ from ..utils import _chunked, _truthy_env
 
 
 class _StagesMixin:
+    async def _await_with_heartbeat(
+        self,
+        awaitable: Awaitable[Any],
+        *,
+        emit: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        payload: dict[str, Any],
+    ) -> Any:
+        if emit is None:
+            return await awaitable
+
+        interval_s = self._int_env("QEEG_PROGRESS_HEARTBEAT_S", 30)
+        if interval_s <= 0:
+            return await awaitable
+
+        task = asyncio.create_task(awaitable)
+        started_at = asyncio.get_running_loop().time()
+        heartbeat_count = 0
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=interval_s)
+            except asyncio.TimeoutError:
+                heartbeat_count += 1
+                heartbeat_payload = dict(payload)
+                heartbeat_payload.update(
+                    {
+                        "status": "heartbeat",
+                        "elapsed_s": int(
+                            asyncio.get_running_loop().time() - started_at
+                        ),
+                        "heartbeat_count": heartbeat_count,
+                    }
+                )
+                await emit(heartbeat_payload)
+
     @staticmethod
     def _select_discovered_model_id(preferred: str) -> str | None:
         pref = (preferred or "").strip()
@@ -467,6 +501,7 @@ class _StagesMixin:
             page_images=page_images,
             candidate_extractor_model_ids=extractor_models,
             strict=strict_data,
+            emit=emit,
         )
 
         transcript_model_id: str | None = None
@@ -483,6 +518,7 @@ class _StagesMixin:
             page_images=page_images,
             transcript_model_id=transcript_model_id,
             strict=strict_data,
+            emit=emit,
         )
 
         data_pack_block = ""
@@ -548,6 +584,16 @@ class _StagesMixin:
 
         async def one(model_id: str) -> tuple[str, str] | None:
             try:
+                await emit(
+                    {
+                        "run_id": run_id,
+                        "stage_num": stage.num,
+                        "stage_name": stage.name,
+                        "task": "stage1_model",
+                        "model_id": model_id,
+                        "status": "start",
+                    }
+                )
                 # Multi-pass multimodal ingestion for vision models: build page-grounded notes in chunks, then write
                 # the final long-form report using the notes + full OCR + data pack.
                 notes_text = ""
@@ -568,7 +614,8 @@ class _StagesMixin:
                     if len(page_images) > 10 and chunk_size > 10:
                         chunk_size = 10
                     notes_parts: list[str] = []
-                    for chunk in _chunked(page_images, chunk_size):
+                    note_chunks = list(_chunked(page_images, chunk_size))
+                    for chunk_index, chunk in enumerate(note_chunks, start=1):
                         pages = [img.page for img in chunk]
                         ingest_prompt = (
                             "Stage 1 multimodal ingestion pass (do NOT write the final report yet).\n"
@@ -580,13 +627,52 @@ class _StagesMixin:
                             "printed numeric values that are likely clinically relevant.\n"
                             "- Do not interpret or diagnose. Do not invent numbers.\n"
                         )
-                        notes = await self._call_model_multimodal(
-                            model_id=model_id,
-                            prompt_text=ingest_prompt,
-                            images=chunk,
-                            temperature=0.0,
-                            max_tokens=2500,
-                            allow_text_fallback=not strict_data,
+                        await emit(
+                            {
+                                "run_id": run_id,
+                                "stage_num": stage.num,
+                                "stage_name": stage.name,
+                                "task": "stage1_vision_notes_chunk",
+                                "model_id": model_id,
+                                "status": "start",
+                                "chunk_index": chunk_index,
+                                "chunk_count": len(note_chunks),
+                                "pages": pages,
+                            }
+                        )
+                        notes = await self._await_with_heartbeat(
+                            self._call_model_multimodal(
+                                model_id=model_id,
+                                prompt_text=ingest_prompt,
+                                images=chunk,
+                                temperature=0.0,
+                                max_tokens=2500,
+                                allow_text_fallback=not strict_data,
+                            ),
+                            emit=emit,
+                            payload={
+                                "run_id": run_id,
+                                "stage_num": stage.num,
+                                "stage_name": stage.name,
+                                "task": "stage1_vision_notes_chunk",
+                                "model_id": model_id,
+                                "chunk_index": chunk_index,
+                                "chunk_count": len(note_chunks),
+                                "pages": pages,
+                            },
+                        )
+                        await emit(
+                            {
+                                "run_id": run_id,
+                                "stage_num": stage.num,
+                                "stage_name": stage.name,
+                                "task": "stage1_vision_notes_chunk",
+                                "model_id": model_id,
+                                "status": "complete",
+                                "chunk_index": chunk_index,
+                                "chunk_count": len(note_chunks),
+                                "pages": pages,
+                            }
                         )
                         notes_parts.append(notes)
                     notes_text = "\n\n".join(notes_parts).strip()
@@ -598,13 +684,23 @@ class _StagesMixin:
                         "MULTIMODAL INGESTION NOTES (generated from ALL PDF pages in multiple passes):\n\n"
                         f"{notes_text}\n"
                     )
-                text = await self._call_longform_chat_with_repairs(
-                    model_id=model_id,
-                    prompt_text=final_prompt.strip(),
-                    temperature=0.2,
-                    max_tokens=stage1_max_tokens,
-                    end_sentinel=end_sentinel,
-                    required_headings=None,
+                text = await self._await_with_heartbeat(
+                    self._call_longform_chat_with_repairs(
+                        model_id=model_id,
+                        prompt_text=final_prompt.strip(),
+                        temperature=0.2,
+                        max_tokens=stage1_max_tokens,
+                        end_sentinel=end_sentinel,
+                        required_headings=None,
+                    ),
+                    emit=emit,
+                    payload={
+                        "run_id": run_id,
+                        "stage_num": stage.num,
+                        "stage_name": stage.name,
+                        "task": "stage1_model",
+                        "model_id": model_id,
+                    },
                 )
                 enforce_complete = stage1_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
@@ -618,8 +714,29 @@ class _StagesMixin:
                         "Stage 1 analysis remained incomplete after repair attempts. "
                         f"End sentinel present: {end_sentinel in (text or '')}"
                     )
+                await emit(
+                    {
+                        "run_id": run_id,
+                        "stage_num": stage.num,
+                        "stage_name": stage.name,
+                        "task": "stage1_model",
+                        "model_id": model_id,
+                        "status": "complete",
+                    }
+                )
                 return model_id, text
-            except Exception:
+            except Exception as exc:
+                await emit(
+                    {
+                        "run_id": run_id,
+                        "stage_num": stage.num,
+                        "stage_name": stage.name,
+                        "task": "stage1_model",
+                        "model_id": model_id,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
                 return None
 
         results = await asyncio.gather(*(one(m) for m in council_model_ids))
@@ -807,8 +924,6 @@ class _StagesMixin:
             "# Auditory ERP: P300 and N100",
             "# Background EEG Metrics",
             "# Speculative Commentary and Interpretive Hypotheses",
-            "# Measurement Recommendations",
-            "# Uncertainties and Limits",
         ]
         end_sentinel = "<!-- END STAGE3 REVISION -->"
 
@@ -982,8 +1097,6 @@ class _StagesMixin:
             "# Auditory ERP: P300 and N100",
             "# Background EEG Metrics",
             "# Speculative Commentary and Interpretive Hypotheses",
-            "# Measurement Recommendations",
-            "# Uncertainties and Limits",
         ]
         end_sentinel = "<!-- END CONSOLIDATED REPORT -->"
 
@@ -1335,8 +1448,6 @@ class _StagesMixin:
             "# Auditory ERP: P300 and N100",
             "# Background EEG Metrics",
             "# Speculative Commentary and Interpretive Hypotheses",
-            "# Measurement Recommendations",
-            "# Uncertainties and Limits",
         ]
         end_sentinel = "<!-- END STAGE6 FINAL DRAFT -->"
 

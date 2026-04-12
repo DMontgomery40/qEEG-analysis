@@ -30,8 +30,6 @@ Incorporate relevant critiques, correct overreach, and clarify uncertainties.
 # Auditory ERP: P300 and N100
 # Background EEG Metrics
 # Speculative Commentary and Interpretive Hypotheses
-# Measurement Recommendations
-# Uncertainties and Limits
 
 ## Revision Guidelines
 

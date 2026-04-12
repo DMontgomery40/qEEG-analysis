@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 def _test_app(temp_data_dir, monkeypatch):
     monkeypatch.setenv("QEEG_MOCK_LLM", "1")
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     from backend import main
 
     monkeypatch.setattr(
@@ -19,7 +20,9 @@ def _test_app(temp_data_dir, monkeypatch):
     return main.app, main
 
 
-def _create_report(storage, temp_data_dir, *, patient_id: str, filename: str = "report.txt"):
+def _create_report(
+    storage, temp_data_dir, *, patient_id: str, filename: str = "report.txt"
+):
     report_id = str(uuid.uuid4())
     report_dir = Path(temp_data_dir) / "reports" / patient_id / report_id
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +95,7 @@ def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
 
         return _Task()
 
-    monkeypatch.setattr(main.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(main, "_spawn_task", fake_create_task)
 
     with TestClient(app, raise_server_exceptions=False) as client:
         first = client.post(f"/api/runs/{run.id}/start")
@@ -188,10 +191,14 @@ def test_export_rejects_selected_artifact_that_is_not_final_markdown(
         response = client.post(f"/api/runs/{run.id}/export")
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "Selected artifact is not a final markdown draft"
+    assert (
+        response.json()["detail"] == "Selected artifact is not a final markdown draft"
+    )
 
 
-def test_export_rejects_selected_artifact_from_different_run(temp_data_dir, monkeypatch):
+def test_export_rejects_selected_artifact_from_different_run(
+    temp_data_dir, monkeypatch
+):
     app, _main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
 
@@ -281,3 +288,72 @@ def test_delete_patient_file_removes_portal_copy(temp_data_dir, monkeypatch):
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert not portal_path.exists()
+
+
+def test_upload_patient_file_schedules_portal_sync(temp_data_dir, monkeypatch):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "_schedule_portal_sync",
+        lambda patient_label, *, source: scheduled.append((patient_label, source)),
+    )
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/patients/{patient.id}/files",
+            files={"file": ("guide.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+
+    assert response.status_code == 200
+    assert scheduled == [("09-05-1954-0", "upload_patient_file")]
+
+
+def test_export_schedules_portal_sync(temp_data_dir, monkeypatch):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "_schedule_portal_sync",
+        lambda patient_label, *, source: scheduled.append((patient_label, source)),
+    )
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("# Final Draft", encoding="utf-8")
+
+    with storage.session_scope() as session:
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        artifact = storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=artifact_path,
+            content_type="text/markdown",
+        )
+        storage.select_artifact(session, run.id, artifact.id)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(f"/api/runs/{run.id}/export")
+
+    assert response.status_code == 200
+    assert scheduled == [("09-05-1954-0", "export_run")]

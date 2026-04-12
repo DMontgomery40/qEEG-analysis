@@ -57,7 +57,12 @@ async def test_chat_completions_falls_back_to_responses():
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_prefers_responses_for_gpt5_and_sets_max_output_tokens():
+async def test_chat_completions_prefers_responses_for_gpt5_and_sets_max_output_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("QEEG_OPENAI_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/responses":
             body = json.loads(request.content)

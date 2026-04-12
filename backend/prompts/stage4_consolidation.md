@@ -24,8 +24,6 @@ Synthesize all revised analyses into a single coherent, comprehensive report tha
 # Auditory ERP: P300 and N100
 # Background EEG Metrics
 # Speculative Commentary and Interpretive Hypotheses
-# Measurement Recommendations
-# Uncertainties and Limits
 
 ## Consolidation Guidelines
 
@@ -71,14 +69,6 @@ Synthesize all revised analyses into a single coherent, comprehensive report tha
 - Present 3-4 competing hypotheses from the analyses
 - Do NOT collapse into a single narrative
 - Include topographic interpretation, stage opposition, task-network anatomy
-
-### Measurement Recommendations
-- Consolidate all recommendations from source analyses
-- 5-7 specific, actionable items
-
-### Uncertainties and Limits
-- Consolidate acknowledged limitations
-- Note where models disagreed and why
 
 ## Rules
 

@@ -37,6 +37,10 @@ from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient
 from .logging_utils import configure_logging, get_logger, log_context, new_request_id
 from .patient_files import save_patient_file_upload
+from .portal_sync import (
+    spawn_portal_sync,
+    watch_portal_patients_forever,
+)
 from .reports import (
     extract_pdf_full,
     extract_text_from_pdf,
@@ -53,7 +57,8 @@ app = FastAPI(title="qEEG Council API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):517\d$",
+    # Allow local dev servers on arbitrary ports so parallel repos don't have to fight over 5173.
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -343,6 +348,35 @@ def _truthy_env(name: str, default: bool) -> bool:
     return default
 
 
+def _schedule_portal_sync(patient_label: str, *, source: str) -> None:
+    if not patient_label:
+        return
+    spawned = spawn_portal_sync(patient_label)
+    LOGGER.info(
+        "portal_sync_scheduled",
+        patient_label=patient_label,
+        source=source,
+        spawned=spawned,
+    )
+
+
+def _spawn_task(coro, *, name: str | None = None):
+    return asyncio.create_task(coro, name=name)
+
+
+async def _cancel_task_if_possible(task: object | None) -> None:
+    if task is None:
+        return
+
+    cancel = getattr(task, "cancel", None)
+    if callable(cancel):
+        cancel()
+
+    if isinstance(task, (asyncio.Task, asyncio.Future)):
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 async def _auto_generate_patient_facing_for_run(
     run_id: str, broker: _EventBroker
 ) -> None:
@@ -364,7 +398,7 @@ async def _auto_generate_patient_facing_for_run(
         return
 
     preferred_model = (
-        os.getenv("QEEG_PATIENT_FACING_MODEL", "claude-opus-4-6") or "claude-opus-4-6"
+        os.getenv("QEEG_PATIENT_FACING_MODEL", "gpt-5.4") or "gpt-5.4"
     ).strip()
     version_prefix = (
         os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto"
@@ -860,7 +894,9 @@ async def _startup() -> None:
     app.state.broker = _EventBroker()
     app.state.cliproxy_pid = None
     app.state.model_refresh_task = None
+    app.state.portal_raw_sync_task = None
 
+    loop = asyncio.get_running_loop()
     if not app.state.mock_mode:
         await _refresh_discovered_models(llm=app.state.llm)
         try:
@@ -871,9 +907,10 @@ async def _startup() -> None:
             interval_s = 7 * 24 * 60 * 60
         if interval_s < 0:
             interval_s = 0
-        app.state.model_refresh_task = asyncio.create_task(
+        app.state.model_refresh_task = loop.create_task(
             _model_refresh_loop(llm=app.state.llm, interval_s=interval_s)
         )
+    app.state.portal_raw_sync_task = loop.create_task(watch_portal_patients_forever())
     LOGGER.info(
         "backend_startup_complete",
         mock_mode=bool(app.state.mock_mode),
@@ -884,10 +921,9 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     LOGGER.info("backend_shutdown_begin")
     task = getattr(app.state, "model_refresh_task", None)
-    if task is not None:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    await _cancel_task_if_possible(task)
+    raw_sync_task = getattr(app.state, "portal_raw_sync_task", None)
+    await _cancel_task_if_possible(raw_sync_task)
     llm: AsyncOpenAICompatClient | None = getattr(app.state, "llm", None)
     if llm is not None:
         await llm.aclose()
@@ -1333,6 +1369,11 @@ async def upload_patient_file(
             src_path=Path(pf.stored_path),
             filename=pf.filename,
         )
+        if portal_path is not None:
+            _schedule_portal_sync(
+                patient_label=patient_label,
+                source="upload_patient_file",
+            )
         return {
             "file": _patient_file_out(pf),
             "portal_published_path": str(portal_path) if portal_path else None,
@@ -1730,7 +1771,7 @@ async def start_run(run_id: str) -> dict[str, Any]:
         patient_id=patient_id,
         report_id=report_id,
     )
-    asyncio.create_task(_runner(), name=f"qeeg-run-{run_id}")
+    _spawn_task(_runner(), name=f"qeeg-run-{run_id}")
     return {"ok": True}
 
 
@@ -1883,6 +1924,11 @@ async def export(run_id: str) -> dict[str, Any]:
         src_path=pdf_path,
         filename=f"{patient_label}.pdf" if patient_label else "final.pdf",
     )
+    if portal_md is not None or portal_pdf is not None:
+        _schedule_portal_sync(
+            patient_label=patient_label,
+            source="export_run",
+        )
 
     return {
         "ok": True,

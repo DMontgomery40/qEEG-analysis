@@ -28,6 +28,7 @@ from ..vision import (
     _try_build_p300_cp_site_crops,
     _try_build_summary_table_crops,
 )
+from ..types import OnEvent
 
 
 class _DataPackMixin:
@@ -256,6 +257,7 @@ class _DataPackMixin:
         page_images: list[PageImage],
         candidate_extractor_model_ids: list[str],
         strict: bool,
+        emit: OnEvent = None,
     ) -> dict[str, Any] | None:
         """
         Build (or load) a structured data pack that makes image-only metrics available to ALL stages.
@@ -458,12 +460,24 @@ class _DataPackMixin:
 
         # Multi-pass extraction across all pages.
         errors: list[str] = []
+        chunks = list(_chunked(page_images, chunk_size))
         for extractor_model_id in candidate_extractor_model_ids:
             try:
+                if emit is not None:
+                    await emit(
+                        {
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "data_pack_model",
+                            "model_id": extractor_model_id,
+                            "status": "start",
+                            "chunk_count": len(chunks),
+                            "pages": [img.page for img in page_images],
+                        }
+                    )
                 parts: list[dict[str, Any]] = []
-                for chunk_index, chunk in enumerate(
-                    _chunked(page_images, chunk_size), start=1
-                ):
+                for chunk_index, chunk in enumerate(chunks, start=1):
                     pages = [img.page for img in chunk]
                     prompt_text = _data_pack_prompt(
                         pages=pages,
@@ -472,14 +486,55 @@ class _DataPackMixin:
                             "theta/beta, alpha ratio, peak frequency) from ONLY these pages."
                         ),
                     )
-                    raw = await self._call_model_multimodal(
-                        model_id=extractor_model_id,
-                        prompt_text=prompt_text,
-                        images=chunk,
-                        temperature=0.0,
-                        max_tokens=3500,
-                        allow_text_fallback=False,
+                    if emit is not None:
+                        await emit(
+                            {
+                                "run_id": run_id,
+                                "stage_num": 1,
+                                "stage_name": STAGES[0].name,
+                                "task": "data_pack_chunk",
+                                "model_id": extractor_model_id,
+                                "status": "start",
+                                "chunk_index": chunk_index,
+                                "chunk_count": len(chunks),
+                                "pages": pages,
+                            }
+                        )
+                    raw = await self._await_with_heartbeat(
+                        self._call_model_multimodal(
+                            model_id=extractor_model_id,
+                            prompt_text=prompt_text,
+                            images=chunk,
+                            temperature=0.0,
+                            max_tokens=3500,
+                            allow_text_fallback=False,
+                        ),
+                        emit=emit,
+                        payload={
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "data_pack_chunk",
+                            "model_id": extractor_model_id,
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(chunks),
+                            "pages": pages,
+                        },
                     )
+                    if emit is not None:
+                        await emit(
+                            {
+                                "run_id": run_id,
+                                "stage_num": 1,
+                                "stage_name": STAGES[0].name,
+                                "task": "data_pack_chunk",
+                                "model_id": extractor_model_id,
+                                "status": "complete",
+                                "chunk_index": chunk_index,
+                                "chunk_count": len(chunks),
+                                "pages": pages,
+                            }
+                        )
                     if debug_dir is not None:
                         try:
                             safe_model = (
@@ -688,8 +743,35 @@ class _DataPackMixin:
                         content_type="application/json",
                     )
 
+                if emit is not None:
+                    await emit(
+                        {
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "data_pack_model",
+                            "model_id": extractor_model_id,
+                            "status": "complete",
+                            "chunk_count": len(chunks),
+                            "pages": [img.page for img in page_images],
+                        }
+                    )
                 return merged
             except Exception as e:
+                if emit is not None:
+                    await emit(
+                        {
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "data_pack_model",
+                            "model_id": extractor_model_id,
+                            "status": "failed",
+                            "chunk_count": len(chunks),
+                            "pages": [img.page for img in page_images],
+                            "error": str(e),
+                        }
+                    )
                 errors.append(f"{extractor_model_id}: {e}")
                 continue
 
@@ -709,6 +791,7 @@ class _DataPackMixin:
         page_images: list[PageImage],
         transcript_model_id: str | None,
         strict: bool,
+        emit: OnEvent = None,
     ) -> str | None:
         """
         Build a run-level multimodal transcript so later stages (2-6) can access image-only tables/figures.
@@ -786,17 +869,73 @@ class _DataPackMixin:
                 f"Pass {chunk_index} of {len(chunks)}\n"
             )
             try:
-                text = await self._call_model_multimodal(
-                    model_id=transcript_model_id,
-                    prompt_text=prompt_text,
-                    images=chunk,
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                    allow_text_fallback=not strict,
+                if emit is not None:
+                    await emit(
+                        {
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "vision_transcript_chunk",
+                            "model_id": transcript_model_id,
+                            "status": "start",
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(chunks),
+                            "pages": pages,
+                        }
+                    )
+                text = await self._await_with_heartbeat(
+                    self._call_model_multimodal(
+                        model_id=transcript_model_id,
+                        prompt_text=prompt_text,
+                        images=chunk,
+                        temperature=0.0,
+                        max_tokens=max_tokens,
+                        allow_text_fallback=not strict,
+                    ),
+                    emit=emit,
+                    payload={
+                        "run_id": run_id,
+                        "stage_num": 1,
+                        "stage_name": STAGES[0].name,
+                        "task": "vision_transcript_chunk",
+                        "model_id": transcript_model_id,
+                        "chunk_index": chunk_index,
+                        "chunk_count": len(chunks),
+                        "pages": pages,
+                    },
                 )
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
+                if emit is not None:
+                    await emit(
+                        {
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "vision_transcript_chunk",
+                            "model_id": transcript_model_id,
+                            "status": "complete",
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(chunks),
+                            "pages": pages,
+                        }
+                    )
             except Exception as e:
+                if emit is not None:
+                    await emit(
+                        {
+                            "run_id": run_id,
+                            "stage_num": 1,
+                            "stage_name": STAGES[0].name,
+                            "task": "vision_transcript_chunk",
+                            "model_id": transcript_model_id,
+                            "status": "failed",
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(chunks),
+                            "pages": pages,
+                            "error": str(e),
+                        }
+                    )
                 errors.append(f"pass {chunk_index} pages {pages_str}: {e}")
                 if strict:
                     raise RuntimeError(

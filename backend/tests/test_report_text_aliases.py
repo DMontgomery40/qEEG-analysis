@@ -48,3 +48,32 @@ def test_expected_sessions_include_plain_markers_from_non_aliased_pages(temp_dat
     )
 
     assert _expected_session_indices(report_text) == [4, 5, 6]
+
+
+def test_expected_sessions_ignore_loose_ocr_marker_when_summary_pages_define_count(
+    temp_data_dir,
+):
+    report_text = (
+        "=== PAGE 1 / 5 ===\n"
+        "Session 1 (2025-12-09)\n"
+        "Session 2 (2026-01-21)\n"
+        "Session 3 (2026-03-04)\n"
+        "Physical Reaction Time 296 ms 293 ms 321 ms 252-362 ms\n"
+        "Audio P300 Delay 276 ms 308 ms 320 ms 251-326 ms\n"
+        "\n"
+        "=== PAGE 2 / 5 ===\n"
+        "P300 Rare Comparison\n"
+        "\n"
+        "=== PAGE 3 / 5 ===\n"
+        "Spectrum page\n"
+        "\n"
+        "=== PAGE 4 / 5 ===\n"
+        "Another non-summary page\n"
+        "\n"
+        "=== PAGE 5 / 5 ===\n"
+        "Session 4 PERCENTAGE CHANGE COMPARED TO SESSION #1\n"
+        "Coherence matrix page\n"
+    )
+
+    assert _find_summary_pages(report_text, page_count=5) == [1]
+    assert _expected_session_indices(report_text) == [1, 2, 3]
