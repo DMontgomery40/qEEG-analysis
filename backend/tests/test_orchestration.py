@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 from pathlib import Path
 
@@ -137,6 +138,111 @@ def test_summarize_run_progress_keeps_partial_success_visible_on_complete(temp_d
     assert "partial 1/2" in summary["phase_label"]
 
 
+def test_derive_run_liveness_marks_old_running_heartbeat_stale(temp_data_dir, monkeypatch):
+    from backend import storage
+    from backend.orchestration import (
+        derive_run_liveness,
+        progress_jsonl_path,
+        summarize_run_progress,
+    )
+
+    monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-stale"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-stale",
+            patient_id=patient.id,
+            filename="source.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, run.id, status="running")
+
+    progress_path = progress_jsonl_path(run.id)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "run_id": run.id,
+                "stage_num": 1,
+                "stage_name": "initial_analysis",
+                "task": "data_pack_chunk",
+                "status": "heartbeat",
+                "timestamp": "2026-04-12T10:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    progress = summarize_run_progress(run)
+    liveness = derive_run_liveness(run, progress=progress)
+
+    assert liveness["is_stale"] is True
+    assert liveness["is_live"] is False
+    assert liveness["display_status"] == "stale"
+    assert "last update" in liveness["display_label"]
+
+
+def test_derive_run_liveness_keeps_fresh_created_runs_blocking_duplicate_work(
+    temp_data_dir, monkeypatch
+):
+    from backend import storage
+    from backend.orchestration import derive_run_liveness
+
+    monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-created"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-created",
+            patient_id=patient.id,
+            filename="source.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+
+    fresh = derive_run_liveness(run, now=run.created_at + timedelta(seconds=60))
+    stale = derive_run_liveness(run, now=run.created_at + timedelta(seconds=301))
+
+    assert fresh["is_live"] is False
+    assert fresh["blocks_duplicate_work"] is True
+    assert fresh["display_status"] == "created"
+    assert stale["is_stale"] is True
+    assert stale["blocks_duplicate_work"] is False
+
+
 def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
     temp_data_dir, monkeypatch
 ):
@@ -214,6 +320,230 @@ def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
     assert payload["pipeline_job"]["status"] == "complete"
     assert payload["cathode"]["handoff_payload_exists"] is True
     assert payload["recommended_cathode_source"]["artifact"]["stage_num"] == 4
+
+
+def test_patient_orchestration_endpoint_surfaces_stale_running_rows(
+    temp_data_dir, monkeypatch
+):
+    from backend import storage
+    from backend.orchestration import progress_jsonl_path
+
+    monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="12-02-1985-0", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-stale-ui"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-stale-ui",
+            patient_id=patient.id,
+            filename="LM_autism-TBI_depressn_20tx_Redacted.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, run.id, status="running")
+
+    progress_path = progress_jsonl_path(run.id)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "run_id": run.id,
+                "stage_num": 1,
+                "stage_name": "initial_analysis",
+                "task": "stage1_model",
+                "model_id": "gpt-5.4",
+                "status": "heartbeat",
+                "timestamp": "2026-04-12T10:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    app = _test_app(temp_data_dir, monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(f"/api/patients/{patient.id}/orchestration")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["status"] == "stale"
+    assert payload["summary"]["state"] == "attention"
+    assert payload["reports"][0]["lifecycle"]["council_status"] == "stale"
+    assert payload["active_runs"] == []
+    assert payload["stale_runs"][0]["display_status"] == "stale"
+
+
+def test_patient_orchestration_summary_liveness_tracks_the_run_being_summarized(
+    temp_data_dir, monkeypatch
+):
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="01-18-1991-0", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-mixed"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-mixed",
+            patient_id=patient.id,
+            filename="source.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        running_run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, running_run.id, status="running")
+        failed_run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, failed_run.id, status="failed", error_message="boom")
+
+    app = _test_app(temp_data_dir, monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/patients")
+
+    assert response.status_code == 200
+    payload = response.json()
+    match = next(item for item in payload if item["label"] == "01-18-1991-0")
+    summary = match["orchestration_summary"]
+    assert summary["state"] == "running"
+    assert summary["status"] == "running"
+    assert summary["liveness"]["raw_status"] == "running"
+    assert summary["liveness"]["display_status"] == "running"
+
+
+def test_patient_orchestration_detail_exposes_current_run_over_newer_failed_run(
+    temp_data_dir, monkeypatch
+):
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="01-18-1991-1", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-mixed-detail"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-mixed-detail",
+            patient_id=patient.id,
+            filename="source.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        running_run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, running_run.id, status="running")
+        failed_run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, failed_run.id, status="failed", error_message="boom")
+
+    app = _test_app(temp_data_dir, monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(f"/api/patients/{patient.id}/orchestration")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["latest_run"]["display_status"] == "failed"
+    assert payload["current_run"]["display_status"] == "running"
+    assert payload["current_run"]["id"] == payload["active_runs"][0]["id"]
+
+
+def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
+    temp_data_dir, monkeypatch
+):
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="02-28-1978-0", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-complete"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = report_dir / "original.txt"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_text("dummy", encoding="utf-8")
+        extracted_path.write_text("dummy", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-complete",
+            patient_id=patient.id,
+            filename="source.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, run.id, status="complete")
+
+    status_dir = Path(temp_data_dir) / "pipeline_jobs"
+    status_dir.mkdir(parents=True, exist_ok=True)
+    (status_dir / "02-28-1978-0.json").write_text(
+        json.dumps(
+            {
+                "patient_id": "02-28-1978-0",
+                "status": "failed",
+                "note": "worker saw duplicate legacy PDFs",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app = _test_app(temp_data_dir, monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/patients")
+
+    assert response.status_code == 200
+    payload = response.json()
+    match = next(item for item in payload if item["label"] == "02-28-1978-0")
+    summary = match["orchestration_summary"]
+    assert summary["state"] == "ready"
+    assert summary["status"] == "complete"
 
 
 def test_prepare_cathode_handoff_action_writes_payload_and_source(

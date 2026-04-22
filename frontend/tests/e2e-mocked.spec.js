@@ -422,6 +422,74 @@ test.describe('App initialization', () => {
     await expect(page.locator('.sidebar-item-status-percent')).toHaveText('25%');
   });
 
+  test('shows stale orchestration without pretending progress is live', async ({ page }) => {
+    const patients = cloneJson(MOCK_PATIENTS);
+    patients[0].orchestration_summary = {
+      status: 'stale',
+      label: 'Stale - last update 2h ago',
+      progress: {
+        percent: 25,
+        determinate: true,
+      },
+      liveness: {
+        is_stale: true,
+        display_status: 'stale',
+      },
+    };
+    const runs = cloneJson(MOCK_RUNS);
+    runs[0].display_status = 'stale';
+    runs[0].liveness = {
+      is_stale: true,
+      display_status: 'stale',
+    };
+    const orchestration = cloneJson(MOCK_ORCHESTRATION);
+    orchestration.council = {
+      status: 'stale',
+      display_status: 'stale',
+      display_label: 'Stale - last update 2h ago',
+      run_id: MOCK_RUN_ID,
+      liveness: {
+        is_stale: true,
+        display_status: 'stale',
+      },
+      progress: { ...MOCK_PROGRESS },
+    };
+
+    await setupMockApi(page, { patients, runs, orchestration });
+    await page.goto('/');
+
+    await expect(page.locator('.sidebar-item-status-label')).toHaveText('Stale - last update 2h ago');
+    await expect(page.locator('.sidebar-item-status-percent')).toHaveCount(0);
+    await expect(
+      page.locator('.run-history-card .list-item-title').filter({ hasText: /run-789 — stale/i })
+    ).toBeVisible();
+    await expect(
+      page.locator('.orchestration-section').filter({ hasText: /Council run/i }).locator('.status-badge')
+    ).toContainText(/stale/i);
+  });
+
+  test('sidebar summary prefers explicit summary fields over nested liveness', async ({ page }) => {
+    const patients = cloneJson(MOCK_PATIENTS);
+    patients[0].orchestration_summary = {
+      status: 'running',
+      label: 'Peer Review · reviewer-a',
+      progress: {
+        percent: 25,
+        determinate: true,
+      },
+      liveness: {
+        display_status: 'failed',
+        display_label: 'Failed',
+      },
+    };
+
+    await setupMockApi(page, { patients });
+    await page.goto('/');
+
+    await expect(page.locator('.sidebar-item-status-label')).toHaveText('Peer Review · reviewer-a');
+    await expect(page.locator('.sidebar-item-status-percent')).toHaveText('25%');
+  });
+
   test('degrades gracefully when sidebar orchestration summary is absent', async ({ page }) => {
     const patients = cloneJson(MOCK_PATIENTS);
     delete patients[0].orchestration_summary;
@@ -532,6 +600,30 @@ test.describe('Patient orchestration', () => {
 
     await expect(page.getByText('sync_portal requested')).toBeVisible();
     await expect(page.getByText('Portal sync requested from frontend')).toBeVisible();
+  });
+
+  test('prefers current_run over latest_run for the council section', async ({ page }) => {
+    const orchestration = cloneJson(MOCK_ORCHESTRATION);
+    orchestration.current_run = {
+      status: 'running',
+      display_status: 'running',
+      run_id: MOCK_RUN_ID,
+      progress: { ...MOCK_PROGRESS },
+    };
+    orchestration.latest_run = {
+      status: 'failed',
+      display_status: 'failed',
+      run_id: 'run-failed',
+      error_message: 'boom',
+    };
+
+    await setupMockApi(page, { orchestration });
+    await page.goto('/');
+
+    const councilSection = page.locator('.orchestration-section').filter({ hasText: /Council run/i });
+    await expect(councilSection.locator('.status-badge')).toContainText(/running/i);
+    await expect(councilSection).toContainText(/run-789/i);
+    await expect(councilSection).toContainText(/peer review/i);
   });
 });
 

@@ -16,6 +16,7 @@ from typing import Any, Iterator
 from . import storage
 from . import config as cfg
 from .logging_utils import get_logger
+from .orchestration import derive_run_liveness, summarize_run_progress
 
 LOGGER = get_logger(__name__)
 
@@ -398,7 +399,12 @@ def _report_run_statuses_by_filename(patient_label: str) -> dict[str, set[str]]:
                     .all()
                 )
                 for run in runs:
+                    liveness = derive_run_liveness(
+                        run, progress=summarize_run_progress(run)
+                    )
                     status = (run.status or "").strip()
+                    if status in {"created", "running"} and not liveness["blocks_duplicate_work"]:
+                        continue
                     if status:
                         statuses.add(status)
     return statuses_by_filename
