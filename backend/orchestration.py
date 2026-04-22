@@ -31,6 +31,15 @@ _STAGE_LABELS = {
     6: "Final Draft",
 }
 
+_RUN_STATUS_LABELS = {
+    "created": "Queued",
+    "running": "Running",
+    "complete": "Complete",
+    "failed": "Failed",
+    "needs_auth": "Needs Auth",
+    "stale": "Stale",
+}
+
 
 def normalize_portal_patient_id(value: str) -> str | None:
     raw = (value or "").strip()
@@ -94,6 +103,47 @@ def progress_log_path(run_id: str) -> Path:
 
 def isoformat_or_none(value: datetime | None) -> str | None:
     return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _coerce_utc(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return _coerce_utc(parsed)
+
+
+def _run_stale_after_seconds() -> int:
+    try:
+        value = int((os.getenv("QEEG_RUN_STALE_AFTER_S") or "600").strip())
+    except Exception:
+        value = 600
+    return max(60, value)
+
+
+def _format_age_label(age_seconds: int | None) -> str:
+    if not isinstance(age_seconds, int):
+        return "unknown"
+    if age_seconds < 60:
+        return f"{age_seconds}s"
+    minutes, seconds = divmod(age_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
 
 
 def _path_iso(path: Path | None) -> str | None:
@@ -294,6 +344,61 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
     return summary
 
 
+def derive_run_liveness(
+    run: storage.Run,
+    *,
+    progress: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    raw_status = (run.status or "").strip() or "unknown"
+    progress = progress if progress is not None else summarize_run_progress(run)
+    progress_timestamp = _parse_iso_datetime(progress.get("timestamp"))
+    started_at = _coerce_utc(run.started_at)
+    created_at = _coerce_utc(run.created_at)
+    completed_at = _coerce_utc(run.completed_at)
+    last_update_at = progress_timestamp or started_at or completed_at or created_at
+    clock = _coerce_utc(now) or datetime.now(timezone.utc)
+
+    age_seconds: int | None = None
+    if last_update_at is not None:
+        age_seconds = max(0, int((clock - last_update_at).total_seconds()))
+
+    stale_after_seconds = _run_stale_after_seconds()
+    is_stale = (
+        raw_status in {"created", "running"}
+        and isinstance(age_seconds, int)
+        and age_seconds > stale_after_seconds
+    )
+    blocks_duplicate_work = raw_status in {"created", "running"} and not is_stale
+
+    if is_stale:
+        display_status = "stale"
+        display_label = f"Stale - last update {_format_age_label(age_seconds)} ago"
+        reason = (
+            "Run is still marked active in SQLite but has not emitted progress within the stale threshold."
+        )
+    else:
+        display_status = raw_status
+        display_label = _RUN_STATUS_LABELS.get(raw_status, raw_status.replace("_", " ").title())
+        reason = ""
+
+    return {
+        "raw_status": raw_status,
+        "display_status": display_status,
+        "display_label": display_label,
+        "is_live": raw_status == "running" and not is_stale,
+        "blocks_duplicate_work": blocks_duplicate_work,
+        "is_stale": is_stale,
+        "last_update_at": isoformat_or_none(last_update_at),
+        "last_progress_at": isoformat_or_none(progress_timestamp),
+        "started_at": isoformat_or_none(started_at),
+        "completed_at": isoformat_or_none(completed_at),
+        "age_seconds": age_seconds,
+        "stale_after_seconds": stale_after_seconds,
+        "reason": reason,
+    }
+
+
 def _looks_generated_pdf(patient_label: str, path: Path) -> bool:
     lower_name = path.name.lower()
     lower_label = patient_label.lower()
@@ -396,6 +501,8 @@ def _artifact_out(artifact: storage.Artifact) -> dict[str, Any]:
 
 
 def _run_out(run: storage.Run) -> dict[str, Any]:
+    progress = summarize_run_progress(run)
+    liveness = derive_run_liveness(run, progress=progress)
     try:
         council_model_ids = json.loads(run.council_model_ids_json)
     except Exception:
@@ -409,6 +516,10 @@ def _run_out(run: storage.Run) -> dict[str, Any]:
         "patient_id": run.patient_id,
         "report_id": run.report_id,
         "status": run.status,
+        "raw_status": liveness["raw_status"],
+        "display_status": liveness["display_status"],
+        "display_label": liveness["display_label"],
+        "is_stale": liveness["is_stale"],
         "error_message": run.error_message,
         "council_model_ids": council_model_ids,
         "consolidator_model_id": run.consolidator_model_id,
@@ -417,7 +528,8 @@ def _run_out(run: storage.Run) -> dict[str, Any]:
         "completed_at": isoformat_or_none(run.completed_at),
         "selected_artifact_id": run.selected_artifact_id,
         "created_at": run.created_at.isoformat(),
-        "progress": summarize_run_progress(run),
+        "progress": progress,
+        "liveness": liveness,
     }
 
 
@@ -519,7 +631,14 @@ def build_patient_orchestration_summary(
 ) -> dict[str, Any]:
     runs = storage.list_runs(session, patient.id)
     latest_run = runs[0] if runs else None
-    active_run = next((run for run in runs if run.status == "running"), None)
+    run_progress_by_id = {run.id: summarize_run_progress(run) for run in runs}
+    run_liveness_by_id = {
+        run.id: derive_run_liveness(run, progress=run_progress_by_id[run.id]) for run in runs
+    }
+    active_run = next(
+        (run for run in runs if run_liveness_by_id[run.id]["is_live"]),
+        None,
+    )
     pipeline_status = load_pipeline_job_status(patient.label)
     portal = classify_portal_files(patient.label)
     sync_entry = _read_sync_state(patient.label)
@@ -527,31 +646,63 @@ def build_patient_orchestration_summary(
     cathode = cathode_status(patient_label=patient.label, source_artifact=source_artifact)
 
     state = "idle"
+    status = "idle"
     label = "No runs yet"
+    summary_run: storage.Run | None = None
     progress: dict[str, Any] | None = None
     if active_run is not None:
-        progress = summarize_run_progress(active_run)
+        summary_run = active_run
+        progress = run_progress_by_id[active_run.id]
         state = "running"
+        status = run_liveness_by_id[active_run.id]["display_status"]
         label = progress.get("phase_label") or "Running"
-    elif latest_run is not None and latest_run.status in {"failed", "needs_auth"}:
-        progress = summarize_run_progress(latest_run)
+    elif latest_run is not None and run_liveness_by_id[latest_run.id]["is_stale"]:
+        summary_run = latest_run
+        progress = run_progress_by_id[latest_run.id]
         state = "attention"
+        status = run_liveness_by_id[latest_run.id]["display_status"]
+        label = run_liveness_by_id[latest_run.id]["display_label"]
+    elif latest_run is not None and latest_run.status == "complete":
+        summary_run = latest_run
+        progress = run_progress_by_id[latest_run.id]
+        state = "ready"
+        status = run_liveness_by_id[latest_run.id]["display_status"]
+        label = (
+            progress.get("phase_label")
+            or run_liveness_by_id[latest_run.id]["display_label"]
+            or "Complete"
+        )
+    elif latest_run is not None and latest_run.status in {"failed", "needs_auth"}:
+        summary_run = latest_run
+        progress = run_progress_by_id[latest_run.id]
+        state = "attention"
+        status = run_liveness_by_id[latest_run.id]["display_status"]
         label = latest_run.error_message or progress.get("phase_label") or latest_run.status
     elif pipeline_status and pipeline_status.get("status") == "failed":
         state = "attention"
+        status = "failed"
         label = str(pipeline_status.get("note") or pipeline_status.get("status"))
     elif latest_run is not None:
-        progress = summarize_run_progress(latest_run)
-        state = "ready" if latest_run.status == "complete" else latest_run.status
-        label = progress.get("phase_label") or latest_run.status
+        summary_run = latest_run
+        progress = run_progress_by_id[latest_run.id]
+        state = latest_run.status
+        status = run_liveness_by_id[latest_run.id]["display_status"]
+        label = (
+            progress.get("phase_label")
+            or run_liveness_by_id[latest_run.id]["display_label"]
+            or latest_run.status
+        )
     elif pipeline_status:
         state = str(pipeline_status.get("status") or "idle")
+        status = state
         label = str(pipeline_status.get("note") or state)
 
     return {
         "state": state,
+        "status": status,
         "label": label,
         "progress": progress,
+        "liveness": run_liveness_by_id.get(summary_run.id) if summary_run is not None else None,
         "pipeline_status": {
             "status": pipeline_status.get("status"),
             "updated_at": pipeline_status.get("updated_at"),
@@ -579,6 +730,10 @@ def build_patient_orchestration_detail(
 ) -> dict[str, Any]:
     reports = storage.list_reports(session, patient.id)
     runs = storage.list_runs(session, patient.id)
+    run_views = [_run_out(run) for run in runs]
+    run_views_by_report: dict[str, list[dict[str, Any]]] = {}
+    for run_view in run_views:
+        run_views_by_report.setdefault(run_view["report_id"], []).append(run_view)
     pipeline_status = load_pipeline_job_status(patient.label)
     portal = classify_portal_files(patient.label)
     sync_entry = _read_sync_state(patient.label)
@@ -606,15 +761,11 @@ def build_patient_orchestration_detail(
                     f"Patient-facing PDF may be stale relative to run {latest_complete_run.id[:8]}"
                 )
 
-    runs_by_report: dict[str, list[storage.Run]] = {}
-    for run in runs:
-        runs_by_report.setdefault(run.report_id, []).append(run)
-
     report_rows: list[dict[str, Any]] = []
     for report in reports:
-        report_runs = runs_by_report.get(report.id, [])
+        report_runs = run_views_by_report.get(report.id, [])
         latest_run = report_runs[0] if report_runs else None
-        completed_runs = [run for run in report_runs if run.status == "complete"]
+        completed_runs = [run for run in report_runs if run["status"] == "complete"]
         extracted_exists = False
         try:
             extracted_path = Path(report.extracted_text_path)
@@ -638,13 +789,15 @@ def build_patient_orchestration_detail(
                 "filename": report.filename,
                 "mime_type": report.mime_type,
                 "created_at": report.created_at.isoformat(),
-                "latest_run": _run_out(latest_run) if latest_run else None,
+                "latest_run": latest_run,
                 "complete_run_count": len(completed_runs),
                 "has_complete_run": bool(completed_runs),
                 "lifecycle": {
                     "uploaded": True,
                     "extracted": extracted_exists,
-                    "council_status": latest_run.status if latest_run else "pending",
+                    "council_status": (
+                        latest_run["display_status"] if latest_run else "pending"
+                    ),
                     "patient_facing_status": "ready" if patient_facing_for_report else "pending",
                     "portal_sync_status": (
                         str(sync_entry.get("status") or sync_entry.get("state"))
@@ -656,8 +809,14 @@ def build_patient_orchestration_detail(
             }
         )
 
-    active_runs = [_run_out(run) for run in runs if run.status == "running"]
-    latest_run = _run_out(runs[0]) if runs else None
+    active_runs = [
+        run_view for run_view in run_views if run_view["liveness"]["is_live"]
+    ]
+    stale_runs = [
+        run_view for run_view in run_views if run_view["liveness"]["is_stale"]
+    ]
+    latest_run = run_views[0] if run_views else None
+    current_run = active_runs[0] if active_runs else latest_run
 
     return {
         "patient_id": patient.id,
@@ -666,6 +825,8 @@ def build_patient_orchestration_detail(
         "summary": build_patient_orchestration_summary(session, patient),
         "reports": report_rows,
         "active_runs": active_runs,
+        "stale_runs": stale_runs,
+        "current_run": current_run,
         "latest_run": latest_run,
         "pipeline_job": pipeline_status,
         "patient_facing": {

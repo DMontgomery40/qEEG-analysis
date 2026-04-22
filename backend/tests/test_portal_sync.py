@@ -193,6 +193,100 @@ def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs
     assert active_runs == []
 
 
+def test_source_pdfs_missing_complete_runs_keeps_fresh_created_rows_active(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+    from backend import storage
+
+    patient_id = "08-10-1989-1"
+    patient_dir = tmp_path / patient_id
+    patient_dir.mkdir()
+    filename = "DK_20Tx_toxic-brain-injury_Redacted.pdf"
+    (patient_dir / filename).write_bytes(b"%PDF-1.4")
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label=patient_id, notes="")
+        report = storage.create_report(
+            session,
+            patient_id=patient.id,
+            filename=filename,
+            mime_type="application/pdf",
+            stored_path=tmp_path / "report.pdf",
+            extracted_text_path=tmp_path / "report.txt",
+        )
+        storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+
+    missing_complete, active_runs = portal_sync._source_pdfs_missing_complete_runs(
+        patient_dir, patient_id
+    )
+
+    assert missing_complete == []
+    assert active_runs == [filename]
+
+
+def test_source_pdfs_missing_complete_runs_ignores_stale_running_rows(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+    from backend import storage
+    from backend.orchestration import progress_jsonl_path
+
+    monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
+
+    patient_id = "08-10-1989-0"
+    patient_dir = tmp_path / patient_id
+    patient_dir.mkdir()
+    filename = "DK_20Tx_toxic-brain-injury_Redacted.pdf"
+    (patient_dir / filename).write_bytes(b"%PDF-1.4")
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label=patient_id, notes="")
+        report = storage.create_report(
+            session,
+            patient_id=patient.id,
+            filename=filename,
+            mime_type="application/pdf",
+            stored_path=tmp_path / "report.pdf",
+            extracted_text_path=tmp_path / "report.txt",
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, run.id, status="running")
+
+    progress_path = progress_jsonl_path(run.id)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "run_id": run.id,
+                "status": "heartbeat",
+                "timestamp": "2026-04-12T10:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    missing_complete, active_runs = portal_sync._source_pdfs_missing_complete_runs(
+        patient_dir, patient_id
+    )
+
+    assert missing_complete == [filename]
+    assert active_runs == []
+
+
 @pytest.mark.asyncio
 async def test_watch_portal_patients_forever_syncs_stable_raw_changes(
     tmp_path: Path, monkeypatch

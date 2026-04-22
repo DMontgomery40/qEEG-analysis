@@ -48,6 +48,7 @@ from .orchestration import (
     cathode_handoff_source_path,
     cathode_project_dir,
     choose_cathode_source_artifact,
+    derive_run_liveness,
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
@@ -2254,6 +2255,8 @@ def _patient_file_out(f: storage.PatientFile) -> dict[str, Any]:
 
 
 def _run_out(r: storage.Run) -> dict[str, Any]:
+    progress = summarize_run_progress(r)
+    liveness = derive_run_liveness(r, progress=progress)
     try:
         council_model_ids = json.loads(r.council_model_ids_json)
     except Exception:
@@ -2268,6 +2271,10 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "patient_id": r.patient_id,
         "report_id": r.report_id,
         "status": r.status,
+        "raw_status": liveness["raw_status"],
+        "display_status": liveness["display_status"],
+        "display_label": liveness["display_label"],
+        "is_stale": liveness["is_stale"],
         "error_message": r.error_message,
         "council_model_ids": council_model_ids,
         "consolidator_model_id": r.consolidator_model_id,
@@ -2275,7 +2282,8 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "started_at": r.started_at.isoformat() if r.started_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
         "selected_artifact_id": r.selected_artifact_id,
-        "progress": summarize_run_progress(r),
+        "progress": progress,
+        "liveness": liveness,
         "created_at": r.created_at.isoformat(),
     }
 
