@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 
@@ -505,6 +506,78 @@ def test_reports_from_file_keys_recovers_pdf_blobs_without_index():
     assert len(reports) == 1
     assert reports[0].file_key == f"{patient_id}__raw-report__v1__2026-03-21.pdf"
     assert worker.source_local_filename(reports[0]) == reports[0].file_key
+
+
+def test_matching_active_run_exists_keeps_fresh_created_row_active(temp_data_dir):
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    patient_label = "03-05-2010-0"
+    filename = "03-05-2010-0__report__v1__2026-03-21.pdf"
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label=patient_label, notes="")
+        report = storage.create_report(
+            session,
+            patient_id=patient.id,
+            filename=filename,
+            mime_type="application/pdf",
+            stored_path=temp_data_dir / "report.pdf",
+            extracted_text_path=temp_data_dir / "report.txt",
+        )
+        storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+
+    assert worker._matching_active_run_exists(patient_label, filename) is True
+
+
+def test_matching_active_run_exists_ignores_stale_running_row(temp_data_dir, monkeypatch):
+    from backend import storage
+    from backend.orchestration import progress_jsonl_path
+    from scripts import portal_pipeline_worker as worker
+
+    monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
+
+    patient_label = "03-05-2010-0"
+    filename = "03-05-2010-0__report__v1__2026-03-21.pdf"
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label=patient_label, notes="")
+        report = storage.create_report(
+            session,
+            patient_id=patient.id,
+            filename=filename,
+            mime_type="application/pdf",
+            stored_path=temp_data_dir / "report.pdf",
+            extracted_text_path=temp_data_dir / "report.txt",
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["gpt-5.4"],
+            consolidator_model_id="claude-sonnet-4-6",
+        )
+        storage.update_run_status(session, run.id, status="running")
+
+    progress_path = progress_jsonl_path(run.id)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "run_id": run.id,
+                "status": "heartbeat",
+                "timestamp": "2026-04-12T10:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert worker._matching_active_run_exists(patient_label, filename) is False
 
 
 def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, monkeypatch):

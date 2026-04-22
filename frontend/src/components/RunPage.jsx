@@ -164,13 +164,19 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
 
   if (!run) return <div className="page">Loading run…</div>;
 
+  const displayStatus = String(run.display_status || run.status || 'unknown')
+    .replace(/[_-]+/g, ' ')
+    .trim();
+  const displayStatusLabel = displayStatus.replace(/\b\w/g, (match) => match.toUpperCase());
+  const rawStatus = String(run.status || '').trim();
+
   return (
     <div className="page">
       <div className="row space-between">
         <button onClick={onBack}>← Back</button>
         <div className="muted">
-          Run {run.id.slice(0, 8)} — {run.status}
-          {run.status === 'needs_auth' ? ' (needs auth)' : ''}
+          Run {run.id.slice(0, 8)} — {displayStatusLabel}
+          {rawStatus === 'needs_auth' ? ' (needs auth)' : ''}
         </div>
       </div>
 
@@ -183,8 +189,8 @@ function RunPage({ runId, modelMetaById, onBack, onError }) {
             <div>
               <div className="run-progress-summary">{runProgress.headline}</div>
               <div className="run-progress-subtitle">
-                {run.status}
-                {run.status === 'needs_auth' ? ' • needs auth' : ''}
+                {displayStatusLabel}
+                {rawStatus === 'needs_auth' ? ' • needs auth' : ''}
               </div>
             </div>
             {runProgress.determinate ? (

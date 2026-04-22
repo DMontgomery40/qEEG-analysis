@@ -141,7 +141,7 @@ function getStatusTone(...values) {
     .join(' ');
 
   if (!haystack) return 'neutral';
-  if (/(fail|error|stalled|blocked|missing|invalid|denied)/.test(haystack)) return 'error';
+  if (/(fail|error|stalled|stale|blocked|missing|invalid|denied)/.test(haystack)) return 'error';
   if (/(warn|degrad|partial|retry|lag|attention)/.test(haystack)) return 'warning';
   if (/(run|progress|queue|working|syncing|generating|preparing|processing|starting)/.test(haystack)) {
     return 'active';
@@ -154,12 +154,13 @@ function getStatusTone(...values) {
 
 function getSources(source) {
   const sources = [];
+  if (isRecord(source)) sources.push(source);
+  if (isRecord(source?.liveness)) sources.push(source.liveness);
   if (isRecord(source?.progress)) sources.push(source.progress);
   if (isRecord(source?.progress_state)) sources.push(source.progress_state);
   if (isRecord(source?.progress_summary)) sources.push(source.progress_summary);
   if (isRecord(source?.progress_details)) sources.push(source.progress_details);
   if (isRecord(source?.sync_entry)) sources.push(source.sync_entry);
-  if (isRecord(source)) sources.push(source);
   return sources;
 }
 
@@ -181,12 +182,15 @@ function getProgressInfo(source) {
   }
 
   const sources = getSources(source);
-  const statusLabel = pickString(sources, ['status', 'state']);
+  const statusLabel = pickString(sources, ['display_status', 'derived_status', 'status', 'state']);
   const stageNum = pickNumber(sources, ['stage_num', 'current_stage_num', 'stage']);
   const stageName = pickString(sources, ['stage_name', 'current_stage_name']);
   const phase = pickString(sources, ['phase', 'phase_label', 'current_phase', 'step_group']);
   const task = pickString(sources, ['task', 'current_task', 'step', 'current_step', 'activity']);
   const model = pickString(sources, ['model', 'model_id', 'current_model', 'current_model_id']);
+  const staleValue = pickFromSources(sources, ['is_stale']);
+  const isStale =
+    staleValue === true || String(staleValue).toLowerCase() === 'true' || statusLabel === 'stale';
 
   const elapsedSeconds =
     pickNumber(sources, ['elapsed_seconds', 'elapsed_s', 'runtime_seconds', 'duration_seconds']) ??
@@ -256,6 +260,11 @@ function getProgressInfo(source) {
     }
   }
 
+  if (isStale) {
+    determinate = false;
+    percent = null;
+  }
+
   const headlineParts = [];
   for (const part of [stageName && humanizeStatus(stageName), phase && humanizeStatus(phase), task]) {
     if (!part) continue;
@@ -263,7 +272,7 @@ function getProgressInfo(source) {
     headlineParts.push(part);
   }
   const headline =
-    pickString(sources, ['summary', 'message', 'detail', 'description']) ||
+    pickString(sources, ['display_label', 'summary', 'message', 'detail', 'description']) ||
     headlineParts.join(' • ') ||
     humanizeStatus(statusLabel);
 
@@ -279,6 +288,7 @@ function getProgressInfo(source) {
     stageName,
     statusLabel,
     headline,
+    isStale,
   };
 }
 
@@ -314,6 +324,11 @@ function buildFallbackCouncilSection(runs) {
   if (!latestRun) return null;
   return {
     status: latestRun.status,
+    raw_status: latestRun.raw_status,
+    display_status: latestRun.display_status,
+    display_label: latestRun.display_label,
+    is_stale: latestRun.is_stale,
+    liveness: latestRun.liveness,
     run_id: latestRun.id,
     created_at: latestRun.created_at,
     progress: latestRun.progress,
@@ -334,7 +349,8 @@ function buildSection(definition, rawValue) {
   const raw = isRecord(rawValue) ? rawValue : null;
   const progress = getProgressInfo(raw || {});
   const sources = raw ? getSources(raw) : [];
-  const statusLabel = pickString(sources, ['status', 'state', 'health']) || progress.statusLabel;
+  const statusLabel =
+    pickString(sources, ['display_status', 'derived_status', 'status', 'state', 'health']) || progress.statusLabel;
   const error = pickString(sources, ['last_error', 'error', 'error_message', 'failure_reason', 'reason']);
   const updatedAt = formatDateTime(
     pickString(sources, ['updated_at', 'last_updated', 'completed_at', 'finished_at', 'started_at', 'timestamp'])
@@ -391,15 +407,17 @@ function getLatestRun(runs) {
 function getSidebarSummary(summary) {
   if (!isRecord(summary)) return null;
   const progress = getProgressInfo(summary);
+  const sources = getSources(summary);
   const label =
-    pickString(getSources(summary), ['label', 'summary', 'message']) ||
+    pickString(sources, ['label', 'display_label', 'summary', 'message']) ||
     [progress.phase && humanizeStatus(progress.phase), progress.task].filter(Boolean).join(' • ') ||
-    humanizeStatus(pickString(getSources(summary), ['status', 'state']) || 'status');
+    humanizeStatus(pickString(sources, ['display_status', 'status', 'state']) || 'status');
+  const status = pickString(sources, ['display_status', 'status', 'state']);
 
   return {
     label,
-    tone: getStatusTone(summary.status, summary.state, label),
-    percent: progress.determinate ? progress.percent : null,
+    tone: getStatusTone(status, summary.status, summary.state, label),
+    percent: progress.determinate && !progress.isStale ? progress.percent : null,
   };
 }
 

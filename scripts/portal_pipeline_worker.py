@@ -19,6 +19,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend import storage  # noqa: E402
+from backend.orchestration import derive_run_liveness, summarize_run_progress  # noqa: E402
 
 PATIENT_RE = re.compile(r"^\d{2}-\d{2}-\d{4}-\d{1,3}$")
 META_NAME = "$meta.json"
@@ -365,8 +366,15 @@ def _matching_active_run_exists(patient_label: str, filename: str) -> bool:
                     .filter(storage.Run.report_id == report.id)
                     .all()
                 )
-                if any((run.status or "") in {"created", "running"} for run in runs):
-                    return True
+                for run in runs:
+                    status = (run.status or "").strip()
+                    if status not in {"created", "running"}:
+                        continue
+                    liveness = derive_run_liveness(
+                        run, progress=summarize_run_progress(run)
+                    )
+                    if liveness["blocks_duplicate_work"]:
+                        return True
     return False
 
 

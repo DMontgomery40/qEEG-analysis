@@ -645,11 +645,15 @@ function RunHistoryItem({ run, onSelectRun }) {
   const progressLabel = [progress.phase && progress.phase.replace(/[_-]+/g, ' '), progress.task]
     .filter(Boolean)
     .join(' • ');
+  const displayStatus = String(run.display_status || run.status || 'unknown')
+    .replace(/[_-]+/g, ' ')
+    .trim();
+  const displayStatusLabel = displayStatus.replace(/\b\w/g, (match) => match.toUpperCase());
 
   return (
     <button className="list-item" onClick={() => onSelectRun(run.id)}>
       <div className="list-item-title">
-        {run.id.slice(0, 8)} — {run.status}
+        {run.id.slice(0, 8)} — {displayStatusLabel}
       </div>
       <div className="list-item-sub">{new Date(run.created_at).toLocaleString()}</div>
       {progressLabel ? <div className="list-item-sub run-history-progress">{progressLabel}</div> : null}
