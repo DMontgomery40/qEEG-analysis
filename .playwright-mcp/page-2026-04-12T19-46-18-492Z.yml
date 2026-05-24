@@ -1,0 +1,483 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - img [ref=e7]
+        - generic [ref=e9]:
+          - generic [ref=e10]: qEEG Council
+          - generic [ref=e11]: Multi-Model Analysis
+      - textbox "Search patients…" [ref=e12]
+      - generic [ref=e13]:
+        - textbox "New patient label…" [ref=e14]
+        - button "New" [ref=e15] [cursor=pointer]
+      - button "Bulk Upload" [ref=e17] [cursor=pointer]
+    - generic [ref=e18]:
+      - button "New Test Patient 45b5e1fb No runs yet" [ref=e24] [cursor=pointer]:
+        - generic [ref=e25]:
+          - generic [ref=e26]: New Test Patient
+          - generic [ref=e27]: 45b5e1fb
+          - generic [ref=e31]: No runs yet
+      - button "10-31-2008-0 00f692b9 Stale - last update 3h 56m ago" [ref=e32] [cursor=pointer]:
+        - generic [ref=e33]:
+          - generic [ref=e34]: 10-31-2008-0
+          - generic [ref=e35]: 00f692b9
+          - generic [ref=e39]: Stale - last update 3h 56m ago
+      - button "03-05-2010-0 85b4b5e0 Complete MP4" [ref=e40] [cursor=pointer]:
+        - generic [ref=e41]:
+          - generic [ref=e42]: 03-05-2010-0
+          - generic [ref=e43]: 85b4b5e0
+          - generic [ref=e47]: Complete
+        - generic "Explainer video uploaded" [ref=e49]: MP4
+      - button "02-12-2012-0 29906ebc Complete" [ref=e50] [cursor=pointer]:
+        - generic [ref=e51]:
+          - generic [ref=e52]: 02-12-2012-0
+          - generic [ref=e53]: 29906ebc
+          - generic [ref=e57]: Complete
+      - button "12-03-1970-0 4b32a3cb Complete" [ref=e58] [cursor=pointer]:
+        - generic [ref=e59]:
+          - generic [ref=e60]: 12-03-1970-0
+          - generic [ref=e61]: 4b32a3cb
+          - generic [ref=e65]: Complete
+      - button "12-20-1975-0 6e2505cb Complete" [ref=e66] [cursor=pointer]:
+        - generic [ref=e67]:
+          - generic [ref=e68]: 12-20-1975-0
+          - generic [ref=e69]: 6e2505cb
+          - generic [ref=e73]: Complete
+      - button "12-15-2002-0 27734df9 Complete" [ref=e74] [cursor=pointer]:
+        - generic [ref=e75]:
+          - generic [ref=e76]: 12-15-2002-0
+          - generic [ref=e77]: 27734df9
+          - generic [ref=e81]: Complete
+      - button "12-02-1985-0 e3b2ea82 Stale - last update 2h 42m ago" [active] [ref=e82] [cursor=pointer]:
+        - generic [ref=e83]:
+          - generic [ref=e84]: 12-02-1985-0
+          - generic [ref=e85]: e3b2ea82
+          - generic [ref=e89]: Stale - last update 2h 42m ago
+      - button "10-31-1973-0 de481d14 Complete" [ref=e90] [cursor=pointer]:
+        - generic [ref=e91]:
+          - generic [ref=e92]: 10-31-1973-0
+          - generic [ref=e93]: de481d14
+          - generic [ref=e97]: Complete
+      - button "08-10-1989-0 8712b1ea Stale - last update 11h 41m ago" [ref=e98] [cursor=pointer]:
+        - generic [ref=e99]:
+          - generic [ref=e100]: 08-10-1989-0
+          - generic [ref=e101]: 8712b1ea
+          - generic [ref=e105]: Stale - last update 11h 41m ago
+      - button "02-28-1978-0 ffc5e946 Complete" [ref=e106] [cursor=pointer]:
+        - generic [ref=e107]:
+          - generic [ref=e108]: 02-28-1978-0
+          - generic [ref=e109]: ffc5e946
+          - generic [ref=e113]: Complete
+      - button "02-25-1988-0 2c383ab6 Complete" [ref=e114] [cursor=pointer]:
+        - generic [ref=e115]:
+          - generic [ref=e116]: 02-25-1988-0
+          - generic [ref=e117]: 2c383ab6
+          - generic [ref=e121]: Complete
+      - button "P2 046976e8 Failed" [ref=e122] [cursor=pointer]:
+        - generic [ref=e123]:
+          - generic [ref=e124]: P2
+          - generic [ref=e125]: "046976e8"
+          - generic [ref=e129]: Failed
+      - button "P 0bbdaf19 Failed" [ref=e130] [cursor=pointer]:
+        - generic [ref=e131]:
+          - generic [ref=e132]: P
+          - generic [ref=e133]: 0bbdaf19
+          - generic [ref=e137]: Failed
+      - button "02-04-1988-0 cb6dcc98 Complete" [ref=e138] [cursor=pointer]:
+        - generic [ref=e139]:
+          - generic [ref=e140]: 02-04-1988-0
+          - generic [ref=e141]: cb6dcc98
+          - generic [ref=e145]: Complete
+      - button "09-23-1982-0 284dc496 Failed" [ref=e146] [cursor=pointer]:
+        - generic [ref=e147]:
+          - generic [ref=e148]: 09-23-1982-0
+          - generic [ref=e149]: 284dc496
+          - generic [ref=e153]: Failed
+      - button "01-01-1983-0 f9ec6fc5 Running" [ref=e154] [cursor=pointer]:
+        - generic [ref=e155]:
+          - generic [ref=e156]: 01-01-1983-0
+          - generic [ref=e157]: f9ec6fc5
+          - generic [ref=e161]: Running
+      - button "01-01-1989-0 b5f4bf15 Complete" [ref=e162] [cursor=pointer]:
+        - generic [ref=e163]:
+          - generic [ref=e164]: 01-01-1989-0
+          - generic [ref=e165]: b5f4bf15
+          - generic [ref=e169]: Complete
+      - button "01-01-2013-0 0c5c9b57 Failed" [ref=e170] [cursor=pointer]:
+        - generic [ref=e171]:
+          - generic [ref=e172]: 01-01-2013-0
+          - generic [ref=e173]: 0c5c9b57
+          - generic [ref=e177]: Failed
+      - button "ignore b9f26162 No runs yet" [ref=e178] [cursor=pointer]:
+        - generic [ref=e179]:
+          - generic [ref=e180]: ignore
+          - generic [ref=e181]: b9f26162
+          - generic [ref=e185]: No runs yet
+      - button "09-05-1954-0 f09e4fe1 Complete MP4" [ref=e186] [cursor=pointer]:
+        - generic [ref=e187]:
+          - generic [ref=e188]: 09-05-1954-0
+          - generic [ref=e189]: f09e4fe1
+          - generic [ref=e193]: Complete
+        - generic "Explainer video uploaded" [ref=e195]: MP4
+      - button "01-19-1966-0 08980961 Failed MP4" [ref=e196] [cursor=pointer]:
+        - generic [ref=e197]:
+          - generic [ref=e198]: 01-19-1966-0
+          - generic [ref=e199]: "08980961"
+          - generic [ref=e203]: Failed
+        - generic "Explainer video uploaded" [ref=e205]: MP4
+      - button "07-14-2008-0 cb09c9ec Failed MP4" [ref=e206] [cursor=pointer]:
+        - generic [ref=e207]:
+          - generic [ref=e208]: 07-14-2008-0
+          - generic [ref=e209]: cb09c9ec
+          - generic [ref=e213]: Failed
+        - generic "Explainer video uploaded" [ref=e215]: MP4
+      - button "10-07-1963-0 937d6a3b Failed MP4" [ref=e216] [cursor=pointer]:
+        - generic [ref=e217]:
+          - generic [ref=e218]: 10-07-1963-0
+          - generic [ref=e219]: 937d6a3b
+          - generic [ref=e223]: Failed
+        - generic "Explainer video uploaded" [ref=e225]: MP4
+      - button "04-08-1997-0 447b5606 Complete MP4" [ref=e226] [cursor=pointer]:
+        - generic [ref=e227]:
+          - generic [ref=e228]: 04-08-1997-0
+          - generic [ref=e229]: 447b5606
+          - generic [ref=e233]: Complete
+        - generic "Explainer video uploaded" [ref=e235]: MP4
+      - button "01-19-1966-0 6ea31f75 Complete MP4" [ref=e236] [cursor=pointer]:
+        - generic [ref=e237]:
+          - generic [ref=e238]: 01-19-1966-0
+          - generic [ref=e239]: 6ea31f75
+          - generic [ref=e243]: Complete
+        - generic "Explainer video uploaded" [ref=e245]: MP4
+      - button "11-21-1996-0 fba0ab4b Complete MP4" [ref=e246] [cursor=pointer]:
+        - generic [ref=e247]:
+          - generic [ref=e248]: 11-21-1996-0
+          - generic [ref=e249]: fba0ab4b
+          - generic [ref=e253]: Complete
+        - generic "Explainer video uploaded" [ref=e255]: MP4
+      - button "01-01-1991-0 ce0c0b66 Stale - last update 6h 23m ago" [ref=e256] [cursor=pointer]:
+        - generic [ref=e257]:
+          - generic [ref=e258]: 01-01-1991-0
+          - generic [ref=e259]: ce0c0b66
+          - generic [ref=e263]: Stale - last update 6h 23m ago
+      - button "diag-401bc4c7 4745a0c0 Failed" [ref=e264] [cursor=pointer]:
+        - generic [ref=e265]:
+          - generic [ref=e266]: diag-401bc4c7
+          - generic [ref=e267]: 4745a0c0
+          - generic [ref=e271]: Failed
+      - button "diag-c1f1d690 1b526c59 Failed" [ref=e272] [cursor=pointer]:
+        - generic [ref=e273]:
+          - generic [ref=e274]: diag-c1f1d690
+          - generic [ref=e275]: 1b526c59
+          - generic [ref=e279]: Failed
+      - button "diag-52b7d079 491396b5 Failed" [ref=e280] [cursor=pointer]:
+        - generic [ref=e281]:
+          - generic [ref=e282]: diag-52b7d079
+          - generic [ref=e283]: 491396b5
+          - generic [ref=e287]: Failed
+      - button "diag-175b76e4 dc46c11e Failed" [ref=e288] [cursor=pointer]:
+        - generic [ref=e289]:
+          - generic [ref=e290]: diag-175b76e4
+          - generic [ref=e291]: dc46c11e
+          - generic [ref=e295]: Failed
+      - button "diag-1f40838d dc4b832c Failed" [ref=e296] [cursor=pointer]:
+        - generic [ref=e297]:
+          - generic [ref=e298]: diag-1f40838d
+          - generic [ref=e299]: dc4b832c
+          - generic [ref=e303]: Failed
+      - button "diag-be23a095 fd2507ea Failed" [ref=e304] [cursor=pointer]:
+        - generic [ref=e305]:
+          - generic [ref=e306]: diag-be23a095
+          - generic [ref=e307]: fd2507ea
+          - generic [ref=e311]: Failed
+      - button "REAL TEST — TBI-Male_20_treatments_ final qeeg_Redacted 836294a1 Complete" [ref=e312] [cursor=pointer]:
+        - generic [ref=e313]:
+          - generic [ref=e314]: REAL TEST — TBI-Male_20_treatments_ final qeeg_Redacted
+          - generic [ref=e315]: 836294a1
+          - generic [ref=e319]: Complete
+      - button "Playwright Test 1768191087090 12f60b87 No runs yet" [ref=e320] [cursor=pointer]:
+        - generic [ref=e321]:
+          - generic [ref=e322]: Playwright Test 1768191087090
+          - generic [ref=e323]: 12f60b87
+          - generic [ref=e327]: No runs yet
+      - button "Playwright Test 1768191065753 e1fe516d No runs yet" [ref=e328] [cursor=pointer]:
+        - generic [ref=e329]:
+          - generic [ref=e330]: Playwright Test 1768191065753
+          - generic [ref=e331]: e1fe516d
+          - generic [ref=e335]: No runs yet
+      - button "Playwright Test 1768190894083 868add4b No runs yet" [ref=e336] [cursor=pointer]:
+        - generic [ref=e337]:
+          - generic [ref=e338]: Playwright Test 1768190894083
+          - generic [ref=e339]: 868add4b
+          - generic [ref=e343]: No runs yet
+      - button "Playwright Test 1768190864521 e255ed91 No runs yet" [ref=e344] [cursor=pointer]:
+        - generic [ref=e345]:
+          - generic [ref=e346]: Playwright Test 1768190864521
+          - generic [ref=e347]: e255ed91
+          - generic [ref=e351]: No runs yet
+      - button "Playwright Test 1768190802265 5a033f6b No runs yet" [ref=e352] [cursor=pointer]:
+        - generic [ref=e353]:
+          - generic [ref=e354]: Playwright Test 1768190802265
+          - generic [ref=e355]: 5a033f6b
+          - generic [ref=e359]: No runs yet
+      - button "Multimodal Pipeline Test f386950b Complete" [ref=e360] [cursor=pointer]:
+        - generic [ref=e361]:
+          - generic [ref=e362]: Multimodal Pipeline Test
+          - generic [ref=e363]: f386950b
+          - generic [ref=e367]: Complete
+      - button "Pipeline Test Patient 6ebf00a3 No runs yet" [ref=e368] [cursor=pointer]:
+        - generic [ref=e369]:
+          - generic [ref=e370]: Pipeline Test Patient
+          - generic [ref=e371]: 6ebf00a3
+          - generic [ref=e375]: No runs yet
+      - button "Test Patient 8f8d6d2d No runs yet" [ref=e376] [cursor=pointer]:
+        - generic [ref=e377]:
+          - generic [ref=e378]: Test Patient
+          - generic [ref=e379]: 8f8d6d2d
+          - generic [ref=e383]: No runs yet
+      - button "10-7-1963 e05af8d9 Complete" [ref=e384] [cursor=pointer]:
+        - generic [ref=e385]:
+          - generic [ref=e386]: 10-7-1963
+          - generic [ref=e387]: e05af8d9
+          - generic [ref=e391]: Complete
+      - button "4-8-1997 6a321ef9 No runs yet" [ref=e392] [cursor=pointer]:
+        - generic [ref=e393]:
+          - generic [ref=e394]: 4-8-1997
+          - generic [ref=e395]: 6a321ef9
+          - generic [ref=e399]: No runs yet
+  - separator [ref=e20]
+  - generic [ref=e23]:
+    - generic [ref=e507]:
+      - generic [ref=e509]: Patient
+      - generic [ref=e510]:
+        - generic [ref=e511]:
+          - text: Label
+          - textbox "Label" [ref=e512]: 12-02-1985-0
+        - button "Save" [ref=e513] [cursor=pointer]
+      - generic [ref=e514]:
+        - text: Notes
+        - textbox "Notes" [ref=e515]
+    - generic [ref=e516]:
+      - generic [ref=e517]:
+        - generic [ref=e518]:
+          - generic [ref=e519]: Orchestration + Sync
+          - generic [ref=e520]: Stale - last update 2h 42m ago
+        - generic [ref=e521]:
+          - generic [ref=e522]: Stale - last update 2h 42m ago
+          - generic [ref=e523]: Updated 4/12/2026, 5:01:31 PM
+      - generic [ref=e524]:
+        - button "Refresh state" [ref=e525] [cursor=pointer]
+        - button "Sync portal" [ref=e526] [cursor=pointer]
+        - button "Rerun council batch" [ref=e527] [cursor=pointer]
+        - button "Regenerate patient-facing" [ref=e528] [cursor=pointer]
+        - button "Prepare Cathode handoff" [ref=e529] [cursor=pointer]
+        - button "Export council artifacts" [ref=e530] [cursor=pointer]
+      - generic [ref=e531]:
+        - generic [ref=e532]:
+          - generic [ref=e533]:
+            - generic [ref=e534]:
+              - generic [ref=e535]: Council run
+              - generic [ref=e536]: Stale - last update 2h 42m ago
+            - generic [ref=e537]: Stale
+          - generic [ref=e538]:
+            - generic [ref=e539]:
+              - generic [ref=e540]: Phase
+              - strong [ref=e541]: Initial Analysis · Data Pack Chunk · Gpt 5.4 · Chunk 1/2 · Heartbeat
+            - generic [ref=e542]:
+              - generic [ref=e543]: Task
+              - strong [ref=e544]: data_pack_chunk
+            - generic [ref=e545]:
+              - generic [ref=e546]: Model
+              - strong [ref=e547]: gpt-5.4
+            - generic [ref=e548]:
+              - generic [ref=e549]: Stage
+              - strong [ref=e550]: Stage 1 • Initial Analysis
+            - generic [ref=e551]:
+              - generic [ref=e552]: Elapsed
+              - strong [ref=e553]: 2m 0s
+            - generic [ref=e554]:
+              - generic [ref=e555]: Updated
+              - strong [ref=e556]: 4/12/2026, 11:01:31 AM
+          - generic [ref=e557]: Run is still marked active in SQLite but has not emitted progress within the stale threshold.
+        - generic [ref=e559]:
+          - generic [ref=e560]:
+            - generic [ref=e561]: Portal sync
+            - generic [ref=e562]: Unknown
+          - generic [ref=e563]: Unknown
+        - generic [ref=e565]:
+          - generic [ref=e566]:
+            - generic [ref=e567]: Patient-facing
+            - generic [ref=e568]: "Latest patient-facing PDF: 12-02-1985-0__patient-facing__auto-b2620384__2026-04-12.pdf"
+          - generic [ref=e569]: Ready
+        - generic [ref=e570]:
+          - generic [ref=e571]:
+            - generic [ref=e572]:
+              - generic [ref=e573]: Worker / pipeline
+              - generic [ref=e574]: Failed
+            - generic [ref=e575]: Failed
+          - generic [ref=e577]:
+            - generic [ref=e578]: Updated
+            - strong [ref=e579]: 4/12/2026, 2:36:53 AM
+        - generic [ref=e581]:
+          - generic [ref=e582]:
+            - generic [ref=e583]: Cathode
+            - generic [ref=e584]: Missing
+          - generic [ref=e585]: Missing
+      - generic [ref=e586]:
+        - generic [ref=e587]:
+          - generic [ref=e588]: Report lifecycle
+          - generic [ref=e589]: Uploaded to extracted to council to patient-facing to portal to Cathode.
+        - generic [ref=e590]:
+          - generic [ref=e591]:
+            - generic [ref=e592]:
+              - generic [ref=e593]: 12-02-1985-0__LM_autism-TBI_depressn_20tx_Redacted__v1__2026-03-19.pdf
+              - generic [ref=e594]: 4/12/2026, 5:01:31 PM
+            - generic [ref=e595]:
+              - generic [ref=e596]: Uploaded
+              - generic [ref=e597]: Extracted
+              - generic [ref=e598]: "Council: stale"
+              - generic [ref=e599]: "Patient PDF: pending"
+              - generic [ref=e600]: "Portal: None"
+              - generic [ref=e601]: "Cathode: pending"
+          - generic [ref=e602]:
+            - generic [ref=e603]:
+              - generic [ref=e604]: LM_autism-TBI_depressn_20tx_Redacted.pdf
+              - generic [ref=e605]: 3/17/2026, 10:33:22 PM
+            - generic [ref=e606]:
+              - generic [ref=e607]: Uploaded
+              - generic [ref=e608]: Extracted
+              - generic [ref=e609]: "Council: complete"
+              - generic [ref=e610]: "Patient PDF: ready"
+              - generic [ref=e611]: "Portal: None"
+              - generic [ref=e612]: "Cathode: missing"
+    - generic:
+      - generic [ref=e613]:
+        - generic [ref=e614]: Reports
+        - generic [ref=e615]:
+          - button "Upload report…" [ref=e616] [cursor=pointer]
+          - button "View extracted" [ref=e617] [cursor=pointer]
+          - button "Re-extract (OCR)" [ref=e618] [cursor=pointer]
+        - generic [ref=e619]:
+          - button "12-02-1985-0__LM_autism-TBI_depressn_20tx_Redacted__v1__2026-03-19.pdf 4/12/2026, 5:01:31 PM" [ref=e620] [cursor=pointer]:
+            - generic [ref=e621]: 12-02-1985-0__LM_autism-TBI_depressn_20tx_Redacted__v1__2026-03-19.pdf
+            - generic [ref=e622]: 4/12/2026, 5:01:31 PM
+          - button "LM_autism-TBI_depressn_20tx_Redacted.pdf 3/17/2026, 10:33:22 PM" [ref=e623] [cursor=pointer]:
+            - generic [ref=e624]: LM_autism-TBI_depressn_20tx_Redacted.pdf
+            - generic [ref=e625]: 3/17/2026, 10:33:22 PM
+        - generic [ref=e627]: Patient Files
+        - generic [ref=e628]: PDFs, Markdown, and MP4 videos (e.g. explainer videos).
+        - button "Upload file…" [ref=e630] [cursor=pointer]
+        - generic [ref=e632]: No files yet.
+      - separator
+      - generic [ref=e633]:
+        - generic [ref=e634]: New Run
+        - generic [ref=e635]:
+          - text: Report
+          - combobox "Report" [ref=e636]:
+            - option "Select…" [disabled]
+            - option "12-02-1985-0__LM_autism-TBI_depressn_20tx_Redacted__v1__2026-03-19.pdf (95ff60b7)" [selected]
+            - option "LM_autism-TBI_depressn_20tx_Redacted.pdf (8caa5824)"
+        - generic [ref=e637]:
+          - text: Council models (multi-select)
+          - generic [ref=e639]:
+            - checkbox "Council models (multi-select) Show legacy models claude-opus-4-6" [ref=e640]
+            - text: Show legacy models
+          - listbox [ref=e641]:
+            - option "claude-opus-4-6" [ref=e642]
+            - option "Claude Sonnet 4.6 (claude-sonnet-4-6)" [ref=e643]
+            - option "gemini-2.5-flash" [ref=e644]
+            - option "gemini-2.5-flash-lite" [ref=e645]
+            - option "gemini-2.5-pro" [ref=e646]
+            - option "gemini-3-flash-preview" [ref=e647]
+            - option "gemini-3-pro-preview" [ref=e648]
+            - option "gemini-3.1-flash-lite-preview" [ref=e649]
+            - option "Gemini 3.1 Pro Preview (gemini-3.1-pro-preview)" [ref=e650]
+            - option "gpt-5.2" [ref=e651]
+            - option "gpt-5.2-codex" [ref=e652]
+            - option "gpt-5.3-codex" [ref=e653]
+            - option "gpt-5.3-codex-spark" [ref=e654]
+            - option "GPT-5.4 (gpt-5.4)" [ref=e655]
+        - generic [ref=e656]:
+          - text: Consolidator
+          - combobox "Consolidator" [ref=e657]:
+            - option "Select…" [disabled]
+            - option "claude-opus-4-6"
+            - option "Claude Sonnet 4.6 (claude-sonnet-4-6)" [selected]
+            - option "gemini-2.5-flash"
+            - option "gemini-2.5-flash-lite"
+            - option "gemini-2.5-pro"
+            - option "gemini-3-flash-preview"
+            - option "gemini-3-pro-preview"
+            - option "gemini-3.1-flash-lite-preview"
+            - option "Gemini 3.1 Pro Preview (gemini-3.1-pro-preview)"
+            - option "gpt-5.2"
+            - option "gpt-5.2-codex"
+            - option "gpt-5.3-codex"
+            - option "gpt-5.3-codex-spark"
+            - option "GPT-5.4 (gpt-5.4)"
+        - button "Create + Start" [disabled] [ref=e658]
+        - generic [ref=e659]:
+          - generic [ref=e660]: Need to re-auth Gemini? Run Google/Gemini login.
+          - button "Gemini Login" [ref=e661] [cursor=pointer]
+          - textbox "project_id (optional)" [ref=e662]
+          - button "Refresh" [ref=e663] [cursor=pointer]
+    - separator [ref=e664]
+    - generic [ref=e666]:
+      - generic [ref=e667]: Run History
+      - generic [ref=e668]:
+        - button "78bfc03f — Stale 4/12/2026, 5:01:31 PM Initial Analysis · data pack chunk · gpt 5.4 · chunk 1/2 · heartbeat • data_pack_chunk" [ref=e669] [cursor=pointer]:
+          - generic [ref=e670]: 78bfc03f — Stale
+          - generic [ref=e671]: 4/12/2026, 5:01:31 PM
+          - generic [ref=e672]: Initial Analysis · data pack chunk · gpt 5.4 · chunk 1/2 · heartbeat • data_pack_chunk
+        - button "b2620384 — Complete 4/12/2026, 4:41:42 PM Final Draft · complete" [ref=e673] [cursor=pointer]:
+          - generic [ref=e674]: b2620384 — Complete
+          - generic [ref=e675]: 4/12/2026, 4:41:42 PM
+          - generic [ref=e676]: Final Draft · complete
+        - button "93824457 — Stale 4/12/2026, 4:18:55 PM Initial Analysis · stage1 model · claude sonnet 4 6 · heartbeat • stage1_model" [ref=e677] [cursor=pointer]:
+          - generic [ref=e678]: 93824457 — Stale
+          - generic [ref=e679]: 4/12/2026, 4:18:55 PM
+          - generic [ref=e680]: Initial Analysis · stage1 model · claude sonnet 4 6 · heartbeat • stage1_model
+        - button "ecf880e2 — Stale 4/12/2026, 4:14:23 PM Initial Analysis · data pack chunk · claude sonnet 4 6 · chunk 1/8 · heartbeat • data_pack_chunk" [ref=e681] [cursor=pointer]:
+          - generic [ref=e682]: ecf880e2 — Stale
+          - generic [ref=e683]: 4/12/2026, 4:14:23 PM
+          - generic [ref=e684]: Initial Analysis · data pack chunk · claude sonnet 4 6 · chunk 1/8 · heartbeat • data_pack_chunk
+        - button "c6e63303 — Failed 4/12/2026, 4:05:52 PM Initial Analysis · failed" [ref=e685] [cursor=pointer]:
+          - generic [ref=e686]: c6e63303 — Failed
+          - generic [ref=e687]: 4/12/2026, 4:05:52 PM
+          - generic [ref=e688]: Initial Analysis · failed
+        - button "897e4fb5 — Failed 4/12/2026, 3:59:42 PM Initial Analysis · failed" [ref=e689] [cursor=pointer]:
+          - generic [ref=e690]: 897e4fb5 — Failed
+          - generic [ref=e691]: 4/12/2026, 3:59:42 PM
+          - generic [ref=e692]: Initial Analysis · failed
+        - button "a7987cb6 — Failed 4/12/2026, 3:54:37 PM Initial Analysis · failed" [ref=e693] [cursor=pointer]:
+          - generic [ref=e694]: a7987cb6 — Failed
+          - generic [ref=e695]: 4/12/2026, 3:54:37 PM
+          - generic [ref=e696]: Initial Analysis · failed
+        - button "4282a7ff — Failed 4/12/2026, 3:52:06 PM Initial Analysis · failed" [ref=e697] [cursor=pointer]:
+          - generic [ref=e698]: 4282a7ff — Failed
+          - generic [ref=e699]: 4/12/2026, 3:52:06 PM
+          - generic [ref=e700]: Initial Analysis · failed
+        - button "763a41ce — Failed 4/12/2026, 3:50:02 PM Initial Analysis · failed" [ref=e701] [cursor=pointer]:
+          - generic [ref=e702]: 763a41ce — Failed
+          - generic [ref=e703]: 4/12/2026, 3:50:02 PM
+          - generic [ref=e704]: Initial Analysis · failed
+        - button "c3023277 — Stale 4/12/2026, 3:47:01 PM Initial Analysis · data pack chunk · gemini 3 flash preview · chunk 1/2 • data_pack_chunk" [ref=e705] [cursor=pointer]:
+          - generic [ref=e706]: c3023277 — Stale
+          - generic [ref=e707]: 4/12/2026, 3:47:01 PM
+          - generic [ref=e708]: Initial Analysis · data pack chunk · gemini 3 flash preview · chunk 1/2 • data_pack_chunk
+        - button "2154eb90 — Stale 4/12/2026, 3:04:25 PM Initial Analysis · data pack chunk · gpt 5.4 · chunk 1/2 · heartbeat • data_pack_chunk" [ref=e709] [cursor=pointer]:
+          - generic [ref=e710]: 2154eb90 — Stale
+          - generic [ref=e711]: 4/12/2026, 3:04:25 PM
+          - generic [ref=e712]: Initial Analysis · data pack chunk · gpt 5.4 · chunk 1/2 · heartbeat • data_pack_chunk
+        - button "f6db1d5b — Failed 4/12/2026, 2:57:26 PM Initial Analysis · failed" [ref=e713] [cursor=pointer]:
+          - generic [ref=e714]: f6db1d5b — Failed
+          - generic [ref=e715]: 4/12/2026, 2:57:26 PM
+          - generic [ref=e716]: Initial Analysis · failed
+        - button "5bad7bad — Failed 4/12/2026, 8:40:22 AM Consolidation · failed" [ref=e717] [cursor=pointer]:
+          - generic [ref=e718]: 5bad7bad — Failed
+          - generic [ref=e719]: 4/12/2026, 8:40:22 AM
+          - generic [ref=e720]: Consolidation · failed
+        - button "c1e1e332 — Failed 3/17/2026, 10:33:22 PM Failed" [ref=e721] [cursor=pointer]:
+          - generic [ref=e722]: c1e1e332 — Failed
+          - generic [ref=e723]: 3/17/2026, 10:33:22 PM
+          - generic [ref=e724]: Failed

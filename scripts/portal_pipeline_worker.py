@@ -19,7 +19,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend import storage  # noqa: E402
-from backend.orchestration import derive_run_liveness, summarize_run_progress  # noqa: E402
+from backend.orchestration import (  # noqa: E402
+    derive_run_liveness,
+    run_downstream_delivery_gaps,
+    summarize_run_progress,
+)
+from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
 
 PATIENT_RE = re.compile(r"^\d{2}-\d{2}-\d{4}-\d{1,3}$")
 META_NAME = "$meta.json"
@@ -123,18 +128,7 @@ def _fallback_original_name_from_file_key(patient_id: str, file_key: str) -> str
 
 
 def _looks_generated_pdf(patient_id: str, name: str) -> bool:
-    lower = str(name or "").lower()
-    if not lower.endswith(".pdf"):
-        return True
-    if "__patient-facing__" in lower or "patient-facing" in lower:
-        return True
-    if re.search(r"__analysis(?:__|\.pdf$)", lower):
-        return True
-    if lower.endswith("_analysis_pdf.pdf"):
-        return True
-    if lower == f"{patient_id.lower()}.pdf" or lower == "main.pdf":
-        return True
-    return False
+    return looks_generated_portal_pdf(patient_id, name)
 
 
 def reports_from_index(
@@ -378,7 +372,7 @@ def _matching_active_run_exists(patient_label: str, filename: str) -> bool:
     return False
 
 
-def _matching_complete_run_exists(patient_label: str, filenames: set[str]) -> bool:
+def _matching_delivery_ready_run_exists(patient_label: str, filenames: set[str]) -> bool:
     with storage.session_scope() as session:
         patients = storage.find_patients_by_label(session, patient_label)
         for patient in patients:
@@ -390,9 +384,20 @@ def _matching_complete_run_exists(patient_label: str, filenames: set[str]) -> bo
                     .filter(storage.Run.report_id == report.id)
                     .all()
                 )
-                if any((run.status or "") == "complete" for run in runs):
-                    return True
+                for run in runs:
+                    artifacts = storage.list_artifacts(session, run.id)
+                    if not run_downstream_delivery_gaps(
+                        run,
+                        progress=summarize_run_progress(run),
+                        artifacts=artifacts,
+                        require_final_draft=True,
+                    ):
+                        return True
     return False
+
+
+def _matching_complete_run_exists(patient_label: str, filenames: set[str]) -> bool:
+    return _matching_delivery_ready_run_exists(patient_label, filenames)
 
 
 def completion_candidate_filenames(report: PortalReport) -> set[str]:
@@ -476,14 +481,14 @@ def should_run_pipeline_for_patient(
     if downloaded:
         return True, "downloaded missing report PDFs"
     if incomplete_reports:
-        note = f"report PDFs without complete runs: {', '.join(incomplete_reports)}"
+        note = f"report PDFs without delivery-ready runs: {', '.join(incomplete_reports)}"
         if active:
             note += "; active report(s) skipped this cycle: " + ", ".join(active)
         return True, note
     patient_dir = portal_dir / patient_id
     if not analysis_artifacts_exist(patient_dir, patient_id):
         return True, "no local analysis artifacts"
-    return False, "matching complete runs already exist for all report PDFs"
+    return False, "matching delivery-ready runs already exist for all report PDFs"
 
 
 class NetlifyBlobClient:

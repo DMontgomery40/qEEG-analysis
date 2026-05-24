@@ -84,6 +84,75 @@ def test_batch_lock_rejects_concurrent_runs(temp_data_dir):
         first.close()
 
 
+def test_report_assets_ready_uses_report_extracted_path_not_report_id(temp_data_dir):
+    from backend import storage
+    from scripts import run_portal_council_batch as script
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="01-19-1966-0", notes="")
+        asset_dir = temp_data_dir / "reports" / patient.id / "upload-folder"
+        pages_dir = asset_dir / "pages"
+        pages_dir.mkdir(parents=True)
+        stored_path = asset_dir / "original.pdf"
+        extracted_path = asset_dir / "extracted.txt"
+        stored_path.write_bytes(b"%PDF-1.4")
+        extracted_path.write_text("raw", encoding="utf-8")
+        (asset_dir / "extracted_enhanced.txt").write_text("enhanced", encoding="utf-8")
+        (asset_dir / "metadata.json").write_text("{}", encoding="utf-8")
+        (pages_dir / "page-1.png").write_bytes(b"png")
+        report = storage.create_report(
+            session,
+            report_id="db-report-id",
+            patient_id=patient.id,
+            filename="report.pdf",
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+
+        assert script._report_assets_ready(report)
+
+
+def test_latest_publishable_run_ignores_unreviewed_complete_runs(temp_data_dir):
+    from backend import storage
+    from scripts import run_portal_council_batch as script
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="01-19-1966-0", notes="")
+        report = storage.create_report(
+            session,
+            report_id="report-publishable-check",
+            patient_id=patient.id,
+            filename="report.pdf",
+            mime_type="application/pdf",
+            stored_path=temp_data_dir / "report.pdf",
+            extracted_text_path=temp_data_dir / "extracted.txt",
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status="complete")
+        stage6 = temp_data_dir / "artifacts" / run.id / "stage-6" / "final.md"
+        stage6.parent.mkdir(parents=True)
+        stage6.write_text("# Final", encoding="utf-8")
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=stage6,
+            content_type="text/markdown",
+        )
+
+    assert script._latest_publishable_run_for_report(report.id) is None
+
+
 def test_resolve_patient_prefers_candidate_with_matching_complete_run(temp_data_dir):
     from backend import storage
     from scripts import run_portal_council_batch as script
@@ -197,7 +266,7 @@ def test_choose_existing_report_prefers_exact_filename_over_wrong_row(temp_data_
 def test_pick_model_id_requires_exact_gpt54_family_match():
     from scripts import run_portal_council_batch as script
 
-    discovered = ["gpt-5", "claude-sonnet-4-6", "gemini-3.1-pro-preview"]
+    discovered = ["gpt-5", "claude-sonnet-4-6", "gemini-3.1-flash-lite-preview"]
 
     assert script._pick_model_id("gpt-5.4", discovered) is None
 
@@ -211,12 +280,14 @@ def test_resolve_model_selection_prefers_current_configured_models(temp_data_dir
         script,
         "COUNCIL_MODELS",
         [
-            CouncilModelConfig(id="gpt-5.4", name="GPT-5.4", source="test"),
+            CouncilModelConfig(id="gpt-5.5", name="GPT-5.5", source="test"),
             CouncilModelConfig(id="claude-sonnet-4-6", name="Claude", source="test"),
-            CouncilModelConfig(id="gemini-3.1-pro-preview", name="Gemini", source="test"),
+            CouncilModelConfig(
+                id="gemini-3.1-flash-lite-preview", name="Gemini", source="test"
+            ),
         ],
     )
-    monkeypatch.setattr(script, "DEFAULT_CONSOLIDATOR", "gpt-5.4")
+    monkeypatch.setattr(script, "DEFAULT_CONSOLIDATOR", "gpt-5.5")
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="02-04-1988-0", notes="")
@@ -240,11 +311,19 @@ def test_resolve_model_selection_prefers_current_configured_models(temp_data_dir
         council_model_ids, consolidator = script._resolve_model_selection_for_run(
             session,
             patient_id=patient.id,
-            discovered_models=["gpt-5.4", "claude-sonnet-4-6", "gemini-3.1-pro-preview"],
+            discovered_models=[
+                "gpt-5.5",
+                "claude-sonnet-4-6",
+                "gemini-3.1-flash-lite-preview",
+            ],
         )
 
-    assert council_model_ids == ["gpt-5.4", "claude-sonnet-4-6", "gemini-3.1-pro-preview"]
-    assert consolidator == "gpt-5.4"
+    assert council_model_ids == [
+        "gpt-5.5",
+        "claude-sonnet-4-6",
+        "gemini-3.1-flash-lite-preview",
+    ]
+    assert consolidator == "gpt-5.5"
 
 
 def test_resolve_model_selection_excludes_opus_by_default(temp_data_dir, monkeypatch):

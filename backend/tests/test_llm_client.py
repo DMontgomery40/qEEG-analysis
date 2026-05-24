@@ -178,6 +178,38 @@ async def test_chat_completions_maps_xhigh_reasoning_for_responses():
 
 
 @pytest.mark.asyncio
+async def test_chat_completions_defaults_gpt55_to_low_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("QEEG_OPENAI_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/responses":
+            body = json.loads(request.content)
+            assert body.get("model") == "gpt-5.5"
+            assert body.get("reasoning") == {"effort": "low"}
+            return httpx.Response(200, json={"output_text": "ok"})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="gpt-5.5",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.2,
+            max_tokens=20,
+            stream=False,
+        )
+    finally:
+        await client.aclose()
+    assert out == "ok"
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_honors_reasoning_override_env(
     monkeypatch: pytest.MonkeyPatch,
 ):

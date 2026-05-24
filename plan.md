@@ -71,7 +71,7 @@ Every clinic-uploaded qEEG report PDF must become a durable pipeline job. A new 
    - Dry-run output must separate actual `downloaded` files from `would_download` paths.
    - Batch dry-run must remain an offline audit path and must not require CLIProxy model discovery.
    - Non-dry-run batch execution must take a local exclusive lock so concurrent agent/manual batches cannot contend for CLIProxy or resume each other's runs.
-   - Default consolidation must use a chat-stable longform model. GPT-5.4 can remain in the council, but it is no longer the default Stage 4 consolidator after repeated CLIProxy 500/hang behavior.
+   - Default consolidation must use a responses-stable longform model. GPT-5.5 with low reasoning is the default Stage 4 consolidator and GPT-5.5 is the default OpenAI council/review model; GPT-5.4 and older are no longer shown in the default picker.
 
 3. Start path keeps worker alive.
    - Update qEEG-analysis startup to optionally launch the portal pipeline worker after CLIProxyAPI is reachable.
@@ -139,7 +139,7 @@ Every clinic-uploaded qEEG report PDF must become a durable pipeline job. A new 
 - **Model policy by role**
   - Re-evaluate each role separately: strict extraction/data-pack, Stage 1 narrative analysis, consolidation, final review, and patient-facing rewrite.
   - Use live CLIProxy inventory plus official vendor docs to choose defaults; quality-first by role, Opus excluded by default for cost.
-  - Replace stale/default vision assumptions such as `gemini-pro-vision`; prefer the strongest currently available Gemini multimodal model for shared extraction work, with explicit fallback order.
+  - Replace stale/default vision assumptions such as `gemini-pro-vision`; use the currently available Gemini 3.1 Flash-family model for shared extraction/transcript work, with explicit fallback order.
   - Surface role defaults and actual live availability in config and `/api/models`.
 
 - **Prompt and workflow contract cleanup**

@@ -1,0 +1,16 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - img [ref=e7]
+        - generic [ref=e9]:
+          - generic [ref=e10]: qEEG Council
+          - generic [ref=e11]: Multi-Model Analysis
+      - textbox "Search patients…" [ref=e12]
+      - generic [ref=e13]:
+        - textbox "New patient label…" [ref=e14]
+        - button "New" [ref=e15] [cursor=pointer]
+      - button "Bulk Upload" [ref=e17] [cursor=pointer]
+    - generic [ref=e19]: No patients
+  - separator [ref=e20]
+  - generic [ref=e23]: Select or create a patient.

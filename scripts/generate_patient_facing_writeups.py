@@ -18,6 +18,10 @@ if str(_REPO_ROOT) not in sys.path:
 from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
 from backend.model_selection import resolve_model_preference  # noqa: E402
+from backend.orchestration import (  # noqa: E402
+    run_downstream_delivery_gaps,
+    summarize_run_progress,
+)
 from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
 from backend.portal_sync import sync_patient_to_thrylen  # noqa: E402
 from backend.storage import (  # noqa: E402
@@ -97,11 +101,16 @@ def _best_source_bundle_for_label(label: str) -> SourceBundle | None:
         if not patients:
             return None
 
-        # Multiple DB patient rows may share the same portal label. Prefer the newest COMPLETE run across them.
+        # Multiple DB patient rows may share the same portal label. Prefer the newest delivery-ready run across them.
         complete_runs: list[tuple[Patient, Run]] = []
         for p in patients:
             for r in list_runs(session, p.id):
-                if (r.status or "") == "complete":
+                artifacts = list_artifacts(session, r.id)
+                if not run_downstream_delivery_gaps(
+                    r,
+                    progress=summarize_run_progress(r),
+                    artifacts=artifacts,
+                ):
                     complete_runs.append((p, r))
         if not complete_runs:
             return None
@@ -305,8 +314,8 @@ async def main() -> int:
     )
     ap.add_argument(
         "--model",
-        default="claude-sonnet-4-6",
-        help="Preferred model id (default: claude-sonnet-4-6)",
+        default="gpt-5.5",
+        help="Preferred model id (default: gpt-5.5)",
     )
     ap.add_argument(
         "--max-tokens", type=int, default=4000, help="Max output tokens (default: 4000)"
@@ -325,6 +334,16 @@ async def main() -> int:
         action="append",
         default=[],
         help="Explicit markdown source file to synthesize from (repeatable). When set, bypasses DB/portal source discovery.",
+    )
+    ap.add_argument(
+        "--allow-portal-markdown-fallback",
+        action="store_true",
+        help="Allow legacy portal-folder markdown sources when no delivery-ready DB run exists.",
+    )
+    ap.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Write local portal outputs without syncing them to thrylen.",
     )
     ap.add_argument(
         "--overwrite", action="store_true", help="Overwrite existing outputs"
@@ -379,8 +398,8 @@ async def main() -> int:
     for label in labels:
         bundle = None if args.source_markdown else _best_source_bundle_for_label(label)
 
-        # Read 2–3 council final reports (markdown). Prefer explicit sources when provided,
-        # otherwise DB Stage 6 artifacts, then fallback to portal markdowns.
+        # Read 2-3 council final reports (markdown). Prefer explicit sources when provided,
+        # otherwise require a DB delivery-ready run unless the legacy fallback is explicitly enabled.
         sources: list[tuple[str, str]] = []
         source_meta: dict[str, Any] = {}
         if args.source_markdown:
@@ -410,12 +429,12 @@ async def main() -> int:
                     for a in bundle.artifacts
                 ],
             }
-        else:
+        elif args.allow_portal_markdown_fallback:
             out_dir = portal_dir / label
             sources = _portal_markdown_sources(out_dir)
             if not sources:
                 print(
-                    f"SKIP {label}: no complete DB run, and no portal markdown sources found"
+                    f"SKIP {label}: no delivery-ready DB run, and no portal markdown sources found"
                 )
                 continue
             source_meta = {
@@ -423,6 +442,11 @@ async def main() -> int:
                 "run_id": None,
                 "portal_source_files": [name for name, _ in sources],
             }
+        else:
+            print(
+                f"SKIP {label}: no delivery-ready DB run (use --allow-portal-markdown-fallback for legacy portal markdown sources)"
+            )
+            continue
 
         prompt = _build_prompt(
             patient_label=label,
@@ -506,11 +530,12 @@ async def main() -> int:
                         pass
                 raise
 
-        synced = sync_patient_to_thrylen(label)
-        print(
-            f"PORTAL SYNC {label}: {'completed' if synced else 'skipped'}",
-            flush=True,
-        )
+        if not args.no_sync:
+            synced = sync_patient_to_thrylen(label)
+            print(
+                f"PORTAL SYNC {label}: {'completed' if synced else 'skipped'}",
+                flush=True,
+            )
 
     if llm is not None:
         await llm.aclose()

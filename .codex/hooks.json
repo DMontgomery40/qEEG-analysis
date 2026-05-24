@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/qeeg_session_context.py\"",
+            "command": "/usr/bin/python3 \"/Users/davidmontgomery/qEEG-analysis/.codex/hooks/qeeg_session_context.py\"",
             "statusMessage": "Loading qEEG portal pipeline guardrails"
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/qeeg_stop_guard.py\"",
+            "command": "/usr/bin/python3 \"/Users/davidmontgomery/qEEG-analysis/.codex/hooks/qeeg_stop_guard.py\"",
             "timeout": 30
           }
         ]

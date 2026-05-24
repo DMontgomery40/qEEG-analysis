@@ -2,25 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import config as cfg
 from . import storage
-
-
-_PORTAL_PATIENT_ID_RE = re.compile(
-    r"^(?P<mm>\d{2})-(?P<dd>\d{2})-(?P<yyyy>\d{4})-(?P<n>\d+)$"
+from .portal_files import (
+    looks_generated_portal_pdf,
+    normalize_portal_patient_id,
 )
 
-_GENERATED_ANALYSIS_PATTERNS = (
-    "__patient-facing__",
-    "__single-agent",
-    "__analysis__",
-    "__patient-facing.pdf",
-)
 
 _STAGE_LABELS = {
     1: "Initial Analysis",
@@ -39,20 +31,6 @@ _RUN_STATUS_LABELS = {
     "needs_auth": "Needs Auth",
     "stale": "Stale",
 }
-
-
-def normalize_portal_patient_id(value: str) -> str | None:
-    raw = (value or "").strip()
-    match = _PORTAL_PATIENT_ID_RE.match(raw)
-    if not match:
-        return None
-    mm = int(match.group("mm"))
-    dd = int(match.group("dd"))
-    yyyy = int(match.group("yyyy"))
-    n = int(match.group("n"))
-    if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2100 and 0 <= n <= 999):
-        return None
-    return f"{mm:02d}-{dd:02d}-{yyyy:04d}-{n}"
 
 
 def portal_patients_dir() -> Path:
@@ -224,7 +202,9 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
         "chunk_count": None,
         "elapsed_s": None,
         "heartbeat_count": None,
-        "timestamp": isoformat_or_none(run.completed_at if run.status == "complete" else run.started_at),
+        "timestamp": isoformat_or_none(
+            run.completed_at if run.status == "complete" else run.started_at
+        ),
         "log_path": str(progress_log_path(run.id)),
         "progress_jsonl_path": str(progress_jsonl_path(run.id)),
     }
@@ -254,12 +234,20 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
     stage_num = (
         latest.get("stage_num")
         if latest.get("stage_num") is not None
-        else (latest_stage_payload.get("stage_num") if isinstance(latest_stage_payload, dict) else None)
+        else (
+            latest_stage_payload.get("stage_num")
+            if isinstance(latest_stage_payload, dict)
+            else None
+        )
     )
     stage_name = (
         latest.get("stage_name")
         if latest.get("stage_name") is not None
-        else (latest_stage_payload.get("stage_name") if isinstance(latest_stage_payload, dict) else None)
+        else (
+            latest_stage_payload.get("stage_name")
+            if isinstance(latest_stage_payload, dict)
+            else None
+        )
     )
     task = latest.get("task")
     model_id = latest.get("model_id")
@@ -270,10 +258,14 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
     heartbeat_count = latest.get("heartbeat_count")
     timestamp = latest.get("timestamp")
     requested_count = (
-        latest_counts.get("requested_count") if isinstance(latest_counts, dict) else latest.get("requested_count")
+        latest_counts.get("requested_count")
+        if isinstance(latest_counts, dict)
+        else latest.get("requested_count")
     )
     success_count = (
-        latest_counts.get("success_count") if isinstance(latest_counts, dict) else latest.get("success_count")
+        latest_counts.get("success_count")
+        if isinstance(latest_counts, dict)
+        else latest.get("success_count")
     )
 
     summary.update(
@@ -287,17 +279,33 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
             "chunk_count": chunk_count if isinstance(chunk_count, int) else None,
             "elapsed_s": elapsed_s if isinstance(elapsed_s, int) else None,
             "elapsed_seconds": elapsed_s if isinstance(elapsed_s, int) else None,
-            "heartbeat_count": heartbeat_count if isinstance(heartbeat_count, int) else None,
-            "timestamp": timestamp if isinstance(timestamp, str) else summary["timestamp"],
-            "requested_count": requested_count if isinstance(requested_count, int) else None,
+            "heartbeat_count": heartbeat_count
+            if isinstance(heartbeat_count, int)
+            else None,
+            "timestamp": timestamp
+            if isinstance(timestamp, str)
+            else summary["timestamp"],
+            "requested_count": requested_count
+            if isinstance(requested_count, int)
+            else None,
             "success_count": success_count if isinstance(success_count, int) else None,
             "raw": latest,
         }
     )
 
-    stage_label = _STAGE_LABELS.get(summary["stage_num"], summary["stage_name"] or "Run")
-    task_bits = [bit for bit in [summary["task"], summary["model_id"]] if isinstance(bit, str) and bit]
-    if isinstance(summary["chunk_index"], int) and isinstance(summary["chunk_count"], int) and summary["chunk_count"] > 0:
+    stage_label = _STAGE_LABELS.get(
+        summary["stage_num"], summary["stage_name"] or "Run"
+    )
+    task_bits = [
+        bit
+        for bit in [summary["task"], summary["model_id"]]
+        if isinstance(bit, str) and bit
+    ]
+    if (
+        isinstance(summary["chunk_index"], int)
+        and isinstance(summary["chunk_count"], int)
+        and summary["chunk_count"] > 0
+    ):
         task_bits.append(f"chunk {summary['chunk_index']}/{summary['chunk_count']}")
     partial_success = (
         isinstance(success_count, int)
@@ -305,13 +313,26 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
         and requested_count > 0
         and success_count < requested_count
     )
+    peer_review_skipped = any(
+        payload.get("stage_num") == 2
+        and payload.get("stage_name") == "peer_review"
+        and payload.get("skipped") is True
+        for payload in payloads
+    )
     if partial_success:
         task_bits.append(f"partial {success_count}/{requested_count}")
+    if peer_review_skipped:
+        task_bits.append("peer review skipped")
     summary["task_label"] = " · ".join(task_bits) if task_bits else None
     summary["phase_label"] = (
         f"{stage_label}"
         + (f" · {summary['task_label']}" if summary["task_label"] else "")
-        + (f" · {summary['status']}" if isinstance(summary["status"], str) and summary["status"] not in {"start", "running"} else "")
+        + (
+            f" · {summary['status']}"
+            if isinstance(summary["status"], str)
+            and summary["status"] not in {"start", "running"}
+            else ""
+        )
     )
 
     percent: float | None = None
@@ -321,7 +342,11 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
         determinate = True
     elif isinstance(summary["stage_num"], int):
         completed_stages = max(0, min(summary["stage_num"] - 1, 6))
-        if isinstance(summary["chunk_index"], int) and isinstance(summary["chunk_count"], int) and summary["chunk_count"] > 0:
+        if (
+            isinstance(summary["chunk_index"], int)
+            and isinstance(summary["chunk_count"], int)
+            and summary["chunk_count"] > 0
+        ):
             sub = min(max(summary["chunk_index"] / summary["chunk_count"], 0.0), 1.0)
             percent = round(((completed_stages + sub) / 6.0) * 100.0, 1)
             determinate = True
@@ -337,6 +362,7 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
     summary["percent"] = percent
     summary["determinate"] = determinate
     summary["partial_success"] = partial_success
+    summary["peer_review_skipped"] = peer_review_skipped
     summary["current_stage_num"] = summary["stage_num"]
     summary["current_stage_name"] = summary["stage_name"]
     summary["current_task"] = summary["task"]
@@ -344,10 +370,204 @@ def summarize_run_progress(run: storage.Run) -> dict[str, Any]:
     return summary
 
 
+def run_council_completion_gaps(
+    run: storage.Run,
+    *,
+    progress: dict[str, Any] | None = None,
+    artifacts: list[storage.Artifact] | None = None,
+) -> list[str]:
+    """Return council-stage gaps that block downstream delivery."""
+    if (run.status or "") != "complete":
+        return []
+
+    progress = progress if progress is not None else summarize_run_progress(run)
+    payloads = _recent_progress_payloads(run.id)
+    gaps: list[str] = []
+
+    def has_majority(success_count: int, requested_count: int) -> bool:
+        return requested_count > 0 and success_count >= ((requested_count // 2) + 1)
+
+    if progress.get("partial_success") is True:
+        success_count = progress.get("success_count")
+        requested_count = progress.get("requested_count")
+        if isinstance(success_count, int) and isinstance(requested_count, int):
+            gaps.append(f"partial council output {success_count}/{requested_count}")
+        else:
+            gaps.append("partial council output")
+
+    peer_review_skipped = any(
+        payload.get("stage_num") == 2
+        and payload.get("stage_name") == "peer_review"
+        and payload.get("skipped") is True
+        for payload in payloads
+    )
+    peer_review_counts = next(
+        (
+            payload
+            for payload in reversed(payloads)
+            if payload.get("stage_num") == 2
+            and payload.get("stage_name") == "peer_review"
+            and isinstance(payload.get("requested_count"), int)
+            and isinstance(payload.get("success_count"), int)
+        ),
+        None,
+    )
+    peer_review_artifacts = (
+        [
+            artifact
+            for artifact in artifacts
+            if artifact.stage_num == 2 and artifact.kind == "peer_review"
+        ]
+        if artifacts is not None
+        else None
+    )
+    if peer_review_skipped or peer_review_artifacts == []:
+        gaps.append("peer review did not complete")
+    if isinstance(peer_review_counts, dict):
+        success_count = peer_review_counts.get("success_count")
+        requested_count = peer_review_counts.get("requested_count")
+        if (
+            isinstance(success_count, int)
+            and isinstance(requested_count, int)
+            and requested_count > 0
+            and not has_majority(success_count, requested_count)
+        ):
+            gaps.append(
+                f"peer review below majority {success_count}/{requested_count}"
+            )
+    elif peer_review_artifacts:
+        try:
+            requested_models = json.loads(run.council_model_ids_json or "[]")
+        except Exception:
+            requested_models = []
+        requested_count = (
+            len([model_id for model_id in requested_models if isinstance(model_id, str)])
+            if isinstance(requested_models, list)
+            else 0
+        )
+        success_count = len(
+            {
+                artifact.model_id
+                for artifact in peer_review_artifacts
+                if isinstance(artifact.model_id, str) and artifact.model_id
+            }
+        )
+        if requested_count > 0 and not has_majority(success_count, requested_count):
+            gaps.append(f"peer review below majority {success_count}/{requested_count}")
+
+    revision_artifacts = (
+        [
+            artifact
+            for artifact in artifacts
+            if artifact.stage_num == 3 and artifact.kind == "revision"
+        ]
+        if artifacts is not None
+        else None
+    )
+    if revision_artifacts == []:
+        gaps.append("no revised council artifact")
+
+    return list(dict.fromkeys(gaps))
+
+
+def selected_final_draft_artifact(
+    run: storage.Run,
+    artifacts: list[storage.Artifact],
+) -> storage.Artifact | None:
+    if not run.selected_artifact_id:
+        return None
+    for artifact in artifacts:
+        if (
+            artifact.id == run.selected_artifact_id
+            and artifact.run_id == run.id
+            and artifact.stage_num == 6
+            and artifact.kind == "final_draft"
+            and artifact.content_type == "text/markdown"
+        ):
+            return artifact
+    return None
+
+
+def final_draft_artifacts(artifacts: list[storage.Artifact]) -> list[storage.Artifact]:
+    return [
+        artifact
+        for artifact in artifacts
+        if artifact.stage_num == 6
+        and artifact.kind == "final_draft"
+        and artifact.content_type == "text/markdown"
+    ]
+
+
+def run_downstream_delivery_gaps(
+    run: storage.Run,
+    *,
+    progress: dict[str, Any] | None = None,
+    artifacts: list[storage.Artifact] | None = None,
+    require_final_draft: bool = False,
+    require_selected_final_draft: bool = False,
+) -> list[str]:
+    """Return gaps that must block publishing patient-visible/downstream outputs."""
+    raw_status = (run.status or "").strip()
+    gaps: list[str] = []
+    if raw_status != "complete":
+        gaps.append(f"run is {raw_status or 'missing status'}")
+
+    if raw_status == "complete" and artifacts is None:
+        gaps.append("council artifacts were not verified")
+    elif raw_status == "complete":
+        gaps.extend(
+            run_council_completion_gaps(
+                run,
+                progress=progress,
+                artifacts=artifacts,
+            )
+        )
+
+    if artifacts is not None and (require_final_draft or require_selected_final_draft):
+        if not final_draft_artifacts(artifacts):
+            gaps.append("no Stage 6 final draft")
+
+    if require_selected_final_draft:
+        if artifacts is None:
+            gaps.append("selected final draft was not verified")
+        elif selected_final_draft_artifact(run, artifacts) is None:
+            gaps.append("selected Stage 6 final draft missing")
+
+    return list(dict.fromkeys(gaps))
+
+
+def run_is_peer_reviewed_for_downstream(
+    run: storage.Run,
+    *,
+    progress: dict[str, Any] | None = None,
+    artifacts: list[storage.Artifact] | None = None,
+) -> bool:
+    return not run_downstream_delivery_gaps(
+        run,
+        progress=progress,
+        artifacts=artifacts,
+    )
+
+
+def run_is_ready_for_final_export(
+    run: storage.Run,
+    *,
+    progress: dict[str, Any] | None = None,
+    artifacts: list[storage.Artifact] | None = None,
+) -> bool:
+    return not run_downstream_delivery_gaps(
+        run,
+        progress=progress,
+        artifacts=artifacts,
+        require_selected_final_draft=True,
+    )
+
+
 def derive_run_liveness(
     run: storage.Run,
     *,
     progress: dict[str, Any] | None = None,
+    artifacts: list[storage.Artifact] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     raw_status = (run.status or "").strip() or "unknown"
@@ -371,15 +591,25 @@ def derive_run_liveness(
     )
     blocks_duplicate_work = raw_status in {"created", "running"} and not is_stale
 
+    council_gaps = run_council_completion_gaps(
+        run,
+        progress=progress,
+        artifacts=artifacts,
+    )
+
     if is_stale:
         display_status = "stale"
         display_label = f"Stale - last update {_format_age_label(age_seconds)} ago"
-        reason = (
-            "Run is still marked active in SQLite but has not emitted progress within the stale threshold."
-        )
+        reason = "Run is still marked active in SQLite but has not emitted progress within the stale threshold."
+    elif raw_status == "complete" and council_gaps:
+        display_status = "incomplete"
+        display_label = f"Incomplete - {council_gaps[0]}"
+        reason = "Workflow ended with salvage artifacts, but the council did not satisfy peer-reviewed downstream-delivery requirements."
     else:
         display_status = raw_status
-        display_label = _RUN_STATUS_LABELS.get(raw_status, raw_status.replace("_", " ").title())
+        display_label = _RUN_STATUS_LABELS.get(
+            raw_status, raw_status.replace("_", " ").title()
+        )
         reason = ""
 
     return {
@@ -396,21 +626,12 @@ def derive_run_liveness(
         "age_seconds": age_seconds,
         "stale_after_seconds": stale_after_seconds,
         "reason": reason,
+        "council_completion_gaps": council_gaps,
     }
 
 
 def _looks_generated_pdf(patient_label: str, path: Path) -> bool:
-    lower_name = path.name.lower()
-    lower_label = patient_label.lower()
-    if not lower_name.endswith(".pdf"):
-        return True
-    if lower_name in {f"{lower_label}.pdf", "main.pdf"}:
-        return True
-    if any(token in lower_name for token in _GENERATED_ANALYSIS_PATTERNS):
-        return True
-    if lower_name.endswith("_analysis_pdf.pdf"):
-        return True
-    return False
+    return looks_generated_portal_pdf(patient_label, path.name)
 
 
 def classify_portal_files(patient_label: str) -> dict[str, Any]:
@@ -454,7 +675,9 @@ def classify_portal_files(patient_label: str) -> dict[str, Any]:
         reverse=True,
     )
     for path in md_paths:
-        final_exports.append({"name": path.name, "path": str(path), "mtime": _path_iso(path)})
+        final_exports.append(
+            {"name": path.name, "path": str(path), "mtime": _path_iso(path)}
+        )
 
     council_dir = patient_dir / "council"
     council_run_ids: list[str] = []
@@ -468,7 +691,9 @@ def classify_portal_files(patient_label: str) -> dict[str, Any]:
             "final_exports": final_exports,
             "council_run_ids": council_run_ids,
             "latest_source_report": source_reports[0] if source_reports else None,
-            "latest_patient_facing_pdf": patient_facing_pdfs[0] if patient_facing_pdfs else None,
+            "latest_patient_facing_pdf": patient_facing_pdfs[0]
+            if patient_facing_pdfs
+            else None,
             "latest_export": final_exports[0] if final_exports else None,
         }
     )
@@ -500,9 +725,9 @@ def _artifact_out(artifact: storage.Artifact) -> dict[str, Any]:
     }
 
 
-def _run_out(run: storage.Run) -> dict[str, Any]:
+def _run_out(run: storage.Run, artifacts: list[storage.Artifact] | None = None) -> dict[str, Any]:
     progress = summarize_run_progress(run)
-    liveness = derive_run_liveness(run, progress=progress)
+    liveness = derive_run_liveness(run, progress=progress, artifacts=artifacts)
     try:
         council_model_ids = json.loads(run.council_model_ids_json)
     except Exception:
@@ -619,7 +844,15 @@ def cathode_status(
         "handoff_source_path": str(source_path),
         "handoff_source_exists": source_path.exists(),
         "updated_at": max(
-            [value for value in (_path_iso(plan_path), _path_iso(payload_path), _path_iso(source_path)) if value],
+            [
+                value
+                for value in (
+                    _path_iso(plan_path),
+                    _path_iso(payload_path),
+                    _path_iso(source_path),
+                )
+                if value
+            ],
             default=None,
         ),
         "recommended_source": recommended,
@@ -633,7 +866,12 @@ def build_patient_orchestration_summary(
     latest_run = runs[0] if runs else None
     run_progress_by_id = {run.id: summarize_run_progress(run) for run in runs}
     run_liveness_by_id = {
-        run.id: derive_run_liveness(run, progress=run_progress_by_id[run.id]) for run in runs
+        run.id: derive_run_liveness(
+            run,
+            progress=run_progress_by_id[run.id],
+            artifacts=storage.list_artifacts(session, run.id),
+        )
+        for run in runs
     }
     active_run = next(
         (run for run in runs if run_liveness_by_id[run.id]["is_live"]),
@@ -643,7 +881,9 @@ def build_patient_orchestration_summary(
     portal = classify_portal_files(patient.label)
     sync_entry = _read_sync_state(patient.label)
     source_artifact = choose_cathode_source_artifact(session, patient_id=patient.id)
-    cathode = cathode_status(patient_label=patient.label, source_artifact=source_artifact)
+    cathode = cathode_status(
+        patient_label=patient.label, source_artifact=source_artifact
+    )
 
     state = "idle"
     status = "idle"
@@ -665,19 +905,36 @@ def build_patient_orchestration_summary(
     elif latest_run is not None and latest_run.status == "complete":
         summary_run = latest_run
         progress = run_progress_by_id[latest_run.id]
-        state = "ready"
-        status = run_liveness_by_id[latest_run.id]["display_status"]
-        label = (
-            progress.get("phase_label")
-            or run_liveness_by_id[latest_run.id]["display_label"]
-            or "Complete"
+        completion_gaps = run_council_completion_gaps(
+            latest_run,
+            progress=progress,
+            artifacts=storage.list_artifacts(session, latest_run.id),
         )
+        delivery_gaps = list(completion_gaps)
+        if not portal["patient_facing_pdfs"]:
+            delivery_gaps.append("patient-facing PDF missing")
+        if cathode["status"] == "missing":
+            delivery_gaps.append("Cathode handoff missing")
+        if delivery_gaps:
+            state = "attention"
+            status = "incomplete"
+            label = f"Not clinic-ready - {delivery_gaps[0]}"
+        else:
+            state = "ready"
+            status = run_liveness_by_id[latest_run.id]["display_status"]
+            label = (
+                progress.get("phase_label")
+                or run_liveness_by_id[latest_run.id]["display_label"]
+                or "Complete"
+            )
     elif latest_run is not None and latest_run.status in {"failed", "needs_auth"}:
         summary_run = latest_run
         progress = run_progress_by_id[latest_run.id]
         state = "attention"
         status = run_liveness_by_id[latest_run.id]["display_status"]
-        label = latest_run.error_message or progress.get("phase_label") or latest_run.status
+        label = (
+            latest_run.error_message or progress.get("phase_label") or latest_run.status
+        )
     elif pipeline_status and pipeline_status.get("status") == "failed":
         state = "attention"
         status = "failed"
@@ -702,7 +959,9 @@ def build_patient_orchestration_summary(
         "status": status,
         "label": label,
         "progress": progress,
-        "liveness": run_liveness_by_id.get(summary_run.id) if summary_run is not None else None,
+        "liveness": run_liveness_by_id.get(summary_run.id)
+        if summary_run is not None
+        else None,
         "pipeline_status": {
             "status": pipeline_status.get("status"),
             "updated_at": pipeline_status.get("updated_at"),
@@ -730,7 +989,11 @@ def build_patient_orchestration_detail(
 ) -> dict[str, Any]:
     reports = storage.list_reports(session, patient.id)
     runs = storage.list_runs(session, patient.id)
-    run_views = [_run_out(run) for run in runs]
+    run_progress_by_id = {run.id: summarize_run_progress(run) for run in runs}
+    run_views = [
+        _run_out(run, artifacts=storage.list_artifacts(session, run.id))
+        for run in runs
+    ]
     run_views_by_report: dict[str, list[dict[str, Any]]] = {}
     for run_view in run_views:
         run_views_by_report.setdefault(run_view["report_id"], []).append(run_view)
@@ -739,8 +1002,23 @@ def build_patient_orchestration_detail(
     sync_entry = _read_sync_state(patient.label)
     portal_patient_id = normalize_portal_patient_id(patient.label)
     source_artifact = choose_cathode_source_artifact(session, patient_id=patient.id)
-    cathode = cathode_status(patient_label=patient.label, source_artifact=source_artifact)
+    cathode = cathode_status(
+        patient_label=patient.label, source_artifact=source_artifact
+    )
     latest_complete_run = next((run for run in runs if run.status == "complete"), None)
+    latest_peer_reviewed_run = next(
+        (
+            run
+            for run in runs
+            if run.status == "complete"
+            and run_is_peer_reviewed_for_downstream(
+                run,
+                progress=run_progress_by_id.get(run.id),
+                artifacts=storage.list_artifacts(session, run.id),
+            )
+        ),
+        None,
+    )
     latest_patient_facing_pdf = portal.get("latest_patient_facing_pdf")
 
     patient_facing_status = "missing"
@@ -757,9 +1035,7 @@ def build_patient_orchestration_detail(
                 and latest_pdf_mtime < latest_complete_run.completed_at.isoformat()
             ):
                 patient_facing_status = "stale"
-                patient_facing_summary = (
-                    f"Patient-facing PDF may be stale relative to run {latest_complete_run.id[:8]}"
-                )
+                patient_facing_summary = f"Patient-facing PDF may be stale relative to run {latest_complete_run.id[:8]}"
 
     report_rows: list[dict[str, Any]] = []
     for report in reports:
@@ -776,12 +1052,17 @@ def build_patient_orchestration_detail(
             extracted_exists = False
         patient_facing_for_report = bool(
             latest_patient_facing_pdf
-            and latest_complete_run is not None
-            and latest_complete_run.report_id == report.id
+            and latest_peer_reviewed_run is not None
+            and latest_peer_reviewed_run.report_id == report.id
         )
         cathode_for_report = bool(
             source_artifact
             and source_artifact[0].report_id == report.id
+            and run_is_peer_reviewed_for_downstream(
+                source_artifact[0],
+                progress=run_progress_by_id.get(source_artifact[0].id),
+                artifacts=storage.list_artifacts(session, source_artifact[0].id),
+            )
         )
         report_rows.append(
             {
@@ -798,13 +1079,17 @@ def build_patient_orchestration_detail(
                     "council_status": (
                         latest_run["display_status"] if latest_run else "pending"
                     ),
-                    "patient_facing_status": "ready" if patient_facing_for_report else "pending",
+                    "patient_facing_status": "ready"
+                    if patient_facing_for_report
+                    else "pending",
                     "portal_sync_status": (
                         str(sync_entry.get("status") or sync_entry.get("state"))
                         if isinstance(sync_entry, dict)
                         else "unknown"
                     ),
-                    "cathode_status": cathode.get("status") if cathode_for_report else "pending",
+                    "cathode_status": cathode.get("status")
+                    if cathode_for_report
+                    else "pending",
                 },
             }
         )
@@ -831,7 +1116,12 @@ def build_patient_orchestration_detail(
             "status": patient_facing_status,
             "summary": patient_facing_summary,
             "latest_pdf": latest_patient_facing_pdf,
-            "latest_complete_run_id": latest_complete_run.id if latest_complete_run else None,
+            "latest_complete_run_id": latest_complete_run.id
+            if latest_complete_run
+            else None,
+            "latest_peer_reviewed_run_id": (
+                latest_peer_reviewed_run.id if latest_peer_reviewed_run else None
+            ),
             "latest_complete_run_completed_at": isoformat_or_none(
                 latest_complete_run.completed_at if latest_complete_run else None
             ),
@@ -862,27 +1152,48 @@ def build_patient_orchestration_detail(
                 else "Patient label is not a canonical portal patient id.",
             },
             "regenerate_patient_facing": {
-                "enabled": latest_complete_run is not None,
+                "enabled": latest_peer_reviewed_run is not None,
                 "reason": ""
-                if latest_complete_run is not None
-                else "No complete run is available yet.",
+                if latest_peer_reviewed_run is not None
+                else "No peer-reviewed complete run is available yet.",
             },
             "prepare_cathode_handoff": {
-                "enabled": portal_patient_id is not None and source_artifact is not None,
+                "enabled": portal_patient_id is not None
+                and source_artifact is not None
+                and run_is_peer_reviewed_for_downstream(
+                    source_artifact[0],
+                    progress=run_progress_by_id.get(source_artifact[0].id),
+                    artifacts=storage.list_artifacts(session, source_artifact[0].id),
+                ),
                 "reason": ""
-                if portal_patient_id is not None and source_artifact is not None
+                if portal_patient_id is not None
+                and source_artifact is not None
+                and run_is_peer_reviewed_for_downstream(
+                    source_artifact[0],
+                    progress=run_progress_by_id.get(source_artifact[0].id),
+                    artifacts=storage.list_artifacts(session, source_artifact[0].id),
+                )
                 else (
-                    "No complete council markdown artifact is available yet."
+                    "No peer-reviewed council markdown artifact is available yet."
                     if portal_patient_id is not None
                     else "Patient label is not a canonical portal patient id."
                 ),
             },
             "export_council_artifacts": {
                 "enabled": latest_complete_run is not None
-                and bool(latest_complete_run.selected_artifact_id),
+                and run_is_ready_for_final_export(
+                    latest_complete_run,
+                    progress=run_progress_by_id.get(latest_complete_run.id),
+                    artifacts=storage.list_artifacts(session, latest_complete_run.id),
+                ),
                 "reason": ""
-                if latest_complete_run is not None and latest_complete_run.selected_artifact_id
-                else "No complete run with a selected final draft is available yet.",
+                if latest_complete_run is not None
+                and run_is_ready_for_final_export(
+                    latest_complete_run,
+                    progress=run_progress_by_id.get(latest_complete_run.id),
+                    artifacts=storage.list_artifacts(session, latest_complete_run.id),
+                )
+                else "No peer-reviewed complete run with a selected final draft is available yet.",
             },
         },
         "updated_at": max(

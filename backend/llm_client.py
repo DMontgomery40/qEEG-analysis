@@ -148,7 +148,8 @@ def _is_anthropic_claude_model(model_id: str) -> bool:
 def _openai_reasoning_effort(model_id: str) -> str | None:
     """Infer a reasoning effort from GPT-5 model ids.
 
-    Defaults to medium for GPT-5.* ids when no explicit tier is encoded.
+    Defaults to low for GPT-5.5 ids and medium for older GPT-5.* ids when
+    no explicit tier is encoded.
     """
     for env_name in ("QEEG_OPENAI_REASONING_EFFORT", "OPENAI_REASONING_EFFORT"):
         override = (os.getenv(env_name) or "").strip().lower()
@@ -166,6 +167,9 @@ def _openai_reasoning_effort(model_id: str) -> str | None:
     for token in reversed([t for t in mid.split("-") if t]):
         if token in {"minimal", "low", "medium", "high", "xhigh"}:
             return token
+
+    if mid == "gpt-5.5" or mid.startswith("gpt-5.5-"):
+        return "low"
 
     return "medium"
 

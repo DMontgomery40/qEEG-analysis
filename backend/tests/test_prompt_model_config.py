@@ -24,18 +24,19 @@ def _reload_config(monkeypatch):
 def test_model_role_defaults_are_quality_first_by_role(monkeypatch):
     config = _reload_config(monkeypatch)
 
-    assert config.MODEL_ROLE_DEFAULTS.stage1_vision == "gemini-3.1-pro-preview"
-    assert config.MODEL_ROLE_DEFAULTS.stage2_review == "gpt-5.4"
-    assert config.MODEL_ROLE_DEFAULTS.stage4_consolidator == "claude-sonnet-4-6"
-    assert config.MODEL_ROLE_DEFAULTS.stage5_final_review == "gpt-5.4"
+    assert config.MODEL_ROLE_DEFAULTS.stage1_vision == "gemini-3.1-flash-lite-preview"
+    assert config.MODEL_ROLE_DEFAULTS.stage2_review == "gpt-5.5"
+    assert config.MODEL_ROLE_DEFAULTS.stage4_consolidator == "gpt-5.5"
+    assert config.MODEL_ROLE_DEFAULTS.stage5_final_review == "gpt-5.5"
     assert config.MODEL_ROLE_DEFAULTS.stage6_final_draft == "claude-sonnet-4-6"
-    assert config.MODEL_ROLE_DEFAULTS.patient_facing_rewrite == "claude-sonnet-4-6"
-    assert config.DEFAULT_CONSOLIDATOR == "claude-sonnet-4-6"
+    assert config.MODEL_ROLE_DEFAULTS.patient_facing_rewrite == "gpt-5.5"
+    assert config.DEFAULT_CONSOLIDATOR == "gpt-5.5"
     assert [model.id for model in config.COUNCIL_MODELS] == [
-        "gpt-5.4",
+        "gpt-5.5",
         "claude-sonnet-4-6",
-        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite-preview",
     ]
+    assert config.COUNCIL_MODELS[0].endpoint_preference == "responses"
 
 
 def test_is_vision_capable_includes_current_gemini_preview_ids(monkeypatch):
@@ -43,3 +44,5 @@ def test_is_vision_capable_includes_current_gemini_preview_ids(monkeypatch):
 
     assert config.is_vision_capable("gemini-3.1-pro-preview") is True
     assert config.is_vision_capable("google/gemini-3.1-pro-preview") is True
+    assert config.is_vision_capable("gemini-3.1-flash-lite-preview") is True
+    assert config.is_vision_capable("google/gemini-3.1-flash-lite-preview") is True
