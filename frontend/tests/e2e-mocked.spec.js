@@ -652,6 +652,25 @@ test.describe('Reports', () => {
     // The first report is auto-selected on load
     await expect(page.getByRole('button', { name: 'View extracted' })).toBeVisible();
   });
+
+  test('keeps report and new-run cards from collapsing into overflow slivers', async ({ page }) => {
+    await setupMockApi(page);
+    await page.goto('/');
+
+    const gridCards = page.locator('.grid-row > .card');
+    await expect(gridCards).toHaveCount(2);
+
+    const reportsBox = await gridCards.nth(0).boundingBox();
+    const newRunBox = await gridCards.nth(1).boundingBox();
+    const runHistoryBox = await page.locator('.run-history-card').boundingBox();
+
+    expect(reportsBox?.height ?? 0).toBeGreaterThan(320);
+    expect(newRunBox?.height ?? 0).toBeGreaterThan(320);
+    expect(runHistoryBox?.y ?? 0).toBeGreaterThan((newRunBox?.y ?? 0) + (newRunBox?.height ?? 0) - 12);
+
+    await page.getByRole('button', { name: 'Create + Start' }).scrollIntoViewIfNeeded();
+    await expect(page.getByRole('button', { name: 'Create + Start' })).toBeVisible();
+  });
 });
 
 test.describe('New Run creation', () => {
