@@ -35,29 +35,61 @@ class _StagesMixin:
         *,
         emit: Callable[[dict[str, Any]], Awaitable[None]] | None,
         payload: dict[str, Any],
+        timeout_s: int | None = None,
     ) -> Any:
-        if emit is None:
-            return await awaitable
+        if timeout_s is not None and timeout_s <= 0:
+            timeout_s = None
 
         interval_s = self._int_env("QEEG_PROGRESS_HEARTBEAT_S", 30)
-        if interval_s <= 0:
-            return await awaitable
+        if emit is None or interval_s <= 0:
+            if timeout_s is None:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=timeout_s)
 
         task = asyncio.create_task(awaitable)
-        started_at = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        deadline = started_at + timeout_s if timeout_s is not None else None
         heartbeat_count = 0
         while True:
+            wait_s = interval_s
+            if deadline is not None:
+                remaining_s = deadline - loop.time()
+                if remaining_s <= 0:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    raise TimeoutError(
+                        f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+                    )
+                wait_s = min(wait_s, remaining_s)
+
             try:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=interval_s)
+                return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
             except asyncio.TimeoutError:
+                if task.done():
+                    return await task
+
+                now = loop.time()
+                elapsed_s = int(now - started_at)
+                if deadline is not None and now >= deadline:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    raise TimeoutError(
+                        f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+                    )
+
                 heartbeat_count += 1
                 heartbeat_payload = dict(payload)
                 heartbeat_payload.update(
                     {
                         "status": "heartbeat",
-                        "elapsed_s": int(
-                            asyncio.get_running_loop().time() - started_at
-                        ),
+                        "elapsed_s": elapsed_s,
                         "heartbeat_count": heartbeat_count,
                     }
                 )
@@ -557,6 +589,9 @@ class _StagesMixin:
         stage1_max_tokens = self._int_env("QEEG_STAGE1_MAX_TOKENS", 12000)
         if stage1_max_tokens <= 0:
             stage1_max_tokens = 12000
+        stage1_retry_max_tokens = self._int_env("QEEG_STAGE1_RETRY_MAX_TOKENS", 6000)
+        if stage1_retry_max_tokens <= 0:
+            stage1_retry_max_tokens = 6000
         stage1_require_complete = _truthy_env("QEEG_STAGE1_REQUIRE_COMPLETE", True)
 
         async def one(model_id: str) -> tuple[str, str] | None:
@@ -661,24 +696,58 @@ class _StagesMixin:
                         "MULTIMODAL INGESTION NOTES (generated from ALL PDF pages in multiple passes):\n\n"
                         f"{notes_text}\n"
                     )
-                text = await self._await_with_heartbeat(
-                    self._call_longform_chat_with_repairs(
-                        model_id=model_id,
-                        prompt_text=final_prompt.strip(),
-                        temperature=0.2,
-                        max_tokens=stage1_max_tokens,
-                        end_sentinel=end_sentinel,
-                        required_headings=None,
-                    ),
-                    emit=emit,
-                    payload={
-                        "run_id": run_id,
-                        "stage_num": stage.num,
-                        "stage_name": stage.name,
-                        "task": "stage1_model",
-                        "model_id": model_id,
-                    },
-                )
+                stage1_payload = {
+                    "run_id": run_id,
+                    "stage_num": stage.num,
+                    "stage_name": stage.name,
+                    "task": "stage1_model",
+                    "model_id": model_id,
+                }
+                try:
+                    text = await self._await_with_heartbeat(
+                        self._call_longform_chat_with_repairs(
+                            model_id=model_id,
+                            prompt_text=final_prompt.strip(),
+                            temperature=0.2,
+                            max_tokens=stage1_max_tokens,
+                            end_sentinel=end_sentinel,
+                            required_headings=None,
+                        ),
+                        emit=emit,
+                        payload=stage1_payload,
+                    )
+                except Exception as primary_exc:
+                    if isinstance(model_id, str) and model_id.startswith("mock-"):
+                        raise
+                    await emit(
+                        {
+                            **stage1_payload,
+                            "status": "retry",
+                            "error": str(primary_exc)
+                            or primary_exc.__class__.__name__,
+                            "max_tokens": stage1_retry_max_tokens,
+                            "operatorHint": "Stage 1 upstream failed after heartbeat; retrying the same model with a smaller complete-output budget.",
+                        }
+                    )
+                    retry_prompt = (
+                        f"{final_prompt.strip()}\n\n---\n\n"
+                        "RETRY CONSTRAINT:\n"
+                        "The previous upstream call failed before returning usable text. "
+                        "Return a concise but complete Stage 1 analysis, preserve all critical numeric findings, "
+                        "do not invent missing values, and still end with the required sentinel line.\n"
+                    )
+                    text = await self._await_with_heartbeat(
+                        self._call_longform_chat_with_repairs(
+                            model_id=model_id,
+                            prompt_text=retry_prompt,
+                            temperature=0.2,
+                            max_tokens=stage1_retry_max_tokens,
+                            end_sentinel=end_sentinel,
+                            required_headings=None,
+                        ),
+                        emit=emit,
+                        payload={**stage1_payload, "attempt": "retry"},
+                    )
                 enforce_complete = stage1_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
                 )
@@ -976,6 +1045,7 @@ class _StagesMixin:
         if stage3_max_tokens <= 0:
             stage3_max_tokens = 12000
         stage3_require_complete = _truthy_env("QEEG_STAGE3_REQUIRE_COMPLETE", True)
+        stage3_timeout_s = self._int_env("QEEG_STAGE3_MODEL_TIMEOUT_S", 0)
 
         async def one(model_id: str) -> tuple[str, str] | None:
             analysis = analyses_by_model.get(model_id)
@@ -1003,14 +1073,27 @@ class _StagesMixin:
                 f"Your original analysis:\n\n{analysis}\n\n"
                 f"Peer review JSON artifacts:\n\n{pr_text}\n"
             )
+            event_payload = {
+                "run_id": run_id,
+                "stage_num": stage.num,
+                "stage_name": stage.name,
+                "task": "stage3_model",
+                "model_id": model_id,
+            }
+            await emit({**event_payload, "status": "start"})
             try:
-                text = await self._call_longform_chat_with_repairs(
-                    model_id=model_id,
-                    prompt_text=prompt_text.strip(),
-                    temperature=0.2,
-                    max_tokens=stage3_max_tokens,
-                    end_sentinel=end_sentinel,
-                    required_headings=required_headings,
+                text = await self._await_with_heartbeat(
+                    self._call_longform_chat_with_repairs(
+                        model_id=model_id,
+                        prompt_text=prompt_text.strip(),
+                        temperature=0.2,
+                        max_tokens=stage3_max_tokens,
+                        end_sentinel=end_sentinel,
+                        required_headings=required_headings,
+                    ),
+                    emit=emit,
+                    payload=event_payload,
+                    timeout_s=stage3_timeout_s,
                 )
                 enforce_complete = stage3_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
@@ -1024,8 +1107,17 @@ class _StagesMixin:
                         "Stage 3 revision remained incomplete after repair attempts. "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
+                await emit({**event_payload, "status": "complete"})
                 return model_id, text
-            except Exception:
+            except Exception as exc:
+                await emit(
+                    {
+                        **event_payload,
+                        "status": "failed",
+                        "error": str(exc) or exc.__class__.__name__,
+                        "operatorHint": "Stage 3 model call failed or timed out; retry with a reachable CLIProxy upstream or a smaller model set.",
+                    }
+                )
                 return None
 
         results = await asyncio.gather(*(one(m) for m in available_models))
@@ -1037,7 +1129,6 @@ class _StagesMixin:
             await self._write_artifact(
                 run_id=run_id, stage=stage, model_id=model_id, text=text
             )
-
         await emit(
             {
                 "run_id": run_id,
@@ -1046,6 +1137,7 @@ class _StagesMixin:
                 "status": "complete",
                 "success_count": len(successes),
                 "requested_count": len(available_models),
+                "partial_success": len(successes) < len(available_models),
             }
         )
 
@@ -1196,6 +1288,7 @@ class _StagesMixin:
         require_complete = _truthy_env("QEEG_STAGE4_REQUIRE_COMPLETE", True)
         if isinstance(consolidator, str) and consolidator.startswith("mock-"):
             require_complete = False
+        stage4_timeout_s = self._int_env("QEEG_STAGE4_MODEL_TIMEOUT_S", 0)
 
         await emit(
             {
@@ -1205,11 +1298,24 @@ class _StagesMixin:
                 "status": "start",
             }
         )
-        text = await self._call_model_chat(
-            model_id=consolidator,
-            prompt_text=base_prompt_text,
-            temperature=0.2,
-            max_tokens=max_tokens,
+        task_payload = {
+            "run_id": run_id,
+            "stage_num": stage.num,
+            "stage_name": stage.name,
+            "task": "stage4_consolidation",
+            "model_id": consolidator,
+        }
+        await emit({**task_payload, "status": "start"})
+        text = await self._await_with_heartbeat(
+            self._call_model_chat(
+                model_id=consolidator,
+                prompt_text=base_prompt_text,
+                temperature=0.2,
+                max_tokens=max_tokens,
+            ),
+            emit=emit,
+            payload=task_payload,
+            timeout_s=stage4_timeout_s,
         )
 
         # Claude-style message APIs frequently clamp output tokens below the requested max, which can truncate
@@ -1219,7 +1325,9 @@ class _StagesMixin:
             for _ in range(repair_calls):
                 # Prefer resuming from the first missing section. If all required sections are present but the
                 # sentinel is missing, resume from the last heading and ask for a clean ending.
-                start_heading = first_missing_heading(repaired) if repair_headings else None
+                start_heading = (
+                    first_missing_heading(repaired) if repair_headings else None
+                )
                 positions = heading_positions(repaired) if repair_headings else []
                 pos_map = {h: idx for h, idx in positions}
                 start_idx = pos_map.get(start_heading) if start_heading else None
@@ -1254,11 +1362,16 @@ class _StagesMixin:
                     f"{partial_tail}\n\n---\n\n"
                     f"{continuation_instruction}"
                 )
-                cont = await self._call_model_chat(
-                    model_id=consolidator,
-                    prompt_text=cont_prompt,
-                    temperature=0.2,
-                    max_tokens=max_tokens,
+                cont = await self._await_with_heartbeat(
+                    self._call_model_chat(
+                        model_id=consolidator,
+                        prompt_text=cont_prompt,
+                        temperature=0.2,
+                        max_tokens=max_tokens,
+                    ),
+                    emit=emit,
+                    payload={**task_payload, "task": "stage4_repair"},
+                    timeout_s=stage4_timeout_s,
                 )
 
                 # Trim any preamble before the requested start heading.
@@ -1267,7 +1380,9 @@ class _StagesMixin:
                     try:
                         import re
 
-                        m = re.search(rf"(?m)^{re.escape(start_heading)}\s*$", cont or "")
+                        m = re.search(
+                            rf"(?m)^{re.escape(start_heading)}\s*$", cont or ""
+                        )
                         if m:
                             clean = cont[m.start() :]
                     except Exception:
@@ -1292,6 +1407,7 @@ class _StagesMixin:
         await self._write_artifact(
             run_id=run_id, stage=stage, model_id=consolidator, text=text
         )
+        await emit({**task_payload, "status": "complete"})
         await emit(
             {
                 "run_id": run_id,

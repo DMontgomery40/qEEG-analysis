@@ -1,6 +1,23 @@
 from __future__ import annotations
 
 
+_OPENAI_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+
+
+def _openai_gpt_effort_tokens(model_id: str) -> set[str]:
+    mid = (model_id or "").strip().lower().removeprefix("openai/")
+    if not mid.startswith("gpt-5."):
+        return set()
+    return {token for token in mid.split("-") if token in _OPENAI_REASONING_EFFORTS}
+
+
+def _default_openai_gpt_effort_tokens(model_id: str) -> set[str]:
+    mid = (model_id or "").strip().lower().removeprefix("openai/")
+    if mid == "gpt-5.5":
+        return {"low"}
+    return set()
+
+
 def _alias_candidates(preferred: str) -> list[str]:
     pref = (preferred or "").strip()
     if not pref:
@@ -25,6 +42,22 @@ def _alias_candidates(preferred: str) -> list[str]:
     lower = pref.lower()
     if lower == "gemini-3.1-pro-preview":
         add("gemini-3-pro-preview")
+    if lower == "gemini-3.1-flash":
+        add("gemini-3.1-flash-lite-preview")
+        add("gemini-3-flash-preview")
+    if lower == "google/gemini-3.1-flash":
+        add("google/gemini-3.1-flash-lite-preview")
+        add("gemini-3.1-flash-lite-preview")
+        add("google/gemini-3-flash-preview")
+        add("gemini-3-flash-preview")
+    if lower == "gemini-3.1-flash-lite-preview":
+        add("gemini-3.1-flash")
+        add("gemini-3-flash-preview")
+    if lower == "google/gemini-3.1-flash-lite-preview":
+        add("google/gemini-3.1-flash")
+        add("gemini-3.1-flash")
+        add("google/gemini-3-flash-preview")
+        add("gemini-3-flash-preview")
     if lower == "google/gemini-3.1-pro-preview":
         add("google/gemini-3-pro-preview")
         add("gemini-3.1-pro-preview")
@@ -58,8 +91,24 @@ def resolve_model_preference(preferred: str, discovered: list[str]) -> str | Non
 
     matches: list[str] = []
     alias_lowers = [candidate.lower() for candidate in aliases]
+    preferred_efforts = set().union(
+        *[_openai_gpt_effort_tokens(candidate) for candidate in aliases]
+    )
+    default_efforts: set[str] = set()
+    if not preferred_efforts:
+        default_efforts = set().union(
+            *[_default_openai_gpt_effort_tokens(candidate) for candidate in aliases]
+        )
+    allowed_efforts = preferred_efforts or default_efforts
     for mid in discovered:
         mid_lower = mid.lower()
+        mid_efforts = _openai_gpt_effort_tokens(mid)
+        if (
+            mid_efforts
+            and allowed_efforts
+            and not mid_efforts.issubset(allowed_efforts)
+        ):
+            continue
         if any(alias_lower in mid_lower for alias_lower in alias_lowers):
             matches.append(mid)
 

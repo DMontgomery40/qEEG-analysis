@@ -410,10 +410,14 @@ def report_pages_dir(patient_id: str, report_id: str) -> Path:
 
 
 def report_original_path(patient_id: str, report_id: str, filename: str) -> Path:
+    return report_original_path_in_dir(report_dir(patient_id, report_id), filename)
+
+
+def report_original_path_in_dir(out_dir: Path, filename: str) -> Path:
     ext = _safe_suffix(filename)
     if not ext:
         ext = ".bin"
-    return report_dir(patient_id, report_id) / f"original{ext}"
+    return out_dir / f"original{ext}"
 
 
 def report_extracted_path(patient_id: str, report_id: str) -> Path:
@@ -435,6 +439,7 @@ def save_report_upload(
     filename: str,
     provided_mime_type: str | None,
     file_bytes: bytes,
+    target_dir: Path | None = None,
 ) -> tuple[Path, Path, str, str]:
     """
     Saves original upload and extracted text; returns (original_path, extracted_path, mime_type, preview).
@@ -446,10 +451,10 @@ def save_report_upload(
     """
     mime_type = _guess_mime_type(filename, provided_mime_type)
 
-    out_dir = report_dir(patient_id, report_id)
+    out_dir = target_dir if target_dir is not None else report_dir(patient_id, report_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    original_path = report_original_path(patient_id, report_id, filename)
+    original_path = report_original_path_in_dir(out_dir, filename)
     original_path.write_bytes(file_bytes)
 
     extracted = ""
@@ -461,7 +466,7 @@ def save_report_upload(
             page_images = full.page_images
 
             # Save enhanced text
-            enhanced_path = report_enhanced_path(patient_id, report_id)
+            enhanced_path = out_dir / "extracted_enhanced.txt"
             enhanced_path.write_text(enhanced_text, encoding="utf-8")
 
             # Also write extracted.txt as the enhanced union so the UI preview ("extracted") is never
@@ -469,7 +474,7 @@ def save_report_upload(
             extracted = enhanced_text
 
             # Save page images
-            pages_dir = report_pages_dir(patient_id, report_id)
+            pages_dir = out_dir / "pages"
             pages_dir.mkdir(parents=True, exist_ok=True)
             for img_data in page_images:
                 page_num = img_data["page"]
@@ -506,7 +511,7 @@ def save_report_upload(
                     "sources_dir": "sources",
                 }
             )
-            metadata_path = report_metadata_path(patient_id, report_id)
+            metadata_path = out_dir / "metadata.json"
             metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
         except Exception:
@@ -514,7 +519,7 @@ def save_report_upload(
     else:
         extracted = file_bytes.decode("utf-8", errors="replace").strip()
 
-    extracted_path = report_extracted_path(patient_id, report_id)
+    extracted_path = out_dir / "extracted.txt"
     extracted_path.write_text(extracted, encoding="utf-8")
 
     preview = extracted[:4000]

@@ -48,10 +48,21 @@ from .orchestration import (
     cathode_handoff_source_path,
     cathode_project_dir,
     choose_cathode_source_artifact,
+    choose_final_export_ready_run,
+    choose_patient_facing_ready_run,
     derive_run_liveness,
+    final_export_delivery_gaps_for_run,
+    patient_facing_delivery_gaps_for_run,
+    run_downstream_delivery_gaps,
+    selected_final_draft_artifact,
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from .portal_export_manifest import (
+    council_export_manifest_payload,
+    write_council_export_manifest,
+)
+from .portal_files import normalize_portal_patient_id
 from .portal_sync import (
     spawn_portal_sync,
     watch_portal_patients_forever,
@@ -242,29 +253,8 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-_PORTAL_PATIENT_ID_RE = re.compile(
-    r"^(?P<mm>\d{2})-(?P<dd>\d{2})-(?P<yyyy>\d{4})-(?P<n>\d+)$"
-)
-
-
 def _normalize_portal_patient_id(value: str) -> str | None:
-    raw = (value or "").strip()
-    m = _PORTAL_PATIENT_ID_RE.match(raw)
-    if not m:
-        return None
-    mm = int(m.group("mm"))
-    dd = int(m.group("dd"))
-    yyyy = int(m.group("yyyy"))
-    n = int(m.group("n"))
-    if mm < 1 or mm > 12:
-        return None
-    if dd < 1 or dd > 31:
-        return None
-    if yyyy < 1900 or yyyy > 2100:
-        return None
-    if n < 0 or n > 999:
-        return None
-    return f"{mm:02d}-{dd:02d}-{yyyy:04d}-{n}"
+    return normalize_portal_patient_id(value)
 
 
 def _portal_patients_dir() -> Path:
@@ -409,9 +399,7 @@ def _latest_complete_run_for_patient(
     runs = storage.list_runs(session, patient_id)
     complete_runs = [run for run in runs if (run.status or "") == "complete"]
     if preferred_run_id:
-        complete_runs = [
-            run for run in complete_runs if run.id == preferred_run_id
-        ] + [run for run in complete_runs if run.id != preferred_run_id]
+        complete_runs = [run for run in complete_runs if run.id == preferred_run_id]
     return complete_runs[0] if complete_runs else None
 
 
@@ -481,27 +469,48 @@ def _prepare_cathode_handoff_for_patient(
 
 
 async def _auto_generate_patient_facing_for_run(
-    run_id: str, broker: _EventBroker
-) -> None:
-    """Best-effort post-run patient-facing generation into portal folder."""
+    run_id: str, broker: _EventBroker, *, sync_outputs: bool = True
+) -> bool:
+    """Generate post-run patient-facing outputs into the portal folder."""
     if not _truthy_env("QEEG_AUTO_PATIENT_FACING", True):
-        return
+        return True
 
     with storage.session_scope() as session:
         run = storage.get_run(session, run_id)
         if run is None or (run.status or "") != "complete":
-            return
+            return False
+        completion_gaps = run_downstream_delivery_gaps(
+            run,
+            progress=summarize_run_progress(run),
+            artifacts=storage.list_artifacts(session, run_id),
+            require_final_draft=True,
+        )
+        if completion_gaps:
+            await broker.publish(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "stage_name": "patient_facing",
+                    "status": "skipped",
+                    "reason": "Council run is not delivery-ready for patient-facing generation.",
+                    "gaps": completion_gaps,
+                    "operatorHint": "Rerun or repair the council until peer review, revision, and Stage 6 final draft artifacts are present before generating patient-facing PDFs.",
+                },
+            )
+            return False
         patient = storage.get_patient(session, run.patient_id)
         if patient is None:
-            return
+            return False
         patient_label = (patient.label or "").strip()
 
     normalized_patient_id = _normalize_portal_patient_id(patient_label)
     if normalized_patient_id is None:
-        return
+        return False
 
     preferred_model = (
-        os.getenv("QEEG_PATIENT_FACING_MODEL", MODEL_ROLE_DEFAULTS.patient_facing_rewrite)
+        os.getenv(
+            "QEEG_PATIENT_FACING_MODEL", MODEL_ROLE_DEFAULTS.patient_facing_rewrite
+        )
         or MODEL_ROLE_DEFAULTS.patient_facing_rewrite
     ).strip()
     version_prefix = (
@@ -520,6 +529,8 @@ async def _auto_generate_patient_facing_for_run(
         version,
         "--overwrite",
     ]
+    if not sync_outputs:
+        cmd.append("--no-sync")
     configured_portal_dir = (os.getenv("QEEG_PORTAL_PATIENTS_DIR", "") or "").strip()
     if configured_portal_dir:
         cmd.extend(["--portal-dir", configured_portal_dir])
@@ -572,6 +583,7 @@ async def _auto_generate_patient_facing_for_run(
                     "log": out_text[-2000:],
                 },
             )
+            return True
         else:
             LOGGER.error(
                 "patient_facing_generation_failed",
@@ -594,6 +606,7 @@ async def _auto_generate_patient_facing_for_run(
                     "operatorHint": "generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
                 },
             )
+            return False
     except Exception as e:
         LOGGER.exception(
             "patient_facing_generation_crashed",
@@ -615,6 +628,163 @@ async def _auto_generate_patient_facing_for_run(
                 "operatorHint": "auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
             },
         )
+        return False
+
+
+async def _auto_generate_cathode_video_for_run(
+    run_id: str, broker: _EventBroker
+) -> None:
+    """Best-effort post-run Cathode video generation into ../cathode/projects."""
+    if not _truthy_env("QEEG_AUTO_CATHODE_VIDEO", True):
+        return
+
+    with storage.session_scope() as session:
+        run = storage.get_run(session, run_id)
+        if run is None or (run.status or "") != "complete":
+            return
+        completion_gaps = run_downstream_delivery_gaps(
+            run,
+            progress=summarize_run_progress(run),
+            artifacts=storage.list_artifacts(session, run_id),
+        )
+        if completion_gaps:
+            await broker.publish(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "stage_name": "cathode_video",
+                    "status": "skipped",
+                    "reason": "Council run is not peer-reviewed enough for Cathode handoff.",
+                    "gaps": completion_gaps,
+                    "operatorHint": "Rerun the council until Stage 2 peer review completes before handing off to Cathode.",
+                },
+            )
+            return
+        patient = storage.get_patient(session, run.patient_id)
+        if patient is None:
+            return
+        patient_label = _normalize_portal_patient_id((patient.label or "").strip())
+        if patient_label is None:
+            return
+        source_choice = choose_cathode_source_artifact(
+            session,
+            patient_id=patient.id,
+            preferred_run_id=run_id,
+            require_peer_reviewed=True,
+        )
+        if source_choice is None:
+            await broker.publish(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "stage_name": "cathode_video",
+                    "status": "failed",
+                    "patient_label": patient_label,
+                    "operatorHint": "No complete stage 4 or stage 3 council markdown artifact was available for Cathode video handoff after the run completed.",
+                },
+            )
+            return
+        source_run, source_artifact = source_choice
+        handoff_paths = _prepare_cathode_handoff_for_patient(
+            patient_label=patient_label,
+            source_run=source_run,
+            source_artifact=source_artifact,
+        )
+
+    cathode_root = _repo_root().parent / "cathode"
+    queue_script = cathode_root / "scripts" / "qeeg_patient_video_queue.py"
+    if not queue_script.exists():
+        await broker.publish(
+            run_id,
+            {
+                "run_id": run_id,
+                "stage_name": "cathode_video",
+                "status": "failed",
+                "patient_label": patient_label,
+                "project_dir": handoff_paths["project_dir"],
+                "operatorHint": f"Cathode queue script was not found at {queue_script}; verify ../cathode is checked out next to qEEG-analysis.",
+            },
+        )
+        return
+
+    cathode_python = Path(
+        os.getenv("QEEG_CATHODE_PYTHON")
+        or (
+            str(cathode_root / ".venv" / "bin" / "python")
+            if (cathode_root / ".venv" / "bin" / "python").exists()
+            else sys.executable
+        )
+    ).expanduser()
+    project_dir = Path(handoff_paths["project_dir"])
+    log_path = project_dir / "qeeg_video_queue.log"
+    status_path = project_dir / "qeeg_video_queue_status.json"
+    log_file = log_path.open("a", encoding="utf-8")
+    cmd = [
+        str(cathode_python),
+        str(queue_script),
+        "--patients",
+        patient_label,
+        "--target-minutes",
+        str(os.getenv("QEEG_CATHODE_TARGET_MINUTES", "6.5") or "6.5"),
+        "--status-path",
+        str(status_path),
+        "--rebuild-storyboard",
+        "--skip-scene-review",
+        "--continue-on-error",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cathode_root),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        log_file.close()
+    except Exception as e:
+        log_file.close()
+        LOGGER.exception(
+            "cathode_video_generation_spawn_failed",
+            run_id=run_id,
+            patient_label=patient_label,
+            operatorHint="Cathode video queue spawn failed after handoff creation; inspect QEEG_CATHODE_PYTHON, ../cathode, and qeeg_patient_video_queue.py permissions.",
+        )
+        await broker.publish(
+            run_id,
+            {
+                "run_id": run_id,
+                "stage_name": "cathode_video",
+                "status": "failed",
+                "patient_label": patient_label,
+                "project_dir": str(project_dir),
+                "error": str(e),
+                "operatorHint": "Cathode video queue spawn failed after handoff creation; inspect QEEG_CATHODE_PYTHON, ../cathode, and qeeg_patient_video_queue.py permissions.",
+            },
+        )
+        return
+
+    LOGGER.info(
+        "cathode_video_generation_started",
+        run_id=run_id,
+        patient_label=patient_label,
+        project_dir=str(project_dir),
+        status_path=str(status_path),
+        pid=proc.pid,
+    )
+    await broker.publish(
+        run_id,
+        {
+            "run_id": run_id,
+            "stage_name": "cathode_video",
+            "status": "queued",
+            "patient_label": patient_label,
+            "project_dir": str(project_dir),
+            "payload_path": handoff_paths["payload_path"],
+            "status_path": str(status_path),
+            "log_path": str(log_path),
+            "pid": proc.pid,
+        },
+    )
 
 
 def _default_clipr_config_path() -> str:
@@ -876,9 +1046,9 @@ def _model_visible_in_ui(model_id: str) -> bool:
     Reduce clutter in the frontend model picker by hiding older provider versions.
 
     Policy (as requested):
-    - OpenAI: show only GPT-5.2 / GPT-5.3 / GPT-5.4 families (codex + non-codex), hide 5.1 and older
+    - OpenAI: show only GPT-5.5 families, hide 5.4 and older
     - Anthropic: hide claude-* models older than 4.6
-    - Gemini: hide gemini-* models older than 2.5
+    - Gemini: hide gemini-* models older than 3
 
     Unknown non-provider-specific model ids are left visible.
     """
@@ -897,7 +1067,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     if m:
         major = int(m.group("major"))
         minor = int(m.group("minor"))
-        if major != 5 or minor not in {2, 3, 4}:
+        if major != 5 or minor != 5:
             return False
         suffix = m.group("suffix") or ""
         tokens = [t for t in suffix.split("-") if t]
@@ -908,7 +1078,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
         efforts = [
             t for t in tokens if t in {"minimal", "low", "medium", "high", "xhigh"}
         ]
-        if efforts and any(t not in {"medium", "high", "xhigh"} for t in efforts):
+        if efforts and any(t != "low" for t in efforts):
             return False
         return True
     if openai_id.startswith("gpt-"):
@@ -962,7 +1132,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     if m:
         major = int(m.group("major"))
         minor = int(m.group("minor") or "0")
-        return major > 2 or (major == 2 and minor >= 5)
+        return major >= 3
     if gemini_id.startswith("gemini-"):
         return False
 
@@ -1401,6 +1571,30 @@ async def run_patient_action(
         preferred_run = _latest_complete_run_for_patient(
             session, patient_id, preferred_run_id=req.run_id
         )
+        patient_facing_run_id: str | None = None
+        patient_facing_delivery_gaps: list[str] = []
+        export_ready_run_id: str | None = None
+        export_delivery_gaps: list[str] = []
+        if action == "regenerate_patient_facing":
+            patient_facing_run = choose_patient_facing_ready_run(
+                session, patient_id=patient_id, preferred_run_id=req.run_id
+            )
+            if patient_facing_run is not None:
+                patient_facing_run_id = patient_facing_run.id
+            elif preferred_run is not None:
+                patient_facing_delivery_gaps = patient_facing_delivery_gaps_for_run(
+                    session, preferred_run
+                )
+        if action == "export_council_artifacts":
+            export_ready_run = choose_final_export_ready_run(
+                session, patient_id=patient_id, preferred_run_id=req.run_id
+            )
+            if export_ready_run is not None:
+                export_ready_run_id = export_ready_run.id
+            elif preferred_run is not None:
+                export_delivery_gaps = final_export_delivery_gaps_for_run(
+                    session, preferred_run
+                )
 
     normalized_patient_label = _normalize_portal_patient_id(patient_label)
 
@@ -1427,7 +1621,9 @@ async def run_patient_action(
                 status_code=400,
                 detail="Patient label is not a canonical portal patient id",
             )
-        log_path = cfg.DATA_DIR / "pipeline_jobs" / f"{normalized_patient_label}.manual.log"
+        log_path = (
+            cfg.DATA_DIR / "pipeline_jobs" / f"{normalized_patient_label}.manual.log"
+        )
         cmd = [
             sys.executable,
             str(_repo_root() / "scripts" / "portal_pipeline_worker.py"),
@@ -1445,20 +1641,28 @@ async def run_patient_action(
         }
 
     if action == "regenerate_patient_facing":
-        if preferred_run is None:
+        if patient_facing_run_id is None:
+            if preferred_run is not None:
+                detail = (
+                    "No delivery-ready complete run is available for "
+                    "patient-facing generation"
+                )
+                if patient_facing_delivery_gaps:
+                    detail += ": " + "; ".join(patient_facing_delivery_gaps)
+                raise HTTPException(status_code=409, detail=detail)
             raise HTTPException(
                 status_code=409,
                 detail="No complete run is available for patient-facing generation",
             )
         broker: _EventBroker = app.state.broker
         _spawn_task(
-            _auto_generate_patient_facing_for_run(preferred_run.id, broker),
-            name=f"patient-facing-{preferred_run.id}",
+            _auto_generate_patient_facing_for_run(patient_facing_run_id, broker),
+            name=f"patient-facing-{patient_facing_run_id}",
         )
         return {
             "ok": True,
             "action": action,
-            "run_id": preferred_run.id,
+            "run_id": patient_facing_run_id,
             "patient_label": patient_label,
             "scheduled": True,
         }
@@ -1471,14 +1675,18 @@ async def run_patient_action(
             )
         with storage.session_scope() as session:
             choice = choose_cathode_source_artifact(
-                session, patient_id=patient_id, preferred_run_id=req.run_id
+                session,
+                patient_id=patient_id,
+                preferred_run_id=req.run_id,
+                require_peer_reviewed=True,
             )
             if choice is None:
                 raise HTTPException(
                     status_code=409,
-                    detail="No complete council markdown artifact is available for Cathode handoff",
+                    detail="No peer-reviewed council markdown artifact is available for Cathode handoff",
                 )
-            source_run, source_artifact = choice
+            source_run, _source_artifact = choice
+            source_artifact = _source_artifact
         handoff_paths = _prepare_cathode_handoff_for_patient(
             patient_label=normalized_patient_label,
             source_run=source_run,
@@ -1494,16 +1702,39 @@ async def run_patient_action(
         }
 
     if action == "export_council_artifacts":
-        if preferred_run is None:
+        if export_ready_run_id is None:
+            if preferred_run is not None:
+                detail = "No export-ready complete run is available"
+                if export_delivery_gaps:
+                    detail += ": " + "; ".join(export_delivery_gaps)
+                raise HTTPException(status_code=409, detail=detail)
             raise HTTPException(
                 status_code=409,
                 detail="No complete run is available for export",
             )
-        export_result = await export(preferred_run.id)
+        with storage.session_scope() as session:
+            run = storage.get_run(session, export_ready_run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            delivery_gaps = run_downstream_delivery_gaps(
+                run,
+                progress=summarize_run_progress(run),
+                artifacts=storage.list_artifacts(session, run.id),
+                require_selected_final_draft=True,
+            )
+            if delivery_gaps:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "No peer-reviewed complete run is available for export: "
+                        + "; ".join(delivery_gaps)
+                    ),
+                )
+        export_result = await export(export_ready_run_id)
         return {
             "ok": True,
             "action": action,
-            "run_id": preferred_run.id,
+            "run_id": export_ready_run_id,
             "patient_label": patient_label,
             **export_result,
         }
@@ -2014,10 +2245,11 @@ async def start_run(run_id: str) -> dict[str, Any]:
             try:
                 await workflow.run_pipeline(run_id, on_event=on_event)
                 await _auto_generate_patient_facing_for_run(run_id, broker)
+                await _auto_generate_cathode_video_for_run(run_id, broker)
             except Exception:
                 LOGGER.exception(
                     "run_task_crashed",
-                    operatorHint="run_task wraps workflow.run_pipeline and _auto_generate_patient_facing_for_run; inspect the first failed workflow stage or patient-facing subprocess for this run.",
+                    operatorHint="run_task wraps workflow.run_pipeline, patient-facing generation, and Cathode video queue launch; inspect the first failed workflow stage or post-run subprocess for this run.",
                 )
                 raise
             LOGGER.info("run_task_completed")
@@ -2146,22 +2378,40 @@ async def export(run_id: str) -> dict[str, Any]:
         patient_label = patient.label if patient is not None else ""
         if not run.selected_artifact_id:
             raise HTTPException(status_code=400, detail="No selected artifact for run")
-        art = storage.get_artifact(session, run.selected_artifact_id)
-        if art is None:
+        selected = storage.get_artifact(session, run.selected_artifact_id)
+        if selected is None:
             raise HTTPException(status_code=400, detail="Selected artifact not found")
-        if art.run_id != run_id:
+        if selected.run_id != run_id:
             raise HTTPException(
                 status_code=400, detail="Selected artifact does not belong to run"
             )
         if (
-            art.stage_num != 6
-            or art.kind != "final_draft"
-            or art.content_type != "text/markdown"
+            selected.stage_num != 6
+            or selected.kind != "final_draft"
+            or selected.content_type != "text/markdown"
         ):
             raise HTTPException(
                 status_code=400,
                 detail="Selected artifact is not a final markdown draft",
             )
+        artifacts = storage.list_artifacts(session, run.id)
+        delivery_gaps = run_downstream_delivery_gaps(
+            run,
+            progress=summarize_run_progress(run),
+            artifacts=artifacts,
+            require_selected_final_draft=True,
+        )
+        if delivery_gaps:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Run is not ready for downstream export: "
+                    + "; ".join(delivery_gaps)
+                ),
+            )
+        art = selected_final_draft_artifact(run, artifacts)
+        if art is None:
+            raise HTTPException(status_code=400, detail="Selected artifact not found")
         md = Path(art.content_path).read_text(encoding="utf-8", errors="replace")
 
     export_dir = EXPORTS_DIR / run_id
@@ -2181,7 +2431,32 @@ async def export(run_id: str) -> dict[str, Any]:
         src_path=pdf_path,
         filename=f"{patient_label}.pdf" if patient_label else "final.pdf",
     )
-    if portal_md is not None or portal_pdf is not None:
+    portal_manifest: Path | None = None
+    portal_patient_id = _normalize_portal_patient_id(patient_label)
+    if portal_patient_id is not None:
+        try:
+            portal_manifest = write_council_export_manifest(
+                portal_patient_dir=_portal_patients_dir() / portal_patient_id,
+                patient_label=patient_label,
+                payload=council_export_manifest_payload(
+                    patient_label=patient_label,
+                    run_id=run_id,
+                    report_id=run.report_id,
+                    selected_artifact=art,
+                    export_md_path=md_path,
+                    export_pdf_path=pdf_path,
+                    portal_md_path=portal_md,
+                    portal_pdf_path=portal_pdf,
+                ),
+            )
+        except Exception:
+            LOGGER.exception(
+                "portal_export_manifest_write_failed",
+                run_id=run_id,
+                patient_label=patient_label,
+                operatorHint="Council export succeeded but the portal export manifest could not be written; inspect data/portal_patients permissions before syncing.",
+            )
+    if portal_md is not None or portal_pdf is not None or portal_manifest is not None:
         _schedule_portal_sync(
             patient_label=patient_label,
             source="export_run",
@@ -2193,22 +2468,78 @@ async def export(run_id: str) -> dict[str, Any]:
         "final_pdf": str(pdf_path),
         "portal_final_md": str(portal_md) if portal_md else None,
         "portal_final_pdf": str(portal_pdf) if portal_pdf else None,
+        "portal_export_meta": str(portal_manifest) if portal_manifest else None,
     }
+
+
+def _verified_export_download_path(run_id: str, filename: str) -> Path:
+    path = EXPORTS_DIR / run_id / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"{filename} not found")
+
+    with storage.session_scope() as session:
+        run = storage.get_run(session, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        artifacts = storage.list_artifacts(session, run.id)
+        delivery_gaps = run_downstream_delivery_gaps(
+            run,
+            progress=summarize_run_progress(run),
+            artifacts=artifacts,
+            require_selected_final_draft=True,
+        )
+        if delivery_gaps:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cached export is not ready for download: "
+                    + "; ".join(delivery_gaps)
+                ),
+            )
+        selected = selected_final_draft_artifact(run, artifacts)
+        if selected is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Cached export is not tied to a selected Stage 6 final draft",
+            )
+        selected_path = Path(selected.content_path)
+
+    export_md_path = EXPORTS_DIR / run_id / "final.md"
+    if not export_md_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="Cached export is missing final.md; rerun export before downloading.",
+        )
+    if not selected_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="Selected Stage 6 final draft file is missing; rerun or repair the council run before downloading.",
+        )
+    try:
+        cached_md = export_md_path.read_text(encoding="utf-8", errors="replace")
+        selected_md = selected_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cached export could not be verified: {exc}",
+        ) from exc
+    if cached_md != selected_md:
+        raise HTTPException(
+            status_code=409,
+            detail="Cached export no longer matches the selected Stage 6 final draft; rerun export before downloading.",
+        )
+    return path
 
 
 @app.get("/api/runs/{run_id}/export/final.md")
 async def get_final_md(run_id: str):
-    path = EXPORTS_DIR / run_id / "final.md"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="final.md not found")
+    path = _verified_export_download_path(run_id, "final.md")
     return FileResponse(str(path), media_type="text/markdown", filename="final.md")
 
 
 @app.get("/api/runs/{run_id}/export/final.pdf")
 async def get_final_pdf(run_id: str):
-    path = EXPORTS_DIR / run_id / "final.pdf"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="final.pdf not found")
+    path = _verified_export_download_path(run_id, "final.pdf")
     return FileResponse(str(path), media_type="application/pdf", filename="final.pdf")
 
 
@@ -2256,7 +2587,12 @@ def _patient_file_out(f: storage.PatientFile) -> dict[str, Any]:
 
 def _run_out(r: storage.Run) -> dict[str, Any]:
     progress = summarize_run_progress(r)
-    liveness = derive_run_liveness(r, progress=progress)
+    try:
+        with storage.session_scope() as session:
+            artifacts = storage.list_artifacts(session, r.id)
+    except Exception:
+        artifacts = None
+    liveness = derive_run_liveness(r, progress=progress, artifacts=artifacts)
     try:
         council_model_ids = json.loads(r.council_model_ids_json)
     except Exception:

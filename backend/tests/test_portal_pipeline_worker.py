@@ -343,7 +343,85 @@ def test_should_skip_when_all_reports_have_complete_runs(tmp_path: Path, monkeyp
     )
 
     assert not should_run
-    assert note == "matching complete runs already exist for all report PDFs"
+    assert note == "matching delivery-ready runs already exist for all report PDFs"
+
+
+def test_matching_complete_run_requires_delivery_ready_artifacts(temp_data_dir):
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    patient_label = "03-05-2010-0"
+    report_name = "report.pdf"
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label=patient_label, notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-1"
+        report_dir.mkdir(parents=True)
+        stored_path = report_dir / "original.pdf"
+        extracted_path = report_dir / "extracted.txt"
+        stored_path.write_bytes(b"%PDF-1.4")
+        extracted_path.write_text("extracted", encoding="utf-8")
+        report = storage.create_report(
+            session,
+            report_id="report-1",
+            patient_id=patient.id,
+            filename=report_name,
+            mime_type="application/pdf",
+            stored_path=stored_path,
+            extracted_text_path=extracted_path,
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status="complete")
+
+    assert not worker._matching_complete_run_exists(patient_label, {report_name})
+
+    with storage.session_scope() as session:
+        artifact_dir = Path(temp_data_dir) / "artifacts" / run.id
+        for stage, name, text in (
+            ("stage-2", "review.json", "{}"),
+            ("stage-3", "revision.md", "# Revision"),
+            ("stage-6", "final.md", "# Final"),
+        ):
+            path = artifact_dir / stage / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=2,
+            stage_name="peer_review",
+            model_id="mock-council-a",
+            kind="peer_review",
+            content_path=artifact_dir / "stage-2" / "review.json",
+            content_type="application/json",
+        )
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=3,
+            stage_name="revision",
+            model_id="mock-council-a",
+            kind="revision",
+            content_path=artifact_dir / "stage-3" / "revision.md",
+            content_type="text/markdown",
+        )
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=artifact_dir / "stage-6" / "final.md",
+            content_type="text/markdown",
+        )
+
+    assert worker._matching_complete_run_exists(patient_label, {report_name})
 
 
 def test_should_run_when_any_report_lacks_complete_run_even_if_artifact_exists(
@@ -391,7 +469,7 @@ def test_should_run_when_any_report_lacks_complete_run_even_if_artifact_exists(
     )
 
     assert should_run
-    assert note == "report PDFs without complete runs: report-two.pdf"
+    assert note == "report PDFs without delivery-ready runs: report-two.pdf"
 
 
 def test_should_run_incomplete_reports_when_another_report_is_active(
@@ -439,7 +517,7 @@ def test_should_run_incomplete_reports_when_another_report_is_active(
 
     assert should_run
     assert note == (
-        "report PDFs without complete runs: b.pdf; "
+        "report PDFs without delivery-ready runs: b.pdf; "
         "active report(s) skipped this cycle: a.pdf"
     )
 

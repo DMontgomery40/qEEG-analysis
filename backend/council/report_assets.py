@@ -4,23 +4,14 @@ import base64
 import json
 from pathlib import Path
 
+from ..portal_files import report_asset_dir_for_report
 from ..reports import get_enhanced_text, get_page_images_base64
 from ..storage import Report
 from .types import PageImage
 
 
 def _derive_report_dir(report: Report) -> Path:
-    report_text_path = Path(report.extracted_text_path)
-    report_dir = report_text_path.parent
-    if report_dir.exists():
-        return report_dir
-    try:
-        stored_dir = Path(report.stored_path).parent
-        if stored_dir.exists():
-            return stored_dir
-    except Exception:
-        pass
-    return report_text_path.parent
+    return report_asset_dir_for_report(report)
 
 
 def _load_best_report_text(report: Report, report_dir: Path) -> str:

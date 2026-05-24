@@ -19,6 +19,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend import config as backend_config  # noqa: E402
 from backend import storage  # noqa: E402
 from backend.config import (  # noqa: E402
     ARTIFACTS_DIR,
@@ -35,11 +36,21 @@ from backend.exports import render_markdown_to_pdf  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
 from backend.main import _auto_generate_patient_facing_for_run  # noqa: E402
 from backend.model_selection import resolve_model_preference  # noqa: E402
+from backend.orchestration import (  # noqa: E402
+    run_downstream_delivery_gaps,
+    summarize_run_progress,
+)
+from backend.portal_export_manifest import (  # noqa: E402
+    council_export_manifest_payload,
+    write_council_export_manifest,
+)
+from backend.portal_files import (  # noqa: E402
+    is_source_report_pdf,
+    normalize_portal_patient_id,
+    report_asset_dir_for_report,
+)
 from backend.portal_sync import sync_patient_to_thrylen  # noqa: E402
 from backend.reports import (  # noqa: E402
-    report_enhanced_path,
-    report_metadata_path,
-    report_pages_dir,
     report_dir,
     save_report_upload,
 )
@@ -69,7 +80,7 @@ class _NullBroker:
 
 
 def _batch_lock_path() -> Path:
-    return _REPO_ROOT / "data" / "pipeline_jobs" / ".run_portal_council_batch.lock"
+    return backend_config.DATA_DIR / "pipeline_jobs" / ".run_portal_council_batch.lock"
 
 
 def _acquire_batch_lock():
@@ -130,21 +141,7 @@ def _format_progress_event(payload: dict[str, Any]) -> str:
 
 
 def _normalize_portal_patient_id(label: str) -> str | None:
-    import re
-
-    m = re.fullmatch(
-        r"\s*(?P<mm>\d{1,2})-(?P<dd>\d{1,2})-(?P<yyyy>\d{4})-(?P<n>\d{1,3})\s*",
-        label or "",
-    )
-    if not m:
-        return None
-    mm = int(m.group("mm"))
-    dd = int(m.group("dd"))
-    yyyy = int(m.group("yyyy"))
-    n = int(m.group("n"))
-    if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2100 and 0 <= n <= 999):
-        return None
-    return f"{mm:02d}-{dd:02d}-{yyyy:04d}-{n}"
+    return normalize_portal_patient_id(label)
 
 
 def _portal_patients_dir() -> Path:
@@ -199,28 +196,7 @@ def _is_special_manifest_patient(patient_dir: Path) -> bool:
 
 
 def _is_source_pdf(patient_label: str, path: Path) -> bool:
-    if not path.is_file() or path.suffix.lower() != ".pdf":
-        return False
-
-    name = path.name
-    lower_name = name.lower()
-    lower_label = patient_label.lower()
-
-    if lower_name == f"{lower_label}.pdf":
-        return False
-    if lower_name == "main.pdf":
-        return False
-    if "__patient-facing__" in lower_name:
-        return False
-    if "__single-agent" in lower_name:
-        return False
-    if "__analysis__" in lower_name or lower_name.endswith("__analysis.pdf"):
-        return False
-    if lower_name.endswith("_analysis_pdf.pdf"):
-        return False
-    if lower_name.endswith("__patient-facing.pdf"):
-        return False
-    return True
+    return is_source_report_pdf(patient_label, path)
 
 
 def _discover_batch_tasks(
@@ -274,16 +250,11 @@ def _portal_batch_model_allowed(model_id: str) -> bool:
 
 def _fallback_council_model_ids(discovered: list[str]) -> list[str]:
     preferred_tokens = [
+        "gpt-5.5",
         "claude-sonnet",
         "gemini-3-pro",
-        "gemini-2.5-pro",
-        "gpt-5.4",
-        "gpt-5.3",
-        "gpt-5.2",
-        "gpt-5.1",
         "claude",
         "gemini",
-        "gpt",
     ]
     picked: list[str] = []
     for token in preferred_tokens:
@@ -402,9 +373,10 @@ def _resolve_model_selection_for_run(
 
 def _report_assets_ready(report: storage.Report) -> bool:
     extracted_path = Path(report.extracted_text_path)
-    enhanced_path = report_enhanced_path(report.patient_id, report.id)
-    metadata_path = report_metadata_path(report.patient_id, report.id)
-    pages_dir = report_pages_dir(report.patient_id, report.id)
+    report_asset_dir = report_asset_dir_for_report(report)
+    enhanced_path = report_asset_dir / "extracted_enhanced.txt"
+    metadata_path = report_asset_dir / "metadata.json"
+    pages_dir = report_asset_dir / "pages"
     page_images = list(pages_dir.glob("page-*.png")) if pages_dir.exists() else []
     return (
         extracted_path.exists()
@@ -528,13 +500,22 @@ def _ensure_report_registered(
 
     if existing_report is not None:
         if reextract_existing or not _report_assets_ready(existing_report):
-            save_report_upload(
+            asset_dir = report_asset_dir_for_report(existing_report)
+            original_path, extracted_path, mime_type, _preview = save_report_upload(
                 patient_id=existing_report.patient_id,
                 report_id=existing_report.id,
                 filename=existing_report.filename,
                 provided_mime_type="application/pdf",
                 file_bytes=pdf_path.read_bytes(),
+                target_dir=asset_dir,
             )
+            with storage.session_scope() as session:
+                report = storage.get_report(session, existing_report.id)
+                if report is not None:
+                    report.stored_path = str(original_path)
+                    report.extracted_text_path = str(extracted_path)
+                    report.mime_type = mime_type
+                    session.commit()
             return existing_report.id, "reextracted"
         return existing_report.id, "reused"
 
@@ -564,7 +545,20 @@ def _ensure_report_registered(
     return report_id, "uploaded"
 
 
-def _latest_complete_run_for_report(report_id: str) -> storage.Run | None:
+def _run_publish_gaps(session, run: storage.Run) -> list[str]:
+    artifacts = storage.list_artifacts(session, run.id)
+    gaps = run_downstream_delivery_gaps(
+        run,
+        progress=summarize_run_progress(run),
+        artifacts=artifacts,
+        require_final_draft=True,
+    )
+    if _choose_stage6_artifact(session, run) is None:
+        gaps.append("no Stage 6 final draft")
+    return list(dict.fromkeys(gaps))
+
+
+def _latest_publishable_run_for_report(report_id: str) -> storage.Run | None:
     with storage.session_scope() as session:
         runs = list(
             session.scalars(
@@ -576,7 +570,10 @@ def _latest_complete_run_for_report(report_id: str) -> storage.Run | None:
                 .order_by(storage.Run.created_at.desc())
             )
         )
-        return runs[0] if runs else None
+        for run in runs:
+            if not _run_publish_gaps(session, run):
+                return run
+        return None
 
 
 def _latest_resume_candidate_run_for_report(report_id: str) -> storage.Run | None:
@@ -645,6 +642,11 @@ def _export_run(run_id: str) -> tuple[Path, Path]:
         patient = storage.get_patient(session, run.patient_id)
         if patient is None:
             raise RuntimeError(f"Patient not found for run: {run_id}")
+        publish_gaps = _run_publish_gaps(session, run)
+        if publish_gaps:
+            raise RuntimeError(
+                f"Run is not ready for downstream export: {'; '.join(publish_gaps)}"
+            )
         artifact = _choose_stage6_artifact(session, run)
         if artifact is None:
             raise RuntimeError(f"No Stage 6 final draft available for run: {run_id}")
@@ -664,16 +666,32 @@ def _export_run(run_id: str) -> tuple[Path, Path]:
     md_path.write_text(md, encoding="utf-8")
     render_markdown_to_pdf(md, pdf_path)
 
-    _publish_file_to_portal_folder(
+    portal_md = _publish_file_to_portal_folder(
         patient_label=patient.label,
         src_path=md_path,
         filename=f"{patient.label}.md",
     )
-    _publish_file_to_portal_folder(
+    portal_pdf = _publish_file_to_portal_folder(
         patient_label=patient.label,
         src_path=pdf_path,
         filename=f"{patient.label}.pdf",
     )
+    patient_id = normalize_portal_patient_id(patient.label)
+    if patient_id is not None:
+        write_council_export_manifest(
+            portal_patient_dir=_portal_patients_dir() / patient_id,
+            patient_label=patient.label,
+            payload=council_export_manifest_payload(
+                patient_label=patient.label,
+                run_id=run_id,
+                report_id=run.report_id,
+                selected_artifact=artifact,
+                export_md_path=md_path,
+                export_pdf_path=pdf_path,
+                portal_md_path=portal_md,
+                portal_pdf_path=portal_pdf,
+            ),
+        )
     return md_path, pdf_path
 
 
@@ -721,8 +739,12 @@ async def _run_pipeline_for_run(
     await workflow.run_pipeline(run_id, on_event=on_event)
 
 
-async def _generate_patient_facing_outputs(run_id: str) -> None:
-    await _auto_generate_patient_facing_for_run(run_id, _NullBroker())
+async def _generate_patient_facing_outputs(run_id: str) -> bool:
+    return await _auto_generate_patient_facing_for_run(
+        run_id,
+        _NullBroker(),
+        sync_outputs=False,
+    )
 
 
 async def _process_task(
@@ -773,19 +795,19 @@ async def _process_task(
                 report_action = "would_reextract"
             else:
                 report_action = "would_reuse"
-        existing_complete_run = (
-            _latest_complete_run_for_report(existing_report.id)
+        existing_publishable_run = (
+            _latest_publishable_run_for_report(existing_report.id)
             if existing_report is not None
             else None
         )
         status = "dry_run"
         dry_run_run_id: str | None = None
-        if existing_complete_run is not None and skip_complete:
-            status = "would_skip_complete"
-            dry_run_run_id = existing_complete_run.id
+        if existing_publishable_run is not None and skip_complete:
+            status = "would_skip_publishable"
+            dry_run_run_id = existing_publishable_run.id
         note = report_action
-        if existing_complete_run is not None:
-            note += f" run={existing_complete_run.id}"
+        if existing_publishable_run is not None:
+            note += f" run={existing_publishable_run.id}"
         elif report_id is not None:
             resume_candidate = _resume_candidate_for_report(
                 report_id,
@@ -808,22 +830,38 @@ async def _process_task(
     assert patient_id is not None
 
     if existing_report is not None:
-        existing_complete_run = _latest_complete_run_for_report(existing_report.id)
-        if existing_complete_run is not None and skip_complete:
-            _export_run(existing_complete_run.id)
-            _stage_run_artifacts(
-                patient_label=task.patient_label,
-                run_id=existing_complete_run.id,
-            )
-            await _generate_patient_facing_outputs(existing_complete_run.id)
-            sync_patient_to_thrylen(task.patient_label)
+        existing_publishable_run = _latest_publishable_run_for_report(existing_report.id)
+        if existing_publishable_run is not None and skip_complete:
+            try:
+                if not await _generate_patient_facing_outputs(
+                    existing_publishable_run.id
+                ):
+                    raise RuntimeError(
+                        "Patient-facing generation did not complete"
+                    )
+                _export_run(existing_publishable_run.id)
+                _stage_run_artifacts(
+                    patient_label=task.patient_label,
+                    run_id=existing_publishable_run.id,
+                )
+                sync_patient_to_thrylen(task.patient_label)
+            except Exception as exc:
+                return TaskOutcome(
+                    patient_label=task.patient_label,
+                    pdf_name=task.pdf_path.name,
+                    status="failed",
+                    patient_id=patient_id,
+                    report_id=existing_report.id,
+                    run_id=existing_publishable_run.id,
+                    note=str(exc),
+                )
             return TaskOutcome(
                 patient_label=task.patient_label,
                 pdf_name=task.pdf_path.name,
                 status="skipped_complete",
                 patient_id=patient_id,
                 report_id=existing_report.id,
-                run_id=existing_complete_run.id,
+                run_id=existing_publishable_run.id,
                 note="reused",
             )
 
@@ -833,22 +871,34 @@ async def _process_task(
         reextract_existing=reextract_existing,
     )
 
-    existing_complete_run = _latest_complete_run_for_report(report_id)
-    if existing_report is None and existing_complete_run is not None and skip_complete:
-        _export_run(existing_complete_run.id)
-        _stage_run_artifacts(
-            patient_label=task.patient_label,
-            run_id=existing_complete_run.id,
-        )
-        await _generate_patient_facing_outputs(existing_complete_run.id)
-        sync_patient_to_thrylen(task.patient_label)
+    existing_publishable_run = _latest_publishable_run_for_report(report_id)
+    if existing_report is None and existing_publishable_run is not None and skip_complete:
+        try:
+            if not await _generate_patient_facing_outputs(existing_publishable_run.id):
+                raise RuntimeError("Patient-facing generation did not complete")
+            _export_run(existing_publishable_run.id)
+            _stage_run_artifacts(
+                patient_label=task.patient_label,
+                run_id=existing_publishable_run.id,
+            )
+            sync_patient_to_thrylen(task.patient_label)
+        except Exception as exc:
+            return TaskOutcome(
+                patient_label=task.patient_label,
+                pdf_name=task.pdf_path.name,
+                status="failed",
+                patient_id=patient_id,
+                report_id=report_id,
+                run_id=existing_publishable_run.id,
+                note=str(exc),
+            )
         return TaskOutcome(
             patient_label=task.patient_label,
             pdf_name=task.pdf_path.name,
             status="skipped_complete",
             patient_id=patient_id,
             report_id=report_id,
-            run_id=existing_complete_run.id,
+            run_id=existing_publishable_run.id,
             note=report_action,
         )
 
@@ -934,10 +984,22 @@ async def _process_task(
                 note=run.error_message or run.status,
             )
 
-    _export_run(run_id)
-    _stage_run_artifacts(patient_label=task.patient_label, run_id=run_id)
-    await _generate_patient_facing_outputs(run_id)
-    sync_patient_to_thrylen(task.patient_label)
+    try:
+        if not await _generate_patient_facing_outputs(run_id):
+            raise RuntimeError("Patient-facing generation did not complete")
+        _export_run(run_id)
+        _stage_run_artifacts(patient_label=task.patient_label, run_id=run_id)
+        sync_patient_to_thrylen(task.patient_label)
+    except Exception as exc:
+        return TaskOutcome(
+            patient_label=task.patient_label,
+            pdf_name=task.pdf_path.name,
+            status="failed",
+            patient_id=patient_id,
+            report_id=report_id,
+            run_id=run_id,
+            note=str(exc),
+        )
     return TaskOutcome(
         patient_label=task.patient_label,
         pdf_name=task.pdf_path.name,
