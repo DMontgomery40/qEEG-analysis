@@ -153,6 +153,98 @@ def test_latest_publishable_run_ignores_unreviewed_complete_runs(temp_data_dir):
     assert script._latest_publishable_run_for_report(report.id) is None
 
 
+def test_patient_facing_failure_blocks_batch_publish_and_sync(
+    temp_data_dir, monkeypatch
+):
+    import asyncio
+
+    from backend import storage
+    from scripts import run_portal_council_batch as script
+
+    patient_label = "01-19-1966-0"
+    portal_dir = temp_data_dir / "portal" / patient_label
+    portal_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = portal_dir / "report.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4")
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label=patient_label, notes="")
+        report = storage.create_report(
+            session,
+            report_id="report-patient-facing-failure",
+            patient_id=patient.id,
+            filename="report.pdf",
+            mime_type="application/pdf",
+            stored_path=temp_data_dir / "report.pdf",
+            extracted_text_path=temp_data_dir / "extracted.txt",
+        )
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status="complete")
+        for stage_num, stage_name, kind, suffix, content_type in (
+            (2, "peer_review", "peer_review", "json", "application/json"),
+            (3, "revision", "revision", "md", "text/markdown"),
+            (6, "final_draft", "final_draft", "md", "text/markdown"),
+        ):
+            artifact_path = (
+                temp_data_dir
+                / "artifacts"
+                / run.id
+                / f"stage-{stage_num}"
+                / f"mock-council-a.{suffix}"
+            )
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text("# artifact", encoding="utf-8")
+            storage.create_artifact(
+                session,
+                run_id=run.id,
+                stage_num=stage_num,
+                stage_name=stage_name,
+                model_id="mock-council-a",
+                kind=kind,
+                content_path=artifact_path,
+                content_type=content_type,
+            )
+
+    async def fail_patient_facing(_run_id: str) -> bool:
+        return False
+
+    exported: list[str] = []
+    synced: list[str] = []
+    monkeypatch.setattr(
+        script, "_generate_patient_facing_outputs", fail_patient_facing
+    )
+    monkeypatch.setattr(script, "_export_run", lambda run_id: exported.append(run_id))
+    monkeypatch.setattr(
+        script, "sync_patient_to_thrylen", lambda label: synced.append(label)
+    )
+
+    outcome = asyncio.run(
+        script._process_task(
+            task=script.BatchTask(
+                patient_label=patient_label,
+                patient_dir=portal_dir,
+                pdf_path=pdf_path,
+            ),
+            workflow=None,  # type: ignore[arg-type]
+            discovered_models=["mock-council-a"],
+            skip_complete=True,
+            reextract_existing=False,
+            dry_run=False,
+        )
+    )
+
+    assert outcome.status == "failed"
+    assert "Patient-facing generation did not complete" in outcome.note
+    assert exported == []
+    assert synced == []
+
+
 def test_resolve_patient_prefers_candidate_with_matching_complete_run(temp_data_dir):
     from backend import storage
     from scripts import run_portal_council_batch as script

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import uuid
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -72,6 +72,21 @@ async def test_auto_patient_facing_runs_for_completed_run(temp_data_dir, monkeyp
             model_id="mock-council-a",
             kind="revision",
             content_path=revision_path,
+            content_type="text/markdown",
+        )
+        final_path = (
+            Path(temp_data_dir) / "artifacts" / run.id / "stage-6" / "mock-council-a.md"
+        )
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path.write_text("# Final", encoding="utf-8")
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=final_path,
             content_type="text/markdown",
         )
 
@@ -272,6 +287,21 @@ async def test_auto_patient_facing_returns_false_on_subprocess_failure(
             model_id="mock-council-a",
             kind="revision",
             content_path=revision_path,
+            content_type="text/markdown",
+        )
+        final_path = (
+            Path(temp_data_dir) / "artifacts" / run.id / "stage-6" / "mock-council-a.md"
+        )
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_path.write_text("# Final", encoding="utf-8")
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=final_path,
             content_type="text/markdown",
         )
 

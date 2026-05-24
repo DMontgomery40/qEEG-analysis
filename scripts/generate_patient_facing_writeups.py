@@ -110,6 +110,7 @@ def _best_source_bundle_for_label(label: str) -> SourceBundle | None:
                     r,
                     progress=summarize_run_progress(r),
                     artifacts=artifacts,
+                    require_final_draft=True,
                 ):
                     complete_runs.append((p, r))
         if not complete_runs:

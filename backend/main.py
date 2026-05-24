@@ -482,6 +482,7 @@ async def _auto_generate_patient_facing_for_run(
             run,
             progress=summarize_run_progress(run),
             artifacts=storage.list_artifacts(session, run_id),
+            require_final_draft=True,
         )
         if completion_gaps:
             await broker.publish(
@@ -490,9 +491,9 @@ async def _auto_generate_patient_facing_for_run(
                     "run_id": run_id,
                     "stage_name": "patient_facing",
                     "status": "skipped",
-                    "reason": "Council run is not peer-reviewed enough for patient-facing generation.",
+                    "reason": "Council run is not delivery-ready for patient-facing generation.",
                     "gaps": completion_gaps,
-                    "operatorHint": "Rerun the council until Stage 2 peer review completes before generating patient-facing PDFs.",
+                    "operatorHint": "Rerun or repair the council until peer review, revision, and Stage 6 final draft artifacts are present before generating patient-facing PDFs.",
                 },
             )
             return False
@@ -1619,14 +1620,23 @@ async def run_patient_action(
             )
         with storage.session_scope() as session:
             run = storage.get_run(session, preferred_run.id)
-            if run is None or not run_is_peer_reviewed_for_downstream(
-                run,
-                progress=summarize_run_progress(run),
-                artifacts=storage.list_artifacts(session, run.id),
-            ):
+            delivery_gaps = (
+                ["run not found"]
+                if run is None
+                else run_downstream_delivery_gaps(
+                    run,
+                    progress=summarize_run_progress(run),
+                    artifacts=storage.list_artifacts(session, run.id),
+                    require_final_draft=True,
+                )
+            )
+            if delivery_gaps:
                 raise HTTPException(
                     status_code=409,
-                    detail="No peer-reviewed complete run is available for patient-facing generation",
+                    detail=(
+                        "No delivery-ready complete run is available for patient-facing generation: "
+                        + "; ".join(delivery_gaps)
+                    ),
                 )
         broker: _EventBroker = app.state.broker
         _spawn_task(

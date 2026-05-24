@@ -18,6 +18,7 @@ def _test_app(temp_data_dir, monkeypatch):
         lambda: Path(temp_data_dir) / "cliproxyapi.conf",
     )
     monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    monkeypatch.setattr(main, "EXPORTS_DIR", Path(temp_data_dir) / "exports")
     return main.app, main
 
 
