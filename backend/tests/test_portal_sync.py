@@ -193,6 +193,26 @@ def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs
     assert active_runs == []
 
 
+def test_source_pdf_classifier_allows_clinic_analysis_report_names(tmp_path: Path):
+    from backend import portal_sync
+    from scripts import portal_pipeline_worker
+    from scripts import run_portal_council_batch
+
+    patient_id = "08-10-1989-0"
+    source_path = tmp_path / f"{patient_id}__analysis_report__v1__2026-02-09.pdf"
+    generated_path = tmp_path / f"{patient_id}__analysis__v1__2026-02-09.pdf"
+    source_path.write_bytes(b"%PDF-1.4")
+    generated_path.write_bytes(b"%PDF-1.4")
+
+    assert portal_sync._is_source_pdf(patient_id, source_path)
+    assert run_portal_council_batch._is_source_pdf(patient_id, source_path)
+    assert not portal_pipeline_worker._looks_generated_pdf(patient_id, source_path.name)
+
+    assert not portal_sync._is_source_pdf(patient_id, generated_path)
+    assert not run_portal_council_batch._is_source_pdf(patient_id, generated_path)
+    assert portal_pipeline_worker._looks_generated_pdf(patient_id, generated_path.name)
+
+
 def test_source_pdfs_missing_complete_runs_keeps_fresh_created_rows_active(
     tmp_path: Path, monkeypatch
 ):

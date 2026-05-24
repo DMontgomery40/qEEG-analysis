@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -69,7 +70,9 @@ def _create_stage4_ready_run(*, report_id: str, consolidator_model_id: str) -> s
 
 
 @pytest.mark.asyncio
-async def test_stage4_repairs_truncated_consolidation(temp_data_dir, mock_llm_client, monkeypatch):
+async def test_stage4_repairs_truncated_consolidation(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
     from backend.council import QEEGCouncilWorkflow
     from backend.storage import list_artifacts, session_scope
 
@@ -95,7 +98,9 @@ async def test_stage4_repairs_truncated_consolidation(temp_data_dir, mock_llm_cl
 
     call_count = {"n": 0}
 
-    async def fake_call_model_chat(*, model_id: str, prompt_text: str, temperature: float, max_tokens: int) -> str:
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
         call_count["n"] += 1
         return truncated if call_count["n"] == 1 else tail
 
@@ -119,7 +124,49 @@ async def test_stage4_repairs_truncated_consolidation(temp_data_dir, mock_llm_cl
 
 
 @pytest.mark.asyncio
-async def test_stage4_repairs_after_multiple_continuation_calls(temp_data_dir, mock_llm_client, monkeypatch):
+async def test_stage4_emits_heartbeat_and_honors_configured_timeout(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    from backend.council import QEEGCouncilWorkflow
+
+    model_id = "claude-sonnet-4-6-20260101"
+    run_id = _create_stage4_ready_run(
+        report_id=str(uuid.uuid4()),
+        consolidator_model_id=model_id,
+    )
+
+    async def stuck_call_model_chat(
+        *,
+        model_id: str,
+        prompt_text: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        await asyncio.sleep(10)
+        return "unreachable"
+
+    monkeypatch.setenv("QEEG_PROGRESS_HEARTBEAT_S", "1")
+    monkeypatch.setenv("QEEG_STAGE4_MODEL_TIMEOUT_S", "2")
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", stuck_call_model_chat)
+
+    events: list[dict[str, object]] = []
+
+    async def emit(payload: dict[str, object]) -> None:
+        events.append(payload)
+
+    with pytest.raises(TimeoutError):
+        await workflow._stage4(run_id, emit)
+
+    model_events = [event for event in events if event.get("model_id") == model_id]
+    assert any(event.get("status") == "start" for event in model_events)
+    assert any(event.get("status") == "heartbeat" for event in model_events)
+
+
+@pytest.mark.asyncio
+async def test_stage4_repairs_after_multiple_continuation_calls(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
     from backend.council import QEEGCouncilWorkflow
     from backend.storage import list_artifacts, session_scope
 
@@ -147,7 +194,9 @@ async def test_stage4_repairs_after_multiple_continuation_calls(temp_data_dir, m
 
     call_count = {"n": 0}
 
-    async def fake_call_model_chat(*, model_id: str, prompt_text: str, temperature: float, max_tokens: int) -> str:
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
         idx = call_count["n"]
         call_count["n"] += 1
         return responses[idx] if idx < len(responses) else responses[-1]
@@ -164,13 +213,17 @@ async def test_stage4_repairs_after_multiple_continuation_calls(temp_data_dir, m
     with session_scope() as session:
         artifacts = [a for a in list_artifacts(session, run_id) if a.stage_num == 4]
     assert len(artifacts) == 1
-    out_text = Path(artifacts[0].content_path).read_text(encoding="utf-8", errors="replace")
+    out_text = Path(artifacts[0].content_path).read_text(
+        encoding="utf-8", errors="replace"
+    )
     assert "# Speculative Commentary and Interpretive Hypotheses" in out_text
     assert "<!-- END CONSOLIDATED REPORT -->" in out_text
 
 
 @pytest.mark.asyncio
-async def test_stage4_raises_if_still_incomplete_after_repairs(temp_data_dir, mock_llm_client, monkeypatch):
+async def test_stage4_raises_if_still_incomplete_after_repairs(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
     from backend.council import QEEGCouncilWorkflow
     from backend.storage import list_artifacts, session_scope
 
@@ -183,7 +236,9 @@ async def test_stage4_raises_if_still_incomplete_after_repairs(temp_data_dir, mo
     monkeypatch.setenv("QEEG_STAGE4_REPAIR_CALLS", "1")
     monkeypatch.setenv("QEEG_STAGE4_REQUIRE_COMPLETE", "1")
 
-    async def fake_call_model_chat(*, model_id: str, prompt_text: str, temperature: float, max_tokens: int) -> str:
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
         return "# Dataset and Sessions\ncut off"
 
     workflow = QEEGCouncilWorkflow(llm=mock_llm_client)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -17,6 +18,7 @@ def _test_app(temp_data_dir, monkeypatch):
         lambda: Path(temp_data_dir) / "cliproxyapi.conf",
     )
     monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    monkeypatch.setattr(main, "EXPORTS_DIR", Path(temp_data_dir) / "exports")
     return main.app, main
 
 
@@ -314,16 +316,9 @@ def test_upload_patient_file_schedules_portal_sync(temp_data_dir, monkeypatch):
     assert scheduled == [("09-05-1954-0", "upload_patient_file")]
 
 
-def test_export_schedules_portal_sync(temp_data_dir, monkeypatch):
+def test_export_rejects_unreviewed_selected_final_draft(temp_data_dir, monkeypatch):
     app, main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
-
-    scheduled: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        main,
-        "_schedule_portal_sync",
-        lambda patient_label, *, source: scheduled.append((patient_label, source)),
-    )
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="09-05-1954-0", notes="")
@@ -351,9 +346,140 @@ def test_export_schedules_portal_sync(temp_data_dir, monkeypatch):
             content_type="text/markdown",
         )
         storage.select_artifact(session, run.id, artifact.id)
+        storage.update_run_status(session, run.id, status="complete")
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(f"/api/runs/{run.id}/export")
 
+    assert response.status_code == 409
+    assert "peer review did not complete" in response.json()["detail"]
+
+
+def test_cached_export_download_rejects_unreviewed_run(temp_data_dir, monkeypatch):
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("# Final Draft", encoding="utf-8")
+
+    with storage.session_scope() as session:
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        artifact = storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=artifact_path,
+            content_type="text/markdown",
+        )
+        storage.select_artifact(session, run.id, artifact.id)
+        storage.update_run_status(session, run.id, status="complete")
+
+    cached_export = Path(temp_data_dir) / "exports" / run.id / "final.md"
+    cached_export.parent.mkdir(parents=True, exist_ok=True)
+    cached_export.write_text("# Final Draft", encoding="utf-8")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(f"/api/runs/{run.id}/export/final.md")
+
+    assert response.status_code == 409
+    assert "peer review did not complete" in response.json()["detail"]
+
+
+def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monkeypatch):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "_schedule_portal_sync",
+        lambda patient_label, *, source: scheduled.append((patient_label, source)),
+    )
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    artifact_dir = Path(temp_data_dir) / "artifacts"
+    stage2_path = artifact_dir / "stage-2" / "peer-review.json"
+    stage3_path = artifact_dir / "stage-3" / "revision.md"
+    stage6_path = artifact_dir / "stage-6" / "final.md"
+    for path, text in (
+        (stage2_path, "{}"),
+        (stage3_path, "# Revision"),
+        (stage6_path, "# Final Draft"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    with storage.session_scope() as session:
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status="complete")
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=2,
+            stage_name="peer_review",
+            model_id="mock-council-a",
+            kind="peer_review",
+            content_path=stage2_path,
+            content_type="application/json",
+        )
+        storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=3,
+            stage_name="revision",
+            model_id="mock-council-a",
+            kind="revision",
+            content_path=stage3_path,
+            content_type="text/markdown",
+        )
+        artifact = storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=stage6_path,
+            content_type="text/markdown",
+        )
+        storage.select_artifact(session, run.id, artifact.id)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(f"/api/runs/{run.id}/export")
+        download = client.get(f"/api/runs/{run.id}/export/final.md")
+        Path(response.json()["final_md"]).write_text("# stale export", encoding="utf-8")
+        stale_download = client.get(f"/api/runs/{run.id}/export/final.md")
+
     assert response.status_code == 200
+    payload = response.json()
+    meta_path = Path(payload["portal_export_meta"])
+    assert meta_path.exists()
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["run_id"] == run.id
+    assert meta["selected_artifact_id"] == artifact.id
+    assert download.status_code == 200
+    assert download.text == "# Final Draft"
+    assert stale_download.status_code == 409
+    assert "no longer matches" in stale_download.json()["detail"]
     assert scheduled == [("09-05-1954-0", "export_run")]

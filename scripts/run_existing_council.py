@@ -53,7 +53,12 @@ async def _main(run_id: str) -> int:
             )
             return 1
 
-    await _auto_generate_patient_facing_for_run(run_id, _NullBroker())
+    if not await _auto_generate_patient_facing_for_run(run_id, _NullBroker()):
+        print(
+            f"Run {run_id} completed, but patient-facing generation did not complete",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

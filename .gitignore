@@ -23,6 +23,7 @@ data/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+frontend/dist-admin/
 frontend/.vite/*.DS_Store
 
 # Playwright tests
@@ -30,3 +31,9 @@ frontend/.vite/*.DS_Store
 .playwright/node_modules/
 .playwright/results/
 .playwright/report/
+.playwright-mcp/
+frontend/playwright-report/
+frontend/test-results/
+
+# Local deployment/operator notes
+LOCAL_LIVE_DEPLOYMENT_NOTES.md

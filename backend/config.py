@@ -80,18 +80,20 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 
 
 MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
-    stage1_vision=os.getenv("DEFAULT_STAGE1_VISION_MODEL", "gemini-3.1-pro-preview"),
-    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "gpt-5.4"),
+    stage1_vision=os.getenv(
+        "DEFAULT_STAGE1_VISION_MODEL", "gemini-3.1-flash-lite-preview"
+    ),
+    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "gpt-5.5"),
     stage4_consolidator=os.getenv(
         "DEFAULT_STAGE4_CONSOLIDATOR",
-        os.getenv("DEFAULT_CONSOLIDATOR", "claude-sonnet-4-6"),
+        os.getenv("DEFAULT_CONSOLIDATOR", "gpt-5.5"),
     ),
-    stage5_final_review=os.getenv("DEFAULT_STAGE5_REVIEW_MODEL", "gpt-5.4"),
+    stage5_final_review=os.getenv("DEFAULT_STAGE5_REVIEW_MODEL", "gpt-5.5"),
     stage6_final_draft=os.getenv(
         "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "claude-sonnet-4-6"
     ),
     patient_facing_rewrite=os.getenv(
-        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "claude-sonnet-4-6"
+        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "gpt-5.5"
     ),
 )
 
@@ -99,9 +101,9 @@ MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     CouncilModelConfig(
         id=MODEL_ROLE_DEFAULTS.stage2_review,
-        name="GPT-5.4",
+        name="GPT-5.5 low",
         source="Subscription via CLIProxyAPI",
-        endpoint_preference="chat",
+        endpoint_preference="responses",
     ),
     CouncilModelConfig(
         id=MODEL_ROLE_DEFAULTS.stage6_final_draft,
@@ -111,7 +113,7 @@ COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     ),
     CouncilModelConfig(
         id=MODEL_ROLE_DEFAULTS.stage1_vision,
-        name="Gemini 3.1 Pro Preview",
+        name="Gemini 3.1 Flash Lite Preview",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="chat",
     ),
@@ -130,9 +132,11 @@ VISION_CAPABLE_MODELS: set[str] = {
     "gpt-5.2",
     "gpt-5.3",
     "gpt-5.4",
+    "gpt-5.5",
     "gpt-5.2-codex",
     "gpt-5.3-codex",
     "gpt-5.4-codex",
+    "gpt-5.5-codex",
     "openai/gpt-4o",
     "openai/gpt-4o-mini",
     "openai/gpt-4-vision-preview",
@@ -140,9 +144,11 @@ VISION_CAPABLE_MODELS: set[str] = {
     "openai/gpt-5.2",
     "openai/gpt-5.3",
     "openai/gpt-5.4",
+    "openai/gpt-5.5",
     "openai/gpt-5.2-codex",
     "openai/gpt-5.3-codex",
     "openai/gpt-5.4-codex",
+    "openai/gpt-5.5-codex",
     # Anthropic Claude models (all Claude 3+ support vision)
     "claude-3-opus",
     "claude-3-sonnet",
@@ -171,6 +177,8 @@ VISION_CAPABLE_MODELS: set[str] = {
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-3.1-pro-preview",
+    "gemini-3.1-flash",
+    "gemini-3.1-flash-lite-preview",
     "gemini-3-pro",
     "gemini-3-flash",
     "gemini-3-pro-preview",
@@ -182,6 +190,8 @@ VISION_CAPABLE_MODELS: set[str] = {
     "google/gemini-2.5-flash",
     "google/gemini-2.5-flash-lite",
     "google/gemini-3.1-pro-preview",
+    "google/gemini-3.1-flash",
+    "google/gemini-3.1-flash-lite-preview",
     "google/gemini-3-pro-preview",
     "google/gemini-3-flash-preview",
     # Legacy compatibility ids kept for older live inventories.

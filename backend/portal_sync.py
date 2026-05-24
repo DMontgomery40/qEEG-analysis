@@ -17,6 +17,7 @@ from . import storage
 from . import config as cfg
 from .logging_utils import get_logger
 from .orchestration import derive_run_liveness, summarize_run_progress
+from .portal_files import is_source_report_pdf, normalize_portal_patient_id
 
 LOGGER = get_logger(__name__)
 
@@ -34,21 +35,7 @@ def _truthy_env(name: str, default: bool) -> bool:
 
 
 def _normalize_portal_patient_id(label: str) -> str | None:
-    import re
-
-    m = re.fullmatch(
-        r"\s*(?P<mm>\d{1,2})-(?P<dd>\d{1,2})-(?P<yyyy>\d{4})-(?P<n>\d{1,3})\s*",
-        label or "",
-    )
-    if not m:
-        return None
-    mm = int(m.group("mm"))
-    dd = int(m.group("dd"))
-    yyyy = int(m.group("yyyy"))
-    n = int(m.group("n"))
-    if not (1 <= mm <= 12 and 1 <= dd <= 31 and 1900 <= yyyy <= 2100 and 0 <= n <= 999):
-        return None
-    return f"{mm:02d}-{dd:02d}-{yyyy:04d}-{n}"
+    return normalize_portal_patient_id(label)
 
 
 def _repo_root() -> Path:
@@ -361,26 +348,7 @@ def spawn_portal_sync(patient_label: str) -> bool:
 
 
 def _is_source_pdf(patient_id: str, path: Path) -> bool:
-    if not path.is_file() or path.suffix.lower() != ".pdf":
-        return False
-
-    lower_name = path.name.lower()
-    lower_label = patient_id.lower()
-    if lower_name == f"{lower_label}.pdf":
-        return False
-    if lower_name == "main.pdf":
-        return False
-    if "__patient-facing__" in lower_name or "patient-facing" in lower_name:
-        return False
-    if "__single-agent" in lower_name:
-        return False
-    if "__analysis" in lower_name:
-        return False
-    if lower_name.endswith("_analysis_pdf.pdf"):
-        return False
-    if lower_name.endswith("__patient-facing.pdf"):
-        return False
-    return True
+    return is_source_report_pdf(patient_id, path)
 
 
 def _report_run_statuses_by_filename(patient_label: str) -> dict[str, set[str]]:
