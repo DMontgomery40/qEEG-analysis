@@ -10,14 +10,13 @@
 .grid-row {
   display: flex;
   gap: 0;
-  flex: 1;
-  min-height: 0;
+  flex: 0 0 auto;
+  align-items: stretch;
   margin-bottom: 0;
 }
 
 .grid-row > .card {
-  overflow: auto;
-  min-height: 0;
+  min-height: 360px;
 }
 
 .card {
