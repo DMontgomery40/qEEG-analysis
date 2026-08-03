@@ -1265,3 +1265,62 @@ def test_a_patient_with_no_share_folder_is_given_one(world):
     assert migrator.run_apply(world, report) == 0
 
     assert (Path(world.portal_root) / "XX_01-01-1913").is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# The line between a question the file answers and one it does not
+# --------------------------------------------------------------------------- #
+
+
+def _patient_with_a_named_report(world, label, initials, title):
+    """A patient whose chart stores initials and whose report carries a name."""
+    _folder(Path(world.portal_root), label, initials=initials)
+    conn = sqlite3.connect(world.db)
+    conn.execute(
+        "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+        "VALUES (?, ?, '', '2026-01-01', '2026-01-01')",
+        (f"uuid-{label}", label),
+    )
+    conn.commit()
+    conn.close()
+    (Path(world.conversations_dir) / f"conv-{label}.json").write_text(
+        json.dumps(
+            {
+                "id": f"conv-{label}",
+                "patient_label": label,
+                "title": title,
+                "messages": [],
+                "artifacts": [],
+            }
+        )
+    )
+
+
+def test_a_surname_that_matches_the_stored_last_initial_is_not_a_question(world):
+    """`Knowles intial qeeg.pdf` says nothing about a first name, and stored
+    `LK` is exactly what `L. Knowles` looks like. Asking about it asks the
+    operator something the file has already answered."""
+    _patient_with_a_named_report(
+        world, "02-02-1902-0", ("L", "K"), "Knowles intial qeeg.pdf"
+    )
+
+    report = migrator.build_report(world)
+
+    assert not any(b.startswith("02-02-1902-0:") for b in report["blockers"])
+    assert report["mapping"]["02-02-1902-0"] == "LK_02-02-1902"
+
+
+def test_two_known_names_in_the_wrong_order_is_still_a_question(world):
+    """`Stubner Helga` names both, and they read as HS. A chart storing SN is
+    not consistent with that, and no amount of quieting the surname-only case
+    may swallow it."""
+    _patient_with_a_named_report(
+        world, "04-04-1904-0", ("S", "N"), "Stubner Helga, initial qeeg.pdf"
+    )
+
+    report = migrator.build_report(world)
+
+    blocker = next(b for b in report["blockers"] if b.startswith("04-04-1904-0:"))
+    assert "SN" in blocker and "Stubner Helga" in blocker
+    assert "HS" in blocker
+    assert "04-04-1904-0" not in report["mapping"]
