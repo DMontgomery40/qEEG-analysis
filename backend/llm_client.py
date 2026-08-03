@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -129,6 +129,28 @@ def _chat_unsupported(err: UpstreamError) -> bool:
     )
 
 
+def _chat_content_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        nested = content.get("content")
+        if nested is not content:
+            return _chat_content_text(nested)
+        return None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            text = _chat_content_text(block)
+            if text:
+                parts.append(text)
+        joined = "".join(parts)
+        return joined if joined.strip() else None
+    return None
+
+
 def _is_openai_gpt5_model(model_id: str) -> bool:
     mid = (model_id or "").strip().lower()
     if not mid:
@@ -174,6 +196,218 @@ def _openai_reasoning_effort(model_id: str) -> str | None:
     return "medium"
 
 
+def _split_env_list(name: str) -> list[str]:
+    raw = os.getenv(name) or ""
+    items: list[str] = []
+    for part in raw.replace("\n", ",").split(","):
+        item = part.strip()
+        if item:
+            items.append(item)
+    return items
+
+
+def _extra_openrouter_model_ids() -> list[str]:
+    configured = os.getenv("QEEG_OPENROUTER_EXTRA_MODELS")
+    if configured is None:
+        configured = "z-ai/glm-5.2"
+    items: list[str] = []
+    for part in configured.replace("\n", ",").split(","):
+        item = part.strip()
+        if item:
+            items.append(item)
+    return items
+
+
+def _is_openrouter_extra_model(model_id: str) -> bool:
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return False
+    return mid in {m.lower() for m in _extra_openrouter_model_ids()}
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _route_openrouter_extras_direct() -> bool:
+    """Require an explicit opt-in before bypassing CLIProxyAPI."""
+    return _env_bool("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT") is True
+
+
+def _model_env_suffix(model_id: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in (model_id or "").upper()).strip(
+        "_"
+    )
+
+
+def _openrouter_reasoning_config(model_id: str) -> dict[str, Any] | None:
+    suffix = _model_env_suffix(model_id)
+    effort = ""
+    for name in (
+        f"QEEG_OPENROUTER_REASONING_EFFORT_{suffix}",
+        "QEEG_OPENROUTER_REASONING_EFFORT",
+    ):
+        effort = (os.getenv(name) or "").strip().lower()
+        if effort:
+            break
+
+    exclude: bool | None = None
+    for name in (
+        f"QEEG_OPENROUTER_REASONING_EXCLUDE_{suffix}",
+        "QEEG_OPENROUTER_REASONING_EXCLUDE",
+    ):
+        exclude = _env_bool(name)
+        if exclude is not None:
+            break
+
+    config: dict[str, Any] = {}
+    is_glm52_writer = (model_id or "").strip().lower() == "z-ai/glm-5.2"
+    if not effort and is_glm52_writer:
+        effort = "high"
+    if exclude is None and is_glm52_writer:
+        exclude = True
+    if effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        config["effort"] = effort
+    if exclude is not None:
+        config["exclude"] = exclude
+    return config or None
+
+
+def _is_glm52_writer(model_id: str) -> bool:
+    return (model_id or "").strip().lower() == "z-ai/glm-5.2"
+
+
+def _looks_like_reasoning_leak(content: str, message: dict[str, Any]) -> bool:
+    text = (content or "").strip()
+    lower = text.lower()
+    if "<think>" in lower or "</think>" in lower:
+        return True
+    reasoning = message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning.strip():
+        reasoning_text = reasoning.strip()
+        if text == reasoning_text or reasoning_text in text:
+            return True
+    return False
+
+
+def _non_openai_reasoning_effort(model_id: str) -> str | None:
+    mid = (model_id or "").strip().lower()
+    if not mid:
+        return None
+    reasoning_models = {m.lower() for m in _split_env_list("QEEG_REASONING_MODEL_IDS")}
+    if mid not in reasoning_models:
+        return None
+    effort = (os.getenv("QEEG_REASONING_EFFORT") or "high").strip().lower()
+    return effort if effort in {"minimal", "low", "medium", "high", "xhigh"} else "high"
+
+
+def _usage_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_number(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nested_dict(root: dict[str, Any], *keys: str) -> dict[str, Any]:
+    for key in keys:
+        value = root.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _response_usage_metadata(
+    data: dict[str, Any],
+    *,
+    requested_model_id: str,
+    endpoint: str,
+    provider: str,
+) -> dict[str, Any] | None:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    input_details = _nested_dict(usage, "input_tokens_details", "prompt_tokens_details")
+    output_details = _nested_dict(usage, "output_tokens_details", "completion_tokens_details")
+    input_tokens = (
+        _usage_int(usage.get("input_tokens"))
+        or _usage_int(usage.get("prompt_tokens"))
+        or _usage_int(usage.get("input_token_count"))
+    )
+    output_tokens = (
+        _usage_int(usage.get("output_tokens"))
+        or _usage_int(usage.get("completion_tokens"))
+        or _usage_int(usage.get("candidates_token_count"))
+    )
+    cache_read_tokens = (
+        _usage_int(usage.get("cache_read_tokens"))
+        or _usage_int(usage.get("cached_tokens"))
+        or _usage_int(input_details.get("cached_tokens"))
+    )
+    total_tokens = (
+        _usage_int(usage.get("total_tokens"))
+        or _usage_int(usage.get("total_token_count"))
+        or ((input_tokens or 0) + (output_tokens or 0) if input_tokens or output_tokens else None)
+    )
+
+    cost_usd = None
+    for key in ("cost", "cost_usd", "total_cost", "total_cost_usd", "price", "price_usd"):
+        cost_usd = _usage_number(usage.get(key))
+        if cost_usd is not None:
+            break
+    if cost_usd is None and isinstance(data.get("cost"), (int, float, str)):
+        cost_usd = _usage_number(data.get("cost"))
+
+    if cost_usd is None and (input_tokens is not None or output_tokens is not None):
+        try:
+            from genai_prices import Usage, calc_price  # type: ignore
+
+            price = calc_price(
+                Usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                ),
+                model_ref=str(data.get("model") or requested_model_id),
+            )
+            cost_usd = float(price.total_price)
+        except Exception:
+            cost_usd = None
+
+    return {
+        "requested_model_id": requested_model_id,
+        "api_model_id": data.get("model") if isinstance(data.get("model"), str) else requested_model_id,
+        "endpoint": endpoint,
+        "provider": provider,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "output_reasoning_tokens": _usage_int(output_details.get("reasoning_tokens")),
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd,
+        "raw_usage": usage,
+    }
+
+
 class AsyncOpenAICompatClient:
     def __init__(
         self,
@@ -188,11 +422,36 @@ class AsyncOpenAICompatClient:
         self._timeout_s = timeout_s
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+        self._openrouter_client: httpx.AsyncClient | None = None
+        self.last_response_metadata: dict[str, Any] | None = None
 
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self._openrouter_client is not None:
+            await self._openrouter_client.aclose()
+            self._openrouter_client = None
+
+    def _remember_response_usage(
+        self,
+        data: dict[str, Any],
+        *,
+        requested_model_id: str,
+        endpoint: str,
+        provider: str,
+        usage_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any] | None:
+        metadata = _response_usage_metadata(
+            data,
+            requested_model_id=requested_model_id,
+            endpoint=endpoint,
+            provider=provider,
+        )
+        self.last_response_metadata = metadata
+        if metadata is not None and usage_callback is not None:
+            usage_callback(metadata)
+        return metadata
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -206,6 +465,35 @@ class AsyncOpenAICompatClient:
                 transport=self._transport,
             )
         return self._client
+
+    def _get_openrouter_client(self) -> httpx.AsyncClient:
+        if self._openrouter_client is None:
+            api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+            if not api_key:
+                raise UpstreamError(
+                    "OpenRouter model requested but OPENROUTER_API_KEY is not set",
+                    operator_hint="Set OPENROUTER_API_KEY when QEEG_OPENROUTER_EXTRA_MODELS contains the selected model.",
+                )
+            base_url = (
+                os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api"
+            ).rstrip("/")
+            headers: dict[str, str] = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            referer = (os.getenv("OPENROUTER_HTTP_REFERER") or "").strip()
+            title = (os.getenv("OPENROUTER_APP_TITLE") or "").strip()
+            if referer:
+                headers["HTTP-Referer"] = referer
+            if title:
+                headers["X-Title"] = title
+            self._openrouter_client = httpx.AsyncClient(
+                base_url=base_url,
+                headers=headers,
+                timeout=httpx.Timeout(self._timeout_s),
+                transport=self._transport,
+            )
+        return self._openrouter_client
 
     def _chat_completions_sync(self, payload: dict[str, Any]) -> httpx.Response:
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -255,6 +543,15 @@ class AsyncOpenAICompatClient:
         for item in data:
             if isinstance(item, dict) and isinstance(item.get("id"), str):
                 ids.append(item["id"])
+        # CLIProxy's advertised inventory is authoritative during normal
+        # operation. Only advertise direct-provider extras when that emergency
+        # bypass is explicitly enabled and has the credential it requires.
+        if _route_openrouter_extras_direct() and (
+            os.getenv("OPENROUTER_API_KEY") or ""
+        ).strip():
+            for model_id in _extra_openrouter_model_ids():
+                if model_id not in ids:
+                    ids.append(model_id)
         return ids
 
     async def chat_completions(
@@ -265,8 +562,13 @@ class AsyncOpenAICompatClient:
         temperature: float = 0.2,
         max_tokens: int = 1800,
         stream: bool = False,
+        usage_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
-        client = self._get_client()
+        self.last_response_metadata = None
+        use_openrouter = _route_openrouter_extras_direct() and _is_openrouter_extra_model(
+            model_id
+        )
+        client = self._get_openrouter_client() if use_openrouter else self._get_client()
         reasoning_effort = _openai_reasoning_effort(model_id)
         if _is_openai_gpt5_model(model_id):
             return await self.responses(
@@ -275,6 +577,7 @@ class AsyncOpenAICompatClient:
                 stream=stream,
                 reasoning_effort=reasoning_effort,
                 max_output_tokens=max_tokens,
+                usage_callback=usage_callback,
             )
 
         payload = {
@@ -288,11 +591,26 @@ class AsyncOpenAICompatClient:
             payload["max_completion_tokens"] = max_tokens
         else:
             payload["max_tokens"] = max_tokens
-        if reasoning_effort:
+        if reasoning_effort and _is_openai_gpt5_model(model_id):
             payload["reasoning_effort"] = reasoning_effort
+        openrouter_reasoning = (
+            _openrouter_reasoning_config(model_id)
+            if use_openrouter or _is_glm52_writer(model_id)
+            else None
+        )
+        if openrouter_reasoning:
+            payload["reasoning"] = openrouter_reasoning
+        else:
+            non_openai_reasoning_effort = _non_openai_reasoning_effort(model_id)
+            if non_openai_reasoning_effort:
+                payload["reasoning"] = {"effort": non_openai_reasoning_effort}
 
         try:
-            if _is_anthropic_claude_model(model_id) and self._transport is None:
+            if (
+                _is_anthropic_claude_model(model_id)
+                and self._transport is None
+                and not use_openrouter
+            ):
                 resp = await asyncio.to_thread(self._chat_completions_sync, payload)
             else:
                 resp = await client.post("/v1/chat/completions", json=payload)
@@ -318,6 +636,7 @@ class AsyncOpenAICompatClient:
                     stream=stream,
                     reasoning_effort=reasoning_effort,
                     max_output_tokens=max_tokens,
+                    usage_callback=usage_callback,
                 )
             raise err
 
@@ -331,8 +650,18 @@ class AsyncOpenAICompatClient:
                 ),
             ) from e
 
+        self._remember_response_usage(
+            data,
+            requested_model_id=model_id,
+            endpoint="/v1/chat/completions",
+            provider="openrouter" if use_openrouter else "cliproxy",
+            usage_callback=usage_callback,
+        )
+
         try:
-            content = data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError("message is not an object")
         except Exception as e:
             raise UpstreamError(
                 f"CLIProxyAPI /v1/chat/completions returned unexpected shape: {e}",
@@ -341,12 +670,81 @@ class AsyncOpenAICompatClient:
                 ),
             ) from e
 
-        if not isinstance(content, str):
+        content_text = _chat_content_text(message.get("content"))
+        if not isinstance(content_text, str) and not _is_glm52_writer(model_id):
             raise UpstreamError(
                 "CLIProxyAPI /v1/chat/completions returned non-text content",
                 operator_hint=_operator_hint("/v1/chat/completions", "non_text"),
             )
-        if not content.strip():
+        if not isinstance(content_text, str):
+            content_text = ""
+        needs_glm_retry = _is_glm52_writer(model_id) and (
+            not content_text.strip()
+            or _looks_like_reasoning_leak(content_text, message)
+        )
+        if needs_glm_retry:
+            retry_payload = dict(payload)
+            retry_payload["messages"] = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Return the complete publishable final draft only. "
+                        "Do not include analysis, planning, chain-of-thought, or reasoning text."
+                    ),
+                },
+            ]
+            retry_payload["reasoning"] = {"effort": "none", "exclude": True}
+            try:
+                retry_response = await client.post(
+                    "/v1/chat/completions", json=retry_payload
+                )
+            except Exception as e:
+                raise UpstreamError(
+                    f"OpenRouter GLM final-content retry failed: {e}",
+                    operator_hint=_operator_hint(
+                        "/v1/chat/completions", "request_failed"
+                    ),
+                ) from e
+            if retry_response.status_code >= 400:
+                raise _format_http_error(
+                    retry_response,
+                    endpoint="/v1/chat/completions",
+                    prefix="OpenRouter GLM final-content retry failed",
+                    fallback_message=f"HTTP {retry_response.status_code}",
+                )
+            try:
+                retry_data = retry_response.json()
+                retry_message = retry_data["choices"][0]["message"]
+                retry_content = _chat_content_text(retry_message.get("content"))
+            except Exception as e:
+                raise UpstreamError(
+                    f"OpenRouter GLM final-content retry returned unexpected shape: {e}",
+                    operator_hint=_operator_hint(
+                        "/v1/chat/completions", "unexpected_shape"
+                    ),
+                ) from e
+            self._remember_response_usage(
+                retry_data,
+                requested_model_id=model_id,
+                endpoint="/v1/chat/completions",
+                provider="openrouter",
+                usage_callback=usage_callback,
+            )
+            if (
+                not isinstance(retry_content, str)
+                or not retry_content.strip()
+                or _looks_like_reasoning_leak(retry_content, retry_message)
+            ):
+                raise UpstreamError(
+                    "OpenRouter GLM did not return publishable final content after one reasoning-disabled retry",
+                    operator_hint=(
+                        "The GLM writer returned empty or reasoning-like text twice; "
+                        "do not publish it and retry the patient-facing generation later."
+                    ),
+                )
+            return retry_content
+        if not content_text.strip():
             await self.aclose()
             raise UpstreamError(
                 "CLIProxyAPI /v1/chat/completions returned empty text content",
@@ -354,7 +752,7 @@ class AsyncOpenAICompatClient:
                     "/v1/chat/completions", "unexpected_shape"
                 ),
             )
-        return content
+        return content_text
 
     async def responses(
         self,
@@ -364,7 +762,9 @@ class AsyncOpenAICompatClient:
         stream: bool = False,
         reasoning_effort: str | None = None,
         max_output_tokens: int | None = None,
+        usage_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        self.last_response_metadata = None
         client = self._get_client()
         payload = {"model": model_id, "input": input_data, "stream": stream}
         if reasoning_effort:
@@ -399,6 +799,13 @@ class AsyncOpenAICompatClient:
         # OpenAI Responses API: output_text may be present; otherwise reconstruct from output blocks.
         output_text = data.get("output_text") if isinstance(data, dict) else None
         if isinstance(output_text, str) and output_text.strip():
+            self._remember_response_usage(
+                data,
+                requested_model_id=model_id,
+                endpoint="/v1/responses",
+                provider="cliproxy",
+                usage_callback=usage_callback,
+            )
             return output_text
 
         if not isinstance(data, dict) or not isinstance(data.get("output"), list):
@@ -426,6 +833,13 @@ class AsyncOpenAICompatClient:
                 "CLIProxyAPI /v1/responses returned empty text content",
                 operator_hint=_operator_hint("/v1/responses", "unexpected_shape"),
             )
+        self._remember_response_usage(
+            data,
+            requested_model_id=model_id,
+            endpoint="/v1/responses",
+            provider="cliproxy",
+            usage_callback=usage_callback,
+        )
         return text
 
     @staticmethod

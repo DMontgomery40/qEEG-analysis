@@ -24,19 +24,21 @@ def _reload_config(monkeypatch):
 def test_model_role_defaults_are_quality_first_by_role(monkeypatch):
     config = _reload_config(monkeypatch)
 
-    assert config.MODEL_ROLE_DEFAULTS.stage1_vision == "gemini-3.1-flash-lite-preview"
-    assert config.MODEL_ROLE_DEFAULTS.stage2_review == "gpt-5.5"
-    assert config.MODEL_ROLE_DEFAULTS.stage4_consolidator == "gpt-5.5"
-    assert config.MODEL_ROLE_DEFAULTS.stage5_final_review == "gpt-5.5"
-    assert config.MODEL_ROLE_DEFAULTS.stage6_final_draft == "claude-sonnet-4-6"
-    assert config.MODEL_ROLE_DEFAULTS.patient_facing_rewrite == "gpt-5.5"
-    assert config.DEFAULT_CONSOLIDATOR == "gpt-5.5"
+    assert config.MODEL_ROLE_DEFAULTS.stage1_vision == "openai/gpt-5.6-sol"
+    assert config.MODEL_ROLE_DEFAULTS.stage2_review == "openai/gpt-5.6-sol"
+    assert config.MODEL_ROLE_DEFAULTS.stage4_consolidator == "z-ai/glm-5.2"
+    assert config.MODEL_ROLE_DEFAULTS.stage5_final_review == "openai/gpt-5.6-sol"
+    assert config.MODEL_ROLE_DEFAULTS.stage6_final_draft == "z-ai/glm-5.2"
+    assert config.MODEL_ROLE_DEFAULTS.patient_facing_rewrite == "z-ai/glm-5.2"
+    assert config.DEFAULT_CONSOLIDATOR == "z-ai/glm-5.2"
     assert [model.id for model in config.COUNCIL_MODELS] == [
-        "gpt-5.5",
-        "claude-sonnet-4-6",
-        "gemini-3.1-flash-lite-preview",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-terra",
     ]
-    assert config.COUNCIL_MODELS[0].endpoint_preference == "responses"
+    assert all(
+        model.endpoint_preference == "responses"
+        for model in config.COUNCIL_MODELS
+    )
 
 
 def test_is_vision_capable_includes_current_gemini_preview_ids(monkeypatch):

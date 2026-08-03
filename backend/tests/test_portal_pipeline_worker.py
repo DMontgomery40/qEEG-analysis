@@ -4,6 +4,68 @@ import json
 from pathlib import Path
 import subprocess
 
+import pytest
+
+
+def test_sync_remote_patient_identity_writes_versioned_local_metadata(tmp_path: Path):
+    from scripts import portal_pipeline_worker as worker
+
+    patient_id = "03-05-2010-0"
+    patient_dir = tmp_path / patient_id
+    patient_dir.mkdir()
+
+    result = worker.sync_remote_patient_identity(
+        portal_dir=tmp_path,
+        patient_id=patient_id,
+        remote_meta={
+            "identity": {
+                "schemaVersion": 1,
+                "firstInitial": "a",
+                "lastInitial": "b",
+            }
+        },
+    )
+
+    stored = json.loads((patient_dir / "$meta.json").read_text(encoding="utf-8"))
+    assert result == {"schemaVersion": 1, "firstInitial": "A", "lastInitial": "B"}
+    assert stored["patientId"] == patient_id
+    assert stored["birthdate"] == "03-05-2010"
+    assert stored["identity"] == result
+    assert "name" not in json.dumps(stored).lower()
+
+
+def test_sync_remote_patient_identity_rejects_conflicting_local_initials(tmp_path: Path):
+    from scripts import portal_pipeline_worker as worker
+
+    patient_id = "03-05-2010-0"
+    patient_dir = tmp_path / patient_id
+    patient_dir.mkdir()
+    (patient_dir / "$meta.json").write_text(
+        json.dumps(
+            {
+                "identity": {
+                    "schemaVersion": 1,
+                    "firstInitial": "A",
+                    "lastInitial": "B",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="conflict"):
+        worker.sync_remote_patient_identity(
+            portal_dir=tmp_path,
+            patient_id=patient_id,
+            remote_meta={
+                "identity": {
+                    "schemaVersion": 1,
+                    "firstInitial": "C",
+                    "lastInitial": "D",
+                }
+            },
+        )
+
 
 def test_reports_from_index_prefers_report_pdf_metadata():
     from scripts import portal_pipeline_worker as worker

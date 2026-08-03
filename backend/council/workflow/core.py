@@ -8,13 +8,13 @@ from typing import Any
 from ...config import ARTIFACTS_DIR
 from ...llm_client import AsyncOpenAICompatClient
 from ...logging_utils import get_logger, log_context
-from ...storage import get_report, get_run, update_run_status
+from ...storage import get_report, get_run, list_artifacts, update_run_status
 from ...storage import session_scope
 from ..json_utils import _loads_json_list
 from ..types import OnEvent
 from .data_pack import _DataPackMixin
 from .exceptions import _NeedsAuth
-from .llm_calls import _LLMCallsMixin
+from .llm_calls import _LLMCallsMixin, _USAGE_RUN_ID
 from .stages import _StagesMixin
 
 
@@ -134,19 +134,33 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
 
             patient_id = run.patient_id
             report_id = run.report_id
+            completed_stage_num = max(
+                (artifact.stage_num for artifact in list_artifacts(session, run_id)),
+                default=0,
+            )
             update_run_status(session, run_id, status="running")
 
         with log_context(run_id=run_id, patient_id=patient_id, report_id=report_id):
             LOGGER.info("pipeline_started", council_model_count=len(council_model_ids))
-            await emit({"run_id": run_id, "status": "running"})
+            running_event: dict[str, Any] = {"run_id": run_id, "status": "running"}
+            if 0 < completed_stage_num < 6:
+                running_event["resuming_at_stage"] = completed_stage_num + 1
+            await emit(running_event)
+            usage_token = _USAGE_RUN_ID.set(run_id)
 
             try:
-                await self._stage1(run_id, council_model_ids, report, emit)
-                await self._stage2(run_id, council_model_ids, emit)
-                await self._stage3(run_id, council_model_ids, emit)
-                await self._stage4(run_id, emit)
-                await self._stage5(run_id, council_model_ids, emit)
-                await self._stage6(run_id, council_model_ids, emit)
+                if completed_stage_num < 1:
+                    await self._stage1(run_id, council_model_ids, report, emit)
+                if completed_stage_num < 2:
+                    await self._stage2(run_id, council_model_ids, emit)
+                if completed_stage_num < 3:
+                    await self._stage3(run_id, council_model_ids, emit)
+                if completed_stage_num < 4:
+                    await self._stage4(run_id, emit)
+                if completed_stage_num < 5:
+                    await self._stage5(run_id, council_model_ids, emit)
+                if completed_stage_num < 6:
+                    await self._stage6(run_id, council_model_ids, emit)
             except _NeedsAuth as e:
                 with session_scope() as session:
                     update_run_status(
@@ -185,6 +199,8 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                     }
                 )
                 return
+            finally:
+                _USAGE_RUN_ID.reset(usage_token)
 
             with session_scope() as session:
                 update_run_status(session, run_id, status="complete")

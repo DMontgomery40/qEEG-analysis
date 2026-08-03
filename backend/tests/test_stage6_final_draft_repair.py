@@ -9,6 +9,27 @@ from pathlib import Path
 import pytest
 
 
+def _complete_stage6(body: str = "ok") -> str:
+    return "\n".join(
+        [
+            "# Dataset and Sessions",
+            body,
+            "# Key Empirical Findings",
+            body,
+            "# Performance Assessments",
+            body,
+            "# Auditory ERP: P300 and N100",
+            body,
+            "# Background EEG Metrics",
+            body,
+            "# Speculative Commentary and Interpretive Hypotheses",
+            body,
+            "<!-- END STAGE6 FINAL DRAFT -->",
+            "",
+        ]
+    )
+
+
 def _create_stage6_ready_run(*, report_id: str, council_model_id: str) -> str:
     from backend.config import ARTIFACTS_DIR, REPORTS_DIR
     from backend.storage import (
@@ -138,3 +159,221 @@ async def test_stage6_repairs_truncated_final_draft(temp_data_dir, mock_llm_clie
 
     assert "# Speculative Commentary and Interpretive Hypotheses" in out_text
     assert "<!-- END STAGE6 FINAL DRAFT -->" in out_text
+
+
+@pytest.mark.asyncio
+async def test_stage6_compacts_oversized_longitudinal_context(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.paths import _data_pack_path, _vision_transcript_path
+    from backend.storage import get_report, get_run, session_scope
+
+    model_id = "deepseek-v4-pro"
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id=model_id,
+    )
+
+    with session_scope() as session:
+        run = get_run(session, run_id)
+        assert run is not None
+        report = get_report(session, run.report_id)
+        assert report is not None
+        extracted_path = Path(report.extracted_text_path)
+
+    extracted_path.write_text(
+        "\n\n".join(
+            [
+                "=== PAGE 1 / 4 ===\nAssessment Scores\nKEEP STAGE6 SUMMARY",
+                "=== PAGE 2 / 4 ===\nstage6 filler " + ("x" * 5000),
+                "=== PAGE 3 / 4 ===\nMoCA\nAudio P300 Delay\nKEEP STAGE6 FINAL",
+                "=== PAGE 4 / 4 ===\nAppendix",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    dp_path = _data_pack_path(run_id)
+    dp_path.parent.mkdir(parents=True, exist_ok=True)
+    dp_path.write_text(
+        '{"critical_fact":"stage6 keeps data pack"}',
+        encoding="utf-8",
+    )
+    vt_path = _vision_transcript_path(run_id)
+    vt_path.parent.mkdir(parents=True, exist_ok=True)
+    vt_path.write_text(
+        "## Page 1\nAssessment Scores\nKEEP STAGE6 VISION\n\n"
+        + "## Page 2\nvision filler "
+        + ("z" * 4000),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("QEEG_STAGE6_REPORT_TEXT_CHAR_LIMIT", "1800")
+    monkeypatch.setenv("QEEG_STAGE6_VISION_TRANSCRIPT_CHAR_LIMIT", "1000")
+    seen_prompts: list[str] = []
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        seen_prompts.append(prompt_text)
+        return _complete_stage6()
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    async def emit(_payload):
+        return None
+
+    await workflow._stage6(run_id, [model_id], emit)
+
+    assert len(seen_prompts) == 1
+    prompt = seen_prompts[0]
+    assert "STAGE 4 SOURCE REPORT COMPACTED" in prompt
+    assert "STAGE 4 VISION TRANSCRIPT COMPACTED" in prompt
+    assert "stage6 keeps data pack" in prompt
+    assert "KEEP STAGE6 SUMMARY" in prompt
+    assert "KEEP STAGE6 FINAL" in prompt
+    assert "KEEP STAGE6 VISION" in prompt
+    assert "stage6 filler" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_stage6_routes_only_glm52_writer(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    from backend.council import QEEGCouncilWorkflow
+    from backend.storage import list_artifacts, session_scope
+
+    council_model = "deepseek-v4-pro"
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id=council_model,
+    )
+    called_models: list[str] = []
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        called_models.append(model_id)
+        return _complete_stage6()
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    async def emit(_payload):
+        return None
+
+    await workflow._stage6(run_id, [council_model], emit)
+
+    assert called_models == ["z-ai/glm-5.2"]
+    with session_scope() as session:
+        stage6 = [a for a in list_artifacts(session, run_id) if a.stage_num == 6]
+    assert [artifact.model_id for artifact in stage6] == ["z-ai/glm-5.2"]
+
+
+@pytest.mark.asyncio
+async def test_stage6_refuses_non_writer_fallback_when_writer_is_undiscovered(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    import backend.council.workflow.stages as stages_module
+    from backend.council import QEEGCouncilWorkflow
+
+    analytical_model = "gpt-5.6-terra"
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id=analytical_model,
+    )
+    called_models: list[str] = []
+    monkeypatch.setattr(
+        stages_module,
+        "DISCOVERED_MODEL_IDS",
+        {analytical_model},
+    )
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        called_models.append(model_id)
+        return _complete_stage6()
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    async def emit(_payload):
+        return None
+
+    with pytest.raises(RuntimeError, match="no available final-draft model"):
+        await workflow._stage6(run_id, [analytical_model], emit)
+
+    assert called_models == []
+
+
+@pytest.mark.asyncio
+async def test_stage6_falls_back_when_discovered_writer_fails_at_call_time(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    import backend.council.workflow.stages as stages_module
+    from backend.council import QEEGCouncilWorkflow
+    from backend.storage import list_artifacts, session_scope
+
+    preferred_model = "z-ai/glm-5.2"
+    fallback_model = "kimi-k3"
+    analytical_model = "gpt-5.6-terra"
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id=analytical_model,
+    )
+    called_models: list[str] = []
+    monkeypatch.setattr(
+        stages_module,
+        "DISCOVERED_MODEL_IDS",
+        {preferred_model, fallback_model},
+    )
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        called_models.append(model_id)
+        if model_id == preferred_model:
+            raise RuntimeError("provider authentication unavailable")
+        return _complete_stage6()
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    async def emit(_payload):
+        return None
+
+    await workflow._stage6(run_id, [analytical_model], emit)
+
+    assert called_models == [preferred_model, fallback_model]
+    with session_scope() as session:
+        stage6 = [a for a in list_artifacts(session, run_id) if a.stage_num == 6]
+    assert [artifact.model_id for artifact in stage6] == [fallback_model]
+
+
+@pytest.mark.asyncio
+async def test_stage6_rejects_final_content_missing_required_sections(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    from backend.council import QEEGCouncilWorkflow
+
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id="deepseek-v4-pro",
+    )
+    monkeypatch.setenv("QEEG_LONGFORM_REPAIR_CALLS", "0")
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        return "# Dataset and Sessions\nIncomplete\n<!-- END STAGE6 FINAL DRAFT -->\n"
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    async def emit(_payload):
+        return None
+
+    with pytest.raises(RuntimeError, match="All models failed during Stage 6"):
+        await workflow._stage6(run_id, ["deepseek-v4-pro"], emit)

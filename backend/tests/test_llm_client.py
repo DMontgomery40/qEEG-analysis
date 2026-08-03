@@ -24,6 +24,55 @@ async def test_list_models_parses_openai_shape():
 
 
 @pytest.mark.asyncio
+async def test_list_models_appends_explicit_openrouter_extras(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "z-ai/glm-5.1, a")
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "a"}, {"id": "b"}]})
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        ids = await client.list_models()
+    finally:
+        await client.aclose()
+    assert ids == ["a", "b", "z-ai/glm-5.1"]
+
+
+@pytest.mark.asyncio
+async def test_list_models_omits_openrouter_extras_when_direct_provider_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "z-ai/glm-5.2")
+    monkeypatch.delenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "a"}, {"id": "b"}]})
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://test",
+        api_key="",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        ids = await client.list_models()
+    finally:
+        await client.aclose()
+
+    assert ids == ["a", "b"]
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_falls_back_to_responses():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/chat/completions":
@@ -54,6 +103,384 @@ async def test_chat_completions_falls_back_to_responses():
     finally:
         await client.aclose()
     assert out == "ok"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_routes_explicit_openrouter_extra(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "z-ai/glm-5.1")
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.test/api")
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.host == "openrouter.test"
+        assert request.url.path == "/api/v1/chat/completions"
+        assert request.headers["Authorization"] == "Bearer or-key"
+        body = json.loads(request.content)
+        assert body["model"] == "z-ai/glm-5.1"
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="z-ai/glm-5.1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=20,
+        )
+    finally:
+        await client.aclose()
+
+    assert out == "ok"
+    assert seen
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_routes_openrouter_extra_through_cliproxy_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "z-ai/glm-5.2")
+    monkeypatch.delenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.test/api")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "cliproxy.test"
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "writer output"}}]},
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="z-ai/glm-5.2",
+            messages=[{"role": "user", "content": "Write the report."}],
+            max_tokens=100,
+        )
+    finally:
+        await client.aclose()
+
+    assert out == "writer output"
+
+
+@pytest.mark.asyncio
+async def test_glm52_writer_uses_high_reasoning_and_returns_only_final_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "cliproxy.test"
+        assert request.url.path == "/v1/chat/completions"
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "# Your Brain Assessment Summary\nFinal report.",
+                            "reasoning": "private chain of thought",
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        output = await client.chat_completions(
+            model_id="z-ai/glm-5.2",
+            messages=[{"role": "user", "content": "Write the report."}],
+            max_tokens=100,
+        )
+    finally:
+        await client.aclose()
+
+    assert output == "# Your Brain Assessment Summary\nFinal report."
+    assert "private chain of thought" not in output
+    assert requests[0]["reasoning"] == {"effort": "high", "exclude": True}
+
+
+@pytest.mark.asyncio
+async def test_glm52_empty_content_retries_once_without_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning": "The unpublished draft reasoning.",
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "# Your Brain Assessment Summary\nRecovered final."
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        output = await client.chat_completions(
+            model_id="z-ai/glm-5.2",
+            messages=[{"role": "user", "content": "Write the report."}],
+            max_tokens=100,
+        )
+    finally:
+        await client.aclose()
+
+    assert output.endswith("Recovered final.")
+    assert len(requests) == 2
+    assert requests[0]["reasoning"] == {"effort": "high", "exclude": True}
+    assert requests[1]["reasoning"] == {"effort": "none", "exclude": True}
+    assert "final draft only" in requests[1]["messages"][-1]["content"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "empty_message",
+    [
+        {"content": None, "reasoning": "Unpublished reasoning."},
+        {"reasoning": "Unpublished reasoning."},
+    ],
+)
+async def test_glm52_null_or_missing_content_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_message: dict,
+):
+    monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        message = (
+            empty_message
+            if calls == 1
+            else {"content": "# Your Brain Assessment Summary\nRecovered final."}
+        )
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        output = await client.chat_completions(
+            model_id="z-ai/glm-5.2",
+            messages=[{"role": "user", "content": "Write the report."}],
+            max_tokens=100,
+        )
+    finally:
+        await client.aclose()
+
+    assert output.endswith("Recovered final.")
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_glm52_rejects_reasoning_leak_after_single_retry(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "private deliberation\n# Your Brain Assessment Summary",
+                            "reasoning": "private deliberation",
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(UpstreamError, match="publishable final content"):
+            await client.chat_completions(
+                model_id="z-ai/glm-5.2",
+                messages=[{"role": "user", "content": "Write the report."}],
+                max_tokens=100,
+            )
+    finally:
+        await client.aclose()
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_reconstructs_text_block_content():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "hello"},
+                                {"type": "text", "text": " world"},
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="block-content-model",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=20,
+        )
+    finally:
+        await client.aclose()
+
+    assert out == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_adds_openrouter_reasoning_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "z-ai/glm-5.1")
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("QEEG_OPENROUTER_REASONING_EFFORT_Z_AI_GLM_5_1", "none")
+    monkeypatch.setenv("QEEG_OPENROUTER_REASONING_EXCLUDE_Z_AI_GLM_5_1", "1")
+    monkeypatch.setenv("QEEG_OPENAI_REASONING_EFFORT", "high")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "openrouter.ai"
+        body = json.loads(request.content)
+        assert body["reasoning"] == {"effort": "none", "exclude": True}
+        assert "reasoning_effort" not in body
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="z-ai/glm-5.1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=20,
+        )
+    finally:
+        await client.aclose()
+
+    assert out == "ok"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_adds_env_gated_non_openai_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("QEEG_REASONING_MODEL_IDS", "deepseek-v4-pro")
+    monkeypatch.setenv("QEEG_REASONING_EFFORT", "high")
+    seen_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        body = json.loads(request.content)
+        seen_payloads.append(body)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", timeout_s=5.0, transport=transport
+    )
+    try:
+        out = await client.chat_completions(
+            model_id="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=20,
+        )
+    finally:
+        await client.aclose()
+
+    assert out == "ok"
+    assert seen_payloads[0]["reasoning"] == {"effort": "high"}
 
 
 @pytest.mark.asyncio

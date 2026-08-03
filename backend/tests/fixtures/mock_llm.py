@@ -191,8 +191,12 @@ def create_mock_transport(
                 },
             )
 
-        # POST /v1/chat/completions - main LLM endpoint
-        if request.url.path == "/v1/chat/completions" and request.method == "POST":
+        # POST chat completions through either the local compatibility proxy or
+        # OpenRouter's native /api/v1 route.
+        if request.url.path in {
+            "/v1/chat/completions",
+            "/api/v1/chat/completions",
+        } and request.method == "POST":
             try:
                 body = json.loads(request.content)
             except (json.JSONDecodeError, TypeError):

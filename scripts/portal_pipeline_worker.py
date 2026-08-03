@@ -96,6 +96,69 @@ def patient_id_from_file_key(key: str) -> str | None:
     return patient_id if is_valid_patient_id(patient_id) else None
 
 
+def _normalized_patient_identity(value: Any) -> dict[str, Any] | None:
+    identity = value if isinstance(value, dict) else {}
+    first = str(identity.get("firstInitial") or "").strip().upper()
+    last = str(identity.get("lastInitial") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]", first) or not re.fullmatch(r"[A-Z]", last):
+        return None
+    return {
+        "schemaVersion": int(identity.get("schemaVersion") or 1),
+        "firstInitial": first,
+        "lastInitial": last,
+    }
+
+
+def sync_remote_patient_identity(
+    *,
+    portal_dir: Path,
+    patient_id: str,
+    remote_meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Persist hub initials beside the immutable local patient folder."""
+    if not is_valid_patient_id(patient_id):
+        raise ValueError("Invalid patient storage identifier")
+    remote_identity = _normalized_patient_identity(
+        remote_meta.get("identity") if isinstance(remote_meta, dict) else None
+    )
+    if remote_identity is None:
+        return None
+
+    patient_dir = portal_dir / patient_id
+    meta_path = patient_dir / META_NAME
+    try:
+        existing = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    local_identity = _normalized_patient_identity(
+        existing.get("identity") if isinstance(existing, dict) else None
+    )
+    if local_identity and (
+        local_identity["firstInitial"],
+        local_identity["lastInitial"],
+    ) != (
+        remote_identity["firstInitial"],
+        remote_identity["lastInitial"],
+    ):
+        raise ValueError("Remote patient initials conflict with local identity metadata")
+
+    patient_dir.mkdir(parents=True, exist_ok=True)
+    birthdate, index_raw = patient_id.rsplit("-", 1)
+    payload = {
+        "patientId": patient_id,
+        "birthdate": birthdate,
+        "index": int(index_raw),
+        "identity": remote_identity,
+    }
+    temp_path = meta_path.with_name(f".{META_NAME}.partial")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(meta_path)
+    return remote_identity
+
+
 def parse_blob_keys(payload: str) -> list[str]:
     parsed = json.loads(payload or "{}")
     blobs = parsed.get("blobs")
@@ -671,6 +734,16 @@ def process_patient(
     reports: list[PortalReport] = []
     temp_batch_dir: Path | None = None
     try:
+        if not dry_run:
+            try:
+                remote_meta = client.get_json(f"patients/{patient_id}/{META_NAME}")
+            except Exception:
+                remote_meta = None
+            sync_remote_patient_identity(
+                portal_dir=portal_dir,
+                patient_id=patient_id,
+                remote_meta=remote_meta,
+            )
         index = client.get_json(f"patients/{patient_id}/{INDEX_NAME}") or {}
         index_reports = reports_from_index(patient_id, index)
         file_reports = reports_from_file_keys(

@@ -36,10 +36,15 @@ def _alias_candidates(preferred: str) -> list[str]:
 
     add(pref)
 
+    lower = pref.lower()
+    if lower.startswith("openai/"):
+        add(pref.split("/", 1)[1])
+    elif lower.startswith("gpt-"):
+        add(f"openai/{pref}")
+
     if "." in pref:
         add(pref.replace(".", "-"))
 
-    lower = pref.lower()
     if lower == "gemini-3.1-pro-preview":
         add("gemini-3-pro-preview")
     if lower == "gemini-3.1-flash":

@@ -527,6 +527,8 @@ async def _auto_generate_patient_facing_for_run(
         preferred_model,
         "--version",
         version,
+        "--max-tokens",
+        "12000",
         "--overwrite",
     ]
     if not sync_outputs:

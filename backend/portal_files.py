@@ -57,6 +57,14 @@ def looks_generated_portal_pdf(patient_label: str, value: str | Path) -> bool:
 
 
 def is_source_report_pdf(patient_label: str, path: Path) -> bool:
+    name = _portal_name(path.name)
+    normalized_label = normalize_portal_patient_id(patient_label) or (
+        patient_label or ""
+    ).strip()
+    lower_label = normalized_label.lower()
+    if name == "guide.pdf" or name.startswith(f"{lower_label}__guide__"):
+        return False
+
     return (
         path.is_file()
         and path.suffix.lower() == ".pdf"

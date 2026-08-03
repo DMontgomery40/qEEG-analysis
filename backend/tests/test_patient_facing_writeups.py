@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import pytest
+
 
 def test_patient_facing_writeups_require_db_source_by_default(
     temp_data_dir, tmp_path, monkeypatch, capsys
@@ -62,3 +64,42 @@ def test_patient_facing_writeups_can_opt_into_portal_markdown_fallback(
     out = capsys.readouterr().out
 
     assert "GENERATE 01-01-2001-0: 1 source reports" in out
+
+
+def test_patient_facing_regeneration_uses_glm52_role_default():
+    from scripts import generate_patient_facing_writeups as script
+
+    assert script.DEFAULT_PATIENT_FACING_MODEL == "z-ai/glm-5.2"
+
+
+def test_patient_facing_writer_validates_all_required_sections():
+    from scripts import generate_patient_facing_writeups as script
+
+    complete = "\n".join(
+        [
+            "# Your Brain Assessment Summary",
+            "Summary.",
+            "## 2. Processing Speed and Attention",
+            "Details.",
+            "## 3. Cognitive Performance",
+            "Details.",
+            "## 4. Brain Rhythm Patterns",
+            "Details.",
+            "## 5. What This May Mean",
+            "Details.",
+            "# Technical Appendix",
+            "Details.",
+            "## Detailed P300 Site Data",
+            "Details.",
+            "## Coherence and Network Connectivity",
+            "Details.",
+            "## Spectral Power Summary",
+            "Details.",
+        ]
+    )
+    script._validate_patient_facing_markdown(complete)
+
+    with pytest.raises(ValueError, match="## Spectral Power Summary"):
+        script._validate_patient_facing_markdown(
+            complete.replace("## Spectral Power Summary", "")
+        )

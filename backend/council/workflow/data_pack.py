@@ -415,6 +415,13 @@ class _DataPackMixin:
         # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
         if len(page_images) > 10 and chunk_size > 10:
             chunk_size = 10
+        chunk_timeout_s = self._int_env(
+            "QEEG_STAGE1_DATA_PACK_TIMEOUT_S",
+            self._int_env(
+                "QEEG_STAGE1_MULTIMODAL_TIMEOUT_S",
+                self._int_env("QEEG_LLM_TIMEOUT_S", 600),
+            ),
+        )
 
         debug_dir: Path | None = None
         attempt_log: list[dict[str, Any]] = []
@@ -520,6 +527,7 @@ class _DataPackMixin:
                             "chunk_count": len(chunks),
                             "pages": pages,
                         },
+                        timeout_s=chunk_timeout_s,
                     )
                     if emit is not None:
                         await emit(
@@ -846,6 +854,13 @@ class _DataPackMixin:
         )
         if max_tokens <= 0:
             max_tokens = 4000
+        chunk_timeout_s = self._int_env(
+            "QEEG_STAGE1_VISION_TRANSCRIPT_TIMEOUT_S",
+            self._int_env(
+                "QEEG_STAGE1_MULTIMODAL_TIMEOUT_S",
+                self._int_env("QEEG_LLM_TIMEOUT_S", 600),
+            ),
+        )
 
         parts: list[str] = []
         errors: list[str] = []
@@ -903,6 +918,7 @@ class _DataPackMixin:
                         "chunk_count": len(chunks),
                         "pages": pages,
                     },
+                    timeout_s=chunk_timeout_s,
                 )
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())

@@ -248,62 +248,12 @@ def _portal_batch_model_allowed(model_id: str) -> bool:
     return "claude-opus" not in (model_id or "").strip().lower()
 
 
-def _fallback_council_model_ids(discovered: list[str]) -> list[str]:
-    preferred_tokens = [
-        "gpt-5.5",
-        "claude-sonnet",
-        "gemini-3-pro",
-        "claude",
-        "gemini",
-    ]
-    picked: list[str] = []
-    for token in preferred_tokens:
-        match = _pick_model_id(token, discovered)
-        if match and match not in picked and _portal_batch_model_allowed(match):
-            picked.append(match)
-        if len(picked) >= 3:
-            break
-    if not picked:
-        picked.extend(
-            model_id for model_id in discovered if _portal_batch_model_allowed(model_id)
-        )
-        picked = picked[:1]
-    return picked
-
-
 def _resolve_model_selection_for_run(
     session,
     *,
     patient_id: str,
     discovered_models: list[str],
 ) -> tuple[list[str], str]:
-    def from_run(run: storage.Run) -> tuple[list[str], str] | None:
-        try:
-            raw_council = json.loads(run.council_model_ids_json or "[]")
-        except Exception:
-            return None
-        if not isinstance(raw_council, list):
-            return None
-        mapped: list[str] = []
-        for item in raw_council:
-            if not isinstance(item, str):
-                continue
-            matched = _pick_model_id(item, discovered_models)
-            if (
-                matched
-                and matched not in mapped
-                and _portal_batch_model_allowed(matched)
-            ):
-                mapped.append(matched)
-        consolidator = _pick_model_id(run.consolidator_model_id, discovered_models)
-        if consolidator is not None and not _portal_batch_model_allowed(consolidator):
-            consolidator = None
-        if not mapped:
-            return None
-        if consolidator is None:
-            consolidator = mapped[0]
-        return mapped, consolidator
-
     configured: list[str] = []
     for model in COUNCIL_MODELS:
         matched = _pick_model_id(model.id, discovered_models)
@@ -329,46 +279,10 @@ def _resolve_model_selection_for_run(
             )
         return configured, consolidator
 
-    patient_runs = list(
-        session.scalars(
-            select(storage.Run)
-            .where(storage.Run.patient_id == patient_id)
-            .order_by(storage.Run.created_at.desc())
-        )
+    raise RuntimeError(
+        "Configured council role models are unavailable from CLIProxyAPI /v1/models; "
+        "set the explicit role environment overrides instead of reusing historical batch models"
     )
-    for run in patient_runs:
-        resolved = from_run(run)
-        if resolved is not None:
-            return resolved
-
-    complete_runs = list(
-        session.scalars(
-            select(storage.Run)
-            .where(storage.Run.status == "complete")
-            .order_by(storage.Run.created_at.desc())
-        )
-    )
-    for run in complete_runs:
-        resolved = from_run(run)
-        if resolved is not None:
-            return resolved
-
-    council_model_ids = _fallback_council_model_ids(discovered_models)
-    if not council_model_ids:
-        raise RuntimeError(
-            "No compatible council models were discovered from CLIProxyAPI /v1/models"
-        )
-    consolidator = _pick_model_id(DEFAULT_CONSOLIDATOR, discovered_models)
-    if consolidator is None:
-        consolidator = next(
-            (
-                model_id
-                for model_id in council_model_ids
-                if "claude" in model_id.lower() or "gpt" in model_id.lower()
-            ),
-            council_model_ids[0],
-        )
-    return council_model_ids, consolidator
 
 
 def _report_assets_ready(report: storage.Report) -> bool:
@@ -583,7 +497,9 @@ def _latest_resume_candidate_run_for_report(report_id: str) -> storage.Run | Non
                 select(storage.Run)
                 .where(
                     storage.Run.report_id == report_id,
-                    storage.Run.status.in_(("created", "running")),
+                    storage.Run.status.in_(
+                        ("created", "running", "failed", "needs_auth")
+                    ),
                 )
                 .order_by(storage.Run.created_at.desc())
             )

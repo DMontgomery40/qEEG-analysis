@@ -123,6 +123,8 @@ async def test_auto_patient_facing_runs_for_completed_run(temp_data_dir, monkeyp
     assert "args" in called
     assert "--patient-label" in called["args"]
     assert patient_label in called["args"]
+    max_tokens_index = called["args"].index("--max-tokens")
+    assert called["args"][max_tokens_index + 1] == "12000"
     assert any(
         e.get("stage_name") == "patient_facing" and e.get("status") == "start"
         for e in broker.events

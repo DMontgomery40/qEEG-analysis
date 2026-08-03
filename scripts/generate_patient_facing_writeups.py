@@ -15,7 +15,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs  # noqa: E402
+from backend.config import (  # noqa: E402
+    CLIPROXY_API_KEY,
+    CLIPROXY_BASE_URL,
+    MODEL_ROLE_DEFAULTS,
+    ensure_data_dirs,
+)
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
 from backend.model_selection import resolve_model_preference  # noqa: E402
 from backend.orchestration import (  # noqa: E402
@@ -41,6 +46,33 @@ class SourceBundle:
     patient: Patient
     run: Run
     artifacts: list[Artifact]
+
+
+DEFAULT_PATIENT_FACING_MODEL = MODEL_ROLE_DEFAULTS.patient_facing_rewrite
+_REQUIRED_PATIENT_FACING_HEADINGS = (
+    "# Your Brain Assessment Summary",
+    "## 2. Processing Speed and Attention",
+    "## 3. Cognitive Performance",
+    "## 4. Brain Rhythm Patterns",
+    "## 5. What This May Mean",
+    "# Technical Appendix",
+    "## Detailed P300 Site Data",
+    "## Coherence and Network Connectivity",
+    "## Spectral Power Summary",
+)
+
+
+def _validate_patient_facing_markdown(markdown: str) -> None:
+    missing = [
+        heading
+        for heading in _REQUIRED_PATIENT_FACING_HEADINGS
+        if heading not in (markdown or "")
+    ]
+    if missing:
+        raise ValueError(
+            "Patient-facing report is missing required sections: "
+            + ", ".join(missing)
+        )
 
 
 def _utcnow() -> datetime:
@@ -315,11 +347,11 @@ async def main() -> int:
     )
     ap.add_argument(
         "--model",
-        default="gpt-5.5",
-        help="Preferred model id (default: gpt-5.5)",
+        default=DEFAULT_PATIENT_FACING_MODEL,
+        help=f"Preferred model id (default: {DEFAULT_PATIENT_FACING_MODEL})",
     )
     ap.add_argument(
-        "--max-tokens", type=int, default=4000, help="Max output tokens (default: 4000)"
+        "--max-tokens", type=int, default=12000, help="Max output tokens (default: 12000)"
     )
     ap.add_argument(
         "--temperature", type=float, default=0.2, help="LLM temperature (default: 0.2)"
@@ -491,6 +523,7 @@ async def main() -> int:
             max_tokens=int(args.max_tokens),
         )
         md = (md or "").strip()
+        _validate_patient_facing_markdown(md)
 
         with tempfile.TemporaryDirectory(
             dir=out_dir, prefix=f".{stem}."

@@ -71,7 +71,7 @@ Every clinic-uploaded qEEG report PDF must become a durable pipeline job. A new 
    - Dry-run output must separate actual `downloaded` files from `would_download` paths.
    - Batch dry-run must remain an offline audit path and must not require CLIProxy model discovery.
    - Non-dry-run batch execution must take a local exclusive lock so concurrent agent/manual batches cannot contend for CLIProxy or resume each other's runs.
-   - Default consolidation must use a responses-stable longform model. GPT-5.5 with low reasoning is the default Stage 4 consolidator and GPT-5.5 is the default OpenAI council/review model; GPT-5.4 and older are no longer shown in the default picker.
+   - Default analysis and review use `openai/gpt-5.6-sol`; Stage 4 consolidation, Stage 6 final drafting, and patient-facing regeneration use `z-ai/glm-5.2`. Both route through CLIProxyAPI: native OpenAI/Codex OAuth for Sol and its configured OpenRouter-compatibility upstream for GLM. Direct OpenRouter transport is an explicit emergency bypass only. Every role remains independently overridable.
 
 3. Start path keeps worker alive.
    - Update qEEG-analysis startup to optionally launch the portal pipeline worker after CLIProxyAPI is reachable.

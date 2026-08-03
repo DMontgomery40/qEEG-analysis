@@ -68,6 +68,10 @@ def _sync_watch_state_path(root_dir: Path) -> Path:
     return root_dir / ".qeeg_portal_sync_watch_state.json"
 
 
+def _sync_spawn_lock_path(root_dir: Path) -> Path:
+    return root_dir / ".qeeg_portal_netlify_sync.spawn.lock"
+
+
 def _load_sync_state(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -270,13 +274,31 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
                 return False
             command, cwd = command_info
 
-            proc = subprocess.run(
-                command,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                timeout_s = float(
+                    os.getenv("QEEG_PORTAL_NETLIFY_SYNC_TIMEOUT_S", "900") or "900"
+                )
+            except Exception:
+                timeout_s = 900.0
+            if timeout_s <= 0:
+                timeout_s = 900.0
+            try:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_s,
+                )
+            except subprocess.TimeoutExpired:
+                LOGGER.error(
+                    "portal_sync_timed_out",
+                    patient_label=patient_id,
+                    timeout_s=timeout_s,
+                    operatorHint="Single-patient Netlify sync exceeded its bounded runtime; the watcher will retry the latest patient-folder state after the active reservation is released.",
+                )
+                return False
             if proc.returncode != 0:
                 LOGGER.error(
                     "portal_sync_failed",
@@ -320,6 +342,23 @@ def spawn_portal_sync(patient_label: str) -> bool:
         )
         return False
 
+    root_dir = portal_patients_dir()
+    spawn_lock_path = _sync_spawn_lock_path(root_dir)
+    spawn_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    spawn_lock_file = spawn_lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(
+            spawn_lock_file.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        spawn_lock_file.close()
+        LOGGER.info(
+            "portal_sync_already_running",
+            patient_label=patient_id,
+        )
+        return False
+
     cmd = [
         sys.executable,
         "-m",
@@ -334,14 +373,17 @@ def spawn_portal_sync(patient_label: str) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            pass_fds=(spawn_lock_file.fileno(),),
         )
     except Exception:
+        spawn_lock_file.close()
         LOGGER.exception(
             "portal_sync_spawn_failed",
             patient_label=patient_id,
             operatorHint="Background portal sync spawn shells back into python -m backend.portal_sync; verify sys.executable, repo cwd, and local process launch permissions.",
         )
         return False
+    spawn_lock_file.close()
 
     LOGGER.info("portal_sync_spawned", patient_label=patient_id)
     return True

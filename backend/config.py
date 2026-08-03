@@ -81,19 +81,21 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 
 MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
     stage1_vision=os.getenv(
-        "DEFAULT_STAGE1_VISION_MODEL", "gemini-3.1-flash-lite-preview"
+        "DEFAULT_STAGE1_VISION_MODEL", "openai/gpt-5.6-sol"
     ),
-    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "gpt-5.5"),
+    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "openai/gpt-5.6-sol"),
     stage4_consolidator=os.getenv(
         "DEFAULT_STAGE4_CONSOLIDATOR",
-        os.getenv("DEFAULT_CONSOLIDATOR", "gpt-5.5"),
+        os.getenv("DEFAULT_CONSOLIDATOR", "z-ai/glm-5.2"),
     ),
-    stage5_final_review=os.getenv("DEFAULT_STAGE5_REVIEW_MODEL", "gpt-5.5"),
+    stage5_final_review=os.getenv(
+        "DEFAULT_STAGE5_REVIEW_MODEL", "openai/gpt-5.6-sol"
+    ),
     stage6_final_draft=os.getenv(
-        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "claude-sonnet-4-6"
+        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "z-ai/glm-5.2"
     ),
     patient_facing_rewrite=os.getenv(
-        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "gpt-5.5"
+        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "z-ai/glm-5.2"
     ),
 )
 
@@ -101,21 +103,15 @@ MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     CouncilModelConfig(
         id=MODEL_ROLE_DEFAULTS.stage2_review,
-        name="GPT-5.5 low",
+        name="GPT-5.6 Sol",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="responses",
     ),
     CouncilModelConfig(
-        id=MODEL_ROLE_DEFAULTS.stage6_final_draft,
-        name="Claude Sonnet 4.6",
+        id="openai/gpt-5.6-terra",
+        name="GPT-5.6 Terra",
         source="Subscription via CLIProxyAPI",
-        endpoint_preference="chat",
-    ),
-    CouncilModelConfig(
-        id=MODEL_ROLE_DEFAULTS.stage1_vision,
-        name="Gemini 3.1 Flash Lite Preview",
-        source="Subscription via CLIProxyAPI",
-        endpoint_preference="chat",
+        endpoint_preference="responses",
     ),
 ]
 

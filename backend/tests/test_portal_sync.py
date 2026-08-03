@@ -107,8 +107,9 @@ def test_sync_patient_to_thrylen_scopes_state_and_merges_updates(
 
     observed: dict[str, Path | str] = {}
 
-    def fake_run(cmd, cwd, capture_output, text, check):
+    def fake_run(cmd, cwd, capture_output, text, check, timeout):
         observed["cwd"] = cwd
+        observed["timeout"] = timeout
         temp_root = Path(cmd[-1])
         observed["temp_root"] = temp_root
 
@@ -148,6 +149,7 @@ def test_sync_patient_to_thrylen_scopes_state_and_merges_updates(
 
     assert portal_sync.sync_patient_to_thrylen(patient_id) is True
     assert observed["cwd"] == str(sync_repo)
+    assert observed["timeout"] == 900.0
 
     merged_state = json.loads(state_path.read_text(encoding="utf-8"))
     assert merged_state["patients"][other_id] == {
@@ -160,6 +162,77 @@ def test_sync_patient_to_thrylen_scopes_state_and_merges_updates(
     assert merged_state["files"][f"{patient_id}/fresh.md"]["remoteFileKey"] == (
         f"{patient_id}__fresh__v1__2026-03-17.md"
     )
+
+
+def test_spawn_portal_sync_skips_when_another_sync_holds_the_global_reservation(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+
+    patient_id = "01-01-2013-0"
+    portal_root = tmp_path / "portal_patients"
+    portal_root.mkdir()
+    sync_repo = tmp_path / "thrylen"
+    sync_script = sync_repo / "scripts" / "qeeg_patients_sync.mjs"
+    sync_script.parent.mkdir(parents=True)
+    sync_script.write_text("// fake sync\n", encoding="utf-8")
+
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal_root))
+    monkeypatch.setenv("QEEG_PORTAL_SYNC_REPO", str(sync_repo))
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
+    monkeypatch.setattr(
+        portal_sync.shutil,
+        "which",
+        lambda name: "/usr/bin/node" if name == "node" else None,
+    )
+    monkeypatch.setattr(
+        portal_sync.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("duplicate sync must not spawn"),
+    )
+
+    lock_path = portal_sync._sync_spawn_lock_path(portal_root)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        portal_sync.fcntl.flock(
+            lock_file.fileno(),
+            portal_sync.fcntl.LOCK_EX | portal_sync.fcntl.LOCK_NB,
+        )
+        assert portal_sync.spawn_portal_sync(patient_id) is False
+
+
+def test_spawn_portal_sync_passes_the_global_reservation_to_the_child(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+
+    patient_id = "01-01-2013-0"
+    portal_root = tmp_path / "portal_patients"
+    portal_root.mkdir()
+    sync_repo = tmp_path / "thrylen"
+    sync_script = sync_repo / "scripts" / "qeeg_patients_sync.mjs"
+    sync_script.parent.mkdir(parents=True)
+    sync_script.write_text("// fake sync\n", encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal_root))
+    monkeypatch.setenv("QEEG_PORTAL_SYNC_REPO", str(sync_repo))
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
+    monkeypatch.setattr(
+        portal_sync.shutil,
+        "which",
+        lambda name: "/usr/bin/node" if name == "node" else None,
+    )
+
+    def fake_popen(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(portal_sync.subprocess, "Popen", fake_popen)
+
+    assert portal_sync.spawn_portal_sync(patient_id) is True
+    assert observed["kwargs"]["start_new_session"] is True
+    assert len(observed["kwargs"]["pass_fds"]) == 1
 
 
 def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs(
@@ -178,6 +251,10 @@ def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs
     (
         patient_dir / "08-10-1989-0__patient-facing__v1__2026-02-09.pdf"
     ).write_bytes(b"%PDF-1.4")
+    (patient_dir / f"{patient_id}__guide__v1__2026-03-17.pdf").write_bytes(
+        b"%PDF-1.4"
+    )
+    (patient_dir / "guide.pdf").write_bytes(b"%PDF-1.4")
 
     monkeypatch.setattr(
         portal_sync,
