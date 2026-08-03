@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select as sa_select
 
 from . import storage
@@ -58,6 +59,15 @@ from .orchestration import (
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from .patient_identity import (
+    PatientIdentityError,
+    allocate_canonical_patient_id,
+    derive_initial,
+    normalize_birthdate,
+    parse_canonical_patient_id,
+    require_initial,
+    reserve_canonical_patient_id,
+)
 from .portal_export_manifest import (
     council_export_manifest_payload,
     write_council_export_manifest,
@@ -169,13 +179,24 @@ async def _request_context_middleware(request: Request, call_next):
 
 
 class PatientCreate(BaseModel):
-    label: str = Field(min_length=1)
+    """Structured identity allocates the canonical clinic ID.
+
+    `first_initial`/`last_initial` are for names whose first letter has no A-Z
+    equivalent, where the operator supplies the intended initial. A bare `label`
+    is the pre-cutover path for patients that already have one.
+    """
+
+    label: str | None = None
     notes: str = ""
+    first_name: str | None = None
+    last_name: str | None = None
+    birthdate: str | None = None
+    first_initial: str | None = None
+    last_initial: str | None = None
 
 
-class PatientUpdate(BaseModel):
-    label: str = Field(min_length=1)
-    notes: str = ""
+class PatientUpdate(PatientCreate):
+    """Same identity fields as create; the canonical ID is re-resolved on save."""
 
 
 class RunCreate(BaseModel):
@@ -1404,12 +1425,75 @@ async def list_patients() -> list[dict[str, Any]]:
         ]
 
 
+def _resolve_patient_identity(
+    session: Any, req: PatientCreate, *, exclude_patient_uuid: str | None = None
+) -> dict[str, Any]:
+    """Turn a request body into the patient fields to store.
+
+    Structured identity wins: it allocates the canonical clinic ID and that ID
+    becomes the label. A bare label is stored as given, and is reserved when it
+    is already canonical so the same ID can never be issued to anyone else.
+    """
+    identity_fields = ("first_name", "last_name", "birthdate", "first_initial", "last_initial")
+    has_identity = any((getattr(req, name) or "").strip() for name in identity_fields)
+
+    if has_identity:
+        try:
+            first = (
+                require_initial(req.first_initial, field="first")
+                if (req.first_initial or "").strip()
+                else derive_initial(req.first_name, field="first")
+            )
+            last = (
+                require_initial(req.last_initial, field="last")
+                if (req.last_initial or "").strip()
+                else derive_initial(req.last_name, field="last")
+            )
+            birthdate = normalize_birthdate(req.birthdate)
+            canonical = allocate_canonical_patient_id(
+                session,
+                first_initial=first,
+                last_initial=last,
+                birthdate=birthdate,
+                exclude_patient_uuid=exclude_patient_uuid,
+            )
+        except PatientIdentityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "label": canonical,
+            "first_name": (req.first_name or "").strip(),
+            "last_name": (req.last_name or "").strip(),
+            "birthdate": birthdate,
+            "first_initial": first,
+            "last_initial": last,
+        }
+
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(
+            status_code=400,
+            detail="Give the patient's name and date of birth, or an existing label.",
+        )
+
+    parsed = reserve_canonical_patient_id(session, label)
+    if parsed is None:
+        return {"label": label}
+    return {
+        "label": parsed.value,
+        "birthdate": parsed.birthdate,
+        "first_initial": parsed.first_initial,
+        "last_initial": parsed.last_initial,
+    }
+
+
 @app.post("/api/patients")
 async def create_patient(req: PatientCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        if storage.find_patients_by_label(session, req.label):
+        fields = _resolve_patient_identity(session, req)
+        if storage.find_patients_by_label(session, fields["label"]):
             raise HTTPException(status_code=409, detail="Patient label already exists")
-        p = storage.create_patient(session, label=req.label, notes=req.notes)
+        p = storage.create_patient(session, notes=req.notes, **fields)
         _ensure_portal_patient_folder(p.label)
         return _patient_out(p)
 
@@ -1747,12 +1831,15 @@ async def run_patient_action(
 @app.put("/api/patients/{patient_id}")
 async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        existing = storage.find_patients_by_label(session, req.label)
+        if storage.get_patient(session, patient_id) is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        fields = _resolve_patient_identity(
+            session, req, exclude_patient_uuid=patient_id
+        )
+        existing = storage.find_patients_by_label(session, fields["label"])
         if any(p.id != patient_id for p in existing):
             raise HTTPException(status_code=409, detail="Patient label already exists")
-        p = storage.update_patient(
-            session, patient_id, label=req.label, notes=req.notes
-        )
+        p = storage.update_patient(session, patient_id, notes=req.notes, **fields)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
         _ensure_portal_patient_folder(p.label)
@@ -1911,6 +1998,50 @@ async def delete_patient_file(file_id: str) -> dict[str, Any]:
     _delete_portal_file(patient_label=patient_label, filename=filename)
 
     return {"ok": True}
+
+
+@app.post("/api/reports/preview")
+async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Read a dropped report so the patient's name and date of birth can be seen.
+
+    Runs the same extraction/OCR as a real upload, in a scratch directory that is
+    deleted on the way out. Creates no patient, no report row, no portal folder,
+    and starts no analysis run, so it costs nothing and files nothing.
+    """
+    filename = (file.filename or "upload").strip() or "upload"
+    file_bytes = await file.read()
+
+    with tempfile.TemporaryDirectory(prefix="qeeg-preview-") as scratch:
+        scratch_dir = Path(scratch)
+        _original, extracted_path, mime_type, preview = save_report_upload(
+            patient_id="preview",
+            report_id="preview",
+            filename=filename,
+            provided_mime_type=file.content_type,
+            file_bytes=file_bytes,
+            target_dir=scratch_dir,
+        )
+        text = extracted_path.read_text(encoding="utf-8")
+
+        page_count = 0
+        metadata_path = scratch_dir / "metadata.json"
+        if metadata_path.exists():
+            try:
+                page_count = int(
+                    json.loads(metadata_path.read_text(encoding="utf-8")).get(
+                        "page_count", 0
+                    )
+                )
+            except Exception:
+                page_count = 0
+
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "preview": preview,
+        "text": text,
+        "page_count": page_count,
+    }
 
 
 @app.get("/api/reports/{report_id}/extracted")
@@ -2555,9 +2686,18 @@ def _patient_out(
     has_explainer_video: bool = False,
     orchestration_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    canonical = parse_canonical_patient_id(p.label)
     return {
+        # `id` is the internal relational UUID; `patient_id` is the clinic ID.
+        # Patients created before the cutover have no canonical ID yet.
         "id": p.id,
+        "patient_id": canonical.value if canonical else None,
         "label": p.label,
+        "first_name": p.first_name or "",
+        "last_name": p.last_name or "",
+        "birthdate": p.birthdate or "",
+        "first_initial": p.first_initial or "",
+        "last_initial": p.last_initial or "",
         "notes": p.notes,
         "has_explainer_video": bool(has_explainer_video),
         "orchestration_summary": orchestration_summary,
