@@ -1129,11 +1129,19 @@ def _fake_save_report_upload(temp_data_dir):
     return _save
 
 
+# The hub names the file by its FULL blob key, not a bare filename. That shape
+# is pinned against the hub's own payload builder by
+# test_the_upload_job_matches_what_the_hub_actually_builds below, so this
+# literal cannot drift away from the thing that produces it.
+UPLOAD_ID = "up-1"
+REPORT_FILE_KEY = f"uploads/pending/{UPLOAD_ID}/scan.pdf"
+
+
 def _upload_job(**resolution):
     return {
         "kind": "new_patient_upload",
-        "uploadId": "up-1",
-        "fileKey": "scan.pdf",
+        "uploadId": UPLOAD_ID,
+        "fileKey": REPORT_FILE_KEY,
         "identity": {
             "firstName": "Barto",
             "lastName": "Tinker",
@@ -1475,10 +1483,16 @@ def test_one_broken_upload_does_not_abandon_the_rest_of_the_cycle(
         worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
     )
 
-    broken = {**_upload_job(), "uploadId": "up-broken"}
+    # Each job names a key under its own upload prefix, as the hub builds it.
+    broken = {
+        **_upload_job(),
+        "uploadId": "up-broken",
+        "fileKey": "uploads/pending/up-broken/scan.pdf",
+    }
     healthy = {
         **_upload_job(),
         "uploadId": "up-ok",
+        "fileKey": "uploads/pending/up-ok/scan.pdf",
         "identity": {
             "firstName": "Cara",
             "lastName": "Dale",
@@ -1640,8 +1654,10 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
     job_key = "pipeline/jobs/new-patient/1712345678-up-1.json"
 
     class _OneBadFileClient(_UploadClient):
+        fail_download = True
+
         def download(self, key, dest):
-            if key.endswith("broken.pdf"):
+            if self.fail_download and key.endswith("broken.pdf"):
                 raise RuntimeError("netlify blobs:get exited 1")
             return super().download(key, dest)
 
@@ -1674,10 +1690,148 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
             f.filename for f in storage.list_patient_files(session, patient.id)
         ] == ["aaa-good.pdf"]
 
-    # The good file's blob is gone; the broken one and the marker stay, so the
-    # next cycle comes back for exactly what is left.
-    assert client.deleted == [
-        "uploads/pending/up-1/scan.pdf",
-        "uploads/pending/up-1/aaa-good.pdf",
-    ]
+    # Nothing under the pending prefix is dropped while any of the submission
+    # is still outstanding. Deleting the report first left the next cycle
+    # re-downloading a blob that was already gone — an exception every cycle
+    # forever, with the upload recorded as failed even though the report had
+    # registered.
+    assert client.deleted == []
     assert job_key not in client.deleted
+
+    # So the retry can actually recover: the report blob is still readable, the
+    # report is not registered twice, and the file that failed now lands.
+    client.fail_download = False
+    retry = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(),
+    )
+
+    assert retry.status in ("registered", "already_registered")
+    with storage.session_scope() as session:
+        patient = storage.list_patients(session)[0]
+        assert [r.filename for r in storage.list_reports(session, patient.id)] == [
+            "scan.pdf"
+        ]
+        assert sorted(
+            f.filename for f in storage.list_patient_files(session, patient.id)
+        ) == ["aaa-good.pdf", "broken.pdf"]
+    # Only once everything has landed does the submission get cleared.
+    assert sorted(client.deleted) == sorted(
+        [
+            "uploads/pending/up-1/scan.pdf",
+            "uploads/pending/up-1/aaa-good.pdf",
+            "uploads/pending/up-1/broken.pdf",
+            job_key,
+        ]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The engine/hub job contract
+# --------------------------------------------------------------------------- #
+
+
+def _thrylen_repo() -> Path | None:
+    """The hub checkout whose payload builder defines this contract."""
+    import os
+
+    candidates = [os.getenv("QEEG_THRYLEN_REPO", "")]
+    here = Path(__file__).resolve().parents[2]
+    candidates += [
+        str(here.parent / "thrylen"),
+        str(Path.home() / ".sdd-worktrees" / "thrylen"),
+        str(Path.home() / "thrylen"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if (path / "netlify" / "functions" / "qeeg-upload.js").is_file():
+            return path
+    return None
+
+
+def test_the_upload_job_matches_what_the_hub_actually_builds():
+    """Both sides had a green suite against contradictory fixtures.
+
+    The hub emitted the full blob key and the worker expected a bare filename,
+    so in production every new-patient upload looked for
+    `uploads/pending/<id>/uploads/pending/<id>/<name>`, found nothing, and
+    failed every cycle forever. Two hand-written fixtures cannot catch that, so
+    this one runs the hub's real builder and checks the engine's fixture
+    against its actual output.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    repo = _thrylen_repo()
+    if repo is None:
+        pytest.skip("no thrylen checkout to read the hub's payload builder from")
+    if shutil.which("node") is None:
+        pytest.skip("node is needed to run the hub's payload builder")
+
+    script = """
+    import { buildPendingUploadKey, buildNewPatientJobPayload }
+      from './netlify/functions/qeeg-upload.js';
+    const [uploadId, filename] = process.argv.slice(-2);
+    const fileKey = buildPendingUploadKey({ uploadId, filename });
+    process.stdout.write(JSON.stringify(buildNewPatientJobPayload({
+      uploadId,
+      fileKey,
+      identity: {
+        firstName: 'Barto', lastName: 'Tinker',
+        firstInitial: 'B', lastInitial: 'T', birthdate: '12-11-1963',
+      },
+      resolution: {},
+      uploadedAt: 1,
+      uploadedBy: 'hub',
+    })));
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script, "--", UPLOAD_ID, "scan.pdf"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    from_the_hub = json.loads(result.stdout)
+
+    ours = _upload_job()
+
+    # The field the two sides disagreed about.
+    assert from_the_hub["fileKey"] == REPORT_FILE_KEY
+    assert from_the_hub["fileKey"].startswith(f"uploads/pending/{UPLOAD_ID}/")
+    # And the rest of the payload the worker reads.
+    assert from_the_hub["kind"] == ours["kind"]
+    assert from_the_hub["uploadId"] == ours["uploadId"]
+    assert from_the_hub["identity"] == ours["identity"]
+    assert from_the_hub["resolution"] == ours["resolution"]
+    assert set(from_the_hub) == set(ours)
+
+
+def test_a_job_naming_a_key_outside_its_upload_prefix_is_refused(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """Reaching for a key the hub could not have written is worth saying out
+    loud rather than failing on a download that was never going to resolve."""
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    job = _upload_job()
+    job["fileKey"] = "scan.pdf"  # the shape the worker used to assume
+    client = _UploadClient({"pipeline/jobs/new-patient/1-up-1.json": job})
+
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key="pipeline/jobs/new-patient/1-up-1.json",
+        payload=job,
+    )
+
+    assert result.status == "failed"
+    assert "uploads/pending/up-1/" in result.note
+    assert client.downloads == []
+    assert client.deleted == []

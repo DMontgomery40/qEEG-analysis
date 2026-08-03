@@ -502,7 +502,7 @@ PORTAL_README = """Local clinician-portal share folder (gitignored)
 One folder per patient, named with the clinic patient ID:
   XX_MM-DD-YYYY[_N]   two initials, date of birth, collision ordinal from 2
 Example:
-  BT_12-11-1963       and BT_12-11-1963_2 for a second patient with the same
+  ZZ_01-01-1900       and ZZ_01-01-1900_2 for a second patient with the same
                       initials and date of birth
 
 This is the only patient identifier the engine, the folders, the filenames, the
@@ -519,7 +519,7 @@ How this maps to the Netlify portal:
 Filename convention:
   <PATIENT_ID>__<name>__v<version>__YYYY-MM-DD.<ext>
 Example:
-  BT_12-11-1963__analysis__v2__2026-01-16.md
+  ZZ_01-01-1900__analysis__v2__2026-01-16.md
 """
 
 

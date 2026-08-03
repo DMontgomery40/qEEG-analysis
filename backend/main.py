@@ -1554,10 +1554,15 @@ def _resolve_patient_identity(
         except PatientIdentityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        # A name that was not supplied is not a name of "". `update_patient`
+        # applies any non-None value, so emitting empty strings here erased the
+        # stored name on an initials-only correction — a legitimate operator
+        # flow, and exactly the class of thing this system must never do to a
+        # patient's record. Omitted means keep.
         return {
             "label": canonical,
-            "first_name": (req.first_name or "").strip(),
-            "last_name": (req.last_name or "").strip(),
+            "first_name": (req.first_name or "").strip() or None,
+            "last_name": (req.last_name or "").strip() or None,
             "birthdate": birthdate,
             "first_initial": first,
             "last_initial": last,

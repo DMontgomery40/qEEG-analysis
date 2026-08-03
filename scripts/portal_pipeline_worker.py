@@ -859,25 +859,32 @@ def _file_remaining_submission_files(
     upload_id: str,
     patient_label: str,
     report_file_key: str,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """File everything else the clinic sent with the report.
 
-    One submission can carry intake forms, prior reports, anything. Each file is
-    registered and dropped before the next is touched, so a failure part way
-    through keeps what already landed; the ones that fail are named and left in
-    place for the retry. Returns the filenames filed and the failures.
+    One submission can carry intake forms, prior reports, anything. Nothing is
+    deleted here: the whole submission's blobs stay put until every file has
+    landed, so a failure part way through leaves a retry something to re-read.
+    Re-filing is safe — ``register_patient_file`` reuses the row it already
+    made for that filename.
+
+    Returns the filenames filed, the keys they came from, and the failures.
     """
     prefix = f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"
     try:
         keys = sorted(client.list_keys(prefix))
     except Exception as exc:
-        return [], [f"listing the rest of the submission failed: {exc}"]
+        return [], [], [f"listing the rest of the submission failed: {exc}"]
 
     filed: list[str] = []
+    filed_keys: list[str] = []
     failures: list[str] = []
     for key in keys:
         relative = key[len(prefix) :]
-        if not relative or relative == report_file_key:
+        # The job names the report by its full blob key, so that is what it is
+        # compared against. Comparing the relative name would let the report
+        # through here and file it a second time as an attachment.
+        if not relative or key == report_file_key:
             continue
         filename = _safe_filename(Path(relative).name, "attachment")
         try:
@@ -905,12 +912,9 @@ def _file_remaining_submission_files(
                 f"{relative}: {str(exc).strip() or exc.__class__.__name__}"
             )
             continue
-        # Only once the row and the published copy exist is the blob spare.
-        drop_failure = _delete_quietly(client, key)
-        if drop_failure:
-            failures.append(drop_failure)
         filed.append(filename)
-    return filed, failures
+        filed_keys.append(key)
+    return filed, filed_keys, failures
 
 
 def process_new_patient_upload(
@@ -939,6 +943,23 @@ def process_new_patient_upload(
             report_count=0,
             ran_batch=False,
             note="upload job is missing a usable uploadId or fileKey",
+        )
+
+    # The hub stores the file and names it by its full blob key. Anything else
+    # is a job this worker cannot honour, and saying so beats reaching for a
+    # key that was never going to exist.
+    expected_prefix = f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"
+    if not file_key.startswith(expected_prefix):
+        return PatientWorkerResult(
+            patient_id=upload_id,
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=(
+                f"upload job names {file_key!r}, which is not under "
+                f"{expected_prefix!r}"
+            ),
         )
 
     identity_payload = payload.get("identity")
@@ -1029,7 +1050,10 @@ def _file_new_patient_upload(
     filename = _safe_filename(Path(file_key).name, "report.pdf")
     with tempfile.TemporaryDirectory(prefix="qeeg-pending-upload-") as scratch:
         local_path = Path(scratch) / filename
-        client.download(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}", local_path)
+        # `fileKey` is the full blob key the hub stored the file under, not a
+        # bare filename. Prepending the prefix again looked for
+        # `uploads/pending/<id>/uploads/pending/<id>/<name>`, which is nothing.
+        client.download(file_key, local_path)
         file_bytes = local_path.read_bytes()
 
     _report_id, registered = _register_new_patient_report(
@@ -1039,19 +1063,10 @@ def _file_new_patient_upload(
         file_bytes=file_bytes,
     )
 
-    # Only now that the report is durable is the pending copy safe to drop. A
-    # crash before this point simply repeats the cycle; the filename lookup
-    # above keeps that from registering the report twice.
-    cleanup_failures: list[str] = []
-    drop_failure = _delete_quietly(
-        client, f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}"
-    )
-    if drop_failure:
-        cleanup_failures.append(drop_failure)
-
     # The rest of the submission goes in before the marker does, because the
     # marker is what brings us back here if any of it fails.
-    extras, extra_failures = _file_remaining_submission_files(
+    cleanup_failures: list[str] = []
+    extras, extra_keys, extra_failures = _file_remaining_submission_files(
         client=client,
         portal_dir=portal_dir,
         upload_id=upload_id,
@@ -1061,9 +1076,15 @@ def _file_new_patient_upload(
     cleanup_failures.extend(extra_failures)
 
     if not extra_failures:
-        drop_failure = _delete_quietly(client, job_key)
-        if drop_failure:
-            cleanup_failures.append(drop_failure)
+        # Nothing under the pending prefix is dropped until the whole
+        # submission has landed. Deleting the report first meant one failed
+        # attachment left the next cycle re-downloading a blob that was already
+        # gone — an exception every cycle, forever, while the upload record
+        # said failed even though the report was registered.
+        for key in [file_key, *extra_keys, job_key]:
+            drop_failure = _delete_quietly(client, key)
+            if drop_failure:
+                cleanup_failures.append(drop_failure)
         pipeline_uploads.record_registered(
             upload_id=upload_id, patient_id=patient_label
         )

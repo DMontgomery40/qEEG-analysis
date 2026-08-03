@@ -1167,3 +1167,46 @@ def test_intake_surfaces_the_conflict_and_force_new_takes_the_next_ordinal(
     with storage.session_scope() as session:
         labels = sorted(p.label for p in storage.list_patients(session))
     assert labels == ["DM_03-05-1970", "DM_03-05-1970_2"]
+
+
+def test_correcting_only_the_initials_never_erases_the_stored_name(
+    temp_data_dir, monkeypatch
+):
+    """The stored name is the clinic's record of who this is.
+
+    An initials-only correction is a legitimate operator flow — the DOB and the
+    letters are what the ID is built from, and a client that sends just those
+    is not saying "this person has no name". The endpoint emitted empty strings
+    for the omitted names and `update_patient` applies any non-None value, so
+    the correction wiped the name off the chart. Omitted means keep.
+    """
+    from backend import storage
+
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/patients",
+            json={
+                "first_name": "Helga",
+                "last_name": "Stubner",
+                "birthdate": "10-14-1997",
+            },
+        ).json()
+
+        corrected = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_initial": "H",
+                "last_initial": "S",
+                "birthdate": "10-14-1997",
+            },
+        )
+
+    assert corrected.status_code == 200, corrected.text
+    assert corrected.json()["patient_id"] == "HS_10-14-1997"
+
+    with storage.session_scope() as session:
+        patient = storage.get_patient(session, created["id"])
+        assert patient.first_name == "Helga"
+        assert patient.last_name == "Stubner"
