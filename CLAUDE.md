@@ -62,6 +62,22 @@ qEEG Council is a **6-stage deliberation workflow** where multiple LLMs collabor
 - This swaps in a deterministic mocked transport for LLM calls.
 - **Do not use mock mode to judge report quality** (it will produce canned content quickly).
 
+### Running against scratch data (local E2E, smoke tests)
+
+- `DATA_DIR` moves this repo's data root. The portal folder follows it
+  (`DATA_DIR/portal_patients`) unless `QEEG_PORTAL_PATIENTS_DIR` overrides it.
+- **Pair it with the workbench's `QEEG_ANALYSIS_ROOT`.** The workbench builds its
+  portal path as `QEEG_ANALYSIS_ROOT/data/portal_patients` and has no override of
+  its own, so setting `DATA_DIR=$S/data` requires `QEEG_ANALYSIS_ROOT=$S`.
+  Changing one alone points the two processes at different folders — and the
+  workbench's default is the *production* checkout.
+- **Export every provider key explicitly, even to run without one.** `config.py`
+  calls a bare `load_dotenv()`, and `find_dotenv()` walks up past this repo to
+  `/Users/davidmontgomery/.env`, so simply leaving `OPENROUTER_API_KEY` unset
+  loads the real one. `load_dotenv()` uses `override=False`, so an explicitly
+  exported value (empty, or an obviously-invalid sentinel) is what actually
+  keeps a test run from being able to spend.
+
 ## Patient identity
 
 Every patient has one canonical clinic ID: `XX_MM-DD-YYYY` — two initials, an
@@ -146,6 +162,10 @@ Important gotcha:
   - FastAPI app + SSE broker + orchestration endpoints
 
 ## API surface (see `backend/main.py`)
+
+In these routes a `{patient_uuid}` path segment is the internal SQLite key.
+The clinic-facing canonical ID is the patient's `label` column, returned as the
+`patient_id` field in responses — never a path segment.
 
 - Health/models
   - `GET /api/health`

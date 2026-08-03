@@ -23,7 +23,14 @@ UI requirements
   - List view with search and quick create
   - Bulk upload:
     - upload multiple report files
-    - create a new patient per file (label = filename stem) and upload that file as the initial report
+    - send each file's patient name and date of birth with it (read them from
+      `POST /api/reports/preview`, which files nothing); the backend finds that
+      person's existing chart or allocates their canonical clinic ID
+      `XX_MM-DD-YYYY[_N]` and registers the report against it
+    - one patient per person, not one per file: a second report for someone
+      already on file lands on their existing chart
+    - a name that disagrees with an existing chart on the same initials and
+      birthdate comes back 409 for the operator to answer — never a new patient
   - Patient detail shows reports and run history
   - Patient detail also supports “Patient Files” (supporting PDFs/Markdown/MP4)
 - Reports

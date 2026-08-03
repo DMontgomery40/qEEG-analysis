@@ -10,7 +10,10 @@ Use this skill when a clinic-uploaded portal patient needs to be found, download
 ## Required Posture
 
 - Real runs only. Do not use `QEEG_MOCK_LLM=1` for incident recovery or quality validation.
-- Read `/Users/davidmontgomery/qEEG-analysis/plan.md` before changing pipeline code.
+- Read `references/pipeline-contract.md` for how the portal pipeline is wired, and
+  `AGENTS.md` + `CLAUDE.md` for patient identity, before changing pipeline code.
+  `plan.md` is a 2026-04 historical record: useful for the reliability lessons,
+  superseded on identity.
 - Read project-local memory under `~/.codex/projects/-Users-davidmontgomery-qEEG-analysis/`.
 - If explainer-video output is involved, also read `~/.codex/projects/-Users-davidmontgomery-local-explainer-video/MEMORY.md` and the linked mandatory validation notes.
 - Treat Netlify job markers, local status files, DB rows, and generated artifacts as evidence. Do not report success from intent alone.

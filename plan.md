@@ -2,6 +2,15 @@
 
 Date: 2026-04-12
 
+> **Historical planning record. Predates the 2026-08 canonical-ID cutover; the
+> identity rules in it are superseded by `AGENTS.md` and `CLAUDE.md`.** In
+> particular, deriving a patient folder from the report's date of birth is no
+> longer how routing works: the folder is the patient's canonical clinic ID
+> `XX_MM-DD-YYYY[_N]`, the analysis engine is the only thing that allocates one,
+> and a report whose name disagrees with an existing chart is asked about rather
+> than routed by birthdate. The reliability lessons below — job markers,
+> loud failures, no silent misrouting — still hold. The body is left as written.
+
 ## Immediate Incident
 
 - Patient label `03-05-2010-0` existed in the thrylen portal blob store but had no local folder under `data/portal_patients/`.
