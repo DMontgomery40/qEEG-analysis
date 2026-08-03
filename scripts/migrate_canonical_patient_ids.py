@@ -567,7 +567,10 @@ def resolve_identity(
         if not letters:
             continue
         proposed = propose_initials_from_title(title)
-        options = " or ".join(f"{p['initials']} ({p['reading']})" for p in proposed)
+        options = " or ".join(
+            f"{p['initials']} ({p['reading']})" if p["initials"] else p["reading"]
+            for p in proposed
+        )
         if not ({resolved[0], resolved[1]} & letters):
             return IdentityFinding(
                 patient_id=patient_id,
@@ -776,8 +779,18 @@ def propose_initials_from_title(title: str) -> list[dict[str, str]]:
         if word.lower() not in _NON_NAME_WORDS
     ]
     if len(words) < 2:
+        # One name is not two initials. Say what is actually known rather than
+        # offering a placeholder as something to confirm.
         return (
-            [{"initials": f"?{words[0][0].upper()}", "reading": f"surname {words[0]}"}]
+            [
+                {
+                    "initials": "",
+                    "reading": (
+                        f"the report names {words[0]}, so the last initial is "
+                        f"{words[0][0].upper()}; the first initial is not on the file"
+                    ),
+                }
+            ]
             if words
             else []
         )
@@ -792,6 +805,13 @@ def propose_initials_from_title(title: str) -> list[dict[str, str]]:
             "reading": f"{surname} {given} (given name first)",
         },
     ]
+
+
+def _name_owners(labels: list[str]) -> str:
+    """Name every patient these initials could mean, never just the first."""
+    if len(labels) == 1:
+        return labels[0]
+    return "either " + " or ".join(sorted(labels))
 
 
 def _live_upload_ids(jobs_dir: Path | None) -> list[str]:
@@ -1059,11 +1079,13 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     # A folder is only trustworthy if everything in it belongs to one person.
-    owned_initials = {
-        "".join(e.initials): e.label
-        for e in classified
-        if e.bucket == BUCKET_MIGRATE and e.initials and e.label
-    }
+    # Initials are not unique — this clinic has two SF patients born in 1970.
+    # Keyed on the token alone, one of them would silently replace the other and
+    # a misfiled report would be attributed to whichever came last.
+    owned_initials: dict[str, list[str]] = defaultdict(list)
+    for entry in classified:
+        if entry.bucket == BUCKET_MIGRATE and entry.initials and entry.label:
+            owned_initials["".join(entry.initials)].append(entry.label)
     mixed: list[dict[str, Any]] = []
     for entry in classified:
         if entry.bucket not in (BUCKET_MIGRATE, BUCKET_UNRESOLVED) or not entry.label:
@@ -1093,7 +1115,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         entry.reason = (
             "the folder holds reports belonging to "
             + ", ".join(
-                f"{owned_initials[t]} ({t}, {len(n)} files)"
+                f"{_name_owners(owned_initials[t])} ({t}, {len(n)} files)"
                 for t, n in sorted(foreign.items())
             )
         )
@@ -1210,7 +1232,12 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     # manifest can say "these are the only places" and mean it.
     other_locations = sweep_other_id_named_locations(portal_root.parent, mapping)
 
-    qa_bundle = qa_fixture_bundle(Path(args.db), portal_root)
+    # Every label apply will delete has to be in the bundle, including candidate
+    # QA rows the owner has confirmed.
+    qa_labels = sorted(
+        {e.label for e in classified if e.label and e.bucket == BUCKET_QA_FIXTURE}
+    )
+    qa_bundle = qa_fixture_bundle(Path(args.db), portal_root, qa_labels)
 
     # The renderers keep a project directory per patient, named for the patient.
     # They are on-disk paths like any other, so they belong in the inventory.
@@ -1278,6 +1305,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "pipeline_job_files": pipeline_jobs,
         "other_id_named_locations": other_locations,
         "renderer_project_dirs": renderer_projects,
+        "qa_fixture_labels": qa_labels,
         "qa_fixture_bundle": qa_bundle,
         "notes": {
             "ordinal_rule": (
@@ -1435,18 +1463,22 @@ def assert_schema_ready(db_path: Path) -> None:
         conn.close()
 
 
-def qa_fixture_bundle(db_path: Path, portal_root: Path) -> dict[str, Any]:
-    """Everything the QA record owns, listed so the rollback bundle can hold it.
+def qa_fixture_bundle(
+    db_path: Path, portal_root: Path, labels: Iterable[str] = QA_FIXTURE_LABELS
+) -> dict[str, Any]:
+    """Everything the QA records own, listed so the rollback bundle can hold it.
 
-    The synthetic record is removed from the roster during apply rather than
-    migrated, so this is the only place its rows and artifacts are written down.
+    A QA record is removed from the roster during apply rather than migrated, so
+    this is the only place its rows and artifacts are written down. It must
+    cover every label apply will delete — a row that is neither migrated nor
+    bundled is a row that just disappears.
     """
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     bundle: dict[str, Any] = {"patients": [], "reports": [], "runs": [],
                               "patient_files": [], "portal_artifacts": []}
     try:
-        for label in sorted(QA_FIXTURE_LABELS):
+        for label in sorted(labels):
             for row in conn.execute(
                 "SELECT id, label, created_at FROM patients WHERE label = ?", (label,)
             ):
@@ -1474,12 +1506,16 @@ def qa_fixture_bundle(db_path: Path, portal_root: Path) -> dict[str, Any]:
     return bundle
 
 
-def remove_qa_fixture(conn: sqlite3.Connection, portal_root: Path) -> dict[str, int]:
-    """Take the synthetic record off the active roster. Bundle it first."""
+def remove_qa_fixture(
+    conn: sqlite3.Connection,
+    portal_root: Path,
+    labels: Iterable[str] = QA_FIXTURE_LABELS,
+) -> dict[str, int]:
+    """Take the QA records off the active roster. Bundle them first."""
     import shutil
 
     removed = {"patients": 0, "rows": 0, "folders": 0}
-    for label in sorted(QA_FIXTURE_LABELS):
+    for label in sorted(labels):
         uuids = [
             row[0]
             for row in conn.execute("SELECT id FROM patients WHERE label = ?", (label,))
@@ -1646,7 +1682,9 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
             print("  rewrote the share folder README onto the clinic ID format")
 
         if not journal.is_done("qa-fixture-removed"):
-            removed = remove_qa_fixture(conn, portal_root)
+            removed = remove_qa_fixture(
+                conn, portal_root, report.get("qa_fixture_labels") or ()
+            )
             journal.record(
                 {"old_id": "qa-fixture-removed", "kind": "qa_fixture_removed",
                  "removed": removed}

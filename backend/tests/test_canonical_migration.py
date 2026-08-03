@@ -754,10 +754,11 @@ def test_initials_are_proposed_surname_first_as_the_clinic_names_files():
         "initials": "HS",
         "reading": "Helga Stubner (surname first, as the clinic names files)",
     }
-    # One name is not enough to place both initials.
-    assert migrator.propose_initials_from_title("Snyder mid qeeg.pdf") == [
-        {"initials": "?S", "reading": "surname Snyder"}
-    ]
+    # One name is not two initials — say what is known, do not invent a pair.
+    only_one = migrator.propose_initials_from_title("Snyder mid qeeg.pdf")
+    assert only_one[0]["initials"] == ""
+    assert "the last initial is S" in only_one[0]["reading"]
+    assert "?" not in only_one[0]["reading"]
 
 
 def test_a_candidate_qa_row_is_not_removed_without_the_owner_saying_so(world):
@@ -811,3 +812,82 @@ def test_an_unpadded_twin_reduces_to_a_confirmation_when_the_bytes_agree(world):
         e for e in report["classified"] if e["label"] == "1-19-1966"
     )
     assert entry["evidence"]["report_byte_match"]["conclusive"] is True
+
+
+def test_two_patients_sharing_initials_are_both_named_not_one_of_them(world):
+    """This clinic has two SF patients born in 1970. Keyed on the token alone,
+    one would silently replace the other and a misfiled report would be
+    attributed to whichever happened to be classified last — on the one
+    decision where files get moved between patients."""
+    portal = Path(world.portal_root)
+    # A second patient with the same initials as 12-11-1963-0's neighbour.
+    _folder(portal, "01-02-1970-0", initials=("S", "F"), files=["SF_one.pdf"])
+    _folder(portal, "03-04-1970-0", initials=("S", "F"), files=["SF_two.pdf"])
+    _folder(portal, "05-06-1990-0", initials=("Q", "Z"),
+            files=["05-06-1990-0__SF_Long_COVID_30_TX__v1__2026-01-01.pdf"])
+    conn = sqlite3.connect(world.db)
+    for uuid, label in (
+        ("s1111111-0000-0000-0000-000000000011", "01-02-1970-0"),
+        ("s2222222-0000-0000-0000-000000000012", "03-04-1970-0"),
+        ("q3333333-0000-0000-0000-000000000013", "05-06-1990-0"),
+    ):
+        conn.execute(
+            "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+            "VALUES (?, ?, '', '2026-01-01', '2026-01-01')",
+            (uuid, label),
+        )
+    conn.commit()
+    conn.close()
+
+    report = migrator.build_report(world)
+
+    blocker = next(b for b in report["blockers"] if b.startswith("05-06-1990-0:"))
+    assert "either 01-02-1970-0 or 03-04-1970-0" in blocker
+    mixed = next(
+        m for m in report["mixed_patient_folders"] if m["patient_id"] == "05-06-1990-0"
+    )
+    assert mixed["foreign_initials"]["SF"]["belongs_to"] == [
+        "01-02-1970-0",
+        "03-04-1970-0",
+    ]
+
+
+def test_a_confirmed_qa_candidate_is_bundled_and_actually_removed(world):
+    """Excluded from the mapping but never bundled and never deleted would leave
+    the row sitting in the live database wearing a legacy label — neither
+    migrated nor recoverable."""
+    conn = sqlite3.connect(world.db)
+    conn.execute(
+        "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+        "VALUES ('qa-cand', '01-01-1983-0', '', '2026-01-01', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO reports (id, patient_id, filename, stored_path) "
+        "VALUES ('qa-cand-r0', 'qa-cand', 'synthetic.pdf', 'data/reports/qa/x.pdf')"
+    )
+    conn.commit()
+    conn.close()
+    world.qa_candidates_confirmed = True
+    _unblock(world)
+
+    report = migrator.build_report(world)
+    assert set(report["qa_fixture_labels"]) == {"02-29-1984-0", "01-01-1983-0"}
+    bundled = {p["label"] for p in report["qa_fixture_bundle"]["patients"]}
+    assert bundled == {"02-29-1984-0", "01-01-1983-0"}
+    assert any(
+        r["filename"] == "synthetic.pdf"
+        for r in report["qa_fixture_bundle"]["reports"]
+    )
+
+    assert migrator.run_apply(world, report) == 0
+
+    conn = sqlite3.connect(world.db)
+    left = conn.execute(
+        "SELECT COUNT(*) FROM patients WHERE label IN ('01-01-1983-0','02-29-1984-0')"
+    ).fetchone()[0]
+    orphan_reports = conn.execute(
+        "SELECT COUNT(*) FROM reports WHERE patient_id = 'qa-cand'"
+    ).fetchone()[0]
+    conn.close()
+    assert left == 0
+    assert orphan_reports == 0
