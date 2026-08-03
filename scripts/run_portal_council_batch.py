@@ -38,6 +38,11 @@ from backend.exports import render_markdown_to_pdf  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient, UpstreamError  # noqa: E402
 from backend.main import _auto_generate_patient_facing_for_run  # noqa: E402
 from backend.model_selection import resolve_model_preference  # noqa: E402
+from backend.patient_identity import (  # noqa: E402
+    PatientIdentityError,
+    parse_canonical_patient_id,
+    reserve_canonical_patient_id,
+)
 from backend.orchestration import (  # noqa: E402
     run_downstream_delivery_gaps,
     summarize_run_progress,
@@ -461,7 +466,27 @@ def _get_or_create_patient_for_label(
     )
     if patient is not None:
         return patient
-    return storage.create_patient(session, label=patient_label, notes="")
+
+    # This is the third place a patient can come into being, and the only one
+    # that takes its ID from a folder name. A folder is not an allocation: left
+    # alone it would mint a label nothing reserved, and the next patient with
+    # the same initials and birthdate could then be issued this person's ID.
+    parsed = parse_canonical_patient_id(patient_label)
+    if parsed is None:
+        raise PatientIdentityError(
+            f"{patient_label!r} is a folder name, not a clinic patient ID. "
+            f"Create the patient through the engine so the ID is allocated and "
+            f"reserved, then run the batch again."
+        )
+    reserve_canonical_patient_id(session, patient_label)
+    return storage.create_patient(
+        session,
+        label=patient_label,
+        notes="",
+        birthdate=parsed.birthdate,
+        first_initial=parsed.first_initial,
+        last_initial=parsed.last_initial,
+    )
 
 
 def _ensure_report_registered(

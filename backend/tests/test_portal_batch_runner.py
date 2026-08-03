@@ -761,3 +761,46 @@ def test_discover_batch_tasks_skips_legacy_dob_folders(tmp_path: Path):
     )
 
     assert [task.patient_label for task in tasks] == ["BT_12-11-1963"]
+
+
+def test_a_folder_name_cannot_mint_an_unreserved_patient(temp_data_dir, monkeypatch):
+    """The batch runner's folder-name path is a third way to create a patient.
+
+    Left open it hands out an ID nothing reserved, so the next patient with the
+    same initials and birthdate could be allocated this person's ID.
+    """
+    from backend import storage
+    from backend.patient_identity import PatientIdentityError
+    from scripts import run_portal_council_batch as batch
+
+    monkeypatch.setattr(
+        batch, "_resolve_patient_for_label", lambda *a, **k: None
+    )
+
+    with storage.session_scope() as session:
+        with pytest.raises(PatientIdentityError, match="not a clinic patient ID"):
+            batch._get_or_create_patient_for_label(
+                session, patient_label="08-10-1989-0", portal_pdfs=[]
+            )
+
+
+def test_a_canonical_folder_name_is_reserved_as_it_is_created(
+    temp_data_dir, monkeypatch
+):
+    from backend import storage
+    from backend.storage import PatientIdReservation
+    from scripts import run_portal_council_batch as batch
+
+    monkeypatch.setattr(
+        batch, "_resolve_patient_for_label", lambda *a, **k: None
+    )
+
+    with storage.session_scope() as session:
+        patient = batch._get_or_create_patient_for_label(
+            session, patient_label="DK_08-10-1989", portal_pdfs=[]
+        )
+
+        assert patient.label == "DK_08-10-1989"
+        assert patient.birthdate == "08-10-1989"
+        # The reservation is what stops the ID being issued twice.
+        assert session.get(PatientIdReservation, "DK_08-10-1989") is not None
