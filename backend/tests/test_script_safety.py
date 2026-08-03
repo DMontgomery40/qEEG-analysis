@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 from pathlib import Path
 
@@ -60,3 +61,55 @@ def test_single_agent_auto_discovery_rejects_ambiguous_matches(tmp_path: Path):
             manifest_path=manifest_path,
             reports_root=reports_root,
         )
+
+
+def test_data_dir_does_not_follow_the_working_directory(tmp_path, monkeypatch):
+    """Six patient rows reached the clinic's live database because DATA_DIR was
+    relative: a suite run with the wrong working directory wrote production.
+
+    The path has to be anchored to the repo, so where the process was launched
+    from cannot decide which clinic's data it opens.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    probe = "import backend.config as c; print(c.DATA_DIR)"
+
+    from_repo = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo_root, capture_output=True, text=True,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(repo_root)},
+    )
+    from_elsewhere = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=tmp_path, capture_output=True, text=True,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(repo_root)},
+    )
+
+    assert from_repo.returncode == 0, from_repo.stderr
+    assert from_elsewhere.returncode == 0, from_elsewhere.stderr
+    assert from_repo.stdout.strip() == from_elsewhere.stdout.strip()
+    assert Path(from_elsewhere.stdout.strip()) == repo_root / "data"
+    # And nothing was created in the directory we happened to run from.
+    assert not (tmp_path / "data").exists()
+
+
+def test_an_explicit_data_dir_still_wins():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-c", "import backend.config as c; print(c.DATA_DIR)"],
+        cwd=repo_root, capture_output=True, text=True,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(repo_root),
+            "DATA_DIR": "/tmp/somewhere-else",
+        },
+    )
+
+    assert result.stdout.strip() == "/tmp/somewhere-else"
