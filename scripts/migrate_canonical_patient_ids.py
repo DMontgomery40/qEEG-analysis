@@ -739,21 +739,40 @@ class Journal:
 # Renderer boundary inventory
 # --------------------------------------------------------------------------- #
 
+# A date-of-birth shaped regex, however many named groups are threaded through
+# it: two two-digit fields and a four-digit year, in that order, on one line.
+_DOB_REGEX_SHAPE = re.compile(
+    r"\\d\{2\}.{0,24}?-.{0,24}?\\d\{2\}.{0,24}?-.{0,24}?\\d\{4\}"
+)
+
+# Two initials and an underscore in front of the birthdate: the canonical ID.
+_CANONICAL_SHAPE = re.compile(r"\[A-Z\]\{2\}\\?_")
+
 RENDERER_REJECT_PATTERNS = (
-    (r"strptime\(\s*[A-Za-z_]*patient_id", "parses the patient ID as a bare date"),
-    (r'r?["\']\^?\\d\{2\}-\\d\{2\}-\\d\{4\}', "matches a DOB-only ID shape"),
-    (r"%m-%d-%Y", "formats or parses an ID as a bare date"),
+    (
+        re.compile(r"strptime\([^)]*patient", re.IGNORECASE),
+        "parses the patient ID as a bare date",
+    ),
+    (_DOB_REGEX_SHAPE, "matches a date-of-birth-only ID shape"),
+    (re.compile(r"%m-%d-%Y"), "formats or parses an ID as a bare date"),
+)
+
+_SCAN_SKIP_DIRS = frozenset(
+    {".git", "node_modules", ".venv", "venv", "__pycache__", "worktrees", "site-packages"}
 )
 
 
 def scan_renderer_repo(root: Path) -> list[dict[str, Any]]:
-    """Find validators and parsers that would reject a canonical ID."""
+    """Find validators and parsers that would reject a canonical ID.
+
+    A renderer that cannot read the clinic's ID off a project folder silently
+    skips every real patient, so an unresolved finding here fails the dry run.
+    """
     findings: list[dict[str, Any]] = []
     if not root.is_dir():
         return [{"path": str(root), "issue": "repository not found", "line": 0}]
     for path in sorted(root.rglob("*.py")):
-        parts = set(path.parts)
-        if parts & {".git", "node_modules", ".venv", "venv", "__pycache__"}:
+        if _SCAN_SKIP_DIRS & set(path.parts):
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -762,8 +781,14 @@ def scan_renderer_repo(root: Path) -> list[dict[str, Any]]:
         if "patient" not in text.lower():
             continue
         for number, line in enumerate(text.splitlines(), start=1):
+            if "patient" not in line.lower() and "_id_re" not in line.lower():
+                continue
+            # The canonical contract contains a birthdate too. What makes it
+            # canonical is the two initials in front of it.
+            if _CANONICAL_SHAPE.search(line):
+                continue
             for pattern, issue in RENDERER_REJECT_PATTERNS:
-                if re.search(pattern, line):
+                if pattern.search(line):
                     findings.append(
                         {
                             "path": str(path),
@@ -772,6 +797,7 @@ def scan_renderer_repo(root: Path) -> list[dict[str, Any]]:
                             "source": line.strip()[:160],
                         }
                     )
+                    break
     return findings
 
 

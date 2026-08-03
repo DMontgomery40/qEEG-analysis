@@ -502,3 +502,64 @@ def test_apply_requires_the_window_to_be_confirmed(capsys, tmp_path):
 
     assert exit_code == 2
     assert "--window-confirmed" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# The renderer boundary
+# --------------------------------------------------------------------------- #
+
+
+def test_the_scanner_finds_a_validator_that_would_reject_a_canonical_id(tmp_path: Path):
+    """A renderer that cannot read the clinic's ID skips every real patient."""
+    repo = tmp_path / "renderer"
+    repo.mkdir()
+    (repo / "publish.py").write_text(
+        'import re\n'
+        'PATIENT_ID_RE = re.compile(r"^\\d{2}-\\d{2}-\\d{4}-\\d+$")\n'
+    )
+
+    findings = migrator.scan_renderer_repo(repo)
+
+    assert len(findings) == 1
+    assert findings[0]["line"] == 2
+    assert "date-of-birth-only" in findings[0]["issue"]
+
+
+def test_named_groups_do_not_hide_a_date_only_validator(tmp_path: Path):
+    """The real one was written with named groups and slipped a naive scan."""
+    repo = tmp_path / "renderer"
+    repo.mkdir()
+    (repo / "publish.py").write_text(
+        'import re\n'
+        '_PATIENT_ID_RE = re.compile('
+        'r"^(?P<mm>\\d{2})-(?P<dd>\\d{2})-(?P<yyyy>\\d{4})-(?P<n>\\d+)$")\n'
+    )
+
+    assert len(migrator.scan_renderer_repo(repo)) == 1
+
+
+def test_the_canonical_contract_is_not_reported_as_a_finding(tmp_path: Path):
+    """The canonical ID contains a birthdate too — the initials are what differ."""
+    repo = tmp_path / "renderer"
+    repo.mkdir()
+    (repo / "publish.py").write_text(
+        'import re\n'
+        'PATIENT_ID_RE = re.compile('
+        'r"^[A-Z]{2}_\\d{2}-\\d{2}-\\d{4}(?:_(?:[2-9]|[1-9]\\d+))?$")\n'
+    )
+
+    assert migrator.scan_renderer_repo(repo) == []
+
+
+def test_an_unresolved_renderer_finding_fails_the_dry_run(world, tmp_path: Path):
+    repo = tmp_path / "renderer"
+    repo.mkdir()
+    (repo / "publish.py").write_text(
+        'import re\n'
+        'PATIENT_ID_RE = re.compile(r"^\\d{2}-\\d{2}-\\d{4}-\\d+$")\n'
+    )
+    world.explainer_root = str(repo)
+
+    report = migrator.build_report(world)
+
+    assert any("local-explainer-video:" in b for b in report["blockers"])
