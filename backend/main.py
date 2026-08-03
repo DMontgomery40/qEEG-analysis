@@ -201,7 +201,14 @@ class PatientCreate(BaseModel):
 
 
 class PatientUpdate(PatientCreate):
-    """Same identity fields as create; the canonical ID is re-resolved on save."""
+    """Same identity fields as create; the canonical ID is re-resolved on save.
+
+    Notes are the exception. They carry what the agent has learned about this
+    patient, so leaving them out of a save keeps what is on file; sending a
+    string, empty one included, replaces it.
+    """
+
+    notes: str | None = None
 
 
 class RunCreate(BaseModel):

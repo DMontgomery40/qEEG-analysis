@@ -853,3 +853,54 @@ def test_generated_portal_filenames_never_carry_a_legacy_patient_key(
     for path in written:
         assert legacy_key.search(path.name) is None, path.name
         assert path.name.startswith("BT_12-11-1963"), path.name
+
+
+def test_saving_a_patient_without_notes_keeps_the_notes_on_file(
+    temp_data_dir, monkeypatch
+):
+    """Notes are agent-managed memory, so silence is not an instruction to erase."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/patients",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+                "notes": "sleeps badly before sessions",
+            },
+        ).json()
+
+        untouched = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+            },
+        ).json()
+
+        replaced = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+                "notes": "sleep improved after week three",
+            },
+        ).json()
+
+        cleared = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+                "notes": "",
+            },
+        ).json()
+
+    assert untouched["notes"] == "sleeps badly before sessions"
+    assert replaced["notes"] == "sleep improved after week three"
+    assert cleared["notes"] == ""

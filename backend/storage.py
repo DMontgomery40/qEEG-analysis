@@ -259,20 +259,25 @@ def update_patient(
     patient_id: str,
     *,
     label: str,
-    notes: str,
+    notes: str | None = None,
     birthdate: str | None = None,
     first_name: str | None = None,
     last_name: str | None = None,
     first_initial: str | None = None,
     last_initial: str | None = None,
 ) -> Patient | None:
-    """Update a patient. Identity fields left as None keep their stored value."""
+    """Update a patient. Fields left as None keep their stored value.
+
+    That includes ``notes``: they hold what the agent has learned about this
+    patient, so a caller that simply does not mention them must not erase them.
+    Passing a string — including ``""`` — still replaces what is stored.
+    """
     patient = session.get(Patient, patient_id)
     if patient is None:
         return None
     patient.label = label
-    patient.notes = notes
     for field, value in (
+        ("notes", notes),
         ("birthdate", birthdate),
         ("first_name", first_name),
         ("last_name", last_name),
