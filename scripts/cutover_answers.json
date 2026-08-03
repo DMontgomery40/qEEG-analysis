@@ -1,0 +1,91 @@
+{
+  "_about": [
+    "The clinic's answers to what the dry run could not decide for itself.",
+    "Every entry here is a person's ruling, not an inference. The migrator",
+    "applies them without re-litigating: a clinic-stated identity outranks a",
+    "filename, a stored record, or anything this tool worked out on its own.",
+    "Answered 2026-08-03 by David Montgomery."
+  ],
+
+  "_initials_rule": [
+    "An initial nobody knows yet is X, per position. Both unknown gives",
+    "XX_MM-DD-YYYY. These are ordinary canonical IDs that route and sync like",
+    "any other, and the clinic corrects one whenever they like through a normal",
+    "relabel. An unknown initial is never a reason to stop a migration.",
+    "Many 1/1 birthdates are from the blacked-out-birthday era and are",
+    "approximate; those get corrected the same way."
+  ],
+  "initials": {
+    "12-11-1963-0": {
+      "first": "C",
+      "last": "L",
+      "note": "the clinic named the patient Connor L"
+    },
+    "04-08-1986-0": {
+      "first": "X",
+      "last": "S",
+      "note": "the clinic said Snyder; the first initial is not known yet"
+    },
+    "01-01-1991-0": {
+      "first": "X",
+      "last": "X",
+      "note": "nobody on file; pending a clinic correction"
+    },
+    "06-28-1977-0": {
+      "first": "X",
+      "last": "X",
+      "note": "nobody on file; pending a clinic correction"
+    },
+    "01-01-2013-0": {
+      "first": "X",
+      "last": "X",
+      "note": "a real patient from the blacked-out-birthday era; DOB approximate"
+    },
+    "03-05-2010-0": {
+      "first": "X",
+      "last": "X",
+      "note": "the folder's own patient, once the misfiled reports move out"
+    },
+    "09-23-1982-0": {
+      "first": "D",
+      "last": "M",
+      "note": "the owner's own chart, and a real one"
+    }
+  },
+
+  "_merge_rule": [
+    "The losing row's reports, runs and patient files move to the survivor's",
+    "UUID first, then the row goes. Same machinery as a duplicate label."
+  ],
+  "merge_into": {
+    "01-01-1983-0": {
+      "survivor": "09-23-1982-0",
+      "note": "the same person as the owner's real chart, filed twice in the blacked-out-birthday era"
+    }
+  },
+
+  "_split_rule": [
+    "A folder holding more than one patient's reports is split: each misfiled",
+    "report goes to the patient the bytes and the filename name, and whoever is",
+    "left keeps the folder."
+  ],
+  "split_misfiled": {
+    "03-05-2010-0": {
+      "note": "holds DK, LC, PL and SF reports; the residual owner keeps the folder"
+    }
+  },
+
+  "_dissolve_rule": [
+    "A row that was never one person's chart. Its reports already exist under",
+    "the patients they belong to, so once that is confirmed the row is retired",
+    "rather than migrated."
+  ],
+  "dissolve": {
+    "4-8-1997": {
+      "note": "one LJ report and one BB report, both byte-identical to copies already filed under 04-08-1997-0 and 10-07-1963-0"
+    },
+    "10-7-1963": {
+      "note": "its only report is byte-identical to one already filed under 10-07-1963-0"
+    }
+  }
+}

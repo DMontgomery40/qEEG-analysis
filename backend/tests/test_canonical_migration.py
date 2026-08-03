@@ -251,6 +251,7 @@ def world(tmp_path: Path):
         pending_uploads_dir="",
         this_is_the_scheduled_cutover=False,
         qa_candidates_confirmed=False,
+        answers="",
         # Synthetic label sets: a fixture world must never wear a real
         # patient's ID, or an --apply pointed at a live directory would
         # match one.
@@ -1136,3 +1137,131 @@ def test_a_patient_whose_rekey_failed_never_reaches_the_hub_artifacts(
 
     # A sibling that succeeded in the same run is still there.
     assert mapping_file["09-09-1909-0"] == "DK_09-09-1909"
+
+
+# --------------------------------------------------------------------------- #
+# The clinic's answers
+# --------------------------------------------------------------------------- #
+
+
+def _answers(world, payload: dict) -> None:
+    path = Path(world.portal_root).parent / "answers.json"
+    path.write_text(json.dumps(payload))
+    world.answers = str(path)
+
+
+def test_an_unknown_initial_is_X_and_never_a_blocker(world):
+    """The clinic corrects an X whenever they like through a normal relabel.
+    Not knowing a letter is not a reason to stop a migration."""
+    _answers(world, {"initials": {
+        "10-10-1910-0": {"first": "X", "last": "X"},
+        "11-11-1911-0": {"first": "X", "last": "X"},
+    }})
+
+    report = migrator.build_report(world)
+
+    assert report["mapping"]["10-10-1910-0"] == "XX_10-10-1910"
+    assert not any(b.startswith("10-10-1910-0:") for b in report["blockers"])
+    # And it is a real canonical id, not a special case downstream.
+    assert migrator.parse_canonical_patient_id("XX_10-10-1910") is not None
+
+
+def test_a_clinic_answer_outranks_the_name_on_the_document(world):
+    """The clinic is the authority on who their patients are. A stored pair the
+    dry run flagged as a placeholder is simply replaced by what they say."""
+    _answers(world, {"initials": {"08-08-1908-0": {"first": "C", "last": "L"}}})
+
+    report = migrator.build_report(world)
+
+    # The folder stores BT and the report is named 'L, Connor final qeeg.pdf';
+    # neither gets a vote once the clinic has answered.
+    assert report["mapping"]["08-08-1908-0"] == "CL_08-08-1908"
+    assert not any(b.startswith("08-08-1908-0:") for b in report["blockers"])
+
+
+def test_a_merged_row_moves_its_work_to_the_survivor(world):
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "merge_into": {"10-10-1910-0": {"survivor": "07-07-1907-0"}},
+    })
+
+    report = migrator.build_report(world)
+
+    merged = next(
+        e for e in report["classified"] if e["label"] == "10-10-1910-0"
+    )
+    assert merged["bucket"] == migrator.BUCKET_DUPLICATE
+    assert merged["survivor_uuid"].startswith("aaaaaaaa")
+    assert "10-10-1910-0" not in report["mapping"]
+
+
+def test_a_row_that_was_never_a_chart_is_retired_not_migrated(world):
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+    })
+
+    report = migrator.build_report(world)
+
+    dissolved = next(e for e in report["classified"] if e["label"] == "7-7-1907")
+    assert dissolved["bucket"] == migrator.BUCKET_DISSOLVED
+    assert "7-7-1907" not in report["mapping"]
+    assert not any(b.startswith("7-7-1907:") for b in report["blockers"])
+
+
+def test_a_split_folder_moves_each_report_to_the_patient_it_belongs_to(world):
+    """The residual owner keeps the folder; everybody else's reports go home."""
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "split_misfiled": {"11-11-1911-0": {"note": "holds DK's reports"}},
+    })
+
+    report = migrator.build_report(world)
+    assert not any(b.startswith("11-11-1911-0:") for b in report["blockers"])
+    assert report["mapping"]["11-11-1911-0"] == "XX_11-11-1911"
+
+    assert migrator.run_apply(world, report) == 0
+
+    portal = Path(world.portal_root)
+    # DK's misfiled report is now under DK's canonical folder...
+    assert (
+        portal / "DK_09-09-1909"
+        / "11-11-1911-0__DK_20Tx_toxic-brain-injury__v1__2026-05-09.pdf"
+    ).is_file()
+    # ...and the residual owner kept the folder, with their own file in it.
+    assert (portal / "XX_11-11-1911" / "XX_11-11-1911__patient-facing__v1__2026-05-09.pdf").is_file()
+
+
+def test_a_patient_with_no_share_folder_is_given_one(world):
+    """Nothing of theirs could ever be published otherwise."""
+    _answers(world, {"initials": {
+        "10-10-1910-0": {"first": "X", "last": "X"},
+        "11-11-1911-0": {"first": "X", "last": "X"},
+    }})
+    conn = sqlite3.connect(world.db)
+    conn.execute(
+        "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+        "VALUES ('nofolder', '01-01-1913-0', '', '2026-01-01', '2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+    _answers(world, {"initials": {
+        "10-10-1910-0": {"first": "X", "last": "X"},
+        "11-11-1911-0": {"first": "X", "last": "X"},
+        "01-01-1913-0": {"first": "X", "last": "X"},
+    }})
+    _unblock(world)
+
+    report = migrator.build_report(world)
+    assert report["mapping"]["01-01-1913-0"] == "XX_01-01-1913"
+    assert migrator.run_apply(world, report) == 0
+
+    assert (Path(world.portal_root) / "XX_01-01-1913").is_dir()

@@ -84,6 +84,39 @@ BUCKET_TEST_POLLUTION = "test_pollution"
 BUCKET_NON_PATIENT = "non_patient_row"
 BUCKET_DUPLICATE = "duplicate_of_survivor"
 BUCKET_ALREADY_CANONICAL = "already_canonical"
+BUCKET_DISSOLVED = "dissolved_not_a_chart"
+
+
+def load_answers(path: Path | None) -> dict[str, Any]:
+    """The clinic's rulings on what this tool could not decide for itself.
+
+    Read as data rather than baked in, so the answers are reviewable, and so a
+    later correction is an edit to a file rather than a patch to a migrator.
+    Keys beginning with an underscore are prose for whoever reads it next.
+    """
+    if path is None or not Path(path).is_file():
+        return {}
+    try:
+        answers = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise MigrationStop(f"could not read the answers at {path}: {exc}") from exc
+    return answers if isinstance(answers, dict) else {}
+
+
+def answered_initials(answers: dict[str, Any], label: str) -> tuple[str, str] | None:
+    """The initials the clinic gave for this patient, if they gave any.
+
+    `X` is a real answer: it means nobody knows that letter yet, and the ID it
+    builds routes and syncs like any other until someone corrects it.
+    """
+    entry = (answers.get("initials") or {}).get(label)
+    if not isinstance(entry, dict):
+        return None
+    first = str(entry.get("first") or "").strip().upper()
+    last = str(entry.get("last") or "").strip().upper()
+    if len(first) == 1 and len(last) == 1 and first.isalpha() and last.isalpha():
+        return first, last
+    return None
 
 
 class MigrationStop(RuntimeError):
@@ -241,6 +274,16 @@ def _initials_tokens_in(name: str) -> set[tuple[str, str]]:
     for match in _EMBEDDED_INITIALS_RE.finditer(name):
         found.add((match.group("a"), match.group("b")))
     return found
+
+
+def _name_words(title: str) -> list[str]:
+    """The words in an uploaded report's filename that read as a person's name."""
+    stem = re.sub(r"\.(pdf|md|mp4|docx)$", "", title, flags=re.IGNORECASE)
+    return [
+        word
+        for word in re.findall(r"[A-Za-z]+", stem)
+        if word.lower() not in _NON_NAME_WORDS
+    ]
 
 
 def title_name_initials(title: str) -> set[str]:
@@ -578,6 +621,15 @@ def resolve_identity(
             f"{p['initials']} ({p['reading']})" if p["initials"] else p["reading"]
             for p in proposed
         )
+
+        # Only a surname on the file is the common case — "Knowles intial
+        # qeeg.pdf" says nothing about a first name. Stored initials whose LAST
+        # letter is that surname's are consistent with it, and asking about them
+        # is asking a question the file already answers.
+        surname_only = len([w for w in _name_words(title)]) < 2
+        if surname_only and letters and resolved[1] in letters:
+            continue
+
         if not ({resolved[0], resolved[1]} & letters):
             return IdentityFinding(
                 patient_id=patient_id,
@@ -1154,6 +1206,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     qa_candidate_labels = frozenset(
         getattr(args, "qa_candidate_labels", None) or QA_CANDIDATE_LABELS
     )
+    answers = load_answers(
+        Path(args.answers) if getattr(args, "answers", "") else None
+    )
     rows = read_patient_rows(Path(args.db))
     classified = classify_patient_rows(
         rows,
@@ -1165,10 +1220,58 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     sync_state = read_sync_state(portal_root / ".qeeg_portal_sync_state.json")
     titles = read_conversation_titles(Path(args.conversations_dir))
 
+    # Rows the clinic has ruled on: merged into another chart, or retired
+    # because they were never one person's chart to begin with.
+    # Prefer the surviving row: a merge target whose label also has a duplicate
+    # must resolve to the record that keeps the work, not to the one about to
+    # be folded into it.
+    uuid_by_label = {
+        e.label: e.uuid
+        for e in classified
+        if e.label and e.uuid and e.bucket != BUCKET_DUPLICATE
+    }
+    for entry in classified:
+        if entry.bucket != BUCKET_MIGRATE or not entry.label:
+            continue
+        merge = (answers.get("merge_into") or {}).get(entry.label)
+        if isinstance(merge, dict) and merge.get("survivor"):
+            survivor = str(merge["survivor"])
+            entry.bucket = BUCKET_DUPLICATE
+            entry.survivor_uuid = uuid_by_label.get(survivor)
+            entry.reason = (
+                f"the clinic says this is the same person as {survivor}; reports, "
+                f"runs and files move there before the row goes"
+            )
+            if not entry.survivor_uuid:
+                entry.bucket = BUCKET_UNRESOLVED
+                entry.reason = f"merge target {survivor} is not a row in this database"
+                entry.needs = "a survivor that exists"
+            continue
+        dissolve = (answers.get("dissolve") or {}).get(entry.label)
+        if isinstance(dissolve, dict):
+            entry.bucket = BUCKET_DISSOLVED
+            entry.reason = str(dissolve.get("note") or "retired by the clinic")
+            entry.evidence["dissolve"] = dissolve
+
     findings: list[IdentityFinding] = []
     for entry in classified:
         if entry.bucket != BUCKET_MIGRATE or not entry.label:
             continue
+        answered = answered_initials(answers, entry.label)
+        if answered is not None:
+            # The clinic is the authority on who their patients are. An answer
+            # is applied as given — not checked against a filename, a stored
+            # record, or anything this tool worked out on its own.
+            entry.initials = answered
+            findings.append(
+                IdentityFinding(
+                    patient_id=entry.label,
+                    resolved=answered,
+                    sources={"clinic": "answered by the clinic"},
+                )
+            )
+            continue
+
         finding = resolve_identity(
             entry.label,
             portal_root=portal_root,
@@ -1224,19 +1327,24 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                         "belongs_to": owned_initials[token],
                         "file_count": len(names),
                         "examples": names[:2],
+                        "all_files": names,
                     }
                     for token, names in sorted(foreign.items())
                 },
             }
         )
-        entry.bucket = BUCKET_UNRESOLVED
-        entry.reason = (
-            "the folder holds reports belonging to "
-            + ", ".join(
-                f"{_name_owners(owned_initials[t])} ({t}, {len(n)} files)"
-                for t, n in sorted(foreign.items())
-            )
+        held = ", ".join(
+            f"{_name_owners(owned_initials[token])} ({token}, {len(names)} files)"
+            for token, names in sorted(foreign.items())
         )
+        if entry.label in (answers.get("split_misfiled") or {}):
+            # Answered: each misfiled report goes to the patient the bytes and
+            # the filename name, and whoever is left keeps the folder.
+            entry.evidence["split_misfiled"] = mixed[-1]["foreign_initials"]
+            entry.reason = f"splitting: holds {held}"
+            continue
+        entry.bucket = BUCKET_UNRESOLVED
+        entry.reason = "the folder holds reports belonging to " + held
         entry.needs = (
             "a decision: move each misfiled report to the patient it belongs to "
             "during the window, or freeze this folder as it stands"
@@ -1252,6 +1360,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         if legacy is None or entry.label == f"{legacy[0]}-{legacy[1]}":
             continue
         twin = f"{legacy[0]}-{legacy[1]}"
+        if entry.label in (answers.get("dissolve") or {}):
+            continue
         if twin in padded_labels and twin != entry.label:
             entry.bucket = BUCKET_UNRESOLVED
             # Do not stop at "this looks odd" when the bytes can answer it.
@@ -1682,6 +1792,48 @@ def remove_qa_fixture(
     return removed
 
 
+def split_misfiled_reports(
+    portal_root: Path, label: str, foreign: dict[str, Any], mapping: dict[str, str]
+) -> list[str]:
+    """Move each misfiled report to the patient the evidence names.
+
+    A folder holding four other people's reports is not one patient's chart.
+    The files move to whoever they belong to — under the destination's canonical
+    name, since that folder is being renamed in the same run — and whoever is
+    left keeps the folder. Bytes are never rewritten; this is a rename across
+    two folders and nothing more.
+    """
+    moved: list[str] = []
+    source = portal_root / label
+    if not source.is_dir():
+        return moved
+
+    for token, detail in sorted(foreign.items()):
+        owners = detail.get("belongs_to") or []
+        if len(owners) != 1:
+            # Two candidates share these initials, so the file's owner is not
+            # settled and moving it would be a guess.
+            continue
+        owner = owners[0]
+        destination = portal_root / mapping.get(owner, owner)
+        for name in detail.get("all_files") or detail.get("examples") or []:
+            path = source / name
+            if not path.is_file():
+                continue
+            destination.mkdir(parents=True, exist_ok=True)
+            target = destination / name
+            if target.exists():
+                # Already there from an earlier run, or the owner has their own
+                # copy. Either way this is not ours to overwrite.
+                continue
+            digest = patient_rekey._sha256_file(path)
+            os.replace(path, target)
+            if patient_rekey._sha256_file(target) != digest:
+                raise MigrationStop(f"{name} changed bytes moving to {owner}")
+            moved.append(f"{name} -> {owner}")
+    return moved
+
+
 def reserve_migrated_id(
     db_path: Path,
     new_id: str,
@@ -1823,6 +1975,22 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
                             ),
                         }
                     )
+                # The misfiled reports leave before the folder is renamed,
+                # so what moves under the new name is only this patient's.
+                foreign = (entry.get("evidence") or {}).get("split_misfiled")
+                if foreign:
+                    moved = split_misfiled_reports(
+                        portal_root, old_id, foreign, report["mapping"]
+                    )
+                    if moved:
+                        print(f"    moved {len(moved)} misfiled report(s): "
+                              + "; ".join(moved[:4]))
+
+                # A patient the clinic keeps but who never had a share folder
+                # gets one, or nothing of theirs can ever be published.
+                if not (portal_root / old_id).exists():
+                    (portal_root / new_id).mkdir(parents=True, exist_ok=True)
+
                 plan = patient_rekey.plan_patient_rekey(
                     old_id,
                     new_id,
@@ -1949,6 +2117,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--journal", default="")
     parser.add_argument("--pipeline-jobs-dir", default="")
     parser.add_argument("--pending-uploads-dir", default="")
+    parser.add_argument(
+        "--answers",
+        default=str(REPO_ROOT / "scripts" / "cutover_answers.json"),
+        help=(
+            "The clinic's rulings on identities, merges, splits and retired "
+            "rows. Pass an empty string to run without them."
+        ),
+    )
     parser.add_argument(
         "--rollback-bundle",
         default="",
