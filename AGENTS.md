@@ -40,7 +40,9 @@ If missing/garbled, use `POST /api/reports/{report_id}/reextract` (or trigger it
 The patient-facing “explainer video” pipeline lives in `../local-explainer-video`, but it depends on this repo as the
 ground truth + publishing target.
 
-- Patient mapping is by **patient label**: `MM-DD-YYYY-N` (must match across repos)
+- Patient mapping is by the **canonical clinic ID**: `XX_MM-DD-YYYY[_N]` (e.g. `ZZ_01-01-1900`).
+  This engine allocates it; every repo uses that same string for the patient's folder, filenames,
+  and portal/hub keys. The SQLite UUID stays internal to this repo.
 - Narrative ground truth: **Stage 4 consolidation** artifact
 - Numeric ground truth: **Stage 1 `_data_pack.json`** artifact
 - Publish target folder (watched by `thrylen`): `data/portal_patients/<PATIENT_ID>/`

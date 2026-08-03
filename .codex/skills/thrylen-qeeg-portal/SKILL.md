@@ -1,6 +1,6 @@
 ---
 name: thrylen-qeeg-portal
-description: "Maintain the Thrylen qEEG clinician portal hosted on Netlify (thrylen.com/qeeg and optionally qeeg.thrylen.com): shared login, patient folders (MM-DD-YYYY-N), versioned file uploads, and authenticated downloads backed by Netlify Blobs. Use when updating portal UI, functions, env vars, blob storage layout, or deployments."
+description: "Maintain the Thrylen qEEG clinician portal hosted on Netlify (thrylen.com/qeeg and optionally qeeg.thrylen.com): shared login, patient folders (canonical XX_MM-DD-YYYY clinic IDs), versioned file uploads, and authenticated downloads backed by Netlify Blobs. Use when updating portal UI, functions, env vars, blob storage layout, or deployments."
 ---
 
 # Thrylen qEEG Portal (Netlify)
@@ -19,7 +19,7 @@ Operate the qEEG clinician portal served from the `thrylen` repo via Netlify: pa
 
 Local (gitignored) clinician-share staging folder:
 
-- `/Users/davidmontgomery/qEEG-analysis/data/portal_patients/<MM-DD-YYYY-N>/`
+- `/Users/davidmontgomery/qEEG-analysis/data/portal_patients/<PATIENT_ID>/`
 
 ## URLs And Routing
 
@@ -66,11 +66,25 @@ npm run qeeg:patients:watch -- --dir /Users/davidmontgomery/qEEG-analysis/data/p
 
 ## Blob Storage Layout
 
-Patient folders (all artifacts live under a patient ID):
+Every artifact lives under the patient's canonical clinic ID — `XX_MM-DD-YYYY`
+with a collision ordinal only when two real people share initials and a birthdate
+(`ZZ_01-01-1900`, `ZZ_01-01-1900_2`). That one string is the blob key here, the
+`portal_patients/` folder name locally, and the filename prefix. The analysis
+engine allocates it; the hub reads and validates it and never mints one.
 
-- Patient meta: `patients/<MM-DD-YYYY-N>/$meta.json`
-- Optional index (fallback listing): `patients/<MM-DD-YYYY-N>/$index.json`
-- Files: `patients/<MM-DD-YYYY-N>/files/<patientId>__<name>__v<version>__YYYY-MM-DD.<ext>`
+- Patient meta: `patients/<PATIENT_ID>/$meta.json` — its `index` field is the
+  1-based canonical ordinal parsed out of the ID (`ZZ_01-01-1900` is 1).
+- Optional index (fallback listing): `patients/<PATIENT_ID>/$index.json`
+- Files: `patients/<PATIENT_ID>/files/<PATIENT_ID>__<name>__v<version>__YYYY-MM-DD.<ext>`
+
+A patient who is not on file yet has no ID, so the hub never creates a folder for
+one. A new-patient upload parks the file under `uploads/pending/<uploadId>/` and
+writes a `new_patient_upload` job marker at
+`pipeline/jobs/new-patient/<uploadedAt>-<uploadId>.json` carrying the identity the
+browser resolved. The local pipeline worker registers the patient with the engine
+— free of model spend — and the folder arrives by the normal sync. A name
+conflict the operator has not answered parks the job instead of bouncing the
+upload.
 
 Files store user metadata (encoded in `x-amz-meta-user`) including `originalName`, `logicalName`, `version`, `uploadedAt`, `uploadedBy`, `size`, `contentType`.
 
