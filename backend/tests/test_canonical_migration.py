@@ -1468,3 +1468,96 @@ def test_the_split_is_journalled_so_a_later_run_can_verify_it(world):
     assert "11-11-1911-0__DK_20Tx_toxic-brain-injury__v1__2026-05-09.pdf" in (
         splits[0]["files"]
     )
+
+
+def test_a_resume_after_a_split_collision_completes_end_to_end(world):
+    """The production state, exactly.
+
+    The first run split files out into a recipient's canonical folder, then hit
+    the collision when that recipient's own rekey came round and stopped with
+    them unfinished. On the next run the pre-apply validation must not call that
+    folder a stray — this migration made it, the journal says so, and its owner
+    is mid-resume. It has to pass validation and then finish.
+    """
+    _split_recipient_sorting_after_the_mixed_folder(world)
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"},
+                     "12-12-1922-0": {"first": "Z", "last": "W"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "split_misfiled": {"11-11-1911-0": {"note": "holds ZW's report"}},
+    })
+
+    # First run, with the merge path unavailable: the split lands, then the
+    # recipient's own rekey cannot proceed. This is where the window stopped.
+    real_plan = migrator.patient_rekey.plan_patient_rekey
+
+    def refuse_to_merge(*args, **kwargs):
+        return real_plan(*args, **{**kwargs, "merge_into_existing": False})
+
+    original = migrator.patient_rekey.plan_patient_rekey
+    migrator.patient_rekey.plan_patient_rekey = refuse_to_merge
+    try:
+        assert migrator.run_apply(world, migrator.build_report(world)) == 1
+    finally:
+        migrator.patient_rekey.plan_patient_rekey = original
+
+    portal = Path(world.portal_root)
+    assert (portal / "ZW_12-12-1922").is_dir()      # created by the split
+    assert (portal / "12-12-1922-0").is_dir()       # their own, not yet moved
+    journal = Journal_lines(Path(world.journal))
+    assert not any(
+        r.get("kind") == "patient_rekeyed" and r["old_id"] == "12-12-1922-0"
+        for r in journal
+    )
+
+    # The resume. Validation must let the half-made folder through, not block.
+    resumed = migrator.build_report(world)
+    assert not any("ZW_12-12-1922" in b for b in resumed["blockers"]), (
+        resumed["blockers"]
+    )
+    assert "ZW_12-12-1922" in resumed["pending_merge_folders"]
+
+    assert migrator.run_apply(world, resumed) == 0
+
+    landed = sorted(p.name for p in (portal / "ZW_12-12-1922").iterdir() if p.is_file())
+    assert "11-11-1911-0__ZW_misfiled__v1__2026-01-01.pdf" in landed
+    assert "ZW_own_report.pdf" in landed
+    assert not (portal / "12-12-1922-0").exists()
+
+
+def test_the_bundle_snapshot_says_which_files_this_run_moved(tmp_path: Path):
+    """The journal is the primary record, but a run that began before split
+    records existed has none. The rollback bundle holds the portal tree as it
+    stood before any of this ran, and unlike a manifest it is never rewritten:
+    a file now in one patient's folder that used to be in somebody else's is a
+    file this migration moved.
+    """
+    bundle = tmp_path / "bundle"
+    snapshot = bundle / "portal_patients.pre-cutover"
+    (snapshot / "11-11-1911-0").mkdir(parents=True)
+    (snapshot / "09-09-1909-0").mkdir(parents=True)
+    (snapshot / "11-11-1911-0" / "moved-out.pdf").write_bytes(b"%PDF-1.4 a")
+    (snapshot / "09-09-1909-0" / "their-own.pdf").write_bytes(b"%PDF-1.4 b")
+
+    receipts = migrator.split_receipts_from_snapshot(
+        bundle, {"09-09-1909-0": "DK_09-09-1909"}
+    )
+    assert "moved-out.pdf" in receipts["09-09-1909-0"]
+    # Their own file is not something this run moved to them.
+    assert "their-own.pdf" not in receipts["09-09-1909-0"]
+
+    portal = tmp_path / "portal_patients"
+    (portal / "DK_09-09-1909").mkdir(parents=True)
+    (portal / "DK_09-09-1909" / "moved-out.pdf").write_bytes(b"%PDF-1.4 a")
+    assert migrator.target_is_this_runs_own_work(
+        portal, "DK_09-09-1909", receipts["09-09-1909-0"]
+    ) == (True, [])
+
+    # And one file the snapshot cannot account for still refuses the whole merge.
+    (portal / "DK_09-09-1909" / "stranger.pdf").write_bytes(b"%PDF-1.4 z")
+    allowed, unaccounted = migrator.target_is_this_runs_own_work(
+        portal, "DK_09-09-1909", receipts["09-09-1909-0"]
+    )
+    assert allowed is False and unaccounted == ["stranger.pdf"]

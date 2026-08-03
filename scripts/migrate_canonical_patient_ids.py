@@ -1415,11 +1415,48 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
     # Portal folders with no database row at all still have to be accounted for.
     known = {e.label for e in classified if e.label}
-    orphan_folders = sorted(
-        entry.name
-        for entry in portal_root.iterdir()
-        if entry.is_dir() and entry.name not in known
-    ) if portal_root.is_dir() else []
+    # A canonical folder standing where a patient is mid-migration is not a
+    # stray: the un-misfile step created it to receive their split-out reports,
+    # and their own rekey has not landed yet. The journal is what says so —
+    # same accounting as the merge gate, so this can only ever wave through a
+    # folder whose entire contents this migration put there.
+    journal_receipts: dict[str, set[str]] = defaultdict(set)
+    journal_path = Path(args.journal) if getattr(args, "journal", "") else None
+    if journal_path is not None and journal_path.is_file():
+        for record in Journal(journal_path).split_records():
+            journal_receipts[record["owner"]].update(record.get("files") or [])
+
+    # The manifest this run is about to replace was written by the run that did
+    # the splitting, and it records which files went to whom. That is the same
+    # evidence as a journal line, and it is what a run started before split
+    # journalling existed has to fall back on.
+    prior = Path(args.manifest_out) if getattr(args, "manifest_out", "") else None
+    if prior is not None and prior.is_file():
+        try:
+            previous = json.loads(prior.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        for owner, files in split_receipts(previous).items():
+            journal_receipts[owner].update(files)
+
+    bundle = Path(args.rollback_bundle) if getattr(args, "rollback_bundle", "") else None
+    for owner, files in split_receipts_from_snapshot(bundle, mapping).items():
+        journal_receipts[owner].update(files)
+
+    pending_merge: list[str] = []
+    orphans: list[str] = []
+    if portal_root.is_dir():
+        for entry in sorted(portal_root.iterdir()):
+            if not entry.is_dir() or entry.name in known:
+                continue
+            owner = next(
+                (old for old, new in mapping.items() if new == entry.name), None
+            )
+            accounted, _unaccounted = target_is_this_runs_own_work(
+                portal_root, entry.name, journal_receipts.get(owner or "", set())
+            )
+            (pending_merge if accounted else orphans).append(entry.name)
+    orphan_folders = orphans
 
     local_files = 0
     local_bytes = 0
@@ -1537,6 +1574,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "mapping": mapping,
         "identity_findings": [asdict(f) for f in findings],
         "orphan_portal_folders": orphan_folders,
+        "pending_merge_folders": pending_merge,
         "orphan_pending_prefixes": orphan_pending,
         "mixed_patient_folders": mixed,
         "pipeline_job_files": pipeline_jobs,
@@ -1859,6 +1897,41 @@ def split_receipts(report: dict[str, Any]) -> dict[str, set[str]]:
             receipts[owners[0]].update(detail.get("all_files") or [])
     for record in report.get("prior_split_receipts") or []:
         receipts[record["owner"]].update(record.get("files") or [])
+    return receipts
+
+
+def split_receipts_from_snapshot(
+    bundle_dir: Path | None, mapping: dict[str, str]
+) -> dict[str, set[str]]:
+    """Which files this migration moved between folders, read off the bundle.
+
+    The rollback bundle holds the portal tree exactly as it stood before any of
+    this ran. A file sitting in a patient's canonical folder today that was, in
+    that snapshot, inside somebody else's folder and not their own, is a file
+    this migration moved. That is durable evidence: unlike a manifest it is
+    never rewritten, and unlike the journal it exists for runs that began
+    before split records were written.
+    """
+    receipts: dict[str, set[str]] = defaultdict(set)
+    if bundle_dir is None:
+        return receipts
+    snapshot = Path(bundle_dir) / "portal_patients.pre-cutover"
+    if not snapshot.is_dir():
+        return receipts
+
+    owners_by_file: dict[str, set[str]] = defaultdict(set)
+    for folder in snapshot.iterdir():
+        if not folder.is_dir():
+            continue
+        for path in folder.rglob("*"):
+            if path.is_file():
+                owners_by_file[path.name].add(folder.name)
+
+    for old_id in mapping:
+        for name, owners in owners_by_file.items():
+            if old_id not in owners and owners:
+                # It lived under somebody else before this began.
+                receipts[old_id].add(name)
     return receipts
 
 
