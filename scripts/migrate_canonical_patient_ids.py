@@ -1420,28 +1420,12 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     # and their own rekey has not landed yet. The journal is what says so —
     # same accounting as the merge gate, so this can only ever wave through a
     # folder whose entire contents this migration put there.
-    journal_receipts: dict[str, set[str]] = defaultdict(set)
-    journal_path = Path(args.journal) if getattr(args, "journal", "") else None
-    if journal_path is not None and journal_path.is_file():
-        for record in Journal(journal_path).split_records():
-            journal_receipts[record["owner"]].update(record.get("files") or [])
-
-    # The manifest this run is about to replace was written by the run that did
-    # the splitting, and it records which files went to whom. That is the same
-    # evidence as a journal line, and it is what a run started before split
-    # journalling existed has to fall back on.
-    prior = Path(args.manifest_out) if getattr(args, "manifest_out", "") else None
-    if prior is not None and prior.is_file():
-        try:
-            previous = json.loads(prior.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            previous = {}
-        for owner, files in split_receipts(previous).items():
-            journal_receipts[owner].update(files)
-
-    bundle = Path(args.rollback_bundle) if getattr(args, "rollback_bundle", "") else None
-    for owner, files in split_receipts_from_snapshot(bundle, mapping).items():
-        journal_receipts[owner].update(files)
+    receipts = gather_split_receipts(args, mapping)
+    # Plus what this run is itself about to split. On a first run there is no
+    # journal line or snapshot yet — the plan in hand is the only record — and
+    # the gate has to see the same thing the check does.
+    for owner, files in split_receipts({"mixed_patient_folders": mixed}).items():
+        receipts[owner].update(files)
 
     pending_merge: list[str] = []
     orphans: list[str] = []
@@ -1453,7 +1437,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 (old for old, new in mapping.items() if new == entry.name), None
             )
             accounted, _unaccounted = target_is_this_runs_own_work(
-                portal_root, entry.name, journal_receipts.get(owner or "", set())
+                portal_root, entry.name, receipts.get(owner or "", set())
             )
             (pending_merge if accounted else orphans).append(entry.name)
     orphan_folders = orphans
@@ -1575,6 +1559,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "identity_findings": [asdict(f) for f in findings],
         "orphan_portal_folders": orphan_folders,
         "pending_merge_folders": pending_merge,
+        "split_receipts": {owner: sorted(files) for owner, files in receipts.items()},
         "orphan_pending_prefixes": orphan_pending,
         "mixed_patient_folders": mixed,
         "pipeline_job_files": pipeline_jobs,
@@ -1900,6 +1885,44 @@ def split_receipts(report: dict[str, Any]) -> dict[str, set[str]]:
     return receipts
 
 
+def gather_split_receipts(
+    args: argparse.Namespace, mapping: dict[str, str]
+) -> dict[str, set[str]]:
+    """Which files this migration moved between folders, from every record of it.
+
+    One function, because the pre-apply check and the merge gate are asking the
+    same question and must never get different answers. Three sources, in order
+    of how directly they were written by the run that did the moving:
+
+    * the journal's own ``split_moved`` lines;
+    * the manifest this run is about to replace, written by the run that split;
+    * the rollback bundle's pre-cutover snapshot, which is the only one that
+      cannot be overwritten and so is the only one a run interrupted before
+      split journalling existed can rely on.
+    """
+    receipts: dict[str, set[str]] = defaultdict(set)
+
+    journal_path = Path(args.journal) if getattr(args, "journal", "") else None
+    if journal_path is not None and journal_path.is_file():
+        for record in Journal(journal_path).split_records():
+            receipts[record["owner"]].update(record.get("files") or [])
+
+    prior = Path(args.manifest_out) if getattr(args, "manifest_out", "") else None
+    if prior is not None and prior.is_file():
+        try:
+            previous = json.loads(prior.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        for owner, files in split_receipts(previous).items():
+            receipts[owner].update(files)
+
+    bundle = Path(args.rollback_bundle) if getattr(args, "rollback_bundle", "") else None
+    for owner, files in split_receipts_from_snapshot(bundle, mapping).items():
+        receipts[owner].update(files)
+
+    return receipts
+
+
 def split_receipts_from_snapshot(
     bundle_dir: Path | None, mapping: dict[str, str]
 ) -> dict[str, set[str]]:
@@ -2048,9 +2071,14 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
         # Work still owed from a previous run: its database label already moved,
         # so build_report no longer sees it as a patient to migrate. Only the
         # journal knows it was left half-done.
-        receipts = split_receipts(report)
-        for record in journal.split_records():
-            receipts[record["owner"]].update(record.get("files") or [])
+        # The one answer the validation already worked out. Gathering it again
+        # here is how the gate and the check came to disagree: the validation
+        # could see the bundle snapshot and the gate could not, so the same
+        # folder was work-in-progress to one and a stray to the other.
+        receipts: dict[str, set[str]] = {
+            owner: set(files)
+            for owner, files in (report.get("split_receipts") or {}).items()
+        }
 
         work: list[tuple[str, str, dict[str, Any]]] = []
         for record in journal.unfinished():

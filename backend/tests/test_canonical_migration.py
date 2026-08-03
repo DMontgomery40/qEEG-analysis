@@ -1341,8 +1341,15 @@ def _split_recipient_sorting_after_the_mixed_folder(world):
     portal = Path(world.portal_root)
     _folder(portal, "12-12-1922-0", initials=("Z", "W"),
             files=["ZW_own_report.pdf"])
-    (portal / "11-11-1911-0"
-     / "11-11-1911-0__ZW_misfiled__v1__2026-01-01.pdf").write_bytes(b"%PDF-1.4 zw")
+    # Named the way production's really are: the mixed folder's own id in
+    # front, sometimes twice, and nothing of the owner's id anywhere.
+    for name in (
+        "11-11-1911-0__ZW_misfiled__v1__2026-01-01.pdf",
+        "11-11-1911-0_ZW_dementia_10tx_mid_qeeg_Redacted_v1_2026-01-01.pdf",
+        "11-11-1911-0__11-11-1911-0_ZW_dementia_10tx_mid_qeeg_Redacted_v1"
+        "_2026-01-01__v1__2026-05-07.pdf",
+    ):
+        (portal / "11-11-1911-0" / name).write_bytes(b"%PDF-1.4 zw")
     conn = sqlite3.connect(world.db)
     conn.execute(
         "INSERT INTO patients (id, label, notes, created_at, updated_at) "
@@ -1379,6 +1386,9 @@ def test_a_patient_who_received_split_files_still_gets_their_own_folder(world):
 
     # Both sides are there: the split-in report and their own file.
     assert "11-11-1911-0__ZW_misfiled__v1__2026-01-01.pdf" in landed
+    assert (
+        "11-11-1911-0_ZW_dementia_10tx_mid_qeeg_Redacted_v1_2026-01-01.pdf" in landed
+    )
     assert "ZW_own_report.pdf" in landed
     # And the legacy folder is gone rather than left behind.
     assert not (portal / "12-12-1922-0").exists()
@@ -1561,3 +1571,46 @@ def test_the_bundle_snapshot_says_which_files_this_run_moved(tmp_path: Path):
         portal, "DK_09-09-1909", receipts["09-09-1909-0"]
     )
     assert allowed is False and unaccounted == ["stranger.pdf"]
+
+
+def test_the_validation_and_the_merge_gate_never_disagree(world):
+    """They ask the same question, so they must read the same answer.
+
+    They did not: the pre-apply check could see the rollback bundle's snapshot
+    and the merge gate could not, so the same folder was work-in-progress to one
+    and a stray to the other. The run passed validation and then refused every
+    patient it had just waved through.
+    """
+    _split_recipient_sorting_after_the_mixed_folder(world)
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"},
+                     "12-12-1922-0": {"first": "Z", "last": "W"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "split_misfiled": {"11-11-1911-0": {"note": "holds ZW's reports"}},
+    })
+
+    # First run stops at the collision, as the window did.
+    real_plan = migrator.patient_rekey.plan_patient_rekey
+    migrator.patient_rekey.plan_patient_rekey = (
+        lambda *a, **k: real_plan(*a, **{**k, "merge_into_existing": False})
+    )
+    try:
+        assert migrator.run_apply(world, migrator.build_report(world)) == 1
+    finally:
+        migrator.patient_rekey.plan_patient_rekey = real_plan
+
+    resumed = migrator.build_report(world)
+    portal = Path(world.portal_root)
+    receipts = {k: set(v) for k, v in (resumed.get("split_receipts") or {}).items()}
+
+    for folder in resumed["pending_merge_folders"]:
+        owner = next(o for o, n in resumed["mapping"].items() if n == folder)
+        allowed, unaccounted = migrator.target_is_this_runs_own_work(
+            portal, folder, receipts.get(owner, set())
+        )
+        # Waved through by the check must mean mergeable by the gate.
+        assert allowed, f"{folder} passed validation but the gate refuses: {unaccounted}"
+
+    assert migrator.run_apply(world, resumed) == 0
