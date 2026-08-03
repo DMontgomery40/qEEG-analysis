@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -24,8 +25,19 @@ from backend.orchestration import (  # noqa: E402
     run_downstream_delivery_gaps,
     summarize_run_progress,
 )
-from backend.patient_identity import parse_canonical_patient_id  # noqa: E402
+from backend.patient_identity import (  # noqa: E402
+    PatientIdentityError,
+    allocate_canonical_patient_id,
+    parse_canonical_patient_id,
+)
+from backend.patient_intake import (  # noqa: E402
+    IdentityInput,
+    IdentityNameConflict,
+    find_patient_by_identity,
+    identity_key,
+)
 from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
+from backend.reports import save_report_upload  # noqa: E402
 
 META_NAME = "$meta.json"
 INDEX_NAME = "$index.json"
@@ -608,6 +620,11 @@ class NetlifyBlobClient:
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or "").strip())
 
+    def delete(self, key: str) -> None:
+        proc = self._run(["blobs:delete", self.store, key, "--force"])
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "").strip())
+
 
 def discover_patient_ids(
     client: NetlifyBlobClient, *, include_labels: set[str]
@@ -665,6 +682,232 @@ def load_job_reports_by_patient(
         if reports:
             reports_by_patient.setdefault(patient_id, []).extend(reports)
     return reports_by_patient
+
+
+NEW_PATIENT_UPLOAD_KIND = "new_patient_upload"
+PENDING_UPLOAD_PREFIX = "uploads/pending"
+
+
+def _identity_from_job(payload: dict[str, Any]) -> IdentityInput:
+    """Read the hub's identity block into the shape both intake paths use."""
+    identity = payload.get("identity") if isinstance(payload, dict) else None
+    identity = identity if isinstance(identity, dict) else {}
+    resolution = payload.get("resolution") if isinstance(payload, dict) else None
+    resolution = resolution if isinstance(resolution, dict) else {}
+    return IdentityInput(
+        first_name=identity.get("firstName"),
+        last_name=identity.get("lastName"),
+        birthdate=identity.get("birthdate"),
+        first_initial=identity.get("firstInitial"),
+        last_initial=identity.get("lastInitial"),
+        attach_to=resolution.get("attachTo"),
+        force_new=bool(resolution.get("forceNew")),
+    )
+
+
+def load_new_patient_upload_jobs(
+    client: NetlifyBlobClient,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Job markers for uploads that have no patient yet.
+
+    These cannot be keyed by patient id — allocating it is the job — so they are
+    found by reading each marker rather than by parsing the key. Markers already
+    parked for an operator answer are skipped without downloading anything.
+    """
+    jobs: list[tuple[str, dict[str, Any]]] = []
+    for key in client.list_keys(f"{JOB_PREFIX}/"):
+        payload = client.get_json(key) or {}
+        if payload.get("kind") != NEW_PATIENT_UPLOAD_KIND:
+            continue
+        if payload.get("status") == "needs_operator_answer":
+            continue
+        jobs.append((key, payload))
+    return jobs
+
+
+def _register_new_patient_report(
+    *, portal_dir: Path, patient_label: str, filename: str, file_bytes: bytes
+) -> tuple[str, bool]:
+    """File the report under an existing patient, or report it already was.
+
+    Returns the report id and whether this call created it. Re-entry after a
+    crash finds the report by filename instead of registering a second one.
+    """
+    with storage.session_scope() as session:
+        patient = next(
+            iter(storage.find_patients_by_label(session, patient_label)), None
+        )
+        if patient is None:
+            raise RuntimeError(f"{patient_label} disappeared before registration")
+        patient_uuid = patient.id
+        existing = next(
+            (
+                report
+                for report in storage.list_reports(session, patient_uuid)
+                if (report.filename or "") == filename
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing.id, False
+
+    report_id = str(uuid.uuid4())
+    original_path, extracted_path, mime_type, _preview = save_report_upload(
+        patient_id=patient_uuid,
+        report_id=report_id,
+        filename=filename,
+        provided_mime_type="application/pdf",
+        file_bytes=file_bytes,
+    )
+    with storage.session_scope() as session:
+        storage.create_report(
+            session,
+            report_id=report_id,
+            patient_id=patient_uuid,
+            filename=filename,
+            mime_type=mime_type,
+            stored_path=original_path,
+            extracted_text_path=extracted_path,
+        )
+    # The raw-sync watcher publishes whatever is in the patient folder, so
+    # dropping the file there is the whole publication step.
+    portal_patient_dir = portal_dir / patient_label
+    portal_patient_dir.mkdir(parents=True, exist_ok=True)
+    portal_path = portal_patient_dir / _safe_filename(filename, "report.pdf")
+    tmp_path = portal_path.with_name(f".{portal_path.name}.partial")
+    tmp_path.write_bytes(file_bytes)
+    tmp_path.replace(portal_path)
+    return report_id, True
+
+
+def _allocate_patient_for_upload(identity: IdentityInput) -> str:
+    """Create or find this person's chart and return their clinic id."""
+    with storage.session_scope() as session:
+        existing, keep_stored_name = find_patient_by_identity(session, identity)
+        if existing is not None and keep_stored_name:
+            return existing.label
+
+        first_initial, last_initial, birthdate = identity_key(identity)
+        canonical = allocate_canonical_patient_id(
+            session,
+            first_initial=first_initial,
+            last_initial=last_initial,
+            birthdate=birthdate,
+            exclude_patient_uuid=existing.id if existing else None,
+        )
+        if existing is not None:
+            storage.update_patient(
+                session,
+                existing.id,
+                label=canonical,
+                birthdate=birthdate,
+                first_name=(identity.first_name or "").strip() or None,
+                last_name=(identity.last_name or "").strip() or None,
+                first_initial=first_initial,
+                last_initial=last_initial,
+            )
+        else:
+            storage.create_patient(
+                session,
+                label=canonical,
+                notes="",
+                birthdate=birthdate,
+                first_name=(identity.first_name or "").strip(),
+                last_name=(identity.last_name or "").strip(),
+                first_initial=first_initial,
+                last_initial=last_initial,
+            )
+        return canonical
+
+
+def process_new_patient_upload(
+    *,
+    client: NetlifyBlobClient,
+    portal_dir: Path,
+    status_dir: Path,
+    job_key: str,
+    payload: dict[str, Any],
+) -> PatientWorkerResult:
+    """Give a hub upload a chart and a report. No paid analysis happens here.
+
+    Creating the patient and registering the report are free, so they run
+    without the paid-run approval flag. Analysis for the new patient stays
+    behind the existing gate and is picked up by the normal per-patient pass.
+    """
+    upload_id = str(payload.get("uploadId") or "").strip()
+    file_key = str(payload.get("fileKey") or "").strip()
+    identity = _identity_from_job(payload)
+
+    if not upload_id or not file_key:
+        return PatientWorkerResult(
+            patient_id=upload_id or "unknown-upload",
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note="upload job is missing uploadId or fileKey",
+        )
+
+    try:
+        patient_label = _allocate_patient_for_upload(identity)
+    except IdentityNameConflict as exc:
+        # Park it. Nothing is downloaded and the marker is kept, so the operator
+        # can answer with attachTo or forceNew and the next cycle picks it up.
+        client.set_json(
+            job_key,
+            {**payload, "status": "needs_operator_answer", "conflict": exc.payload},
+        )
+        result = PatientWorkerResult(
+            patient_id=upload_id,
+            status="needs_operator_answer",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=exc.payload["detail"],
+        )
+        _write_local_status(status_dir, result)
+        return result
+    except PatientIdentityError as exc:
+        result = PatientWorkerResult(
+            patient_id=upload_id,
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=str(exc),
+        )
+        _write_local_status(status_dir, result)
+        return result
+
+    filename = _safe_filename(Path(file_key).name, "report.pdf")
+    with tempfile.TemporaryDirectory(prefix="qeeg-pending-upload-") as scratch:
+        local_path = Path(scratch) / filename
+        client.download(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}", local_path)
+        file_bytes = local_path.read_bytes()
+
+    _report_id, registered = _register_new_patient_report(
+        portal_dir=portal_dir,
+        patient_label=patient_label,
+        filename=filename,
+        file_bytes=file_bytes,
+    )
+
+    # Only now that the report is durable is the pending copy safe to drop. A
+    # crash before this point simply repeats the cycle; the filename lookup
+    # above keeps that from registering the report twice.
+    client.delete(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}")
+    client.delete(job_key)
+
+    result = PatientWorkerResult(
+        patient_id=patient_label,
+        status="registered" if registered else "already_registered",
+        downloaded=[str(portal_dir / patient_label / filename)],
+        report_count=1,
+        ran_batch=False,
+        note=f"new patient upload {upload_id} filed under {patient_label}",
+    )
+    _write_local_status(status_dir, result)
+    return result
 
 
 def download_missing_reports(
@@ -994,6 +1237,9 @@ def main() -> int:
 
         while True:
             try:
+                new_patient_jobs = (
+                    [] if args.dry_run else load_new_patient_upload_jobs(client)
+                )
                 job_reports_by_patient = load_job_reports_by_patient(
                     client, include_labels=include_labels
                 )
@@ -1016,6 +1262,23 @@ def main() -> int:
                 continue
             print(f"Portal pipeline worker found {len(labels)} patient label(s).", flush=True)
             failures = 0
+            for job_key, payload in new_patient_jobs:
+                # Giving a hub upload its chart is free, so it runs regardless
+                # of the paid-run gate. Analysis waits for the pass below.
+                upload_result = process_new_patient_upload(
+                    client=client,
+                    portal_dir=portal_dir,
+                    status_dir=status_dir,
+                    job_key=job_key,
+                    payload=payload,
+                )
+                if upload_result.status == "failed":
+                    failures += 1
+                print(
+                    f"- {upload_result.patient_id}: {upload_result.status} "
+                    f"({upload_result.note})",
+                    flush=True,
+                )
             for patient_id in labels:
                 result = process_patient(
                     client=client,

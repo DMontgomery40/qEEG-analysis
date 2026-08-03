@@ -1105,3 +1105,224 @@ def test_worker_refuses_an_include_label_that_is_not_a_clinic_id(
 
     assert worker.main() == 2
     assert "bt_12-11-1963" in capsys.readouterr().err
+
+
+# --------------------------------------------------- hub new-patient uploads
+
+
+def _fake_save_report_upload(temp_data_dir):
+    """Stand in for extraction, which has its own tests and needs a real PDF.
+
+    Writes the same two files the real one does so the stored paths on the
+    report row point at something.
+    """
+
+    def _save(*, patient_id, report_id, filename, provided_mime_type, file_bytes, **_):
+        folder = Path(temp_data_dir) / "reports" / patient_id / report_id
+        folder.mkdir(parents=True, exist_ok=True)
+        stored = folder / filename
+        extracted = folder / "extracted.txt"
+        stored.write_bytes(file_bytes)
+        extracted.write_text("extracted text", encoding="utf-8")
+        return stored, extracted, provided_mime_type, "extracted text"
+
+    return _save
+
+
+def _upload_job(**resolution):
+    return {
+        "kind": "new_patient_upload",
+        "uploadId": "up-1",
+        "fileKey": "scan.pdf",
+        "identity": {
+            "firstName": "Barto",
+            "lastName": "Tinker",
+            "firstInitial": "B",
+            "lastInitial": "T",
+            "birthdate": "12-11-1963",
+        },
+        "resolution": resolution,
+        "uploadedAt": 1,
+        "uploadedBy": "hub",
+    }
+
+
+class _UploadClient:
+    """Stands in for the blob store, recording what the worker asked it to do."""
+
+    def __init__(self, jobs):
+        self._jobs = dict(jobs)
+        self.downloads = []
+        self.deleted = []
+        self.written = {}
+
+    def list_keys(self, prefix):
+        return [key for key in self._jobs if key.startswith(prefix)]
+
+    def get_json(self, key):
+        return self._jobs.get(key)
+
+    def download(self, key, dest):
+        self.downloads.append(key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"report bytes")
+
+    def set_json(self, key, payload):
+        self.written[key] = payload
+        self._jobs[key] = payload
+
+    def delete(self, key):
+        self.deleted.append(key)
+        self._jobs.pop(key, None)
+
+
+def _no_paid_work(monkeypatch, worker):
+    monkeypatch.setattr(
+        worker,
+        "run_batch_for_patient",
+        lambda *a, **k: pytest.fail("registering a patient must not run paid analysis"),
+    )
+
+
+def test_new_patient_upload_allocates_the_chart_and_files_the_report(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """A hub upload with no patient yet gets one, for free."""
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    job_key = "pipeline/jobs/up-1/upload.json"
+    client = _UploadClient({job_key: _upload_job()})
+
+    jobs = worker.load_new_patient_upload_jobs(client)
+    assert [key for key, _ in jobs] == [job_key]
+
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=jobs[0][1],
+    )
+
+    assert result.status == "registered"
+    assert result.patient_id == "BT_12-11-1963"
+    assert result.ran_batch is False
+
+    with storage.session_scope() as session:
+        patients = storage.list_patients(session)
+        reports = storage.list_reports(session, patients[0].id)
+    assert [p.label for p in patients] == ["BT_12-11-1963"]
+    assert [r.filename for r in reports] == ["scan.pdf"]
+    assert (tmp_path / "portal" / "BT_12-11-1963" / "scan.pdf").exists()
+
+    # The pending blob and the marker only go once the report is durable.
+    assert client.deleted == ["uploads/pending/up-1/scan.pdf", job_key]
+
+    # A crash between registering and cleaning up replays the marker. The
+    # filename lookup has to find the report rather than file a second one.
+    replay = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(),
+    )
+    assert replay.status == "already_registered"
+    with storage.session_scope() as session:
+        patients = storage.list_patients(session)
+        assert [p.label for p in patients] == ["BT_12-11-1963"]
+        assert len(storage.list_reports(session, patients[0].id)) == 1
+
+
+def test_new_patient_upload_force_new_takes_the_next_ordinal(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """Two real people sharing initials and a birthday, resolved by the hub."""
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    with storage.session_scope() as session:
+        storage.create_patient(
+            session,
+            label="BT_12-11-1963",
+            notes="",
+            first_name="Bella",
+            last_name="Turner",
+            birthdate="12-11-1963",
+            first_initial="B",
+            last_initial="T",
+        )
+
+    job_key = "pipeline/jobs/up-1/upload.json"
+    client = _UploadClient({job_key: _upload_job(forceNew=True)})
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(forceNew=True),
+    )
+
+    assert result.patient_id == "BT_12-11-1963_2"
+    assert result.ran_batch is False
+    with storage.session_scope() as session:
+        labels = sorted(p.label for p in storage.list_patients(session))
+    assert labels == ["BT_12-11-1963", "BT_12-11-1963_2"]
+
+
+def test_new_patient_upload_without_a_resolution_parks_and_is_skipped_next_cycle(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """An unanswered name conflict waits for the operator without spinning."""
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    with storage.session_scope() as session:
+        storage.create_patient(
+            session,
+            label="BT_12-11-1963",
+            notes="",
+            first_name="Bella",
+            last_name="Turner",
+            birthdate="12-11-1963",
+            first_initial="B",
+            last_initial="T",
+        )
+
+    job_key = "pipeline/jobs/up-1/upload.json"
+    client = _UploadClient({job_key: _upload_job()})
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(),
+    )
+
+    assert result.status == "needs_operator_answer"
+    assert result.ran_batch is False
+    parked = client.written[job_key]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["candidates"] == [
+        {"patient_id": "BT_12-11-1963", "name": "Bella Turner"}
+    ]
+    # Nothing downloaded, nothing deleted: the file and the marker both stay put.
+    assert client.downloads == []
+    assert client.deleted == []
+
+    # Second cycle: the parked marker is skipped without re-reading the blob.
+    assert worker.load_new_patient_upload_jobs(client) == []
+    assert client.downloads == []
+
+    with storage.session_scope() as session:
+        assert [p.label for p in storage.list_patients(session)] == ["BT_12-11-1963"]

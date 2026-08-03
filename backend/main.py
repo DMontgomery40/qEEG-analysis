@@ -59,6 +59,11 @@ from .orchestration import (
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from .patient_intake import (
+    IdentityInput,
+    IdentityNameConflict,
+    find_patient_by_identity,
+)
 from .patient_identity import (
     PatientIdentityError,
     allocate_canonical_patient_id,
@@ -1591,141 +1596,22 @@ def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
     return identities
 
 
-def _identity_key(req: PatientCreate) -> tuple[str, str, str]:
-    """Derive initials and date of birth without allocating anything.
-
-    Allocation reserves an id permanently, so the search for an existing
-    patient has to happen before it — otherwise every re-upload retires a
-    collision ordinal nobody is wearing.
-    """
-    try:
-        first = (
-            require_initial(req.first_initial, field="first")
-            if (req.first_initial or "").strip()
-            else derive_initial(req.first_name, field="first")
-        )
-        last = (
-            require_initial(req.last_initial, field="last")
-            if (req.last_initial or "").strip()
-            else derive_initial(req.last_name, field="last")
-        )
-        return first, last, normalize_birthdate(req.birthdate)
-    except PatientIdentityError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-class IdentityNameConflict(Exception):
-    """A chart with these initials and birthday carries a different name.
-
-    In a clinic this size that is nearly always one person written down two
-    ways — Dave and David, with or without a middle initial — so allocating the
-    next ordinal would quietly split their history in half. It is occasionally
-    two real people, which is what the ordinal is for. Neither guess is safe, so
-    the operator is asked.
-    """
-
-    def __init__(self, payload: dict[str, Any]) -> None:
-        super().__init__("identity_name_mismatch")
-        self.payload = payload
-
-
-def _stored_full_name(patient: storage.Patient) -> str:
-    return " ".join(
-        part for part in ((patient.first_name or ""), (patient.last_name or "")) if part
-    ).strip()
+def _identity_input(req: PatientCreate) -> IdentityInput:
+    return IdentityInput(
+        first_name=req.first_name,
+        last_name=req.last_name,
+        birthdate=req.birthdate,
+        first_initial=req.first_initial,
+        last_initial=req.last_initial,
+        attach_to=req.attach_to,
+        force_new=req.force_new,
+    )
 
 
 def _find_patient_by_identity(
     session: Any, req: PatientCreate
 ) -> tuple[storage.Patient | None, bool]:
-    """Resolve which chart this identity belongs to.
-
-    Returns the patient to file under (or None to allocate a new one) and
-    whether that patient's stored name must be left alone.
-
-    Same initials, same date of birth, and no name on file that contradicts the
-    one given is the same person — a second report must land on that chart
-    rather than allocating a `_2` and splitting the patient into two families.
-    A chart created from a bare canonical label carries initials and a date of
-    birth but no names, so an absent stored name matches anything and gets
-    filled in.
-
-    A name that differs raises `IdentityNameConflict` instead of choosing, and
-    `attach_to` / `force_new` are how the operator answers it.
-
-    Raises `PatientIdentityError` when two charts already answer to one
-    identity, because picking between them is the operator's call too.
-    """
-    attach_to = (req.attach_to or "").strip()
-    if attach_to:
-        patient = next(
-            iter(storage.find_patients_by_label(session, attach_to)), None
-        )
-        if patient is None:
-            raise PatientIdentityError(f"{attach_to} is not a patient on file.")
-        # The operator said this is the same person, not that the name on file
-        # is wrong. Correcting a name is what the patient update path is for.
-        return patient, True
-
-    if req.force_new:
-        return None, False
-
-    first_initial, last_initial, birthdate = _identity_key(req)
-    first_name = (req.first_name or "").strip().lower()
-    last_name = (req.last_name or "").strip().lower()
-
-    def name_fits(stored: str | None, given: str) -> bool:
-        on_file = (stored or "").strip().lower()
-        return not on_file or on_file == given
-
-    candidates = session.scalars(
-        sa_select(storage.Patient).where(
-            storage.Patient.first_initial == first_initial,
-            storage.Patient.last_initial == last_initial,
-            storage.Patient.birthdate == birthdate,
-        )
-    ).all()
-    matches = [
-        patient
-        for patient in candidates
-        if name_fits(patient.first_name, first_name)
-        and name_fits(patient.last_name, last_name)
-    ]
-    if len(matches) > 1:
-        raise PatientIdentityError(
-            "This name and date of birth already match more than one patient: "
-            + ", ".join(sorted(patient.label for patient in matches))
-            + ". Say which one this report belongs to."
-        )
-    if matches:
-        return matches[0], False
-
-    differing = [patient for patient in candidates if patient not in matches]
-    if differing:
-        raise IdentityNameConflict(
-            {
-                "conflict": "identity_name_mismatch",
-                "incoming_name": " ".join(
-                    part
-                    for part in ((req.first_name or ""), (req.last_name or ""))
-                    if part
-                ).strip(),
-                "candidates": [
-                    {
-                        "patient_id": patient.label,
-                        "name": _stored_full_name(patient),
-                    }
-                    for patient in differing
-                ],
-                "detail": (
-                    "Someone with these initials and this date of birth is "
-                    "already on file under a different name. Say which patient "
-                    "this is with attach_to, or force_new if they are two "
-                    "different people."
-                ),
-            }
-        )
-    return None, False
+    return find_patient_by_identity(session, _identity_input(req))
 
 
 def _discard_half_created_patient(patient_uuid: str | None, patient_label: str) -> None:
