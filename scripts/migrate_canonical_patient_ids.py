@@ -1050,6 +1050,7 @@ class Journal:
         self.path = path
         self.started: dict[str, dict[str, Any]] = {}
         self.done: dict[str, dict[str, Any]] = {}
+        self.splits: dict[str, dict[str, Any]] = {}
         if path.is_file():
             for line in path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
@@ -1061,7 +1062,9 @@ class Journal:
                     continue
                 if not isinstance(record, dict) or not record.get("old_id"):
                     continue
-                if record.get("kind") == "started":
+                if record.get("kind") == "split_moved":
+                    self.splits[record["old_id"]] = record
+                elif record.get("kind") == "started":
                     self.started[record["old_id"]] = record
                 else:
                     self.done[record["old_id"]] = record
@@ -1076,6 +1079,10 @@ class Journal:
             for old_id, record in sorted(self.started.items())
             if old_id not in self.done
         ]
+
+    def split_records(self) -> list[dict[str, Any]]:
+        """Files this migration moved out of a mixed folder, and to whom."""
+        return list(self.splits.values())
 
     def completed_records(self) -> list[dict[str, Any]]:
         """The intent line of every patient whose local rekey finished.
@@ -1113,7 +1120,9 @@ class Journal:
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        if entry.get("kind") == "started":
+        if entry.get("kind") == "split_moved":
+            self.splits[entry["old_id"]] = entry
+        elif entry.get("kind") == "started":
             self.started[entry["old_id"]] = entry
         else:
             self.done[entry["old_id"]] = entry
@@ -1834,6 +1843,42 @@ def split_misfiled_reports(
     return moved
 
 
+def split_receipts(report: dict[str, Any]) -> dict[str, set[str]]:
+    """Which files this migration split into which patient, by legacy label.
+
+    Built from the split records the run itself produced. A destination folder
+    that exists only because those files were put there is this run's own work
+    and can be merged into; anything else is a genuine collision and is refused.
+    """
+    receipts: dict[str, set[str]] = defaultdict(set)
+    for folder in report.get("mixed_patient_folders") or []:
+        for detail in (folder.get("foreign_initials") or {}).values():
+            owners = detail.get("belongs_to") or []
+            if len(owners) != 1:
+                continue
+            receipts[owners[0]].update(detail.get("all_files") or [])
+    for record in report.get("prior_split_receipts") or []:
+        receipts[record["owner"]].update(record.get("files") or [])
+    return receipts
+
+
+def target_is_this_runs_own_work(
+    portal_root: Path, new_id: str, expected: set[str]
+) -> tuple[bool, list[str]]:
+    """Is everything in the destination folder something this run put there?
+
+    Returns the verdict and whatever is not accounted for, so a refusal can name
+    it. An empty expectation set means nothing was split into this patient, so
+    a folder standing there is somebody else's and stays untouched.
+    """
+    folder = portal_root / new_id
+    if not folder.is_dir():
+        return False, []
+    present = [p.name for p in folder.rglob("*") if p.is_file()]
+    unaccounted = sorted(name for name in present if name not in expected)
+    return (bool(expected) and not unaccounted), unaccounted
+
+
 def reserve_migrated_id(
     db_path: Path,
     new_id: str,
@@ -1930,6 +1975,10 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
         # Work still owed from a previous run: its database label already moved,
         # so build_report no longer sees it as a patient to migrate. Only the
         # journal knows it was left half-done.
+        receipts = split_receipts(report)
+        for record in journal.split_records():
+            receipts[record["owner"]].update(record.get("files") or [])
+
         work: list[tuple[str, str, dict[str, Any]]] = []
         for record in journal.unfinished():
             work.append((record["old_id"], record["new_id"], record))
@@ -1985,15 +2034,36 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
                     if moved:
                         print(f"    moved {len(moved)} misfiled report(s): "
                               + "; ".join(moved[:4]))
+                    # Recorded so a later run can tell a folder this migration
+                    # created from one that was already there.
+                    for token, detail in sorted(foreign.items()):
+                        owners = detail.get("belongs_to") or []
+                        key = f"split:{old_id}:{token}"
+                        if len(owners) == 1 and key not in journal.splits:
+                            journal.record({
+                                "old_id": key,
+                                "kind": "split_moved",
+                                "owner": owners[0],
+                                "files": detail.get("all_files") or [],
+                            })
 
                 # A patient the clinic keeps but who never had a share folder
                 # gets one, or nothing of theirs can ever be published.
                 if not (portal_root / old_id).exists():
                     (portal_root / new_id).mkdir(parents=True, exist_ok=True)
 
+                merge_ok, unaccounted = target_is_this_runs_own_work(
+                    portal_root, new_id, receipts.get(old_id, set())
+                )
+                if unaccounted and not merge_ok:
+                    print(
+                        f"    {new_id} already holds files this run did not put "
+                        f"there ({', '.join(unaccounted[:3])}); refusing to merge"
+                    )
                 plan = patient_rekey.plan_patient_rekey(
                     old_id,
                     new_id,
+                    merge_into_existing=merge_ok,
                     portal_root=portal_root,
                     conversations_dir=Path(args.conversations_dir),
                     sync_state_paths=sync_paths,

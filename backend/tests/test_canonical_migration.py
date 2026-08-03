@@ -1324,3 +1324,147 @@ def test_two_known_names_in_the_wrong_order_is_still_a_question(world):
     assert "SN" in blocker and "Stubner Helga" in blocker
     assert "HS" in blocker
     assert "04-04-1904-0" not in report["mapping"]
+
+
+# --------------------------------------------------------------------------- #
+# A patient who owns a legacy folder AND received split-in files
+# --------------------------------------------------------------------------- #
+
+
+def _split_recipient_sorting_after_the_mixed_folder(world):
+    """A patient whose legacy label sorts AFTER the mixed folder's.
+
+    Order is the whole defect: the mixed folder is processed first, its split
+    creates the recipient's canonical directory, and only then does the
+    recipient's own rekey try to rename their legacy folder onto it.
+    """
+    portal = Path(world.portal_root)
+    _folder(portal, "12-12-1922-0", initials=("Z", "W"),
+            files=["ZW_own_report.pdf"])
+    (portal / "11-11-1911-0"
+     / "11-11-1911-0__ZW_misfiled__v1__2026-01-01.pdf").write_bytes(b"%PDF-1.4 zw")
+    conn = sqlite3.connect(world.db)
+    conn.execute(
+        "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+        "VALUES ('zw-uuid', '12-12-1922-0', '', '2026-01-01', '2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_a_patient_who_received_split_files_still_gets_their_own_folder(world):
+    """The shape that stopped the real window.
+
+    Un-misfiling created the recipient's canonical directory to receive a report
+    split out of the mixed folder. Their own rekey then tried to rename their
+    legacy folder onto that directory and refused, because renaming would have
+    had to destroy one side. Their folder joins the destination instead, file by
+    file, and nothing is written over.
+    """
+    _split_recipient_sorting_after_the_mixed_folder(world)
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"},
+                     "12-12-1922-0": {"first": "Z", "last": "W"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "split_misfiled": {"11-11-1911-0": {"note": "holds ZW's report"}},
+    })
+
+    report = migrator.build_report(world)
+    assert migrator.run_apply(world, report) == 0
+
+    portal = Path(world.portal_root)
+    landed = sorted(p.name for p in (portal / "ZW_12-12-1922").iterdir() if p.is_file())
+
+    # Both sides are there: the split-in report and their own file.
+    assert "11-11-1911-0__ZW_misfiled__v1__2026-01-01.pdf" in landed
+    assert "ZW_own_report.pdf" in landed
+    # And the legacy folder is gone rather than left behind.
+    assert not (portal / "12-12-1922-0").exists()
+
+
+def test_a_destination_holding_anything_this_run_did_not_put_there_is_refused(world):
+    """Merging is only ever safe for what this migration put there itself.
+
+    A destination carrying anything else is a real collision, and joining the
+    two folders would silently mix two patients' work. It fails that patient by
+    name and touches neither side.
+    """
+    _split_recipient_sorting_after_the_mixed_folder(world)
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"},
+                     "12-12-1922-0": {"first": "Z", "last": "W"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "split_misfiled": {"11-11-1911-0": {"note": "holds ZW's report"}},
+    })
+    portal = Path(world.portal_root)
+    # Something this run did not write is already standing at the destination.
+    (portal / "ZW_12-12-1922").mkdir()
+    (portal / "ZW_12-12-1922" / "someone-elses-work.pdf").write_bytes(b"%PDF-1.4 x")
+
+    report = migrator.build_report(world)
+
+    # The dry run stops first: a folder standing on a canonical destination with
+    # no patient behind it is named before anything is allowed to move.
+    assert any("ZW_12-12-1922" in b for b in report["blockers"]), report["blockers"]
+    assert migrator.run_apply(world, report) == 1
+
+    # Neither side was touched: their legacy folder stands, and the stranger's
+    # file is exactly where it was.
+    assert (portal / "12-12-1922-0" / "ZW_own_report.pdf").is_file()
+    assert (portal / "ZW_12-12-1922" / "someone-elses-work.pdf").is_file()
+
+
+def test_the_merge_gate_itself_refuses_anything_it_did_not_write(tmp_path: Path):
+    """The inner gate, on its own: merging is permitted only when every file at
+    the destination is one this run's split put there."""
+    portal = tmp_path / "portal_patients"
+    (portal / "ZW_12-12-1922").mkdir(parents=True)
+    (portal / "ZW_12-12-1922" / "split-in.pdf").write_bytes(b"%PDF-1.4 a")
+
+    ours = {"split-in.pdf"}
+    assert migrator.target_is_this_runs_own_work(portal, "ZW_12-12-1922", ours) == (
+        True,
+        [],
+    )
+
+    # One file nobody can account for is enough to refuse the whole merge.
+    (portal / "ZW_12-12-1922" / "stranger.pdf").write_bytes(b"%PDF-1.4 b")
+    allowed, unaccounted = migrator.target_is_this_runs_own_work(
+        portal, "ZW_12-12-1922", ours
+    )
+    assert allowed is False
+    assert unaccounted == ["stranger.pdf"]
+
+    # And a destination nothing was split into is never mergeable, even if it
+    # happens to be empty of surprises.
+    assert migrator.target_is_this_runs_own_work(portal, "ZW_12-12-1922", set()) == (
+        False,
+        ["split-in.pdf", "stranger.pdf"],
+    )
+
+
+def test_the_split_is_journalled_so_a_later_run_can_verify_it(world):
+    """A resumed run must be able to tell a folder this migration created from
+    one that was already there — which is not something to infer from names."""
+    _answers(world, {
+        "initials": {"10-10-1910-0": {"first": "J", "last": "M"},
+                     "08-08-1908-0": {"first": "C", "last": "L"},
+                     "11-11-1911-0": {"first": "X", "last": "X"}},
+        "dissolve": {"7-7-1907": {"note": "a copy filed elsewhere"}},
+        "split_misfiled": {"11-11-1911-0": {"note": "holds DK's report"}},
+    })
+    assert migrator.run_apply(world, migrator.build_report(world)) == 0
+
+    splits = [
+        r for r in Journal_lines(Path(world.journal))
+        if r.get("kind") == "split_moved"
+    ]
+    assert splits, "the split must be on the record"
+    assert splits[0]["owner"] == "09-09-1909-0"
+    assert "11-11-1911-0__DK_20Tx_toxic-brain-injury__v1__2026-05-09.pdf" in (
+        splits[0]["files"]
+    )

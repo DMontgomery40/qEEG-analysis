@@ -113,6 +113,7 @@ class RekeyPlan:
     conversations_dir: Path | None = None
     sync_state_paths: tuple[Path, ...] = ()
     folder_move: tuple[Path, Path] | None = None
+    folder_merge: tuple[Path, Path] | None = None
     file_renames: list[FileRename] = field(default_factory=list)
     carried_files: list[FileRename] = field(default_factory=list)
     conversation_files: list[Path] = field(default_factory=list)
@@ -126,6 +127,7 @@ class RekeyResult:
     old_id: str
     new_id: str
     folder_moved: bool = False
+    folder_merged: int = 0
     files_renamed: int = 0
     files_already_renamed: int = 0
     files_carried_verified: int = 0
@@ -149,6 +151,7 @@ def plan_patient_rekey(
     conversations_dir: Path | None = None,
     sync_state_paths: Sequence[Path] = (),
     pipeline_jobs_dir: Path | None = None,
+    merge_into_existing: bool = False,
     hash_files: bool = True,
 ) -> RekeyPlan:
     """Work out every rename for this patient without touching anything."""
@@ -168,12 +171,19 @@ def plan_patient_rekey(
         source = old_dir if old_dir.is_dir() else (new_dir if new_dir.is_dir() else None)
         if source is not None:
             if old_dir.is_dir() and old_id != new_id:
-                if new_dir.exists():
+                if new_dir.exists() and not merge_into_existing:
                     raise PatientRekeyError(
                         f"{new_dir} already exists, so {old_dir} cannot move onto it. "
                         f"Resolve the collision before rekeying {old_id}."
                     )
-                plan.folder_move = (old_dir, new_dir)
+                if new_dir.exists():
+                    # The destination is here because this same migration put a
+                    # misfiled report of this patient's into it. Their own
+                    # folder joins it file by file rather than replacing it —
+                    # a rename would have had to destroy one side or the other.
+                    plan.folder_merge = (old_dir, new_dir)
+                else:
+                    plan.folder_move = (old_dir, new_dir)
             # Renames are computed against wherever the files live right now, so
             # a resumed run that already moved the folder still finds them.
             for path in sorted(source.rglob("*")):
@@ -187,7 +197,12 @@ def plan_patient_rekey(
                     if hash_files and path.suffix.lower() in DELIVERABLE_SUFFIXES
                     else ""
                 )
-                if renamed == path.name:
+                destination_dir = (
+                    plan.folder_merge[1] / path.parent.relative_to(source)
+                    if plan.folder_merge is not None
+                    else path.parent
+                )
+                if renamed == path.name and plan.folder_merge is None:
                     # A file whose name never carried the ID still crosses the
                     # migration — inside the folder move, which is a copy when
                     # the destination is on another filesystem. Original source
@@ -208,7 +223,7 @@ def plan_patient_rekey(
                 plan.file_renames.append(
                     FileRename(
                         old_path=path,
-                        new_path=path.with_name(renamed),
+                        new_path=destination_dir / renamed,
                         size=size,
                         sha256=digest,
                     )
@@ -389,8 +404,57 @@ def apply_patient_rekey(
         else:
             result.notes.append("portal folder was already at the new ID")
 
+    if plan.folder_merge is not None:
+        old_dir, new_dir = plan.folder_merge
+        if old_dir.is_dir():
+            # Every file goes across on its own, and nothing is ever written
+            # over. A name that exists on both sides is two patients' work
+            # meeting, which is not something to resolve by picking one.
+            for path in sorted(old_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                target = _merge_target(path, old_dir, new_dir, plan)
+                if target.exists():
+                    raise PatientRekeyError(
+                        f"{target} already exists, so {path} cannot join it. "
+                        f"Two patients' files meet at that name; nothing was moved."
+                    )
+            for path in sorted(old_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                target = _merge_target(path, old_dir, new_dir, plan)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                digest = (
+                    _sha256_file(path)
+                    if path.suffix.lower() in DELIVERABLE_SUFFIXES
+                    else ""
+                )
+                os.replace(path, target)
+                if digest and _sha256_file(target) != digest:
+                    raise PatientRekeyError(
+                        f"{target.name} changed bytes joining {plan.new_id}."
+                    )
+                result.folder_merged += 1
+            # Only empty directories are left behind, and only those go.
+            for directory in sorted(
+                (d for d in old_dir.rglob("*") if d.is_dir()), reverse=True
+            ):
+                if not any(directory.iterdir()):
+                    directory.rmdir()
+            if not any(old_dir.iterdir()):
+                old_dir.rmdir()
+            else:
+                result.notes.append(f"{old_dir} still holds files; left in place")
+        else:
+            result.notes.append("the folder was already merged")
+
     for rename in plan.file_renames:
         old_path, new_path = rename.old_path, rename.new_path
+        if plan.folder_merge is not None:
+            # The merge above already moved and verified every file.
+            if new_path.exists():
+                result.files_already_renamed += 1
+                continue
         # A resumed run finds the folder already moved, so re-anchor both ends.
         if plan.folder_move is not None:
             old_dir, new_dir = plan.folder_move
@@ -488,6 +552,15 @@ def apply_patient_rekey(
             result.db_label_changed = True
 
     return result
+
+
+def _merge_target(path: Path, old_dir: Path, new_dir: Path, plan: RekeyPlan) -> Path:
+    """Where one file lands when a patient's folder joins an existing one."""
+    return (
+        new_dir
+        / path.parent.relative_to(old_dir)
+        / rename_in_name(path.name, plan.old_id, plan.new_id)
+    )
 
 
 def _reanchor(path: Path, old_dir: Path, new_dir: Path) -> Path:
