@@ -163,7 +163,7 @@ def test_export_rejects_selected_artifact_that_is_not_final_markdown(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "stage5.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +205,7 @@ def test_export_rejects_selected_artifact_from_different_run(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,7 +271,7 @@ def test_delete_patient_file_removes_portal_copy(temp_data_dir, monkeypatch):
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
 
     with TestClient(app, raise_server_exceptions=False) as client:
         upload = client.post(
@@ -281,7 +281,7 @@ def test_delete_patient_file_removes_portal_copy(temp_data_dir, monkeypatch):
         file_id = upload.json()["file"]["id"]
 
         portal_path = (
-            Path(temp_data_dir) / "portal_patients" / "09-05-1954-0" / "guide.pdf"
+            Path(temp_data_dir) / "portal_patients" / "HT_09-05-1954" / "guide.pdf"
         )
         assert portal_path.exists()
 
@@ -304,7 +304,7 @@ def test_upload_patient_file_schedules_portal_sync(temp_data_dir, monkeypatch):
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
@@ -313,7 +313,7 @@ def test_upload_patient_file_schedules_portal_sync(temp_data_dir, monkeypatch):
         )
 
     assert response.status_code == 200
-    assert scheduled == [("09-05-1954-0", "upload_patient_file")]
+    assert scheduled == [("HT_09-05-1954", "upload_patient_file")]
 
 
 def test_export_rejects_unreviewed_selected_final_draft(temp_data_dir, monkeypatch):
@@ -321,7 +321,7 @@ def test_export_rejects_unreviewed_selected_final_draft(temp_data_dir, monkeypat
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,7 +360,7 @@ def test_cached_export_download_rejects_unreviewed_run(temp_data_dir, monkeypatc
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,7 +410,7 @@ def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monk
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_dir = Path(temp_data_dir) / "artifacts"
     stage2_path = artifact_dir / "stage-2" / "peer-review.json"
@@ -482,4 +482,194 @@ def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monk
     assert download.text == "# Final Draft"
     assert stale_download.status_code == 409
     assert "no longer matches" in stale_download.json()["detail"]
-    assert scheduled == [("09-05-1954-0", "export_run")]
+    assert scheduled == [("HT_09-05-1954", "export_run")]
+
+
+def test_bulk_upload_registers_a_report_under_an_allocated_canonical_id(
+    temp_data_dir, monkeypatch
+):
+    """Intake order: identity first, canonical patient second, report third.
+
+    Nothing downstream may carry the date of birth on its own. This asserts the
+    database label, the portal folder, and the API payload all land on
+    ``BT_12-11-1963`` even though the uploaded file is named after the DOB.
+    """
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("12-11-1963-0.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "12-11-1963-0.txt",
+                            "first_name": "Barto",
+                            "last_name": "Tinker",
+                            "birthdate": "12-11-1963",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"] == {"created": 1, "skipped": 0, "errors": 0}
+    created = body["created"][0]
+    assert created["patient"]["patient_id"] == "BT_12-11-1963"
+    assert created["patient"]["label"] == "BT_12-11-1963"
+    assert created["patient"]["first_name"] == "Barto"
+
+    with storage.session_scope() as session:
+        labels = [patient.label for patient in storage.list_patients(session)]
+        reports = storage.list_reports(session, created["patient"]["id"])
+    assert labels == ["BT_12-11-1963"]
+    assert [report.filename for report in reports] == ["12-11-1963-0.txt"]
+
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    assert sorted(path.name for path in portal_root.iterdir()) == ["BT_12-11-1963"]
+
+
+def test_bulk_upload_without_identity_creates_no_patient_and_no_folder(
+    temp_data_dir, monkeypatch
+):
+    """A file the operator has not identified is an error, never a fallback label."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("12-11-1963-0.txt", b"qEEG report text", "text/plain"))],
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"] == {"created": 0, "skipped": 0, "errors": 1}
+    assert body["errors"][0]["filename"] == "12-11-1963-0.txt"
+
+    with storage.session_scope() as session:
+        assert storage.list_patients(session) == []
+
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    assert not portal_root.exists() or list(portal_root.iterdir()) == []
+
+
+def test_bulk_upload_reuses_the_patient_already_wearing_that_canonical_id(
+    temp_data_dir, monkeypatch
+):
+    """The same person twice is one patient, never a ``_2`` duplicate family."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    identity = {
+        "first_name": "Barto",
+        "last_name": "Tinker",
+        "birthdate": "12-11-1963",
+    }
+    with TestClient(app, raise_server_exceptions=False) as client:
+        first = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-one.txt", b"qEEG report text", "text/plain"))],
+            data={"identities": json.dumps([{"filename": "session-one.txt", **identity}])},
+        )
+        second = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-two.txt", b"qEEG report text", "text/plain"))],
+            data={"identities": json.dumps([{"filename": "session-two.txt", **identity}])},
+        )
+
+    assert first.json()["counts"]["created"] == 1
+    assert second.json()["counts"]["created"] == 1
+    patient_ids = {
+        first.json()["created"][0]["patient"]["id"],
+        second.json()["created"][0]["patient"]["id"],
+    }
+    assert len(patient_ids) == 1
+
+    with storage.session_scope() as session:
+        labels = [patient.label for patient in storage.list_patients(session)]
+        reports = storage.list_reports(session, patient_ids.pop())
+    assert labels == ["BT_12-11-1963"]
+    assert sorted(report.filename for report in reports) == [
+        "session-one.txt",
+        "session-two.txt",
+    ]
+
+
+def test_portal_publishing_refuses_a_legacy_dob_label(temp_data_dir, monkeypatch):
+    """``MM-DD-YYYY-N`` is not a patient id any more, so nothing routes on it."""
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "_schedule_portal_sync",
+        lambda patient_label, *, source: scheduled.append((patient_label, source)),
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/patients/{patient.id}/files",
+            files={"file": ("guide.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["portal_published_path"] is None
+    assert scheduled == []
+    assert not (Path(temp_data_dir) / "portal_patients" / "09-05-1954-0").exists()
+
+
+def test_bulk_upload_names_the_ambiguity_instead_of_adding_a_third_chart(
+    temp_data_dir, monkeypatch
+):
+    """Two charts already matching one identity is the operator's call, not a guess."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    for label in ("BT_12-11-1963", "BT_12-11-1963_2"):
+        with storage.session_scope() as session:
+            storage.create_patient(
+                session,
+                label=label,
+                notes="",
+                first_name="Barto",
+                last_name="Tinker",
+                birthdate="12-11-1963",
+                first_initial="B",
+                last_initial="T",
+            )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-three.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "session-three.txt",
+                            "first_name": "Barto",
+                            "last_name": "Tinker",
+                            "birthdate": "12-11-1963",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"]["created"] == 0
+    assert "BT_12-11-1963, BT_12-11-1963_2" in body["errors"][0]["error"]
+
+    with storage.session_scope() as session:
+        labels = sorted(patient.label for patient in storage.list_patients(session))
+    assert labels == ["BT_12-11-1963", "BT_12-11-1963_2"]

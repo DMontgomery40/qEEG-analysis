@@ -32,7 +32,7 @@ def _create_stage1_run(
     extracted_path.write_text("=== PAGE 1 / 1 ===\nAlpha beta 12.3\n", encoding="utf-8")
 
     with session_scope() as session:
-        patient = create_patient(session, label="12-30-1970-0", notes="")
+        patient = create_patient(session, label="NR_12-30-1970", notes="")
         report = create_report(
             session,
             report_id=report_id,
@@ -75,7 +75,7 @@ def _create_stage3_ready_run(
     extracted_path.write_text("=== PAGE 1 / 1 ===\nHello\n", encoding="utf-8")
 
     with session_scope() as session:
-        patient = create_patient(session, label="12-30-1970-0", notes="")
+        patient = create_patient(session, label="NR_12-30-1970", notes="")
         create_report(
             session,
             report_id=report_id,

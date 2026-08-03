@@ -13,8 +13,8 @@ def test_qeeg_process_does_not_compete_with_launchd_sync_by_default(monkeypatch)
 
     monkeypatch.delenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", raising=False)
 
-    assert portal_sync.sync_patient_to_thrylen("01-01-2013-0") is False
-    assert portal_sync.spawn_portal_sync("01-01-2013-0") is False
+    assert portal_sync.sync_patient_to_thrylen("MK_01-01-2013") is False
+    assert portal_sync.spawn_portal_sync("MK_01-01-2013") is False
 
 
 def test_sync_lock_acquires_nonblocking_and_releases(tmp_path: Path, monkeypatch):
@@ -64,8 +64,8 @@ def test_sync_lock_times_out_instead_of_waiting_forever(
 def test_filter_and_merge_sync_state_preserve_other_patients():
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
-    other_id = "09-05-1954-0"
+    patient_id = "MK_01-01-2013"
+    other_id = "HT_09-05-1954"
     base_state = {
         "patients": {
             patient_id: {"createdAt": 1},
@@ -101,8 +101,8 @@ def test_sync_patient_to_thrylen_scopes_state_and_merges_updates(
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
-    other_id = "09-05-1954-0"
+    patient_id = "MK_01-01-2013"
+    other_id = "HT_09-05-1954"
 
     portal_root = tmp_path / "portal_patients"
     patient_dir = portal_root / patient_id
@@ -222,8 +222,8 @@ def test_sync_timeout_persists_partial_file_progress_and_requeues_patient(
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
-    other_id = "09-05-1954-0"
+    patient_id = "MK_01-01-2013"
+    other_id = "HT_09-05-1954"
     portal_root = tmp_path / "portal_patients"
     patient_dir = portal_root / patient_id
     patient_dir.mkdir(parents=True)
@@ -300,7 +300,7 @@ def test_spawn_portal_sync_skips_when_another_sync_holds_the_global_reservation(
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
+    patient_id = "MK_01-01-2013"
     portal_root = tmp_path / "portal_patients"
     portal_root.mkdir()
     sync_repo = tmp_path / "thrylen"
@@ -336,7 +336,7 @@ def test_spawn_portal_sync_passes_the_global_reservation_to_the_child(
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
+    patient_id = "MK_01-01-2013"
     portal_root = tmp_path / "portal_patients"
     portal_root.mkdir()
     sync_repo = tmp_path / "thrylen"
@@ -371,7 +371,7 @@ def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs
 ):
     from backend import portal_sync
 
-    patient_id = "08-10-1989-0"
+    patient_id = "GH_08-10-1989"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
     (patient_dir / "DK_Mid_10Tx_Toxic-brain-injury.pdf").write_bytes(b"%PDF-1.4")
@@ -380,7 +380,7 @@ def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs
     )
     (patient_dir / f"{patient_id}.pdf").write_bytes(b"%PDF-1.4")
     (
-        patient_dir / "08-10-1989-0__patient-facing__v1__2026-02-09.pdf"
+        patient_dir / "GH_08-10-1989__patient-facing__v1__2026-02-09.pdf"
     ).write_bytes(b"%PDF-1.4")
     (patient_dir / f"{patient_id}__guide__v1__2026-03-17.pdf").write_bytes(
         b"%PDF-1.4"
@@ -406,7 +406,7 @@ def test_source_pdf_classifier_allows_clinic_analysis_report_names(tmp_path: Pat
     from scripts import portal_pipeline_worker
     from scripts import run_portal_council_batch
 
-    patient_id = "08-10-1989-0"
+    patient_id = "GH_08-10-1989"
     source_path = tmp_path / f"{patient_id}__analysis_report__v1__2026-02-09.pdf"
     generated_path = tmp_path / f"{patient_id}__analysis__v1__2026-02-09.pdf"
     generated_sync_echo = (
@@ -435,7 +435,7 @@ def test_source_pdfs_missing_complete_runs_keeps_fresh_created_rows_active(
     from backend import portal_sync
     from backend import storage
 
-    patient_id = "08-10-1989-1"
+    patient_id = "GH_08-10-1989_2"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
     filename = "DK_20Tx_toxic-brain-injury_Redacted.pdf"
@@ -476,7 +476,7 @@ def test_source_pdfs_missing_complete_runs_ignores_stale_running_rows(
 
     monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
 
-    patient_id = "08-10-1989-0"
+    patient_id = "GH_08-10-1989"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
     filename = "DK_20Tx_toxic-brain-injury_Redacted.pdf"
@@ -529,7 +529,7 @@ async def test_watch_portal_patients_forever_syncs_stable_raw_changes(
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
+    patient_id = "MK_01-01-2013"
     snapshots = [
         {patient_id: (1, 100, 1000)},
         {patient_id: (2, 200, 2000)},
@@ -579,7 +579,7 @@ async def test_watch_portal_patients_forever_retries_snapshot_cleared_by_child(
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
+    patient_id = "MK_01-01-2013"
     fingerprint = (2, 200, 2000)
     sync_calls: list[str] = []
     sleep_calls = 0
@@ -629,7 +629,7 @@ async def test_watch_portal_patients_forever_seeds_sync_state_without_mass_resyn
 ):
     from backend import portal_sync
 
-    patient_id = "01-01-2013-0"
+    patient_id = "MK_01-01-2013"
     snapshots = [
         {patient_id: (2, 200, 2000)},
         {patient_id: (2, 200, 2000)},
@@ -678,7 +678,7 @@ async def test_watch_portal_patients_forever_spawns_local_pipeline_for_missing_f
 ):
     from backend import portal_sync
 
-    patient_id = "08-10-1989-0"
+    patient_id = "GH_08-10-1989"
     snapshots = [
         {patient_id: (2, 200, 2000)},
         {patient_id: (2, 200, 2000)},
@@ -733,3 +733,37 @@ async def test_watch_portal_patients_forever_spawns_local_pipeline_for_missing_f
         await portal_sync.watch_portal_patients_forever()
 
     assert pipeline_calls == [patient_id]
+
+
+def test_portal_sync_paths_route_only_on_canonical_ids(tmp_path: Path, monkeypatch):
+    """Every sync entry point refuses a legacy ``MM-DD-YYYY-N`` key outright."""
+    from backend import portal_sync
+
+    portal_root = tmp_path / "portal_patients"
+    (portal_root / "09-05-1954-0").mkdir(parents=True)
+    (portal_root / "BT_12-11-1963").mkdir(parents=True)
+    sync_repo = tmp_path / "thrylen"
+    sync_script = sync_repo / "scripts" / "qeeg_patients_sync.mjs"
+    sync_script.parent.mkdir(parents=True)
+    sync_script.write_text("// fake sync\n", encoding="utf-8")
+
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal_root))
+    monkeypatch.setenv("QEEG_PORTAL_SYNC_REPO", str(sync_repo))
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
+    monkeypatch.setattr(
+        portal_sync.shutil,
+        "which",
+        lambda name: "/usr/bin/node" if name == "node" else None,
+    )
+    monkeypatch.setattr(
+        portal_sync.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("a legacy key must never spawn work"),
+    )
+
+    assert portal_sync.sync_patient_to_thrylen("09-05-1954-0") is False
+    assert portal_sync.spawn_portal_sync("09-05-1954-0") is False
+    assert portal_sync.spawn_portal_pipeline("09-05-1954-0") is False
+
+    snapshots = portal_sync._snapshot_portal_patient_fingerprints(portal_root)
+    assert list(snapshots) == ["BT_12-11-1963"]

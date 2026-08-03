@@ -32,7 +32,7 @@ def _create_run_with_report(report_text: str) -> tuple[str, Any]:
     extracted_path.write_text(report_text, encoding="utf-8")
 
     with session_scope() as session:
-        patient = create_patient(session, label="01-01-1990-0", notes="")
+        patient = create_patient(session, label="SL_01-01-1990", notes="")
         report = create_report(
             session,
             report_id=report_id,

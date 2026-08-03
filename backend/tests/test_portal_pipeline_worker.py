@@ -10,7 +10,7 @@ import pytest
 def test_sync_remote_patient_identity_writes_versioned_local_metadata(tmp_path: Path):
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
 
@@ -37,7 +37,7 @@ def test_sync_remote_patient_identity_writes_versioned_local_metadata(tmp_path: 
 def test_sync_remote_patient_identity_rejects_conflicting_local_initials(tmp_path: Path):
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
     (patient_dir / "$meta.json").write_text(
@@ -71,18 +71,18 @@ def test_reports_from_index_prefers_report_pdf_metadata():
     from scripts import portal_pipeline_worker as worker
 
     reports = worker.reports_from_index(
-        "03-05-2010-0",
+        "AB_03-05-2010",
         {
             "files": [
                 {
-                    "fileKey": "03-05-2010-0__patient-facing__v1__2026-03-21.pdf",
-                    "originalName": "03-05-2010-0__patient-facing__v1__2026-03-21.pdf",
+                    "fileKey": "AB_03-05-2010__patient-facing__v1__2026-03-21.pdf",
+                    "originalName": "AB_03-05-2010__patient-facing__v1__2026-03-21.pdf",
                     "logicalName": "patient-facing.pdf",
                     "contentType": "application/pdf",
                     "documentKind": None,
                 },
                 {
-                    "fileKey": "03-05-2010-0__report__v1__2026-03-21.pdf",
+                    "fileKey": "AB_03-05-2010__report__v1__2026-03-21.pdf",
                     "originalName": "clinic report.pdf",
                     "logicalName": "qeeg-report__session-2026-03-21.pdf",
                     "uploadedAt": 2,
@@ -93,7 +93,7 @@ def test_reports_from_index_prefers_report_pdf_metadata():
                     "sessionDate": "2026-03-21",
                 },
                 {
-                    "fileKey": "03-05-2010-0__notes__v1__2026-03-21.txt",
+                    "fileKey": "AB_03-05-2010__notes__v1__2026-03-21.txt",
                     "originalName": "notes.txt",
                     "contentType": "text/plain",
                 },
@@ -102,7 +102,7 @@ def test_reports_from_index_prefers_report_pdf_metadata():
     )
 
     assert len(reports) == 1
-    assert reports[0].file_key == "03-05-2010-0__report__v1__2026-03-21.pdf"
+    assert reports[0].file_key == "AB_03-05-2010__report__v1__2026-03-21.pdf"
     assert reports[0].original_name == "clinic report.pdf"
     assert reports[0].document_kind == "report"
 
@@ -111,17 +111,17 @@ def test_reports_from_index_falls_back_to_source_pdf_heuristic():
     from scripts import portal_pipeline_worker as worker
 
     reports = worker.reports_from_index(
-        "09-23-1982-0",
+        "CD_09-23-1982",
         {
             "files": [
                 {
-                    "fileKey": "09-23-1982-0__D_EEG_Dec_redacted__v1__2026-03-19.pdf",
+                    "fileKey": "CD_09-23-1982__D_EEG_Dec_redacted__v1__2026-03-19.pdf",
                     "originalName": "D_EEG_Dec_redacted.pdf",
                     "contentType": "application/pdf",
                 },
                 {
-                    "fileKey": "09-23-1982-0__09-23-1982-0__v1__2026-03-19.pdf",
-                    "originalName": "09-23-1982-0.pdf",
+                    "fileKey": "CD_09-23-1982__CD_09-23-1982__v1__2026-03-19.pdf",
+                    "originalName": "CD_09-23-1982.pdf",
                     "contentType": "application/pdf",
                 },
             ]
@@ -134,7 +134,7 @@ def test_reports_from_index_falls_back_to_source_pdf_heuristic():
 def test_reports_from_index_does_not_filter_clinic_analysis_named_report():
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     reports = worker.reports_from_index(
         patient_id,
         {
@@ -163,7 +163,7 @@ def test_reports_from_index_does_not_filter_clinic_analysis_named_report():
 def test_reports_from_index_uses_file_key_as_single_report_identity():
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     reports = worker.reports_from_index(
         patient_id,
         {
@@ -195,11 +195,11 @@ def test_reports_from_index_deduplicates_local_sync_echoes():
     from scripts import portal_pipeline_worker as worker
 
     reports = worker.reports_from_index(
-        "03-05-2010-0",
+        "AB_03-05-2010",
         {
             "files": [
                 {
-                    "fileKey": "03-05-2010-0_DK_20Tx_toxic-brain-injury_Redacted_v1_2026-03-21.pdf",
+                    "fileKey": "AB_03-05-2010_DK_20Tx_toxic-brain-injury_Redacted_v1_2026-03-21.pdf",
                     "originalName": "DK_20Tx_toxic-brain-injury_Redacted.pdf",
                     "logicalName": "DK_20Tx_toxic-brain-injury_Redacted.pdf",
                     "uploadedAt": 10,
@@ -209,7 +209,7 @@ def test_reports_from_index_deduplicates_local_sync_echoes():
                     "uploadedBy": "clinic",
                 },
                 {
-                    "fileKey": "03-05-2010-0__DK_20Tx_toxic-brain-injury_Redacted__v1__2026-04-12.pdf",
+                    "fileKey": "AB_03-05-2010__DK_20Tx_toxic-brain-injury_Redacted__v1__2026-04-12.pdf",
                     "originalName": "DK_20Tx_toxic-brain-injury_Redacted.pdf",
                     "logicalName": "DK_20Tx_toxic-brain-injury_Redacted.pdf",
                     "uploadedAt": 20,
@@ -227,7 +227,7 @@ def test_reports_from_index_deduplicates_local_sync_echoes():
 def test_reports_from_index_keeps_same_session_versions_distinct():
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     reports = worker.reports_from_index(
         patient_id,
         {
@@ -267,13 +267,13 @@ def test_reports_from_job_payload_uses_versioned_file_key_as_local_source_name()
     from scripts import portal_pipeline_worker as worker
 
     reports = worker.reports_from_job_payload(
-        "03-05-2010-0",
+        "AB_03-05-2010",
         {
             "uploadedAt": 1774087200000,
             "uploadedBy": "clinic",
             "reportFiles": [
                 {
-                    "fileKey": "03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf",
+                    "fileKey": "AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf",
                     "originalName": "same-name.pdf",
                     "logicalName": "qeeg-report__session-2026-03-21.pdf",
                     "contentType": "application/pdf",
@@ -288,7 +288,7 @@ def test_reports_from_job_payload_uses_versioned_file_key_as_local_source_name()
     assert reports[0].from_job is True
     assert (
         worker.source_local_filename(reports[0])
-        == "03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
+        == "AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
     )
 
 
@@ -296,8 +296,8 @@ def test_completion_candidates_for_job_report_are_version_exact():
     from scripts import portal_pipeline_worker as worker
 
     report = worker.PortalReport(
-        patient_id="03-05-2010-0",
-        file_key="03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf",
+        patient_id="AB_03-05-2010",
+        file_key="AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf",
         original_name="same-name.pdf",
         logical_name="qeeg-report__session-2026-03-21.pdf",
         uploaded_at=1,
@@ -308,32 +308,32 @@ def test_completion_candidates_for_job_report_are_version_exact():
     )
 
     assert worker.completion_candidate_filenames(report) == {
-        "03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
+        "AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
     }
 
 
 def test_analysis_artifacts_exist_recognizes_council_and_patient_facing(tmp_path: Path):
     from scripts import portal_pipeline_worker as worker
 
-    patient_dir = tmp_path / "03-05-2010-0"
+    patient_dir = tmp_path / "AB_03-05-2010"
     patient_dir.mkdir()
     (patient_dir / "raw.pdf").write_bytes(b"%PDF-1.4")
 
-    assert not worker.analysis_artifacts_exist(patient_dir, "03-05-2010-0")
+    assert not worker.analysis_artifacts_exist(patient_dir, "AB_03-05-2010")
 
     council_file = patient_dir / "council" / "run-id" / "stage-4" / "gpt.md"
     council_file.parent.mkdir(parents=True)
     council_file.write_text("analysis", encoding="utf-8")
 
-    assert worker.analysis_artifacts_exist(patient_dir, "03-05-2010-0")
+    assert worker.analysis_artifacts_exist(patient_dir, "AB_03-05-2010")
 
 
 def test_should_run_pipeline_when_report_downloaded(tmp_path: Path, monkeypatch):
     from scripts import portal_pipeline_worker as worker
 
     report = worker.PortalReport(
-        patient_id="03-05-2010-0",
-        file_key="03-05-2010-0__report__v1__2026-03-21.pdf",
+        patient_id="AB_03-05-2010",
+        file_key="AB_03-05-2010__report__v1__2026-03-21.pdf",
         original_name="report.pdf",
         logical_name="report.pdf",
         uploaded_at=1,
@@ -343,9 +343,9 @@ def test_should_run_pipeline_when_report_downloaded(tmp_path: Path, monkeypatch)
     )
     should_run, note = worker.should_run_pipeline_for_patient(
         portal_dir=tmp_path,
-        patient_id="03-05-2010-0",
+        patient_id="AB_03-05-2010",
         reports=[report],
-        downloaded=[str(tmp_path / "03-05-2010-0" / "report.pdf")],
+        downloaded=[str(tmp_path / "AB_03-05-2010" / "report.pdf")],
     )
 
     assert should_run
@@ -356,8 +356,8 @@ def test_should_not_duplicate_active_run_when_no_analysis_yet(tmp_path: Path, mo
     from scripts import portal_pipeline_worker as worker
 
     report = worker.PortalReport(
-        patient_id="03-05-2010-0",
-        file_key="03-05-2010-0__report__v1__2026-03-21.pdf",
+        patient_id="AB_03-05-2010",
+        file_key="AB_03-05-2010__report__v1__2026-03-21.pdf",
         original_name="report.pdf",
         logical_name="report.pdf",
         uploaded_at=1,
@@ -369,7 +369,7 @@ def test_should_not_duplicate_active_run_when_no_analysis_yet(tmp_path: Path, mo
 
     should_run, note = worker.should_run_pipeline_for_patient(
         portal_dir=tmp_path,
-        patient_id="03-05-2010-0",
+        patient_id="AB_03-05-2010",
         reports=[report],
         downloaded=[],
     )
@@ -381,13 +381,13 @@ def test_should_not_duplicate_active_run_when_no_analysis_yet(tmp_path: Path, mo
 def test_should_skip_when_all_reports_have_complete_runs(tmp_path: Path, monkeypatch):
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
     (patient_dir / f"{patient_id}.md").write_text("final", encoding="utf-8")
     report = worker.PortalReport(
         patient_id=patient_id,
-        file_key="03-05-2010-0__report__v1__2026-03-21.pdf",
+        file_key="AB_03-05-2010__report__v1__2026-03-21.pdf",
         original_name="report.pdf",
         logical_name="report.pdf",
         uploaded_at=1,
@@ -412,7 +412,7 @@ def test_matching_complete_run_requires_delivery_ready_artifacts(temp_data_dir):
     from backend import storage
     from scripts import portal_pipeline_worker as worker
 
-    patient_label = "03-05-2010-0"
+    patient_label = "AB_03-05-2010"
     report_name = "report.pdf"
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label=patient_label, notes="")
@@ -491,7 +491,7 @@ def test_should_run_when_any_report_lacks_complete_run_even_if_artifact_exists(
 ):
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     patient_dir = tmp_path / patient_id
     patient_dir.mkdir()
     (patient_dir / f"{patient_id}.md").write_text("old final", encoding="utf-8")
@@ -539,7 +539,7 @@ def test_should_run_incomplete_reports_when_another_report_is_active(
 ):
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     reports = [
         worker.PortalReport(
             patient_id=patient_id,
@@ -587,7 +587,7 @@ def test_should_run_incomplete_reports_when_another_report_is_active(
 def test_merge_reports_keeps_index_reports_when_job_markers_exist():
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     job_report = worker.PortalReport(
         patient_id=patient_id,
         file_key=f"{patient_id}__report-one__v1__2026-03-21.pdf",
@@ -634,7 +634,7 @@ def test_merge_reports_keeps_index_reports_when_job_markers_exist():
 def test_reports_from_file_keys_recovers_pdf_blobs_without_index():
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     reports = worker.reports_from_file_keys(
         patient_id,
         [
@@ -652,8 +652,8 @@ def test_matching_active_run_exists_keeps_fresh_created_row_active(temp_data_dir
     from backend import storage
     from scripts import portal_pipeline_worker as worker
 
-    patient_label = "03-05-2010-0"
-    filename = "03-05-2010-0__report__v1__2026-03-21.pdf"
+    patient_label = "AB_03-05-2010"
+    filename = "AB_03-05-2010__report__v1__2026-03-21.pdf"
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label=patient_label, notes="")
         report = storage.create_report(
@@ -682,8 +682,8 @@ def test_matching_active_run_exists_ignores_stale_running_row(temp_data_dir, mon
 
     monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
 
-    patient_label = "03-05-2010-0"
-    filename = "03-05-2010-0__report__v1__2026-03-21.pdf"
+    patient_label = "AB_03-05-2010"
+    filename = "AB_03-05-2010__report__v1__2026-03-21.pdf"
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label=patient_label, notes="")
         report = storage.create_report(
@@ -727,17 +727,17 @@ def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, mon
         writes = []
 
         def get_json(self, key):
-            assert key == "patients/03-05-2010-0/$index.json"
+            assert key == "patients/AB_03-05-2010/$index.json"
             return None
 
         def list_keys(self, prefix):
-            assert prefix == "patients/03-05-2010-0/files/"
+            assert prefix == "patients/AB_03-05-2010/files/"
             return []
 
         def download(self, key, dest):
             assert key == (
-                "patients/03-05-2010-0/files/"
-                "03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
+                "patients/AB_03-05-2010/files/"
+                "AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
             )
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(b"%PDF-1.4")
@@ -746,8 +746,8 @@ def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, mon
             self.writes.append((key, payload))
 
     job_report = worker.PortalReport(
-        patient_id="03-05-2010-0",
-        file_key="03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf",
+        patient_id="AB_03-05-2010",
+        file_key="AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf",
         original_name="same-name.pdf",
         logical_name="qeeg-report__session-2026-03-21.pdf",
         uploaded_at=1,
@@ -768,7 +768,7 @@ def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, mon
         client=FakeClient(),
         portal_dir=tmp_path / "portal",
         status_dir=tmp_path / "status",
-        patient_id="03-05-2010-0",
+        patient_id="AB_03-05-2010",
         job_reports=[job_report],
         dry_run=False,
         allow_paid_runs=True,
@@ -780,11 +780,11 @@ def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, mon
         str(
             tmp_path
             / "portal"
-            / "03-05-2010-0"
-            / "03-05-2010-0__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
+            / "AB_03-05-2010"
+            / "AB_03-05-2010__qeeg-report__session-2026-03-21__v2__2026-03-21.pdf"
         )
     ]
-    assert (tmp_path / "status" / "03-05-2010-0.json").exists()
+    assert (tmp_path / "status" / "AB_03-05-2010.json").exists()
 
 
 @pytest.mark.parametrize("from_job", [False, True])
@@ -793,7 +793,7 @@ def test_process_patient_never_starts_unapproved_paid_work(
 ):
     from scripts import portal_pipeline_worker as worker
 
-    patient_id = "03-05-2010-0"
+    patient_id = "AB_03-05-2010"
     file_key = f"{patient_id}__report__v1__2026-03-21.pdf"
 
     class FakeClient:
@@ -875,7 +875,7 @@ def test_process_patient_never_starts_unapproved_paid_work(
     [
         (False, set(), False),
         (True, set(), True),
-        (False, {"03-05-2010-0"}, True),
+        (False, {"AB_03-05-2010"}, True),
     ],
 )
 def test_patient_discovery_scope_separates_continuous_jobs_from_manual_audits(
@@ -892,7 +892,7 @@ def test_patient_discovery_scope_separates_continuous_jobs_from_manual_audits(
     ("include_labels", "allow_paid_runs", "expected"),
     [
         (set(), False, False),
-        ({"03-05-2010-0"}, False, True),
+        ({"AB_03-05-2010"}, False, True),
         (set(), True, True),
     ],
 )
@@ -914,11 +914,11 @@ def test_process_patient_records_final_remote_status_failure(tmp_path: Path, mon
             self.write_count = 0
 
         def get_json(self, key):
-            assert key == "patients/03-05-2010-0/$index.json"
+            assert key == "patients/AB_03-05-2010/$index.json"
             return {
                 "files": [
                     {
-                        "fileKey": "03-05-2010-0__report__v1__2026-03-21.pdf",
+                        "fileKey": "AB_03-05-2010__report__v1__2026-03-21.pdf",
                         "originalName": "report.pdf",
                         "logicalName": "report.pdf",
                         "uploadedAt": 1,
@@ -930,8 +930,8 @@ def test_process_patient_records_final_remote_status_failure(tmp_path: Path, mon
             }
 
         def list_keys(self, prefix):
-            assert prefix == "patients/03-05-2010-0/files/"
-            return ["patients/03-05-2010-0/files/03-05-2010-0__report__v1__2026-03-21.pdf"]
+            assert prefix == "patients/AB_03-05-2010/files/"
+            return ["patients/AB_03-05-2010/files/AB_03-05-2010__report__v1__2026-03-21.pdf"]
 
         def download(self, key, dest):
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -954,13 +954,13 @@ def test_process_patient_records_final_remote_status_failure(tmp_path: Path, mon
         client=FakeClient(),
         portal_dir=tmp_path / "portal",
         status_dir=tmp_path / "status",
-        patient_id="03-05-2010-0",
+        patient_id="AB_03-05-2010",
         job_reports=[],
         dry_run=False,
         allow_paid_runs=True,
     )
 
-    local_status = (tmp_path / "status" / "03-05-2010-0.json").read_text(
+    local_status = (tmp_path / "status" / "AB_03-05-2010.json").read_text(
         encoding="utf-8"
     )
     assert result.status == "complete"
@@ -975,13 +975,13 @@ def test_process_patient_dry_run_reports_would_download_without_claiming_downloa
 
     class FakeClient:
         def get_json(self, key):
-            assert key == "patients/03-05-2010-0/$index.json"
+            assert key == "patients/AB_03-05-2010/$index.json"
             return None
 
         def list_keys(self, prefix):
-            assert prefix == "patients/03-05-2010-0/files/"
+            assert prefix == "patients/AB_03-05-2010/files/"
             return [
-                "patients/03-05-2010-0/files/03-05-2010-0__report__v1__2026-03-21.pdf"
+                "patients/AB_03-05-2010/files/AB_03-05-2010__report__v1__2026-03-21.pdf"
             ]
 
     monkeypatch.setattr(worker, "_matching_active_run_exists", lambda *_args, **_kwargs: False)
@@ -991,7 +991,7 @@ def test_process_patient_dry_run_reports_would_download_without_claiming_downloa
         client=FakeClient(),
         portal_dir=tmp_path / "portal",
         status_dir=tmp_path / "status",
-        patient_id="03-05-2010-0",
+        patient_id="AB_03-05-2010",
         job_reports=[],
         dry_run=True,
     )
@@ -1002,8 +1002,77 @@ def test_process_patient_dry_run_reports_would_download_without_claiming_downloa
         str(
             tmp_path
             / "portal"
-            / "03-05-2010-0"
-            / "03-05-2010-0__report__v1__2026-03-21.pdf"
+            / "AB_03-05-2010"
+            / "AB_03-05-2010__report__v1__2026-03-21.pdf"
         )
     ]
     assert result.note == "would download missing report PDFs"
+
+
+def test_portal_keys_route_only_on_canonical_ids():
+    """Blob, job, and status keys all carry the canonical clinic id, never a DOB."""
+    from scripts import portal_pipeline_worker as worker
+
+    assert worker.is_valid_patient_id("BT_12-11-1963") is True
+    assert worker.is_valid_patient_id("BT_12-11-1963_2") is True
+    assert worker.is_valid_patient_id("03-05-2010-0") is False
+    assert worker.is_valid_patient_id("BT_12-11-1963_1") is False
+
+    assert (
+        worker.patient_id_from_meta_key("patients/BT_12-11-1963/$meta.json")
+        == "BT_12-11-1963"
+    )
+    assert worker.patient_id_from_meta_key("patients/03-05-2010-0/$meta.json") is None
+    assert (
+        worker.patient_id_from_job_key("pipeline/jobs/BT_12-11-1963/job-1.json")
+        == "BT_12-11-1963"
+    )
+    assert worker.patient_id_from_job_key("pipeline/jobs/03-05-2010-0/job-1.json") is None
+    assert (
+        worker.patient_id_from_file_key("patients/BT_12-11-1963/files/report.pdf")
+        == "BT_12-11-1963"
+    )
+    assert (
+        worker.patient_id_from_file_key("patients/03-05-2010-0/files/report.pdf") is None
+    )
+
+
+def test_sync_remote_patient_identity_reads_the_dob_out_of_the_canonical_id(
+    tmp_path: Path,
+):
+    """The id is the only source of the date of birth and the collision ordinal."""
+    from scripts import portal_pipeline_worker as worker
+
+    patient_id = "AB_03-05-2010_2"
+    (tmp_path / patient_id).mkdir()
+
+    worker.sync_remote_patient_identity(
+        portal_dir=tmp_path,
+        patient_id=patient_id,
+        remote_meta={
+            "identity": {"schemaVersion": 1, "firstInitial": "A", "lastInitial": "B"}
+        },
+    )
+
+    stored = json.loads((tmp_path / patient_id / "$meta.json").read_text(encoding="utf-8"))
+    assert stored["birthdate"] == "03-05-2010"
+    assert stored["index"] == 2
+
+
+def test_sync_remote_patient_identity_rejects_initials_the_id_contradicts(
+    tmp_path: Path,
+):
+    """Hub initials that disagree with the id would be a second source of truth."""
+    from scripts import portal_pipeline_worker as worker
+
+    patient_id = "AB_03-05-2010"
+    (tmp_path / patient_id).mkdir()
+
+    with pytest.raises(ValueError, match="conflict"):
+        worker.sync_remote_patient_identity(
+            portal_dir=tmp_path,
+            patient_id=patient_id,
+            remote_meta={
+                "identity": {"schemaVersion": 1, "firstInitial": "C", "lastInitial": "D"}
+            },
+        )

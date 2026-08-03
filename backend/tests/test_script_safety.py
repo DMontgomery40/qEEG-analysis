@@ -11,11 +11,11 @@ def test_create_combined_report_rejects_duplicate_patient_labels(temp_data_dir):
     from scripts import create_combined_council_report as script
 
     with storage.session_scope() as session:
-        storage.create_patient(session, label="09-05-1954-0", notes="")
-        storage.create_patient(session, label="09-05-1954-0", notes="")
+        storage.create_patient(session, label="HT_09-05-1954", notes="")
+        storage.create_patient(session, label="HT_09-05-1954", notes="")
 
     with pytest.raises(RuntimeError, match="Multiple patients found for label"):
-        script._patient_id_for_label("09-05-1954-0")
+        script._patient_id_for_label("HT_09-05-1954")
 
 
 def test_single_agent_auto_discovery_rejects_ambiguous_matches(tmp_path: Path):
@@ -28,7 +28,7 @@ def test_single_agent_auto_discovery_rejects_ambiguous_matches(tmp_path: Path):
 
     manifest_path = tmp_path / "combined.manifest.json"
     manifest = {
-        "patient_label": "09-05-1954-0",
+        "patient_label": "HT_09-05-1954",
         "sources": [
             {"path": str(source_a)},
             {"path": str(source_b)},
