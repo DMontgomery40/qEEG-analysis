@@ -9,16 +9,17 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select as sa_select
 
 from . import storage
@@ -58,6 +59,21 @@ from .orchestration import (
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from . import pipeline_uploads
+from .patient_intake import (
+    IdentityInput,
+    IdentityNameConflict,
+    find_patient_by_identity,
+)
+from .patient_identity import (
+    PatientIdentityError,
+    allocate_canonical_patient_id,
+    derive_initial,
+    normalize_birthdate,
+    parse_canonical_patient_id,
+    require_initial,
+    reserve_canonical_patient_id,
+)
 from .portal_export_manifest import (
     council_export_manifest_payload,
     write_council_export_manifest,
@@ -169,13 +185,36 @@ async def _request_context_middleware(request: Request, call_next):
 
 
 class PatientCreate(BaseModel):
-    label: str = Field(min_length=1)
+    """Structured identity allocates the canonical clinic ID.
+
+    `first_initial`/`last_initial` are for names whose first letter has no A-Z
+    equivalent, where the operator supplies the intended initial. A bare `label`
+    is the pre-cutover path for patients that already have one.
+    """
+
+    label: str | None = None
     notes: str = ""
+    first_name: str | None = None
+    last_name: str | None = None
+    birthdate: str | None = None
+    first_initial: str | None = None
+    last_initial: str | None = None
+    # How the operator answers an identity_name_mismatch conflict. `attach_to`
+    # names the existing clinic id this is the same person as; `force_new` says
+    # they are genuinely two people and takes the next collision ordinal.
+    attach_to: str | None = None
+    force_new: bool = False
 
 
-class PatientUpdate(BaseModel):
-    label: str = Field(min_length=1)
-    notes: str = ""
+class PatientUpdate(PatientCreate):
+    """Same identity fields as create; the canonical ID is re-resolved on save.
+
+    Notes are the exception. They carry what the agent has learned about this
+    patient, so leaving them out of a save keeps what is on file; sending a
+    string, empty one included, replaces it.
+    """
+
+    notes: str | None = None
 
 
 class RunCreate(BaseModel):
@@ -1377,6 +1416,70 @@ async def models() -> dict[str, Any]:
     }
 
 
+class UploadResolution(BaseModel):
+    """How the operator answers a parked upload's name conflict."""
+
+    attach_to: str | None = None
+    force_new: bool = False
+
+
+@app.get("/api/pipeline/uploads")
+async def list_pipeline_uploads() -> list[dict[str, Any]]:
+    """Hub uploads the worker has seen, including any waiting on an answer."""
+    return pipeline_uploads.list_uploads()
+
+
+@app.post("/api/pipeline/uploads/{upload_id}/resolution")
+async def resolve_pipeline_upload(
+    upload_id: str, req: UploadResolution
+) -> dict[str, Any]:
+    """Answer a parked upload. The worker acts on it next cycle."""
+    record = pipeline_uploads.read_upload(upload_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    if record.get("status") == pipeline_uploads.STATUS_REGISTERED:
+        # Answering twice, or answering after the worker got there first, is not
+        # an error — say where the report went.
+        return {
+            "ok": True,
+            "upload_id": upload_id,
+            "status": pipeline_uploads.STATUS_REGISTERED,
+            "patient_id": record.get("patientId"),
+            "detail": "This upload is already filed.",
+        }
+
+    attach_to = (req.attach_to or "").strip()
+    if bool(attach_to) == bool(req.force_new):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Say which patient this is with attach_to, or force_new if they "
+                "are two different people — one or the other."
+            ),
+        )
+    if attach_to and parse_canonical_patient_id(attach_to) is None:
+        raise HTTPException(
+            status_code=400, detail=f"{attach_to} is not a clinic patient id."
+        )
+
+    resolution = {"attachTo": attach_to} if attach_to else {"forceNew": True}
+    pipeline_uploads.write_upload(
+        {
+            **record,
+            "uploadId": upload_id,
+            "status": pipeline_uploads.STATUS_PENDING,
+            "resolution": resolution,
+        }
+    )
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "status": pipeline_uploads.STATUS_PENDING,
+        "resolution": resolution,
+    }
+
+
 @app.get("/api/patients")
 async def list_patients() -> list[dict[str, Any]]:
     with storage.session_scope() as session:
@@ -1404,117 +1507,335 @@ async def list_patients() -> list[dict[str, Any]]:
         ]
 
 
+_IDENTITY_FIELDS = (
+    "first_name",
+    "last_name",
+    "birthdate",
+    "first_initial",
+    "last_initial",
+)
+
+
+def _has_structured_identity(req: PatientCreate) -> bool:
+    return any((getattr(req, name) or "").strip() for name in _IDENTITY_FIELDS)
+
+
+def _resolve_patient_identity(
+    session: Any, req: PatientCreate, *, exclude_patient_uuid: str | None = None
+) -> dict[str, Any]:
+    """Turn a request body into the patient fields to store.
+
+    Structured identity wins: it allocates the canonical clinic ID and that ID
+    becomes the label. A bare label has to already be a canonical ID; it is
+    reserved on the way through so the same ID can never be issued to anyone
+    else. Anything else is refused, because a label the portal cannot route on
+    would leave the patient with no folder, no publishing, and no sync.
+    """
+    if _has_structured_identity(req):
+        try:
+            first = (
+                require_initial(req.first_initial, field="first")
+                if (req.first_initial or "").strip()
+                else derive_initial(req.first_name, field="first")
+            )
+            last = (
+                require_initial(req.last_initial, field="last")
+                if (req.last_initial or "").strip()
+                else derive_initial(req.last_name, field="last")
+            )
+            birthdate = normalize_birthdate(req.birthdate)
+            canonical = allocate_canonical_patient_id(
+                session,
+                first_initial=first,
+                last_initial=last,
+                birthdate=birthdate,
+                exclude_patient_uuid=exclude_patient_uuid,
+            )
+        except PatientIdentityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # A name that was not supplied is not a name of "". `update_patient`
+        # applies any non-None value, so emitting empty strings here erased the
+        # stored name on an initials-only correction — a legitimate operator
+        # flow, and exactly the class of thing this system must never do to a
+        # patient's record. Omitted means keep.
+        return {
+            "label": canonical,
+            "first_name": (req.first_name or "").strip() or None,
+            "last_name": (req.last_name or "").strip() or None,
+            "birthdate": birthdate,
+            "first_initial": first,
+            "last_initial": last,
+        }
+
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(
+            status_code=400,
+            detail="Give the patient's name and date of birth, or an existing label.",
+        )
+
+    parsed = reserve_canonical_patient_id(session, label)
+    if parsed is None:
+        # A label that is not a clinic id routes nowhere: every portal path
+        # rejects it, so the patient would be created, show up in the roster,
+        # and silently have no folder, no publishing, no sync, and no batch
+        # work. Refuse it here instead. Patients already carrying a pre-cutover
+        # label keep it; Task 5 migrates them.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{label} is not a clinic patient id. Give the patient's name "
+                "and date of birth, or an id written as XX_MM-DD-YYYY."
+            ),
+        )
+    return {
+        "label": parsed.value,
+        "birthdate": parsed.birthdate,
+        "first_initial": parsed.first_initial,
+        "last_initial": parsed.last_initial,
+    }
+
+
 @app.post("/api/patients")
 async def create_patient(req: PatientCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        if storage.find_patients_by_label(session, req.label):
+        if _has_structured_identity(req) or (req.attach_to or "").strip():
+            try:
+                existing, _keep_stored_name = _find_patient_by_identity(session, req)
+            except IdentityNameConflict as exc:
+                raise HTTPException(status_code=409, detail=exc.payload) from exc
+            except PatientIdentityError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if existing is not None:
+                # The operator named this person's existing chart, so there is
+                # nothing to create.
+                return _patient_out(existing)
+
+        fields = _resolve_patient_identity(session, req)
+        if storage.find_patients_by_label(session, fields["label"]):
             raise HTTPException(status_code=409, detail="Patient label already exists")
-        p = storage.create_patient(session, label=req.label, notes=req.notes)
+        p = storage.create_patient(session, notes=req.notes, **fields)
         _ensure_portal_patient_folder(p.label)
         return _patient_out(p)
 
 
-@app.post("/api/patients/bulk_upload")
-async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    """
-    Bulk upload qEEG report files. Each file creates a new patient whose label is the filename stem.
+def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
+    """Read the operator's per-file identities, keyed by the filename they name.
 
-    If a patient with the same label already exists (case-insensitive), the file is skipped and reported.
+    Comes from the preview step: the operator reads the name and date of birth
+    off the report before anything is filed, so the canonical id exists before
+    the patient does.
     """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Identities are not readable JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Identities must be a list with one entry per file.",
+        )
+
+    identities: dict[str, PatientCreate] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise HTTPException(
+                status_code=400, detail="Each identity must be an object."
+            )
+        filename = str(entry.get("filename") or "").strip()
+        if not filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Each identity must name the file it belongs to.",
+            )
+        identities[filename] = PatientCreate(
+            first_name=entry.get("first_name"),
+            last_name=entry.get("last_name"),
+            birthdate=entry.get("birthdate"),
+            first_initial=entry.get("first_initial"),
+            last_initial=entry.get("last_initial"),
+            attach_to=entry.get("attach_to"),
+            force_new=bool(entry.get("force_new")),
+        )
+    return identities
+
+
+def _identity_input(req: PatientCreate) -> IdentityInput:
+    return IdentityInput(
+        first_name=req.first_name,
+        last_name=req.last_name,
+        birthdate=req.birthdate,
+        first_initial=req.first_initial,
+        last_initial=req.last_initial,
+        attach_to=req.attach_to,
+        force_new=req.force_new,
+    )
+
+
+def _find_patient_by_identity(
+    session: Any, req: PatientCreate
+) -> tuple[storage.Patient | None, bool]:
+    return find_patient_by_identity(session, _identity_input(req))
+
+
+def _discard_half_created_patient(patient_uuid: str | None, patient_label: str) -> None:
+    """Undo a patient created for a report that then failed to file.
+
+    Identity has to be committed before the upload can be read, so a failure
+    after that point leaves a patient with a real person's name, no reports, and
+    an empty portal folder that batch discovery would go on to enumerate.
+
+    The reservation row is deliberately left behind. IDs are issued once and
+    never reused, so this ordinal is spent even though nobody ended up wearing
+    it — the same rule that stops a relabel from freeing an ID for the next
+    patient.
+    """
+    if patient_uuid is None:
+        return
+
+    portal_dir = _portal_patients_dir() / patient_label if patient_label else None
+    if portal_dir is not None and portal_dir.is_dir():
+        try:
+            portal_dir.rmdir()
+        except OSError:
+            # Files landed in it after all; leave the folder and its contents.
+            pass
+
+    try:
+        with storage.session_scope() as session:
+            patient = storage.get_patient(session, patient_uuid)
+            if patient is not None:
+                session.delete(patient)
+                session.commit()
+    except Exception:
+        LOGGER.exception(
+            "bulk_upload_patient_cleanup_failed",
+            patient_label=patient_label,
+            operatorHint="A patient row created for a report that failed to file could not be removed; delete it from the roster before re-uploading.",
+        )
+
+
+@app.post("/api/patients/bulk_upload")
+async def bulk_upload_patients(
+    files: list[UploadFile] = File(...),
+    identities: str = Form(""),
+) -> dict[str, Any]:
+    """Register uploaded qEEG reports under canonical clinic patient ids.
+
+    Intake runs in one order and only that order: the operator previews each
+    report and reads off the name and date of birth, that identity allocates or
+    finds the canonical patient, and the report is registered under it. A file
+    nobody has identified is an error — the filename never becomes a label.
+    """
+    identities_by_filename = _parse_bulk_upload_identities(identities)
+
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    seen_labels: set[str] = set()
     for file in files:
         filename = (file.filename or "upload").strip() or "upload"
-        patient_label = Path(filename).stem.strip()
-        if not patient_label:
+        identity = identities_by_filename.get(filename)
+        if identity is None:
             errors.append(
                 {
                     "filename": filename,
-                    "error": "Empty filename stem (cannot derive patient label)",
+                    "error": (
+                        "Give this report's patient name and date of birth. "
+                        "Preview it first if they are not to hand."
+                    ),
                 }
             )
             continue
-
-        label_key = patient_label.lower()
-        if label_key in seen_labels:
-            skipped.append(
-                {
-                    "filename": filename,
-                    "patient_label": patient_label,
-                    "reason": "duplicate_label_in_batch",
-                }
-            )
-            continue
-        seen_labels.add(label_key)
-
-        with storage.session_scope() as session:
-            existing = storage.find_patients_by_label(session, patient_label)
-            if existing:
-                skipped.append(
-                    {
-                        "filename": filename,
-                        "patient_label": patient_label,
-                        "reason": "patient_label_exists",
-                        "existing_patient_ids": [p.id for p in existing],
-                    }
-                )
-                continue
 
         report_id = str(uuid.uuid4())
         report_folder: Path | None = None
+        patient_label = ""
+        created_patient_uuid: str | None = None
         try:
-            file_bytes = await file.read()
-            preview = ""
-
             with storage.session_scope() as session:
-                patient = storage.Patient(label=patient_label, notes="")
-                session.add(patient)
-                session.flush()
-                patient_id = patient.id
-
+                existing, keep_stored_name = _find_patient_by_identity(
+                    session, identity
+                )
+                if keep_stored_name and existing is not None:
+                    # Attached by the operator to a chart they named. Its label
+                    # and the name on it both stay exactly as they are.
+                    patient = existing
+                else:
+                    fields = _resolve_patient_identity(
+                        session,
+                        identity,
+                        exclude_patient_uuid=existing.id if existing else None,
+                    )
+                    if existing is not None:
+                        # Never blank a name already on file: an identity given
+                        # as bare initials carries empty name strings.
+                        patient = storage.update_patient(
+                            session,
+                            existing.id,
+                            notes=existing.notes,
+                            **{key: value or None for key, value in fields.items()},
+                        )
+                    else:
+                        patient = storage.create_patient(
+                            session, notes=identity.notes, **fields
+                        )
+                        created_patient_uuid = patient.id
+                patient_label = patient.label
+                patient_uuid = patient.id
                 _ensure_portal_patient_folder(patient_label)
 
-                report_folder = report_storage_dir(patient_id, report_id)
-                original_path, extracted_path, mime_type, preview = save_report_upload(
-                    patient_id=patient_id,
-                    report_id=report_id,
-                    filename=filename,
-                    provided_mime_type=file.content_type,
-                    file_bytes=file_bytes,
-                )
+            file_bytes = await file.read()
+            report_folder = report_storage_dir(patient_uuid, report_id)
+            original_path, extracted_path, mime_type, preview = save_report_upload(
+                patient_id=patient_uuid,
+                report_id=report_id,
+                filename=filename,
+                provided_mime_type=file.content_type,
+                file_bytes=file_bytes,
+            )
 
-                report = storage.Report(
-                    id=report_id,
-                    patient_id=patient_id,
+            with storage.session_scope() as session:
+                report = storage.create_report(
+                    session,
+                    report_id=report_id,
+                    patient_id=patient_uuid,
                     filename=filename,
                     mime_type=mime_type,
-                    stored_path=str(original_path),
-                    extracted_text_path=str(extracted_path),
+                    stored_path=original_path,
+                    extracted_text_path=extracted_path,
                 )
-                session.add(report)
-                session.commit()
-                session.refresh(patient)
-                session.refresh(report)
-
-            created.append(
+                patient = storage.get_patient(session, patient_uuid)
+                created.append(
+                    {
+                        "filename": filename,
+                        "patient": _patient_out(patient),
+                        "report": _report_out(report),
+                        "preview": preview,
+                    }
+                )
+        except IdentityNameConflict as exc:
+            # Structured so the operator can answer it per file, with attach_to
+            # or force_new, without holding up the rest of the batch.
+            errors.append({"filename": filename, **exc.payload, "error": exc.payload["detail"]})
+        except HTTPException as exc:
+            errors.append({"filename": filename, "error": str(exc.detail)})
+        except Exception as exc:
+            if report_folder is not None:
+                shutil.rmtree(report_folder, ignore_errors=True)
+            _discard_half_created_patient(created_patient_uuid, patient_label)
+            errors.append(
                 {
                     "filename": filename,
-                    "patient": _patient_out(patient),
-                    "report": _report_out(report),
-                    "preview": preview,
+                    "patient_label": patient_label,
+                    "error": str(exc),
                 }
-            )
-        except Exception as e:
-            if report_folder is not None:
-                try:
-                    shutil.rmtree(report_folder, ignore_errors=True)
-                except Exception:
-                    pass
-            errors.append(
-                {"filename": filename, "patient_label": patient_label, "error": str(e)}
             )
 
     return {
@@ -1747,12 +2068,15 @@ async def run_patient_action(
 @app.put("/api/patients/{patient_id}")
 async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        existing = storage.find_patients_by_label(session, req.label)
+        if storage.get_patient(session, patient_id) is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        fields = _resolve_patient_identity(
+            session, req, exclude_patient_uuid=patient_id
+        )
+        existing = storage.find_patients_by_label(session, fields["label"])
         if any(p.id != patient_id for p in existing):
             raise HTTPException(status_code=409, detail="Patient label already exists")
-        p = storage.update_patient(
-            session, patient_id, label=req.label, notes=req.notes
-        )
+        p = storage.update_patient(session, patient_id, notes=req.notes, **fields)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
         _ensure_portal_patient_folder(p.label)
@@ -1911,6 +2235,47 @@ async def delete_patient_file(file_id: str) -> dict[str, Any]:
     _delete_portal_file(patient_label=patient_label, filename=filename)
 
     return {"ok": True}
+
+
+@app.post("/api/reports/preview")
+async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Read a dropped report so the patient's name and date of birth can be seen.
+
+    Runs the same extraction/OCR as a real upload, in a scratch directory that is
+    deleted on the way out. Creates no patient, no report row, no portal folder,
+    and starts no analysis run, so it costs nothing and files nothing.
+    """
+    filename = (file.filename or "upload").strip() or "upload"
+    file_bytes = await file.read()
+
+    with tempfile.TemporaryDirectory(prefix="qeeg-preview-") as scratch:
+        scratch_dir = Path(scratch)
+        _original, extracted_path, mime_type, preview = save_report_upload(
+            patient_id="preview",
+            report_id="preview",
+            filename=filename,
+            provided_mime_type=file.content_type,
+            file_bytes=file_bytes,
+            target_dir=scratch_dir,
+        )
+        text = extracted_path.read_text(encoding="utf-8")
+
+        page_count = 0
+        metadata_path = scratch_dir / "metadata.json"
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                page_count = int(metadata.get("page_count", 0))
+            except (ValueError, TypeError, AttributeError, OSError):
+                page_count = 0
+
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "preview": preview,
+        "text": text,
+        "page_count": page_count,
+    }
 
 
 @app.get("/api/reports/{report_id}/extracted")
@@ -2555,9 +2920,18 @@ def _patient_out(
     has_explainer_video: bool = False,
     orchestration_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    canonical = parse_canonical_patient_id(p.label)
     return {
+        # `id` is the internal relational UUID; `patient_id` is the clinic ID.
+        # Patients created before the cutover have no canonical ID yet.
         "id": p.id,
+        "patient_id": canonical.value if canonical else None,
         "label": p.label,
+        "first_name": p.first_name or "",
+        "last_name": p.last_name or "",
+        "birthdate": p.birthdate or "",
+        "first_initial": p.first_initial or "",
+        "last_initial": p.last_initial or "",
         "notes": p.notes,
         "has_explainer_video": bool(has_explainer_video),
         "orchestration_summary": orchestration_summary,

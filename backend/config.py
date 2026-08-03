@@ -15,7 +15,15 @@ load_dotenv()
 CLIPROXY_BASE_URL = os.getenv("CLIPROXY_BASE_URL", "http://127.0.0.1:8317").rstrip("/")
 CLIPROXY_API_KEY = os.getenv("CLIPROXY_API_KEY", "")
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+# The clinic's data lives beside the code, not beside whatever directory someone
+# happened to launch from. A relative default meant a test suite run from the
+# production checkout wrote the live database, and a run from a worktree wrote a
+# different one — six patient rows reached the clinic's database that way.
+# An explicit DATA_DIR still wins, and a relative one is still honoured as given.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_DATA_DIR_ENV = os.getenv("DATA_DIR")
+DATA_DIR = Path(_DATA_DIR_ENV) if _DATA_DIR_ENV else REPO_ROOT / "data"
 REPORTS_DIR = DATA_DIR / "reports"
 PATIENT_FILES_DIR = DATA_DIR / "patient_files"
 ARTIFACTS_DIR = DATA_DIR / "artifacts"

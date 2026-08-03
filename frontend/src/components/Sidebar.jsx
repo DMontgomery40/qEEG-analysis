@@ -53,7 +53,7 @@ function Sidebar({ patients, selectedPatientId, onSelectPatient, onCreatePatient
         <div className="sidebar-new">
           <input
             className="sidebar-input"
-            placeholder="New patient label…"
+            placeholder="New patient — ZZ_01-01-1900"
             value={newLabel}
             onChange={(e) => setNewLabel(e.target.value)}
           />

@@ -105,7 +105,7 @@ async def test_pipeline_failure_emits_operator_hint(temp_data_dir, mock_llm_clie
     from backend.council import QEEGCouncilWorkflow
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-1"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -157,7 +157,7 @@ async def test_pipeline_events_write_tail_friendly_progress_log(
     from backend.council.workflow.core import _progress_log_paths
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-2"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"

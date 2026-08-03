@@ -18,11 +18,13 @@ Frontend (React/Vite)  →  Backend (FastAPI)  →  CLIProxyAPI(Plus)  →  LLM 
 ### Storage
 
 - `data/app.db` - SQLite metadata (patients, reports, runs, artifacts)
-- `data/reports/{patient_id}/{report_id}/` - uploaded files, extracted text, page images
+- `data/reports/{patient_uuid}/{report_id}/` - uploaded files, extracted text, page images
 - `data/artifacts/{run_id}/stage-{n}/` - stage outputs per model
 - `data/exports/{run_id}/` - final exported reports
-- `data/patient_files/{patient_id}/{file_id}/` - DB-tracked uploaded patient files (MP4/PDF/etc)
-- `data/portal_patients/{patient_id}/` - clinician portal **sync folder** (drop final MP4s here)
+- `data/patient_files/{patient_uuid}/{file_id}/` - DB-tracked uploaded patient files (MP4/PDF/etc)
+- `data/portal_patients/{PATIENT_ID}/` - clinician portal **sync folder** (drop final MP4s here).
+  `{patient_uuid}` above is the internal SQLite key; `{PATIENT_ID}` here is the canonical clinic ID
+  `XX_MM-DD-YYYY[_N]` that the clinic, the hub, and the renderers all use.
 
 ## 6-Stage Workflow
 

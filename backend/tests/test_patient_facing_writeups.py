@@ -11,7 +11,7 @@ def test_patient_facing_writeups_require_db_source_by_default(
 ):
     from scripts import generate_patient_facing_writeups as script
 
-    patient_label = "01-01-2001-0"
+    patient_label = "RS_01-01-2001"
     patient_dir = tmp_path / patient_label
     patient_dir.mkdir(parents=True)
     (patient_dir / "legacy-council.md").write_text("# Legacy", encoding="utf-8")
@@ -41,7 +41,7 @@ def test_patient_facing_writeups_can_opt_into_portal_markdown_fallback(
 ):
     from scripts import generate_patient_facing_writeups as script
 
-    patient_label = "01-01-2001-0"
+    patient_label = "RS_01-01-2001"
     patient_dir = tmp_path / patient_label
     patient_dir.mkdir(parents=True)
     (patient_dir / "legacy-council.md").write_text("# Legacy", encoding="utf-8")
@@ -63,7 +63,7 @@ def test_patient_facing_writeups_can_opt_into_portal_markdown_fallback(
     assert asyncio.run(script.main()) == 0
     out = capsys.readouterr().out
 
-    assert "GENERATE 01-01-2001-0: 1 source reports" in out
+    assert "GENERATE RS_01-01-2001: 1 source reports" in out
 
 
 def test_patient_facing_regeneration_uses_glm52_role_default():

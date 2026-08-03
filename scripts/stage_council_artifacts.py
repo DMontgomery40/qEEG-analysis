@@ -21,6 +21,7 @@ import argparse
 import shutil
 from pathlib import Path
 
+from backend.portal_files import normalize_portal_patient_id
 from backend.portal_sync import sync_patient_to_thrylen
 from backend.storage import Patient, init_db, session_scope
 
@@ -33,13 +34,12 @@ def get_completed_runs_by_patient_label() -> dict[str, list[tuple[str, str]]]:
     result: dict[str, list[tuple[str, str]]] = {}
 
     with session_scope() as session:
-        # Get all patients with valid labels (MM-DD-YYYY-N format)
+        # Only patients wearing a canonical clinic id have a portal folder.
         patients = session.query(Patient).all()
 
         for patient in patients:
-            label = patient.label
-            # Skip invalid labels
-            if not label or not _is_valid_patient_label(label):
+            label = normalize_portal_patient_id(patient.label or "")
+            if label is None:
                 continue
 
             # Get completed runs for this patient
@@ -52,17 +52,6 @@ def get_completed_runs_by_patient_label() -> dict[str, list[tuple[str, str]]]:
                 ]
 
     return result
-
-
-def _is_valid_patient_label(label: str) -> bool:
-    """Check if label matches MM-DD-YYYY-N format."""
-    import re
-
-    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})-(\d+)$", label)
-    if not m:
-        return False
-    month, day, year, idx = int(m[1]), int(m[2]), int(m[3]), int(m[4])
-    return 1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100 and idx >= 0
 
 
 def stage_artifacts(dry_run: bool = False) -> None:

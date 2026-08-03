@@ -11,7 +11,7 @@ import pytest
 async def test_auto_patient_facing_runs_for_completed_run(temp_data_dir, monkeypatch):
     from backend import main, storage
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -142,7 +142,7 @@ async def test_auto_patient_facing_skips_unreviewed_partial_run(
     from backend import main, storage
     from backend.orchestration import progress_jsonl_path
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -228,7 +228,7 @@ async def test_auto_patient_facing_returns_false_on_subprocess_failure(
 ):
     from backend import main, storage
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -343,7 +343,7 @@ async def test_auto_cathode_video_prepares_handoff_and_spawns_queue(
 ):
     from backend import main, storage
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
