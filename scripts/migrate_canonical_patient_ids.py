@@ -1025,21 +1025,34 @@ class Journal:
             if old_id not in self.done
         ]
 
-    def all_records(self) -> list[dict[str, Any]]:
-        """Every intent line, finished or not — one per patient."""
-        return [record for _, record in sorted(self.started.items())]
+    def completed_records(self) -> list[dict[str, Any]]:
+        """The intent line of every patient whose local rekey finished.
+
+        The intent line is what carries the hub worklist, and it is written
+        before the work is attempted — so it exists for patients that failed
+        immediately too. Gating on the completion record is what keeps those
+        out: their local world never changed, and moving their hub blobs would
+        strand them the other way round.
+        """
+        return [
+            record
+            for old_id, record in sorted(self.started.items())
+            if old_id in self.done
+        ]
 
     def migrated_pairs(self) -> dict[str, str]:
-        """Old ID to new ID for every patient this journal ever started.
+        """Old ID to new ID for every patient whose local rekey finished.
 
-        This, not a mapping recomputed from the database, is what the hub rekey
-        must be driven from: a patient finished on a resumed run already wears
-        their canonical label, so they are absent from any fresh computation.
+        Driven from the journal rather than a mapping recomputed from the
+        database, because a patient finished on a resumed run already wears
+        their canonical label and is absent from any fresh computation — and
+        driven from the *completions* rather than the intents, because a patient
+        whose rekey failed never moved locally and must not move remotely.
         """
         return {
             old_id: record["new_id"]
             for old_id, record in sorted(self.started.items())
-            if record.get("new_id")
+            if record.get("new_id") and old_id in self.done
         }
 
     def record(self, entry: dict[str, Any]) -> None:
@@ -1889,7 +1902,7 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
     # drops out of it, and their hub blobs would silently never be rekeyed.
     migrated = journal.migrated_pairs()
     remote_items: list[dict[str, Any]] = []
-    for record in journal.all_records():
+    for record in journal.completed_records():
         remote_items.extend(record.get("remote") or [])
 
     worklist = worklist_dir / "remote-rekey-worklist.json"

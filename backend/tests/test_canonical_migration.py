@@ -1096,3 +1096,43 @@ def test_apply_without_qa_records_does_not_need_a_rollback_bundle(world):
     assert report["qa_fixture_labels"] == []
     assert migrator.run_apply(world, report) == 0
     assert (Path(world.journal).parent / "remote-rekey-worklist.json").is_file()
+
+
+def test_a_patient_whose_rekey_failed_never_reaches_the_hub_artifacts(
+    world, monkeypatch
+):
+    """The intent line is written before the work is attempted, so it exists
+    even for a patient that failed immediately — nothing local touched, no
+    reservation taken. Driving the hub off intents would hand the operator a
+    command that moves those blobs, stranding the patient the other way round:
+    hub canonical, local still legacy."""
+    _unblock(world)
+    report = migrator.build_report(world)
+
+    real_plan = migrator.patient_rekey.plan_patient_rekey
+
+    def fail_one_patient_before_anything_moves(old_id, new_id, **kwargs):
+        if old_id == "07-07-1907-0":
+            raise RuntimeError("disk went away")
+        return real_plan(old_id, new_id, **kwargs)
+
+    monkeypatch.setattr(
+        migrator.patient_rekey,
+        "plan_patient_rekey",
+        fail_one_patient_before_anything_moves,
+    )
+
+    assert migrator.run_apply(world, report) == 1
+
+    worklist_dir = Path(world.journal).parent
+    mapping_file = json.loads((worklist_dir / "remote-rekey-mapping.json").read_text())
+    worklist = json.loads((worklist_dir / "remote-rekey-worklist.json").read_text())
+
+    # The failed patient is absent from both artifacts the operator would paste.
+    assert "07-07-1907-0" not in mapping_file
+    assert all(item["patientIdOld"] != "07-07-1907-0" for item in worklist)
+    # Its portal folder is genuinely untouched, which is why the hub must be too.
+    assert (Path(world.portal_root) / "07-07-1907-0").is_dir()
+
+    # A sibling that succeeded in the same run is still there.
+    assert mapping_file["09-09-1909-0"] == "DK_09-09-1909"
