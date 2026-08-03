@@ -332,7 +332,7 @@ def test_analysis_artifacts_exist_recognizes_council_and_patient_facing(tmp_path
     assert worker.analysis_artifacts_exist(patient_dir, "AB_03-05-2010")
 
 
-def test_should_run_pipeline_when_report_downloaded(tmp_path: Path, monkeypatch):
+def test_should_run_pipeline_when_report_downloaded(temp_data_dir, tmp_path: Path, monkeypatch):
     from scripts import portal_pipeline_worker as worker
 
     report = worker.PortalReport(
@@ -382,7 +382,7 @@ def test_should_not_duplicate_active_run_when_no_analysis_yet(tmp_path: Path, mo
     assert note == "matching run already active for report.pdf"
 
 
-def test_should_skip_when_all_reports_have_complete_runs(tmp_path: Path, monkeypatch):
+def test_should_skip_when_all_reports_have_complete_runs(temp_data_dir, tmp_path: Path, monkeypatch):
     from scripts import portal_pipeline_worker as worker
 
     patient_id = "AB_03-05-2010"
