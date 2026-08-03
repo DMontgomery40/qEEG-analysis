@@ -86,6 +86,25 @@ def test_parse_rejects_impossible_calendar_dates(value):
     assert parse_canonical_patient_id(value) is None
 
 
+@pytest.mark.parametrize("value", ["BT_12-11-1900", "BT_12-11-2100"])
+def test_parse_accepts_years_inside_the_plausible_range(value):
+    assert parse_canonical_patient_id(value) is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "BT_01-01-0001",  # a mistyped year must not earn a permanent reservation
+        "BT_12-11-1899",
+        "BT_12-11-2101",
+        "BT_12-11-9999",
+    ],
+)
+def test_parse_rejects_years_outside_the_plausible_range(value):
+    """Matches the 1900-2100 bound the legacy portal normalizer already uses."""
+    assert parse_canonical_patient_id(value) is None
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -167,6 +186,9 @@ def test_canonical_patient_id_rejects_nonpositive_ordinals(ordinal):
         ("B", "T", "13-01-1990"),
         ("B", "T", "not-a-date"),
         ("B", "T", ""),
+        ("B", "T", "01-01-0001"),
+        ("B", "T", "12-11-1899"),
+        ("B", "T", "12-11-2101"),
         ("", "T", "12-11-1963"),
         ("B", "", "12-11-1963"),
         ("BT", "T", "12-11-1963"),
@@ -384,6 +406,88 @@ def test_allocate_survives_losing_the_race_to_another_writer(db, monkeypatch):
         _allocate(db, first_initial="B", last_initial="T", birthdate="12-11-1963")
         == "BT_12-11-1963_2"
     )
+
+
+def test_confirming_an_unreserved_id_a_patient_already_wears_reserves_it(db):
+    """A canonical-looking label can reach the database without a reservation.
+
+    Bulk upload mints a label from the filename stem, so `BT_12-11-1963.pdf`
+    produces a patient wearing that ID with nothing reserved behind it.
+    Confirming that patient's identity has to close the gap.
+    """
+    with db.session_scope() as session:
+        patient = db.create_patient(session, label="BT_12-11-1963", notes="")
+        assert session.get(db.PatientIdReservation, "BT_12-11-1963") is None
+
+    confirmed = _allocate(
+        db,
+        first_initial="B",
+        last_initial="T",
+        birthdate="12-11-1963",
+        exclude_patient_uuid=patient.id,
+    )
+
+    assert confirmed == "BT_12-11-1963"
+    with db.session_scope() as session:
+        assert session.get(db.PatientIdReservation, "BT_12-11-1963") is not None
+
+
+def test_an_id_vacated_after_confirmation_never_reaches_another_person(db):
+    """The whole chain: unreserved label, confirmed, relabelled away, reissued."""
+    with db.session_scope() as session:
+        patient = db.create_patient(session, label="BT_12-11-1963", notes="")
+
+    _allocate(
+        db,
+        first_initial="B",
+        last_initial="T",
+        birthdate="12-11-1963",
+        exclude_patient_uuid=patient.id,
+    )
+
+    with db.session_scope() as session:
+        db.update_patient(session, patient.id, label="ZZ_01-01-1900", notes="")
+
+    assert (
+        _allocate(db, first_initial="B", last_initial="T", birthdate="12-11-1963")
+        == "BT_12-11-1963_2"
+    )
+
+
+def test_losing_the_race_keeps_the_callers_pending_work(db, monkeypatch):
+    """A lost race must not discard writes the caller had pending.
+
+    Task 5's migrator holds a pending patient mutation while it allocates, so a
+    rollback here would silently throw away work already done.
+    """
+    with db.session_scope() as session:
+        session.add(
+            db.PatientIdReservation(
+                patient_id="BT_12-11-1963",
+                first_initial="B",
+                last_initial="T",
+                birthdate="12-11-1963",
+                ordinal=1,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(pid, "_canonical_id_is_taken", lambda *a, **k: False)
+
+    with Session(db.engine, expire_on_commit=False) as session:
+        session.add(db.Patient(id="pending-uuid", label="work in progress", notes=""))
+        session.flush()
+
+        value = allocate_canonical_patient_id(
+            session, first_initial="B", last_initial="T", birthdate="12-11-1963"
+        )
+
+        assert value == "BT_12-11-1963_2"
+        assert session.get(db.Patient, "pending-uuid") is not None
+        session.commit()
+
+    with db.session_scope() as session:
+        assert session.get(db.Patient, "pending-uuid") is not None
 
 
 def test_concurrent_allocators_never_issue_the_same_id(db):
@@ -829,6 +933,11 @@ def test_report_preview_extracts_text_without_creating_anything(
     app, _main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
 
+    # Create the folders up front so "still empty" is a real assertion rather
+    # than one that passes because nothing ever made them.
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    portal_root.mkdir(parents=True, exist_ok=True)
+
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
             "/api/reports/preview",
@@ -851,12 +960,15 @@ def test_report_preview_extracts_text_without_creating_anything(
         assert storage.list_patients(session) == []
         assert session.scalars(select(storage.Report)).all() == []
 
-    portal_root = Path(temp_data_dir) / "portal_patients"
-    assert not portal_root.exists() or list(portal_root.iterdir()) == []
+    assert portal_root.exists()
+    assert list(portal_root.iterdir()) == []
 
 
 def test_report_preview_leaves_no_report_files_behind(temp_data_dir, monkeypatch):
     app, _main = _test_app(temp_data_dir, monkeypatch)
+
+    reports_root = Path(temp_data_dir) / "reports"
+    reports_root.mkdir(parents=True, exist_ok=True)
 
     with TestClient(app, raise_server_exceptions=False) as client:
         client.post(
@@ -864,8 +976,8 @@ def test_report_preview_leaves_no_report_files_behind(temp_data_dir, monkeypatch
             files={"file": ("intake.txt", b"Patient: Bob Tester\n", "text/plain")},
         )
 
-    reports_root = Path(temp_data_dir) / "reports"
-    assert not reports_root.exists() or list(reports_root.rglob("*.txt")) == []
+    assert reports_root.exists()
+    assert list(reports_root.rglob("*")) == []
 
 
 def test_report_preview_reuses_the_real_pdf_extraction_path(

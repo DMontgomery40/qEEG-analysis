@@ -10,6 +10,14 @@ The engine's SQLite UUID stays behind it as an invisible relational key.
 Every ID this module hands out is written to ``patient_id_reservations`` at
 allocation and is never recomputed, compacted, or reused — not after a patient
 is deleted, and not after a relabel frees it.
+
+**Transaction contract.** ``allocate_canonical_patient_id`` and
+``reserve_canonical_patient_id`` COMMIT the session they are given, because a
+reservation has to be durable the moment it is issued. They never roll the
+caller's session back: each reservation insert runs inside its own SAVEPOINT, so
+losing a race to a simultaneous writer undoes only that insert and leaves
+pending caller work intact. Call these before staging other writes, or expect
+those writes to be committed along with the reservation.
 """
 
 from __future__ import annotations
@@ -41,6 +49,11 @@ _LOOSE_BIRTHDATE_RE = re.compile(r"^(\d{1,2})-(\d{1,2})-(\d{4})$")
 # only stops a broken database from spinning the loop forever.
 MAX_COLLISION_ORDINAL = 999
 
+# Matches the bound the legacy portal normalizer already applies. Reservations
+# are never deleted, so a mistyped year would otherwise retire an ID forever.
+BIRTH_YEAR_MIN = 1900
+BIRTH_YEAR_MAX = 2100
+
 
 class PatientIdentityError(ValueError):
     """Identity the operator has to correct or supply. Never guess past it."""
@@ -55,9 +68,12 @@ class CanonicalPatientId:
     ordinal: int
 
 
-def _is_real_calendar_date(birthdate: str) -> bool:
+def _is_plausible_birthdate(month: int, day: int, year: int) -> bool:
+    """A real calendar date inside the range a living patient can be born in."""
+    if not BIRTH_YEAR_MIN <= year <= BIRTH_YEAR_MAX:
+        return False
     try:
-        datetime.strptime(birthdate, "%m-%d-%Y")
+        datetime(year, month, day)
     except ValueError:
         return False
     return True
@@ -72,10 +88,11 @@ def normalize_birthdate(value: Any) -> str:
             f"{raw or 'A blank value'} is not a date of birth written as MM-DD-YYYY."
         )
     month, day, year = (int(part) for part in match.groups())
-    try:
-        datetime(year, month, day)
-    except ValueError:
-        raise PatientIdentityError(f"{raw} is not a real calendar date.") from None
+    if not _is_plausible_birthdate(month, day, year):
+        raise PatientIdentityError(
+            f"{raw} is not a real date of birth between "
+            f"{BIRTH_YEAR_MIN} and {BIRTH_YEAR_MAX}."
+        )
     return f"{month:02d}-{day:02d}-{year:04d}"
 
 
@@ -128,7 +145,8 @@ def parse_canonical_patient_id(value: Any) -> CanonicalPatientId | None:
         return None
 
     birthdate = match.group("birthdate")
-    if not _is_real_calendar_date(birthdate):
+    month, day, year = (int(part) for part in birthdate.split("-"))
+    if not _is_plausible_birthdate(month, day, year):
         return None
 
     raw_ordinal = match.group("ordinal")
@@ -182,23 +200,28 @@ def _claim_reservation(session: Session, parsed: CanonicalPatientId) -> bool:
     The reservation primary key — not the scan above it — is what stops two
     simultaneous allocations from issuing the same ID. The insert takes SQLite's
     write lock, and the writer that loses gets an IntegrityError and moves on.
+
+    COMMITS the caller's session on success, so the reservation is durable the
+    moment it is issued. The insert runs inside a SAVEPOINT, so a lost race
+    undoes only the insert: anything the caller had pending survives.
     """
     from .storage import PatientIdReservation
 
-    session.add(
-        PatientIdReservation(
-            patient_id=parsed.value,
-            first_initial=parsed.first_initial,
-            last_initial=parsed.last_initial,
-            birthdate=parsed.birthdate,
-            ordinal=parsed.ordinal,
-        )
-    )
     try:
-        session.commit()
+        with session.begin_nested():
+            session.add(
+                PatientIdReservation(
+                    patient_id=parsed.value,
+                    first_initial=parsed.first_initial,
+                    last_initial=parsed.last_initial,
+                    birthdate=parsed.birthdate,
+                    ordinal=parsed.ordinal,
+                )
+            )
     except IntegrityError:
-        session.rollback()
         return False
+
+    session.commit()
     return True
 
 
@@ -209,6 +232,9 @@ def reserve_canonical_patient_id(
 
     Returns None when the value is not a canonical ID, which is how pre-cutover
     labels pass through untouched.
+
+    COMMITS the caller's session when it writes a reservation. See the module
+    docstring for the full transaction contract.
     """
     from .storage import PatientIdReservation
 
@@ -233,6 +259,9 @@ def allocate_canonical_patient_id(
     Pass ``exclude_patient_uuid`` when re-confirming an existing patient's
     identity: a patient that already wears the ID keeps it instead of being
     bumped to the next ordinal.
+
+    COMMITS the caller's session, and never rolls it back. See the module
+    docstring for the full transaction contract.
     """
     from .storage import Patient
 
@@ -250,6 +279,11 @@ def allocate_canonical_patient_id(
         candidate = canonical_patient_id(first, last, dob, ordinal=ordinal)
 
         if already_held is not None and already_held == candidate.lower():
+            # A label can reach the database without ever passing through
+            # allocation — bulk upload mints one from a filename stem. Reserve it
+            # here too, or the ID goes unreserved and a later patient with the
+            # same initials and birthdate could be issued this person's ID.
+            reserve_canonical_patient_id(session, candidate)
             return candidate
 
         if _canonical_id_is_taken(

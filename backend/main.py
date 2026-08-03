@@ -2027,12 +2027,9 @@ async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
         metadata_path = scratch_dir / "metadata.json"
         if metadata_path.exists():
             try:
-                page_count = int(
-                    json.loads(metadata_path.read_text(encoding="utf-8")).get(
-                        "page_count", 0
-                    )
-                )
-            except Exception:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                page_count = int(metadata.get("page_count", 0))
+            except (ValueError, TypeError, AttributeError, OSError):
                 page_count = 0
 
     return {
