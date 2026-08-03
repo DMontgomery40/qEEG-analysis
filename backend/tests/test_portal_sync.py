@@ -8,6 +8,15 @@ from pathlib import Path
 import pytest
 
 
+def test_qeeg_process_does_not_compete_with_launchd_sync_by_default(monkeypatch):
+    from backend import portal_sync
+
+    monkeypatch.delenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", raising=False)
+
+    assert portal_sync.sync_patient_to_thrylen("01-01-2013-0") is False
+    assert portal_sync.spawn_portal_sync("01-01-2013-0") is False
+
+
 def test_sync_lock_acquires_nonblocking_and_releases(tmp_path: Path, monkeypatch):
     from backend import portal_sync
 
@@ -206,6 +215,84 @@ def test_sync_patient_to_thrylen_scopes_state_and_merges_updates(
     assert merged_state["files"][f"{patient_id}/fresh.md"]["remoteFileKey"] == (
         f"{patient_id}__fresh__v1__2026-03-17.md"
     )
+
+
+def test_sync_timeout_persists_partial_file_progress_and_requeues_patient(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+
+    patient_id = "01-01-2013-0"
+    other_id = "09-05-1954-0"
+    portal_root = tmp_path / "portal_patients"
+    patient_dir = portal_root / patient_id
+    patient_dir.mkdir(parents=True)
+    (patient_dir / "source.pdf").write_bytes(b"%PDF-1.4\n")
+
+    state_path = portal_root / ".qeeg_portal_sync_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "patients": {other_id: {"createdAt": 2}},
+                "files": {f"{other_id}/keep.pdf": {"version": 9}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    watch_state_path = portal_root / ".qeeg_portal_sync_watch_state.json"
+    watch_state_path.write_text(
+        json.dumps(
+            {
+                "patients": {
+                    patient_id: [1, 10, 100],
+                    other_id: [2, 20, 200],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sync_repo = tmp_path / "thrylen"
+    sync_script = sync_repo / "scripts" / "qeeg_patients_sync.mjs"
+    sync_script.parent.mkdir(parents=True)
+    sync_script.write_text("// fake sync\n", encoding="utf-8")
+
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal_root))
+    monkeypatch.setenv("QEEG_PORTAL_SYNC_REPO", str(sync_repo))
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
+    monkeypatch.setattr(
+        portal_sync.shutil,
+        "which",
+        lambda name: "/usr/bin/node" if name == "node" else None,
+    )
+
+    def fake_run(cmd, cwd, capture_output, text, check, timeout):
+        temp_root = Path(cmd[-1])
+        temp_state_path = temp_root / ".qeeg_portal_sync_state.json"
+        partial_state = json.loads(temp_state_path.read_text(encoding="utf-8"))
+        partial_state["patients"][patient_id] = {"createdAt": 1}
+        partial_state["files"][f"{patient_id}/source.pdf"] = {
+            "size": 9,
+            "mtimeMs": 100,
+            "remoteFileKey": f"{patient_id}__source__v1__2026-08-02.pdf",
+            "logicalName": "source.pdf",
+            "version": 1,
+        }
+        temp_state_path.write_text(
+            json.dumps(partial_state), encoding="utf-8"
+        )
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(portal_sync.subprocess, "run", fake_run)
+
+    assert portal_sync.sync_patient_to_thrylen(patient_id) is False
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert f"{patient_id}/source.pdf" in persisted["files"]
+    assert persisted["files"][f"{other_id}/keep.pdf"] == {"version": 9}
+    retry_state = json.loads(watch_state_path.read_text(encoding="utf-8"))
+    assert patient_id not in retry_state["patients"]
+    assert retry_state["patients"][other_id] == [2, 20, 200]
 
 
 def test_spawn_portal_sync_skips_when_another_sync_holds_the_global_reservation(
@@ -467,6 +554,7 @@ async def test_watch_portal_patients_forever_syncs_stable_raw_changes(
             raise asyncio.CancelledError
 
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "1")
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
     monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(tmp_path))
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "0.01")
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_STABLE_POLLS", "2")
@@ -483,6 +571,56 @@ async def test_watch_portal_patients_forever_syncs_stable_raw_changes(
         await portal_sync.watch_portal_patients_forever()
 
     assert sync_calls == [patient_id]
+
+
+@pytest.mark.asyncio
+async def test_watch_portal_patients_forever_retries_snapshot_cleared_by_child(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+
+    patient_id = "01-01-2013-0"
+    fingerprint = (2, 200, 2000)
+    sync_calls: list[str] = []
+    sleep_calls = 0
+    sync_state_path = tmp_path / ".qeeg_portal_sync_watch_state.json"
+    sync_state_path.write_text(
+        json.dumps({"patients": {patient_id: [1, 100, 1000]}}),
+        encoding="utf-8",
+    )
+
+    def fake_snapshot(_root_dir):
+        return {patient_id: fingerprint}
+
+    def fake_spawn(label: str) -> bool:
+        sync_calls.append(label)
+        return True
+
+    async def fake_sleep(_seconds: float):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 2:
+            sync_state_path.write_text(
+                json.dumps({"patients": {}}), encoding="utf-8"
+            )
+        if sleep_calls >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "1")
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(tmp_path))
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "0.01")
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_STABLE_POLLS", "2")
+    monkeypatch.setattr(
+        portal_sync, "_snapshot_portal_patient_fingerprints", fake_snapshot
+    )
+    monkeypatch.setattr(portal_sync, "spawn_portal_sync", fake_spawn)
+    monkeypatch.setattr(portal_sync.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await portal_sync.watch_portal_patients_forever()
+
+    assert sync_calls == [patient_id, patient_id]
 
 
 @pytest.mark.asyncio

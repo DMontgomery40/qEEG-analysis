@@ -179,6 +179,32 @@ def _merge_sync_state_for_patient(
     return merged
 
 
+def _persist_scoped_sync_progress(
+    *,
+    state_path: Path,
+    base_state: dict[str, Any],
+    temp_state_path: Path,
+    patient_id: str,
+) -> dict[str, Any]:
+    synced_state = _load_sync_state(temp_state_path)
+    merged_state = _merge_sync_state_for_patient(
+        base_state, synced_state, patient_id
+    )
+    _write_sync_state(state_path, merged_state)
+    return merged_state
+
+
+def _mark_patient_sync_retryable(root_dir: Path, patient_id: str) -> None:
+    watch_state_path = _sync_watch_state_path(root_dir)
+    if not watch_state_path.exists():
+        return
+    watch_state = _load_pipeline_watch_state(watch_state_path)
+    if patient_id not in watch_state:
+        return
+    watch_state.pop(patient_id, None)
+    _write_pipeline_watch_state(watch_state_path, watch_state)
+
+
 def _mirror_tree_with_hardlinks(src_dir: Path, dest_dir: Path) -> None:
     for path in src_dir.rglob("*"):
         rel_path = path.relative_to(src_dir)
@@ -241,7 +267,7 @@ def _sync_lock(root_dir: Path) -> Iterator[bool]:
 
 
 def sync_patient_to_thrylen(patient_label: str) -> bool:
-    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", True):
+    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False):
         return False
 
     patient_id = _normalize_portal_patient_id(patient_label)
@@ -273,6 +299,7 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
 
     with _sync_lock(root_dir) as lock_acquired:
         if not lock_acquired:
+            _mark_patient_sync_retryable(root_dir, patient_id)
             LOGGER.warning(
                 "portal_sync_lock_timed_out",
                 patient_label=patient_id,
@@ -322,6 +349,13 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
                     timeout=timeout_s,
                 )
             except subprocess.TimeoutExpired:
+                _persist_scoped_sync_progress(
+                    state_path=state_path,
+                    base_state=base_state,
+                    temp_state_path=temp_state_path,
+                    patient_id=patient_id,
+                )
+                _mark_patient_sync_retryable(root_dir, patient_id)
                 LOGGER.error(
                     "portal_sync_timed_out",
                     patient_label=patient_id,
@@ -329,7 +363,28 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
                     operatorHint="Single-patient Netlify sync exceeded its bounded runtime; the watcher will retry the latest patient-folder state after the active reservation is released.",
                 )
                 return False
+            except Exception:
+                _persist_scoped_sync_progress(
+                    state_path=state_path,
+                    base_state=base_state,
+                    temp_state_path=temp_state_path,
+                    patient_id=patient_id,
+                )
+                _mark_patient_sync_retryable(root_dir, patient_id)
+                LOGGER.exception(
+                    "portal_sync_process_failed",
+                    patient_label=patient_id,
+                    operatorHint="The single-patient sync process failed after partial progress was saved; the watcher will retry the remaining files.",
+                )
+                return False
             if proc.returncode != 0:
+                _persist_scoped_sync_progress(
+                    state_path=state_path,
+                    base_state=base_state,
+                    temp_state_path=temp_state_path,
+                    patient_id=patient_id,
+                )
+                _mark_patient_sync_retryable(root_dir, patient_id)
                 LOGGER.error(
                     "portal_sync_failed",
                     patient_label=patient_id,
@@ -356,7 +411,7 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
 
 
 def spawn_portal_sync(patient_label: str) -> bool:
-    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", True):
+    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False):
         return False
 
     patient_id = _normalize_portal_patient_id(patient_label)
@@ -564,6 +619,9 @@ async def watch_portal_patients_forever() -> None:
     local_pipeline_watcher = _truthy_env(
         "QEEG_PORTAL_LOCAL_PIPELINE_WATCHER", True
     )
+    netlify_sync_watcher = _truthy_env(
+        "QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False
+    )
 
     try:
         poll_interval_s = float(os.getenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "5") or "5")
@@ -588,6 +646,7 @@ async def watch_portal_patients_forever() -> None:
         poll_interval_s=poll_interval_s,
         stable_polls=stable_polls,
         local_pipeline_watcher=local_pipeline_watcher,
+        netlify_sync_watcher=netlify_sync_watcher,
     )
 
     previous_snapshots: dict[str, tuple[int, int, int]] | None = None
@@ -608,6 +667,10 @@ async def watch_portal_patients_forever() -> None:
             current_snapshots = await asyncio.to_thread(
                 _snapshot_portal_patient_fingerprints, root_dir
             )
+            if sync_state_path.exists():
+                last_synced_snapshots = _load_pipeline_watch_state(
+                    sync_state_path
+                )
 
             if previous_snapshots is None:
                 previous_snapshots = current_snapshots
@@ -646,7 +709,8 @@ async def watch_portal_patients_forever() -> None:
                     stable_counts[patient_id] = 1
 
                 if (
-                    fingerprint != last_synced_snapshots.get(patient_id)
+                    netlify_sync_watcher
+                    and fingerprint != last_synced_snapshots.get(patient_id)
                     and stable_counts[patient_id] >= stable_polls
                 ):
                     LOGGER.info(
