@@ -185,12 +185,12 @@ The “generate narrative + slides” pipeline lives in `../local-explainer-vide
 Visual QC note:
 - By default, the explainer repo runs visual QC in **check-only** mode (no automated image edits). When issues are found it writes:
   - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`
-- Image models (in the explainer repo): generate via `qwen/qwen-image-2512`, edit via `qwen/qwen-image-edit-2511` (or DashScope `qwen-image-edit-max` when configured).
+- Image models for qEEG explainer assets: use Cathode with Codex/OpenAI native image generation (`gpt-image-2`) for generation and edits. Do not use Qwen for assets that include or may include text.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **qEEG-analysis** (5903 symbols, 14667 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **qEEG-analysis** (4894 symbols, 13485 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
