@@ -630,6 +630,20 @@ def discover_patient_ids(
     return sorted(ids)
 
 
+def should_discover_all_patients(
+    *, once: bool, include_labels: set[str]
+) -> bool:
+    """Keep the continuous worker scoped to explicit upload job markers."""
+    return bool(once or include_labels)
+
+
+def paid_runs_are_authorized(
+    *, include_labels: set[str], allow_paid_runs: bool
+) -> bool:
+    """A patient selection or explicit flag is the confirmation boundary."""
+    return bool(include_labels or allow_paid_runs)
+
+
 def load_job_reports_by_patient(
     client: NetlifyBlobClient, *, include_labels: set[str]
 ) -> dict[str, list[PortalReport]]:
@@ -729,6 +743,7 @@ def process_patient(
     patient_id: str,
     job_reports: list[PortalReport],
     dry_run: bool,
+    allow_paid_runs: bool = False,
 ) -> PatientWorkerResult:
     downloaded: list[str] = []
     reports: list[PortalReport] = []
@@ -795,6 +810,16 @@ def process_patient(
                 report_count=len(reports),
                 ran_batch=False,
                 note=note,
+            )
+        elif should_run and not allow_paid_runs:
+            approval_note = "paid analysis requires explicit approval"
+            result = PatientWorkerResult(
+                patient_id=patient_id,
+                status="awaiting_confirmation",
+                downloaded=downloaded,
+                report_count=len(reports),
+                ran_batch=False,
+                note=f"{note}; {approval_note}" if note else approval_note,
             )
         elif should_run:
             running_payload = {
@@ -910,6 +935,11 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Run one audit pass and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Plan work without downloading or running jobs.")
     parser.add_argument("--include-label", action="append", default=[], help="Only process this patient label. Repeatable.")
+    parser.add_argument(
+        "--allow-paid-runs",
+        action="store_true",
+        help="Allow paid analysis for discovered upload jobs. A selected patient label also authorizes that patient.",
+    )
     parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("QEEG_PORTAL_PIPELINE_POLL_S", "60") or "60"))
     parser.add_argument("--store", default=os.getenv("QEEG_BLOBS_STORE", "qeeg-portal"))
     parser.add_argument("--netlify-bin", default=os.getenv("NETLIFY_BIN", "netlify"))
@@ -929,6 +959,10 @@ def main() -> int:
         for label in args.include_label
         if is_valid_patient_id(str(label).strip())
     }
+    allow_paid_runs = paid_runs_are_authorized(
+        include_labels=include_labels,
+        allow_paid_runs=args.allow_paid_runs,
+    )
 
     storage.init_db()
     client = NetlifyBlobClient(netlify_bin=args.netlify_bin, store=args.store, cwd=Path(args.thrylen_repo).expanduser())
@@ -945,8 +979,15 @@ def main() -> int:
                 job_reports_by_patient = load_job_reports_by_patient(
                     client, include_labels=include_labels
                 )
-                labels = discover_patient_ids(client, include_labels=include_labels)
-                labels = sorted(set(labels) | set(job_reports_by_patient))
+                if should_discover_all_patients(
+                    once=args.once, include_labels=include_labels
+                ):
+                    labels = discover_patient_ids(
+                        client, include_labels=include_labels
+                    )
+                    labels = sorted(set(labels) | set(job_reports_by_patient))
+                else:
+                    labels = sorted(job_reports_by_patient)
             except Exception as exc:
                 message = f"portal discovery failed: {exc}"
                 _write_worker_failure(status_dir, message)
@@ -965,6 +1006,7 @@ def main() -> int:
                     patient_id=patient_id,
                     job_reports=job_reports_by_patient.get(patient_id, []),
                     dry_run=args.dry_run,
+                    allow_paid_runs=allow_paid_runs,
                 )
                 if result.status == "failed":
                     failures += 1

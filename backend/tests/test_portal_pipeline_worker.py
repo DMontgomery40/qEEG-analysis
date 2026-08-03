@@ -771,6 +771,7 @@ def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, mon
         patient_id="03-05-2010-0",
         job_reports=[job_report],
         dry_run=False,
+        allow_paid_runs=True,
     )
 
     assert result.status == "complete"
@@ -784,6 +785,125 @@ def test_process_patient_runs_from_job_payload_without_index(tmp_path: Path, mon
         )
     ]
     assert (tmp_path / "status" / "03-05-2010-0.json").exists()
+
+
+@pytest.mark.parametrize("from_job", [False, True])
+def test_process_patient_never_starts_unapproved_paid_work(
+    tmp_path: Path, monkeypatch, from_job: bool
+):
+    from scripts import portal_pipeline_worker as worker
+
+    patient_id = "03-05-2010-0"
+    file_key = f"{patient_id}__report__v1__2026-03-21.pdf"
+
+    class FakeClient:
+        def get_json(self, key):
+            if key == f"patients/{patient_id}/$meta.json":
+                return None
+            if key == f"patients/{patient_id}/$index.json":
+                if from_job:
+                    return None
+                return {
+                    "files": [
+                        {
+                            "fileKey": file_key,
+                            "originalName": "report.pdf",
+                            "logicalName": "report.pdf",
+                            "uploadedAt": 1,
+                            "size": 8,
+                            "contentType": "application/pdf",
+                            "documentKind": "report",
+                        }
+                    ]
+                }
+            raise AssertionError(key)
+
+        def list_keys(self, prefix):
+            assert prefix == f"patients/{patient_id}/files/"
+            return [] if from_job else [f"{prefix}{file_key}"]
+
+        def download(self, key, dest):
+            assert key == f"patients/{patient_id}/files/{file_key}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"%PDF-1.4")
+
+        def set_json(self, key, payload):
+            pass
+
+    job_reports = []
+    if from_job:
+        job_reports = [
+            worker.PortalReport(
+                patient_id=patient_id,
+                file_key=file_key,
+                original_name="report.pdf",
+                logical_name="report.pdf",
+                uploaded_at=1,
+                size=8,
+                content_type="application/pdf",
+                document_kind="report",
+                from_job=True,
+            )
+        ]
+
+    paid_calls = []
+    monkeypatch.setattr(worker, "_matching_active_run_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(worker, "_matching_complete_run_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        worker,
+        "run_batch_for_patient",
+        lambda *args, **kwargs: paid_calls.append((args, kwargs)),
+    )
+
+    result = worker.process_patient(
+        client=FakeClient(),
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        patient_id=patient_id,
+        job_reports=job_reports,
+        dry_run=False,
+    )
+
+    assert result.status == "awaiting_confirmation"
+    assert result.ran_batch is False
+    assert "explicit approval" in result.note
+    assert paid_calls == []
+
+
+@pytest.mark.parametrize(
+    ("once", "include_labels", "expected"),
+    [
+        (False, set(), False),
+        (True, set(), True),
+        (False, {"03-05-2010-0"}, True),
+    ],
+)
+def test_patient_discovery_scope_separates_continuous_jobs_from_manual_audits(
+    once: bool, include_labels: set[str], expected: bool
+):
+    from scripts import portal_pipeline_worker as worker
+
+    assert worker.should_discover_all_patients(
+        once=once, include_labels=include_labels
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    ("include_labels", "allow_paid_runs", "expected"),
+    [
+        (set(), False, False),
+        ({"03-05-2010-0"}, False, True),
+        (set(), True, True),
+    ],
+)
+def test_paid_work_requires_patient_selection_or_explicit_flag(
+    include_labels: set[str], allow_paid_runs: bool, expected: bool
+):
+    from scripts import portal_pipeline_worker as worker
+
+    assert worker.paid_runs_are_authorized(
+        include_labels=include_labels, allow_paid_runs=allow_paid_runs
+    ) is expected
 
 
 def test_process_patient_records_final_remote_status_failure(tmp_path: Path, monkeypatch):
@@ -837,6 +957,7 @@ def test_process_patient_records_final_remote_status_failure(tmp_path: Path, mon
         patient_id="03-05-2010-0",
         job_reports=[],
         dry_run=False,
+        allow_paid_runs=True,
     )
 
     local_status = (tmp_path / "status" / "03-05-2010-0.json").read_text(
