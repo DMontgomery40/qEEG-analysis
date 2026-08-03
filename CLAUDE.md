@@ -72,8 +72,10 @@ authoritative regex and the real-calendar-date check.
 
 - **This engine is the only allocator.** `allocate_canonical_patient_id` runs
   under a SQLite write transaction against the durable `patient_id_reservations`
-  table, so an ordinal is issued once and never recomputed or reused. The
-  workbench, the hub, and the renderers read the ID; none of them mint one.
+  table, so an ordinal is issued once and never recomputed or reused. Ordinals
+  are scoped to one initials-and-birthdate pair, not global: whatever happens to
+  `ZZ_01-01-1900` leaves `QX_02-29-1904` untouched. The workbench, the hub, and
+  the renderers read the ID; none of them mint one.
 - **The ID is the clinic-visible key.** It is the patient's `label` column, the
   `data/portal_patients/` folder name, the prefix on every published filename,
   the hub's blob key, and the `patient_id` field in API responses.

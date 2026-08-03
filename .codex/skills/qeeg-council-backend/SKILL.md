@@ -65,7 +65,8 @@ If missing/garbled, repair via:
 - `POST /api/reports/{report_id}/reextract`
 
 ## Report storage gotcha (don’t miss)
-- Report files live under `data/reports/<patient_id>/<upload_id>/...`
+- Report files live under `data/reports/<patient_uuid>/<upload_id>/...` — keyed by the internal
+  SQLite patient key, not the canonical clinic ID `XX_MM-DD-YYYY[_N]`.
 - The DB `report_id` is not guaranteed to equal `<upload_id>` (folder name).
 - Always locate report assets via `stored_path` / `extracted_text_path`, not by constructing paths from ids.
 

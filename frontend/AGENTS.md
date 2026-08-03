@@ -57,8 +57,8 @@ Networking contracts
   - `POST /api/cliproxy/install`
 - Patient bulk upload + file endpoints used by the UI:
   - `POST /api/patients/bulk_upload`
-  - `GET /api/patients/{patient_id}/files`
-  - `POST /api/patients/{patient_id}/files`
+  - `GET /api/patients/{patient_uuid}/files`
+  - `POST /api/patients/{patient_uuid}/files`
   - `GET /api/patient_files/{file_id}`
   - `DELETE /api/patient_files/{file_id}`
 - Use `EventSource` for SSE:
