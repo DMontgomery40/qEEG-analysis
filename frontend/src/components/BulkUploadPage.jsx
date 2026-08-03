@@ -39,6 +39,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [identities, setIdentities] = useState({});
   const [readings, setReadings] = useState({});
+  const [conflicts, setConflicts] = useState({});
   const [uploading, setUploading] = useState(false);
   const [result, setResult] = useState(null);
 
@@ -52,6 +53,20 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
       ...prev,
       [filename]: { ...(prev[filename] || {}), [field]: value },
     }));
+  };
+
+  // The operator answers a name conflict on the file it belongs to, then
+  // uploads again. Clearing the conflict takes the prompt off that row.
+  const resolveConflict = (filename, resolution) => {
+    setIdentities((prev) => ({
+      ...prev,
+      [filename]: { ...(prev[filename] || {}), ...resolution },
+    }));
+    setConflicts((prev) => {
+      const next = { ...prev };
+      delete next[filename];
+      return next;
+    });
   };
 
   const readReport = async (file) => {
@@ -107,6 +122,13 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
                 }));
                 const res = await api.bulkUploadPatients(selectedFiles, payload);
                 setResult(res);
+                setConflicts(
+                  Object.fromEntries(
+                    (res?.errors || [])
+                      .filter((e) => e?.conflict === 'identity_name_mismatch')
+                      .map((e) => [e.filename, e]),
+                  ),
+                );
                 await onRefreshPatients?.();
               } catch (e) {
                 onError(e, { action: 'bulk_upload_patients', fileCount: selectedFiles.length });
@@ -130,6 +152,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
               setSelectedFiles(files);
               setIdentities({});
               setReadings({});
+              setConflicts({});
               setResult(null);
               // Allow selecting the same file again later
               e.target.value = '';
@@ -151,6 +174,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
               {selectedFiles.map((file, idx) => {
                 const identity = identities[file.name] || {};
                 const reading = readings[file.name];
+                const conflict = conflicts[file.name];
                 return (
                   <div key={`${file.name}-${idx}`} className="bulk-file-row">
                     <div className="bulk-file-name">{file.name}</div>
@@ -176,6 +200,44 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
                         {reading?.loading ? 'Reading…' : 'Read report'}
                       </button>
                     </div>
+                    {conflict ? (
+                      <div className="bulk-conflict">
+                        <div>
+                          Already on file with these initials and this date of birth:
+                        </div>
+                        <div className="bulk-conflict-actions">
+                          {(conflict.candidates || []).map((c) => (
+                            <button
+                              key={c.patient_id}
+                              onClick={() =>
+                                resolveConflict(file.name, {
+                                  attach_to: c.patient_id,
+                                  force_new: false,
+                                })
+                              }
+                            >
+                              Same as {c.name} ({c.patient_id})
+                            </button>
+                          ))}
+                          <button
+                            onClick={() =>
+                              resolveConflict(file.name, {
+                                attach_to: null,
+                                force_new: true,
+                              })
+                            }
+                          >
+                            Different person
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                    {identity.attach_to ? (
+                      <div className="muted">Filing under {identity.attach_to}.</div>
+                    ) : null}
+                    {identity.force_new ? (
+                      <div className="muted">Filing as a new patient.</div>
+                    ) : null}
                     {reading && !reading.loading && reading.text ? (
                       <pre className="bulk-report-text">{reading.text.slice(0, 4000)}</pre>
                     ) : null}

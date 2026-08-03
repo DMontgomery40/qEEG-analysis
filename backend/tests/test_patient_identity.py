@@ -7,6 +7,7 @@ and it lives in the patient label column.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -673,7 +674,7 @@ def test_second_patient_with_the_same_initials_and_dob_gets_a_suffix(
                 "birthdate": "12-11-1963",
             },
         )
-        second = client.post(
+        conflict = client.post(
             "/api/patients",
             json={
                 "first_name": "Brenda",
@@ -681,8 +682,20 @@ def test_second_patient_with_the_same_initials_and_dob_gets_a_suffix(
                 "birthdate": "12-11-1963",
             },
         )
+        second = client.post(
+            "/api/patients",
+            json={
+                "first_name": "Brenda",
+                "last_name": "Tolliver",
+                "birthdate": "12-11-1963",
+                "force_new": True,
+            },
+        )
 
     assert first.json()["patient_id"] == "BT_12-11-1963"
+    # A different name on the same initials and birthday is a question now, not
+    # a silent second chart. The ordinal is still what answers it.
+    assert conflict.status_code == 409, conflict.text
     assert second.status_code == 200, second.text
     assert second.json()["patient_id"] == "BT_12-11-1963_2"
 
@@ -1016,3 +1029,140 @@ def test_report_preview_reuses_the_real_pdf_extraction_path(
     assert body["mime_type"] == "application/pdf"
     assert len(body["text"]) > 100
     assert body["page_count"] >= 1
+
+
+# ------------------------------------------------- name conflicts are a question
+
+
+def test_a_differing_name_surfaces_the_candidates_instead_of_splitting_the_chart(
+    temp_data_dir, monkeypatch
+):
+    """Dave and David are one person far more often than they are two."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post(
+            "/api/patients",
+            json={
+                "first_name": "Dave",
+                "last_name": "Montgomery",
+                "birthdate": "03-05-1970",
+            },
+        )
+        response = client.post(
+            "/api/patients",
+            json={
+                "first_name": "David",
+                "last_name": "Montgomery",
+                "birthdate": "03-05-1970",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["conflict"] == "identity_name_mismatch"
+    assert detail["incoming_name"] == "David Montgomery"
+    assert detail["candidates"] == [
+        {"patient_id": "DM_03-05-1970", "name": "Dave Montgomery"}
+    ]
+
+    with storage.session_scope() as session:
+        assert [p.label for p in storage.list_patients(session)] == ["DM_03-05-1970"]
+
+
+def test_attach_to_files_the_report_under_the_named_chart(temp_data_dir, monkeypatch):
+    """Attaching says 'same person', not 'the name on file is wrong'."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post(
+            "/api/patients",
+            json={
+                "first_name": "Dave",
+                "last_name": "Montgomery",
+                "birthdate": "03-05-1970",
+            },
+        )
+        uploaded = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-two.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "session-two.txt",
+                            "first_name": "David",
+                            "last_name": "Montgomery",
+                            "birthdate": "03-05-1970",
+                            "attach_to": "DM_03-05-1970",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json()["counts"]["created"] == 1
+    assert uploaded.json()["created"][0]["patient"]["patient_id"] == "DM_03-05-1970"
+
+    with storage.session_scope() as session:
+        patients = storage.list_patients(session)
+        reports = storage.list_reports(session, patients[0].id)
+    assert [p.label for p in patients] == ["DM_03-05-1970"]
+    assert (patients[0].first_name, patients[0].last_name) == ("Dave", "Montgomery")
+    assert [r.filename for r in reports] == ["session-two.txt"]
+
+
+def test_intake_surfaces_the_conflict_and_force_new_takes_the_next_ordinal(
+    temp_data_dir, monkeypatch
+):
+    """Two real people sharing initials and a birthday is what the ordinal is for."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    def upload(client, extra):
+        return client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "session.txt",
+                            "first_name": "Dana",
+                            "last_name": "Mercer",
+                            "birthdate": "03-05-1970",
+                            **extra,
+                        }
+                    ]
+                )
+            },
+        )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post(
+            "/api/patients",
+            json={
+                "first_name": "Dave",
+                "last_name": "Montgomery",
+                "birthdate": "03-05-1970",
+            },
+        )
+        conflicted = upload(client, {})
+        forced = upload(client, {"force_new": True})
+
+    assert conflicted.json()["counts"] == {"created": 0, "skipped": 0, "errors": 1}
+    reported = conflicted.json()["errors"][0]
+    assert reported["conflict"] == "identity_name_mismatch"
+    assert reported["candidates"] == [
+        {"patient_id": "DM_03-05-1970", "name": "Dave Montgomery"}
+    ]
+
+    assert forced.json()["counts"]["created"] == 1
+    assert forced.json()["created"][0]["patient"]["patient_id"] == "DM_03-05-1970_2"
+
+    with storage.session_scope() as session:
+        labels = sorted(p.label for p in storage.list_patients(session))
+    assert labels == ["DM_03-05-1970", "DM_03-05-1970_2"]

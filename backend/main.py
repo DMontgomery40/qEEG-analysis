@@ -193,6 +193,11 @@ class PatientCreate(BaseModel):
     birthdate: str | None = None
     first_initial: str | None = None
     last_initial: str | None = None
+    # How the operator answers an identity_name_mismatch conflict. `attach_to`
+    # names the existing clinic id this is the same person as; `force_new` says
+    # they are genuinely two people and takes the next collision ordinal.
+    attach_to: str | None = None
+    force_new: bool = False
 
 
 class PatientUpdate(PatientCreate):
@@ -1425,6 +1430,19 @@ async def list_patients() -> list[dict[str, Any]]:
         ]
 
 
+_IDENTITY_FIELDS = (
+    "first_name",
+    "last_name",
+    "birthdate",
+    "first_initial",
+    "last_initial",
+)
+
+
+def _has_structured_identity(req: PatientCreate) -> bool:
+    return any((getattr(req, name) or "").strip() for name in _IDENTITY_FIELDS)
+
+
 def _resolve_patient_identity(
     session: Any, req: PatientCreate, *, exclude_patient_uuid: str | None = None
 ) -> dict[str, Any]:
@@ -1436,10 +1454,7 @@ def _resolve_patient_identity(
     else. Anything else is refused, because a label the portal cannot route on
     would leave the patient with no folder, no publishing, and no sync.
     """
-    identity_fields = ("first_name", "last_name", "birthdate", "first_initial", "last_initial")
-    has_identity = any((getattr(req, name) or "").strip() for name in identity_fields)
-
-    if has_identity:
+    if _has_structured_identity(req):
         try:
             first = (
                 require_initial(req.first_initial, field="first")
@@ -1503,6 +1518,18 @@ def _resolve_patient_identity(
 @app.post("/api/patients")
 async def create_patient(req: PatientCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
+        if _has_structured_identity(req) or (req.attach_to or "").strip():
+            try:
+                existing, _keep_stored_name = _find_patient_by_identity(session, req)
+            except IdentityNameConflict as exc:
+                raise HTTPException(status_code=409, detail=exc.payload) from exc
+            except PatientIdentityError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if existing is not None:
+                # The operator named this person's existing chart, so there is
+                # nothing to create.
+                return _patient_out(existing)
+
         fields = _resolve_patient_identity(session, req)
         if storage.find_patients_by_label(session, fields["label"]):
             raise HTTPException(status_code=409, detail="Patient label already exists")
@@ -1551,6 +1578,8 @@ def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
             birthdate=entry.get("birthdate"),
             first_initial=entry.get("first_initial"),
             last_initial=entry.get("last_initial"),
+            attach_to=entry.get("attach_to"),
+            force_new=bool(entry.get("force_new")),
         )
     return identities
 
@@ -1578,24 +1607,62 @@ def _identity_key(req: PatientCreate) -> tuple[str, str, str]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class IdentityNameConflict(Exception):
+    """A chart with these initials and birthday carries a different name.
+
+    In a clinic this size that is nearly always one person written down two
+    ways — Dave and David, with or without a middle initial — so allocating the
+    next ordinal would quietly split their history in half. It is occasionally
+    two real people, which is what the ordinal is for. Neither guess is safe, so
+    the operator is asked.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__("identity_name_mismatch")
+        self.payload = payload
+
+
+def _stored_full_name(patient: storage.Patient) -> str:
+    return " ".join(
+        part for part in ((patient.first_name or ""), (patient.last_name or "")) if part
+    ).strip()
+
+
 def _find_patient_by_identity(
     session: Any, req: PatientCreate
-) -> storage.Patient | None:
-    """Return the patient this identity already belongs to, if there is one.
+) -> tuple[storage.Patient | None, bool]:
+    """Resolve which chart this identity belongs to.
+
+    Returns the patient to file under (or None to allocate a new one) and
+    whether that patient's stored name must be left alone.
 
     Same initials, same date of birth, and no name on file that contradicts the
     one given is the same person — a second report must land on that chart
     rather than allocating a `_2` and splitting the patient into two families.
-
     A chart created from a bare canonical label carries initials and a date of
     birth but no names, so an absent stored name matches anything and gets
-    filled in. Only a stored name that differs marks a different patient.
+    filled in.
+
+    A name that differs raises `IdentityNameConflict` instead of choosing, and
+    `attach_to` / `force_new` are how the operator answers it.
 
     Raises `PatientIdentityError` when two charts already answer to one
-    identity, because picking between them is the operator's call. The caller
-    turns that into a per-file error, so one ambiguous report never fails the
-    rest of the batch.
+    identity, because picking between them is the operator's call too.
     """
+    attach_to = (req.attach_to or "").strip()
+    if attach_to:
+        patient = next(
+            iter(storage.find_patients_by_label(session, attach_to)), None
+        )
+        if patient is None:
+            raise PatientIdentityError(f"{attach_to} is not a patient on file.")
+        # The operator said this is the same person, not that the name on file
+        # is wrong. Correcting a name is what the patient update path is for.
+        return patient, True
+
+    if req.force_new:
+        return None, False
+
     first_initial, last_initial, birthdate = _identity_key(req)
     first_name = (req.first_name or "").strip().lower()
     last_name = (req.last_name or "").strip().lower()
@@ -1604,15 +1671,16 @@ def _find_patient_by_identity(
         on_file = (stored or "").strip().lower()
         return not on_file or on_file == given
 
+    candidates = session.scalars(
+        sa_select(storage.Patient).where(
+            storage.Patient.first_initial == first_initial,
+            storage.Patient.last_initial == last_initial,
+            storage.Patient.birthdate == birthdate,
+        )
+    ).all()
     matches = [
         patient
-        for patient in session.scalars(
-            sa_select(storage.Patient).where(
-                storage.Patient.first_initial == first_initial,
-                storage.Patient.last_initial == last_initial,
-                storage.Patient.birthdate == birthdate,
-            )
-        ).all()
+        for patient in candidates
         if name_fits(patient.first_name, first_name)
         and name_fits(patient.last_name, last_name)
     ]
@@ -1622,7 +1690,35 @@ def _find_patient_by_identity(
             + ", ".join(sorted(patient.label for patient in matches))
             + ". Say which one this report belongs to."
         )
-    return matches[0] if matches else None
+    if matches:
+        return matches[0], False
+
+    differing = [patient for patient in candidates if patient not in matches]
+    if differing:
+        raise IdentityNameConflict(
+            {
+                "conflict": "identity_name_mismatch",
+                "incoming_name": " ".join(
+                    part
+                    for part in ((req.first_name or ""), (req.last_name or ""))
+                    if part
+                ).strip(),
+                "candidates": [
+                    {
+                        "patient_id": patient.label,
+                        "name": _stored_full_name(patient),
+                    }
+                    for patient in differing
+                ],
+                "detail": (
+                    "Someone with these initials and this date of birth is "
+                    "already on file under a different name. Say which patient "
+                    "this is with attach_to, or force_new if they are two "
+                    "different people."
+                ),
+            }
+        )
+    return None, False
 
 
 def _discard_half_created_patient(patient_uuid: str | None, patient_label: str) -> None:
@@ -1701,27 +1797,34 @@ async def bulk_upload_patients(
         created_patient_uuid: str | None = None
         try:
             with storage.session_scope() as session:
-                existing = _find_patient_by_identity(session, identity)
-                fields = _resolve_patient_identity(
-                    session,
-                    identity,
-                    exclude_patient_uuid=existing.id if existing else None,
+                existing, keep_stored_name = _find_patient_by_identity(
+                    session, identity
                 )
-                patient_label = fields["label"]
-                if existing is not None:
-                    # Never blank a name already on file: an identity given as
-                    # bare initials carries empty name strings.
-                    patient = storage.update_patient(
-                        session,
-                        existing.id,
-                        notes=existing.notes,
-                        **{key: value or None for key, value in fields.items()},
-                    )
+                if keep_stored_name and existing is not None:
+                    # Attached by the operator to a chart they named. Its label
+                    # and the name on it both stay exactly as they are.
+                    patient = existing
                 else:
-                    patient = storage.create_patient(
-                        session, notes=identity.notes, **fields
+                    fields = _resolve_patient_identity(
+                        session,
+                        identity,
+                        exclude_patient_uuid=existing.id if existing else None,
                     )
-                    created_patient_uuid = patient.id
+                    if existing is not None:
+                        # Never blank a name already on file: an identity given
+                        # as bare initials carries empty name strings.
+                        patient = storage.update_patient(
+                            session,
+                            existing.id,
+                            notes=existing.notes,
+                            **{key: value or None for key, value in fields.items()},
+                        )
+                    else:
+                        patient = storage.create_patient(
+                            session, notes=identity.notes, **fields
+                        )
+                        created_patient_uuid = patient.id
+                patient_label = patient.label
                 patient_uuid = patient.id
                 _ensure_portal_patient_folder(patient_label)
 
@@ -1754,6 +1857,10 @@ async def bulk_upload_patients(
                         "preview": preview,
                     }
                 )
+        except IdentityNameConflict as exc:
+            # Structured so the operator can answer it per file, with attach_to
+            # or force_new, without holding up the rest of the batch.
+            errors.append({"filename": filename, **exc.payload, "error": exc.payload["detail"]})
         except HTTPException as exc:
             errors.append({"filename": filename, "error": str(exc.detail)})
         except Exception as exc:
