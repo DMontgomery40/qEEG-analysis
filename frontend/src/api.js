@@ -219,9 +219,15 @@ export const api = {
   listRuns(patientId) {
     return request(`/api/patients/${patientId}/runs`);
   },
-  async bulkUploadPatients(files) {
+  async previewReport(file) {
+    const form = new FormData();
+    form.append('file', file);
+    return request('/api/reports/preview', { method: 'POST', body: form });
+  },
+  async bulkUploadPatients(files, identities) {
     const form = new FormData();
     for (const f of files || []) form.append('files', f);
+    form.append('identities', JSON.stringify(identities || []));
     return request('/api/patients/bulk_upload', { method: 'POST', body: form });
   },
 

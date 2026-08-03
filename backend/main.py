@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
@@ -1498,107 +1498,207 @@ async def create_patient(req: PatientCreate) -> dict[str, Any]:
         return _patient_out(p)
 
 
-@app.post("/api/patients/bulk_upload")
-async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    """
-    Bulk upload qEEG report files. Each file creates a new patient whose label is the filename stem.
+def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
+    """Read the operator's per-file identities, keyed by the filename they name.
 
-    If a patient with the same label already exists (case-insensitive), the file is skipped and reported.
+    Comes from the preview step: the operator reads the name and date of birth
+    off the report before anything is filed, so the canonical id exists before
+    the patient does.
     """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Identities are not readable JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Identities must be a list with one entry per file.",
+        )
+
+    identities: dict[str, PatientCreate] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise HTTPException(
+                status_code=400, detail="Each identity must be an object."
+            )
+        filename = str(entry.get("filename") or "").strip()
+        if not filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Each identity must name the file it belongs to.",
+            )
+        identities[filename] = PatientCreate(
+            first_name=entry.get("first_name"),
+            last_name=entry.get("last_name"),
+            birthdate=entry.get("birthdate"),
+            first_initial=entry.get("first_initial"),
+            last_initial=entry.get("last_initial"),
+        )
+    return identities
+
+
+def _identity_key(req: PatientCreate) -> tuple[str, str, str]:
+    """Derive initials and date of birth without allocating anything.
+
+    Allocation reserves an id permanently, so the search for an existing
+    patient has to happen before it — otherwise every re-upload retires a
+    collision ordinal nobody is wearing.
+    """
+    try:
+        first = (
+            require_initial(req.first_initial, field="first")
+            if (req.first_initial or "").strip()
+            else derive_initial(req.first_name, field="first")
+        )
+        last = (
+            require_initial(req.last_initial, field="last")
+            if (req.last_initial or "").strip()
+            else derive_initial(req.last_name, field="last")
+        )
+        return first, last, normalize_birthdate(req.birthdate)
+    except PatientIdentityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _find_patient_by_identity(
+    session: Any, req: PatientCreate
+) -> storage.Patient | None:
+    """Return the patient this identity already belongs to, if there is one.
+
+    Same initials, same date of birth, and the same name on file is the same
+    person — a second report must land on that chart rather than allocating a
+    `_2` and splitting the patient into two families.
+
+    Raises `PatientIdentityError` when two charts already answer to one
+    identity, because picking between them is the operator's call. The caller
+    turns that into a per-file error, so one ambiguous report never fails the
+    rest of the batch.
+    """
+    first_initial, last_initial, birthdate = _identity_key(req)
+    first_name = (req.first_name or "").strip().lower()
+    last_name = (req.last_name or "").strip().lower()
+    matches = [
+        patient
+        for patient in session.scalars(
+            sa_select(storage.Patient).where(
+                storage.Patient.first_initial == first_initial,
+                storage.Patient.last_initial == last_initial,
+                storage.Patient.birthdate == birthdate,
+            )
+        ).all()
+        if (patient.first_name or "").strip().lower() == first_name
+        and (patient.last_name or "").strip().lower() == last_name
+    ]
+    if len(matches) > 1:
+        raise PatientIdentityError(
+            "This name and date of birth already match more than one patient: "
+            + ", ".join(sorted(patient.label for patient in matches))
+            + ". Say which one this report belongs to."
+        )
+    return matches[0] if matches else None
+
+
+@app.post("/api/patients/bulk_upload")
+async def bulk_upload_patients(
+    files: list[UploadFile] = File(...),
+    identities: str = Form(""),
+) -> dict[str, Any]:
+    """Register uploaded qEEG reports under canonical clinic patient ids.
+
+    Intake runs in one order and only that order: the operator previews each
+    report and reads off the name and date of birth, that identity allocates or
+    finds the canonical patient, and the report is registered under it. A file
+    nobody has identified is an error — the filename never becomes a label.
+    """
+    identities_by_filename = _parse_bulk_upload_identities(identities)
+
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    seen_labels: set[str] = set()
     for file in files:
         filename = (file.filename or "upload").strip() or "upload"
-        patient_label = Path(filename).stem.strip()
-        if not patient_label:
+        identity = identities_by_filename.get(filename)
+        if identity is None:
             errors.append(
                 {
                     "filename": filename,
-                    "error": "Empty filename stem (cannot derive patient label)",
+                    "error": (
+                        "Give this report's patient name and date of birth. "
+                        "Preview it first if they are not to hand."
+                    ),
                 }
             )
             continue
-
-        label_key = patient_label.lower()
-        if label_key in seen_labels:
-            skipped.append(
-                {
-                    "filename": filename,
-                    "patient_label": patient_label,
-                    "reason": "duplicate_label_in_batch",
-                }
-            )
-            continue
-        seen_labels.add(label_key)
-
-        with storage.session_scope() as session:
-            existing = storage.find_patients_by_label(session, patient_label)
-            if existing:
-                skipped.append(
-                    {
-                        "filename": filename,
-                        "patient_label": patient_label,
-                        "reason": "patient_label_exists",
-                        "existing_patient_ids": [p.id for p in existing],
-                    }
-                )
-                continue
 
         report_id = str(uuid.uuid4())
         report_folder: Path | None = None
+        patient_label = ""
         try:
-            file_bytes = await file.read()
-            preview = ""
-
             with storage.session_scope() as session:
-                patient = storage.Patient(label=patient_label, notes="")
-                session.add(patient)
-                session.flush()
-                patient_id = patient.id
-
+                existing = _find_patient_by_identity(session, identity)
+                fields = _resolve_patient_identity(
+                    session,
+                    identity,
+                    exclude_patient_uuid=existing.id if existing else None,
+                )
+                patient_label = fields["label"]
+                if existing is not None:
+                    patient = storage.update_patient(
+                        session, existing.id, notes=existing.notes, **fields
+                    )
+                else:
+                    patient = storage.create_patient(
+                        session, notes=identity.notes, **fields
+                    )
+                patient_uuid = patient.id
                 _ensure_portal_patient_folder(patient_label)
 
-                report_folder = report_storage_dir(patient_id, report_id)
-                original_path, extracted_path, mime_type, preview = save_report_upload(
-                    patient_id=patient_id,
-                    report_id=report_id,
-                    filename=filename,
-                    provided_mime_type=file.content_type,
-                    file_bytes=file_bytes,
-                )
+            file_bytes = await file.read()
+            report_folder = report_storage_dir(patient_uuid, report_id)
+            original_path, extracted_path, mime_type, preview = save_report_upload(
+                patient_id=patient_uuid,
+                report_id=report_id,
+                filename=filename,
+                provided_mime_type=file.content_type,
+                file_bytes=file_bytes,
+            )
 
-                report = storage.Report(
-                    id=report_id,
-                    patient_id=patient_id,
+            with storage.session_scope() as session:
+                report = storage.create_report(
+                    session,
+                    report_id=report_id,
+                    patient_id=patient_uuid,
                     filename=filename,
                     mime_type=mime_type,
-                    stored_path=str(original_path),
-                    extracted_text_path=str(extracted_path),
+                    stored_path=original_path,
+                    extracted_text_path=extracted_path,
                 )
-                session.add(report)
-                session.commit()
-                session.refresh(patient)
-                session.refresh(report)
-
-            created.append(
+                patient = storage.get_patient(session, patient_uuid)
+                created.append(
+                    {
+                        "filename": filename,
+                        "patient": _patient_out(patient),
+                        "report": _report_out(report),
+                        "preview": preview,
+                    }
+                )
+        except HTTPException as exc:
+            errors.append({"filename": filename, "error": str(exc.detail)})
+        except Exception as exc:
+            if report_folder is not None:
+                shutil.rmtree(report_folder, ignore_errors=True)
+            errors.append(
                 {
                     "filename": filename,
-                    "patient": _patient_out(patient),
-                    "report": _report_out(report),
-                    "preview": preview,
+                    "patient_label": patient_label,
+                    "error": str(exc),
                 }
-            )
-        except Exception as e:
-            if report_folder is not None:
-                try:
-                    shutil.rmtree(report_folder, ignore_errors=True)
-                except Exception:
-                    pass
-            errors.append(
-                {"filename": filename, "patient_label": patient_label, "error": str(e)}
             )
 
     return {

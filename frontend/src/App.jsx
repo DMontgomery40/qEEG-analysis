@@ -338,7 +338,6 @@ function App() {
 
         {showBulkUpload ? (
           <BulkUploadPage
-            patients={patients}
             onSelectPatient={(id) => {
               setSelectedPatientId(id);
             }}
