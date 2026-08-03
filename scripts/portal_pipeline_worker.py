@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import mimetypes
 import tempfile
 import time
 import uuid
@@ -39,6 +40,7 @@ from backend.patient_intake import (  # noqa: E402
 )
 from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
 from backend.reports import report_dir, save_report_upload  # noqa: E402
+from scripts.register_patient_file import register_patient_file  # noqa: E402
 
 META_NAME = "$meta.json"
 INDEX_NAME = "$index.json"
@@ -836,6 +838,81 @@ def _allocate_patient_for_upload(identity: IdentityInput) -> str:
         return canonical
 
 
+def _delete_quietly(client: NetlifyBlobClient, key: str) -> str | None:
+    """Drop a blob we are finished with, reporting rather than raising.
+
+    The work these blobs describe is already durable by the time we get here, so
+    a delete that fails — or one that already happened on an earlier attempt —
+    must not undo it or stop the rest of the submission.
+    """
+    try:
+        client.delete(key)
+    except Exception as exc:
+        return f"{key}: {str(exc).strip() or exc.__class__.__name__}"
+    return None
+
+
+def _file_remaining_submission_files(
+    *,
+    client: NetlifyBlobClient,
+    portal_dir: Path,
+    upload_id: str,
+    patient_label: str,
+    report_file_key: str,
+) -> tuple[list[str], list[str]]:
+    """File everything else the clinic sent with the report.
+
+    One submission can carry intake forms, prior reports, anything. Each file is
+    registered and dropped before the next is touched, so a failure part way
+    through keeps what already landed; the ones that fail are named and left in
+    place for the retry. Returns the filenames filed and the failures.
+    """
+    prefix = f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"
+    try:
+        keys = sorted(client.list_keys(prefix))
+    except Exception as exc:
+        return [], [f"listing the rest of the submission failed: {exc}"]
+
+    filed: list[str] = []
+    failures: list[str] = []
+    for key in keys:
+        relative = key[len(prefix) :]
+        if not relative or relative == report_file_key:
+            continue
+        filename = _safe_filename(Path(relative).name, "attachment")
+        try:
+            with tempfile.TemporaryDirectory(prefix="qeeg-pending-extra-") as scratch:
+                local_path = Path(scratch) / filename
+                client.download(key, local_path)
+                register_patient_file(
+                    patient_label=patient_label,
+                    src_path=local_path,
+                    filename=filename,
+                    mime_type=(
+                        mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                    ),
+                )
+                # Same publication step as the report: the raw-sync watcher
+                # sends on whatever is sitting in the patient folder.
+                portal_patient_dir = portal_dir / patient_label
+                portal_patient_dir.mkdir(parents=True, exist_ok=True)
+                portal_path = portal_patient_dir / filename
+                tmp_path = portal_path.with_name(f".{portal_path.name}.partial")
+                tmp_path.write_bytes(local_path.read_bytes())
+                tmp_path.replace(portal_path)
+        except Exception as exc:
+            failures.append(
+                f"{relative}: {str(exc).strip() or exc.__class__.__name__}"
+            )
+            continue
+        # Only once the row and the published copy exist is the blob spare.
+        drop_failure = _delete_quietly(client, key)
+        if drop_failure:
+            failures.append(drop_failure)
+        filed.append(filename)
+    return filed, failures
+
+
 def process_new_patient_upload(
     *,
     client: NetlifyBlobClient,
@@ -965,9 +1042,37 @@ def _file_new_patient_upload(
     # Only now that the report is durable is the pending copy safe to drop. A
     # crash before this point simply repeats the cycle; the filename lookup
     # above keeps that from registering the report twice.
-    client.delete(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}")
-    client.delete(job_key)
-    pipeline_uploads.record_registered(upload_id=upload_id, patient_id=patient_label)
+    cleanup_failures: list[str] = []
+    drop_failure = _delete_quietly(
+        client, f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}"
+    )
+    if drop_failure:
+        cleanup_failures.append(drop_failure)
+
+    # The rest of the submission goes in before the marker does, because the
+    # marker is what brings us back here if any of it fails.
+    extras, extra_failures = _file_remaining_submission_files(
+        client=client,
+        portal_dir=portal_dir,
+        upload_id=upload_id,
+        patient_label=patient_label,
+        report_file_key=file_key,
+    )
+    cleanup_failures.extend(extra_failures)
+
+    if not extra_failures:
+        drop_failure = _delete_quietly(client, job_key)
+        if drop_failure:
+            cleanup_failures.append(drop_failure)
+        pipeline_uploads.record_registered(
+            upload_id=upload_id, patient_id=patient_label
+        )
+
+    note = f"new patient upload {upload_id} filed under {patient_label}"
+    if extras:
+        note += f"; also filed {', '.join(extras)}"
+    if cleanup_failures:
+        note += "; left for retry: " + "; ".join(cleanup_failures)
 
     result = PatientWorkerResult(
         patient_id=patient_label,
@@ -975,7 +1080,7 @@ def _file_new_patient_upload(
         downloaded=[str(portal_dir / patient_label / filename)],
         report_count=1,
         ran_batch=False,
-        note=f"new patient upload {upload_id} filed under {patient_label}",
+        note=note,
     )
     _write_local_status(status_dir, result)
     return result

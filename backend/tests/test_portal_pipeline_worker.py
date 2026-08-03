@@ -1150,14 +1150,20 @@ def _upload_job(**resolution):
 class _UploadClient:
     """Stands in for the blob store, recording what the worker asked it to do."""
 
-    def __init__(self, jobs):
+    def __init__(self, jobs, blobs=None):
         self._jobs = dict(jobs)
+        # Pending upload blobs: key -> bytes. A submission can carry several.
+        self._blobs = dict(blobs or {})
         self.downloads = []
         self.deleted = []
         self.written = {}
 
     def list_keys(self, prefix):
-        return [key for key in self._jobs if key.startswith(prefix)]
+        return [
+            key
+            for key in [*self._jobs, *self._blobs]
+            if key.startswith(prefix)
+        ]
 
     def get_json(self, key):
         return self._jobs.get(key)
@@ -1165,7 +1171,7 @@ class _UploadClient:
     def download(self, key, dest):
         self.downloads.append(key)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"report bytes")
+        dest.write_bytes(self._blobs.get(key, b"report bytes"))
 
     def set_json(self, key, payload):
         self.written[key] = payload
@@ -1174,6 +1180,7 @@ class _UploadClient:
     def delete(self, key):
         self.deleted.append(key)
         self._jobs.pop(key, None)
+        self._blobs.pop(key, None)
 
 
 def _no_paid_work(monkeypatch, worker):
@@ -1549,3 +1556,128 @@ def test_a_malformed_upload_id_fails_that_job_without_raising(
 
     assert result.status == "failed"
     assert "uploadId" in result.note
+
+
+def test_the_whole_submission_is_filed_not_just_the_report(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """A submission is a report plus whatever else the clinic sent with it."""
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    job_key = "pipeline/jobs/new-patient/1712345678-up-1.json"
+    client = _UploadClient(
+        {job_key: _upload_job()},
+        blobs={
+            "uploads/pending/up-1/scan.pdf": b"%PDF-1.4 report",
+            "uploads/pending/up-1/intake-form.pdf": b"%PDF-1.4 intake",
+        },
+    )
+
+    # The hub's real key shape carries no patient id, so enumeration has to find
+    # it by payload rather than by parsing the key.
+    jobs = worker.load_new_patient_upload_jobs(client)
+    assert [key for key, _ in jobs] == [job_key]
+
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=jobs[0][1],
+    )
+
+    assert result.status == "registered"
+    assert "intake-form.pdf" in result.note
+
+    with storage.session_scope() as session:
+        patient = storage.list_patients(session)[0]
+        reports = storage.list_reports(session, patient.id)
+        files = storage.list_patient_files(session, patient.id)
+    assert patient.label == "BT_12-11-1963"
+    assert [r.filename for r in reports] == ["scan.pdf"]
+    assert [f.filename for f in files] == ["intake-form.pdf"]
+    assert (tmp_path / "portal" / "BT_12-11-1963" / "intake-form.pdf").exists()
+
+    # Everything pending is gone, marker last.
+    assert client.deleted == [
+        "uploads/pending/up-1/scan.pdf",
+        "uploads/pending/up-1/intake-form.pdf",
+        job_key,
+    ]
+
+    # Replaying the marker files nothing twice.
+    replay = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(),
+    )
+    assert replay.status == "already_registered"
+    with storage.session_scope() as session:
+        patients = storage.list_patients(session)
+        assert len(patients) == 1
+        assert len(storage.list_reports(session, patients[0].id)) == 1
+        assert len(storage.list_patient_files(session, patients[0].id)) == 1
+
+
+def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """One unreadable attachment must not cost the report or its siblings."""
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    job_key = "pipeline/jobs/new-patient/1712345678-up-1.json"
+
+    class _OneBadFileClient(_UploadClient):
+        def download(self, key, dest):
+            if key.endswith("broken.pdf"):
+                raise RuntimeError("netlify blobs:get exited 1")
+            return super().download(key, dest)
+
+    client = _OneBadFileClient(
+        {job_key: _upload_job()},
+        blobs={
+            "uploads/pending/up-1/scan.pdf": b"%PDF-1.4 report",
+            "uploads/pending/up-1/aaa-good.pdf": b"%PDF-1.4 good",
+            "uploads/pending/up-1/broken.pdf": b"%PDF-1.4 broken",
+        },
+    )
+
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(),
+    )
+
+    assert result.status == "registered"
+    assert "broken.pdf" in result.note
+
+    with storage.session_scope() as session:
+        patient = storage.list_patients(session)[0]
+        assert [r.filename for r in storage.list_reports(session, patient.id)] == [
+            "scan.pdf"
+        ]
+        assert [
+            f.filename for f in storage.list_patient_files(session, patient.id)
+        ] == ["aaa-good.pdf"]
+
+    # The good file's blob is gone; the broken one and the marker stay, so the
+    # next cycle comes back for exactly what is left.
+    assert client.deleted == [
+        "uploads/pending/up-1/scan.pdf",
+        "uploads/pending/up-1/aaa-good.pdf",
+    ]
+    assert job_key not in client.deleted
