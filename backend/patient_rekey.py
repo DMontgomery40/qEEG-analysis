@@ -25,8 +25,17 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-# Historical content the brief requires to survive byte-identical.
-DELIVERABLE_SUFFIXES = frozenset({".pdf", ".mp4", ".md", ".docx", ".rtf", ".zip", ".txt"})
+# Historical content the brief requires to survive byte-identical: what the hub
+# accepts, plus the stills and alternative video containers that sit in patient
+# folders. Cheaper to hash something that did not need it than to carry a file
+# across a filesystem boundary unchecked.
+DELIVERABLE_SUFFIXES = frozenset(
+    {
+        ".pdf", ".mp4", ".md", ".docx", ".rtf", ".zip", ".txt",
+        ".mov", ".webm", ".m4v", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+        ".wav", ".mp3", ".m4a", ".csv", ".edf",
+    }
+)
 
 
 class PatientRekeyError(RuntimeError):

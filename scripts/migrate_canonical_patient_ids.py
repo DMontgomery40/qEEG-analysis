@@ -1025,6 +1025,23 @@ class Journal:
             if old_id not in self.done
         ]
 
+    def all_records(self) -> list[dict[str, Any]]:
+        """Every intent line, finished or not — one per patient."""
+        return [record for _, record in sorted(self.started.items())]
+
+    def migrated_pairs(self) -> dict[str, str]:
+        """Old ID to new ID for every patient this journal ever started.
+
+        This, not a mapping recomputed from the database, is what the hub rekey
+        must be driven from: a patient finished on a resumed run already wears
+        their canonical label, so they are absent from any fresh computation.
+        """
+        return {
+            old_id: record["new_id"]
+            for old_id, record in sorted(self.started.items())
+            if record.get("new_id")
+        }
+
     def record(self, entry: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
@@ -1610,6 +1627,13 @@ def remove_qa_fixture(
     """
     import shutil
 
+    labels = sorted(labels)
+    if not labels:
+        # Nothing to remove is not a reason to fail a run that has already
+        # finished every patient — and failing here loses the worklist, which
+        # is written afterwards.
+        return {"patients": 0, "rows": 0, "folders": 0, "files_kept": 0}
+
     if bundle_dir is None:
         raise MigrationStop(
             "Refusing to delete QA portal folders with nowhere to keep their "
@@ -1762,6 +1786,13 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
                 # to finish this patient from a database whose label has already
                 # moved. Without it a crash in the next few lines is invisible.
                 if old_id not in journal.started:
+                    # The hub work has to be captured now, before the local
+                    # rekey rewrites the sync state onto the new ID. Afterwards
+                    # the state describes the new world while the hub still
+                    # holds the old prefix, so it can no longer say what needs
+                    # copying — and a patient finished on a resumed run is
+                    # `already_canonical`, so the recomputed mapping does not
+                    # list them either. The journal is what remembers.
                     journal.record(
                         {
                             "old_id": old_id,
@@ -1770,6 +1801,13 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
                             "uuid": uuid,
                             "birthdate": entry.get("birthdate") or "",
                             "initials": list(initials),
+                            "remote": patient_rekey.remote_rekey_worklist(
+                                read_sync_state(
+                                    portal_root / ".qeeg_portal_sync_state.json"
+                                ),
+                                old_id,
+                                new_id,
+                            ),
                         }
                     )
                 plan = patient_rekey.plan_patient_rekey(
@@ -1844,11 +1882,34 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
         else Path(args.rollback_bundle or portal_root)
     )
     worklist_dir.mkdir(parents=True, exist_ok=True)
+
+    # Both artifacts come from the journal, which knows every patient this run
+    # and every interrupted run before it actually moved. The recomputed mapping
+    # does not: a patient finished on a resumed run is already canonical and
+    # drops out of it, and their hub blobs would silently never be rekeyed.
+    migrated = journal.migrated_pairs()
+    remote_items: list[dict[str, Any]] = []
+    for record in journal.all_records():
+        remote_items.extend(record.get("remote") or [])
+
     worklist = worklist_dir / "remote-rekey-worklist.json"
-    worklist.write_text(
-        json.dumps(report["remote_manifest"], indent=2), encoding="utf-8"
+    worklist.write_text(json.dumps(remote_items, indent=2), encoding="utf-8")
+
+    # The shape the thrylen rekey's --mapping actually consumes. Nothing else
+    # the migrator writes has it: the manifest is the whole report and the
+    # worklist is an array, and feeding either one to the rekey made it treat
+    # top-level keys as patient IDs and exit 0 having done nothing.
+    mapping_file = worklist_dir / "remote-rekey-mapping.json"
+    mapping_file.write_text(
+        json.dumps(migrated, indent=2, sort_keys=True), encoding="utf-8"
     )
+
     print(f"\nRemote rekey worklist written to {worklist}")
+    print(f"Remote rekey mapping written to {mapping_file}")
+    print(
+        f"  next: node scripts/qeeg_rekey_patients.mjs --mapping {mapping_file} "
+        f"--apply --i-have-stopped-every-writer"
+    )
 
     if failures:
         print(f"\n{len(failures)} patient(s) failed:", file=sys.stderr)

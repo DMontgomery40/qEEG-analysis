@@ -1022,3 +1022,77 @@ def test_apply_refuses_to_remove_qa_records_with_nowhere_to_keep_them(world, cap
 
     assert migrator.run_apply(world, migrator.build_report(world)) == 1
     assert "--rollback-bundle" in capsys.readouterr().err
+
+
+def test_a_patient_finished_on_resume_still_reaches_the_hub(world, monkeypatch):
+    """C3's fix moved the failure one layer out: a resumed patient is already
+    canonical, so the recomputed mapping omits them — and so did the remote
+    worklist. Their hub blobs would have stayed under the retired prefix while
+    the run reported success. The journal is what remembers."""
+    _unblock(world)
+    report = migrator.build_report(world)
+
+    real_apply = migrator.patient_rekey.apply_patient_rekey
+    crashed = {"done": False}
+
+    def crash_on_the_first_patient(plan, **kwargs):
+        if not crashed["done"] and plan.old_id == "07-07-1907-0":
+            crashed["done"] = True
+            if plan.folder_move:
+                plan.folder_move[0].rename(plan.folder_move[1])
+            raise RuntimeError("power cut")
+        return real_apply(plan, **kwargs)
+
+    monkeypatch.setattr(
+        migrator.patient_rekey, "apply_patient_rekey", crash_on_the_first_patient
+    )
+    migrator.run_apply(world, report)
+
+    monkeypatch.setattr(migrator.patient_rekey, "apply_patient_rekey", real_apply)
+    resumed = migrator.build_report(world)
+    assert "07-07-1907-0" not in resumed["mapping"]
+    assert migrator.run_apply(world, resumed) == 0
+
+    worklist_dir = Path(world.journal).parent
+    mapping_file = json.loads(
+        (worklist_dir / "remote-rekey-mapping.json").read_text()
+    )
+    worklist = json.loads((worklist_dir / "remote-rekey-worklist.json").read_text())
+
+    # The resumed patient is in both artifacts the hub rekey consumes.
+    assert mapping_file["07-07-1907-0"] == "PG_07-07-1907"
+    assert any(item["patientIdOld"] == "07-07-1907-0" for item in worklist)
+
+
+def test_the_mapping_file_is_the_shape_the_hub_rekey_consumes(world):
+    """The manifest is the whole report and the worklist is an array; neither
+    is a mapping, and feeding either to the rekey exited 0 having done nothing."""
+    _unblock(world)
+    report = migrator.build_report(world)
+    assert migrator.run_apply(world, report) == 0
+
+    mapping_file = json.loads(
+        (Path(world.journal).parent / "remote-rekey-mapping.json").read_text()
+    )
+
+    assert isinstance(mapping_file, dict) and mapping_file
+    for old_id, new_id in mapping_file.items():
+        assert isinstance(new_id, str) and old_id != new_id
+        assert migrator.parse_canonical_patient_id(new_id) is not None
+        assert migrator.parse_legacy_id(old_id) is not None
+
+
+def test_apply_without_qa_records_does_not_need_a_rollback_bundle(world):
+    """Failing here loses the worklist, which is written afterwards — and there
+    was nothing to remove in the first place."""
+    _unblock(world)
+    world.rollback_bundle = ""
+    conn = sqlite3.connect(world.db)
+    conn.execute("DELETE FROM patients WHERE label = '12-12-1912-0'")
+    conn.commit()
+    conn.close()
+
+    report = migrator.build_report(world)
+    assert report["qa_fixture_labels"] == []
+    assert migrator.run_apply(world, report) == 0
+    assert (Path(world.journal).parent / "remote-rekey-worklist.json").is_file()
