@@ -24,13 +24,36 @@ from scripts import migrate_canonical_patient_ids as migrator
 # --------------------------------------------------------------------------- #
 
 
-def _make_db(path: Path, patients: list[dict]) -> None:
+def _make_db(path: Path, patients: list[dict], *, upgraded: bool = True) -> None:
+    """A database in the shape the new engine leaves behind.
+
+    ``upgraded=False`` gives the pre-cutover five-column shape, which is what
+    the live database still looks like until the new engine runs against it.
+    """
     conn = sqlite3.connect(path)
+    if upgraded:
+        conn.executescript(
+            """
+            CREATE TABLE patient_id_reservations (
+                patient_id VARCHAR NOT NULL PRIMARY KEY,
+                first_initial VARCHAR NOT NULL DEFAULT '',
+                last_initial VARCHAR NOT NULL DEFAULT '',
+                birthdate VARCHAR NOT NULL DEFAULT '',
+                ordinal INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT '');
+            """
+        )
+    identity_columns = (
+        ", birthdate VARCHAR, first_name VARCHAR, last_name VARCHAR,"
+        " first_initial VARCHAR, last_initial VARCHAR"
+        if upgraded
+        else ""
+    )
     conn.executescript(
-        """
+        f"""
         CREATE TABLE patients (id VARCHAR NOT NULL PRIMARY KEY, label VARCHAR NOT NULL,
             notes TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL,
-            updated_at DATETIME NOT NULL DEFAULT '');
+            updated_at DATETIME NOT NULL DEFAULT ''{identity_columns});
         CREATE TABLE reports (id VARCHAR NOT NULL PRIMARY KEY, patient_id VARCHAR NOT NULL,
             filename VARCHAR NOT NULL DEFAULT '', mime_type VARCHAR NOT NULL DEFAULT '',
             stored_path VARCHAR NOT NULL DEFAULT '',
@@ -142,6 +165,12 @@ def world(tmp_path: Path):
         ],
     )
 
+    jobs = tmp_path / "pipeline_jobs"
+    jobs.mkdir()
+    (jobs / "01-19-1966-0.json").write_text(
+        json.dumps({"patient_id": "01-19-1966-0", "status": "complete"})
+    )
+
     convs = tmp_path / "conversations"
     convs.mkdir()
     (convs / "conv_1.json").write_text(
@@ -187,6 +216,9 @@ def world(tmp_path: Path):
         explainer_root="",
         manifest_out="",
         journal=str(tmp_path / "journal.jsonl"),
+        pipeline_jobs_dir=str(jobs),
+        pending_uploads_dir="",
+        this_is_the_scheduled_cutover=False,
         apply=False,
         dry_run=True,
         window_confirmed=True,
@@ -563,3 +595,64 @@ def test_an_unresolved_renderer_finding_fails_the_dry_run(world, tmp_path: Path)
     report = migrator.build_report(world)
 
     assert any("local-explainer-video:" in b for b in report["blockers"])
+
+
+def test_apply_refuses_a_database_the_new_engine_has_not_upgraded(tmp_path: Path):
+    """Writing canonical labels into the old shape leaves every patient with no
+    reservation and no identity — the exact state the cutover exists to end."""
+    db = tmp_path / "old.db"
+    _make_db(db, [{"uuid": "a" * 8, "label": "01-19-1966-0"}], upgraded=False)
+
+    with pytest.raises(migrator.MigrationStop, match="patient_id_reservations"):
+        migrator.assert_schema_ready(db)
+
+
+def test_migrated_patients_get_a_reservation_and_their_identity_columns(world):
+    _unblock(world)
+    report = migrator.build_report(world)
+    assert migrator.run_apply(world, report) == 0
+
+    conn = sqlite3.connect(world.db)
+    reserved = {r[0] for r in conn.execute("SELECT patient_id FROM patient_id_reservations")}
+    # Without this the ID becomes reissuable the moment the row is deleted.
+    assert "PG_01-19-1966" in reserved
+    assert "DK_08-10-1989" in reserved
+
+    row = conn.execute(
+        "SELECT birthdate, first_initial, last_initial FROM patients WHERE label = ?",
+        ("PG_01-19-1966",),
+    ).fetchone()
+    # A migrated patient with NULL identity sends the next intake through name
+    # matching with nothing to match.
+    assert row == ("01-19-1966", "P", "G")
+    conn.close()
+
+
+def test_the_qa_fixture_is_bundled_before_it_is_removed(world):
+    report = migrator.build_report(world)
+
+    bundle = report["qa_fixture_bundle"]
+    assert [p["label"] for p in bundle["patients"]] == ["02-29-1984-0"]
+    assert bundle["reports"], "its rows have to be recoverable from the bundle"
+
+    _unblock(world)
+    assert migrator.run_apply(world, migrator.build_report(world)) == 0
+
+    conn = sqlite3.connect(world.db)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM patients WHERE label = ?", ("02-29-1984-0",)
+    ).fetchone()[0]
+    conn.close()
+    assert remaining == 0
+
+
+def test_the_pipeline_job_file_moves_with_the_patient(world):
+    _unblock(world)
+    assert migrator.run_apply(world, migrator.build_report(world)) == 0
+
+    jobs = Path(world.pipeline_jobs_dir)
+    assert not (jobs / "01-19-1966-0.json").exists()
+    moved = json.loads((jobs / "PG_01-19-1966.json").read_text())
+    # The worker keys its status on this; left behind it reports on a dead ID.
+    assert moved["patient_id"] == "PG_01-19-1966"
+    assert moved["status"] == "complete"

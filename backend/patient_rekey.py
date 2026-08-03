@@ -102,6 +102,7 @@ class RekeyPlan:
     folder_move: tuple[Path, Path] | None = None
     file_renames: list[FileRename] = field(default_factory=list)
     conversation_files: list[Path] = field(default_factory=list)
+    pipeline_job_files: list[Path] = field(default_factory=list)
     remote_rekeys: list[dict[str, Any]] = field(default_factory=list)
     total_bytes: int = 0
 
@@ -115,6 +116,7 @@ class RekeyResult:
     files_already_renamed: int = 0
     conversations_repointed: int = 0
     sync_entries_repointed: int = 0
+    pipeline_jobs_repointed: int = 0
     db_label_changed: bool = False
     message_hashes: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
@@ -131,6 +133,7 @@ def plan_patient_rekey(
     portal_root: Path | None = None,
     conversations_dir: Path | None = None,
     sync_state_paths: Sequence[Path] = (),
+    pipeline_jobs_dir: Path | None = None,
     hash_files: bool = True,
 ) -> RekeyPlan:
     """Work out every rename for this patient without touching anything."""
@@ -186,6 +189,14 @@ def plan_patient_rekey(
             filed = record.get("patient_id") or record.get("patient_label")
             if filed in (old_id, new_id):
                 plan.conversation_files.append(path)
+
+    # The pipeline worker's per-patient status file is named for the patient and
+    # names them again inside. It is live routing state, not history: left
+    # behind, the worker keeps reporting on an ID nothing else uses.
+    if pipeline_jobs_dir is not None and pipeline_jobs_dir.is_dir():
+        old_job = pipeline_jobs_dir / f"{old_id}.json"
+        if old_job.is_file():
+            plan.pipeline_job_files.append(old_job)
 
     return plan
 
@@ -388,6 +399,28 @@ def apply_patient_rekey(
         result.sync_entries_repointed += _rekey_sync_state(
             path, plan.old_id, plan.new_id
         )
+
+    for path in plan.pipeline_job_files:
+        target = path.with_name(f"{plan.new_id}.json")
+        if not path.is_file():
+            continue
+        if target.exists():
+            raise PatientRekeyError(
+                f"{target} already exists; the pipeline job file for "
+                f"{plan.old_id} cannot move onto it."
+            )
+        try:
+            job = _load_json(path)
+        except ValueError:
+            job = None
+        if isinstance(job, dict):
+            if isinstance(job.get("patient_id"), str):
+                job["patient_id"] = plan.new_id
+            if isinstance(job.get("note"), str):
+                job["note"] = rename_in_name(job["note"], plan.old_id, plan.new_id)
+            _write_json_atomic(path, job)
+        os.replace(path, target)
+        result.pipeline_jobs_repointed += 1
 
     if session is not None and patient_uuid:
         from .storage import Patient

@@ -8,8 +8,11 @@ starts at one and is left off when it is one. The two ordinals do not
 correspond: the legacy one counts collisions on the birthdate alone, the
 canonical one counts collisions on initials *and* birthdate. Two people born the
 same day with different initials both end up unsuffixed. So this migrator never
-carries a legacy ordinal across — it asks ``backend.patient_identity`` to
-allocate, and the reservation table remembers the answer forever.
+carries a legacy ordinal across: the dry run works out each patient's ordinal
+from the initials-and-birthdate collisions it can see, and ``--apply`` writes
+every resulting ID through ``reserve_canonical_patient_id`` so the reservation
+table remembers it forever. An ID that is only worn by a live row would become
+reissuable the moment that row was deleted or relabelled.
 
 Run it twice: ``--dry-run`` first, which writes nothing and tells you exactly
 what it would do and what it cannot decide, and ``--apply`` inside a maintenance
@@ -48,6 +51,7 @@ from backend.patient_identity import (  # noqa: E402
     canonical_patient_id,
     normalize_birthdate,
     parse_canonical_patient_id,
+    reserve_canonical_patient_id,
 )
 
 # The legacy key: birthdate plus a zero-based collision counter.
@@ -638,6 +642,53 @@ def find_orphan_pending_prefixes(
     )
 
 
+def _live_upload_ids(jobs_dir: Path | None) -> list[str]:
+    """Upload ids named by a pipeline job marker that still exists."""
+    if jobs_dir is None or not jobs_dir.is_dir():
+        return []
+    live: list[str] = []
+    for path in jobs_dir.rglob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("uploadId"), str):
+            live.append(payload["uploadId"])
+    return live
+
+
+# Where else a legacy ID appears in a name. Archives and backups are history
+# and stay as they are; the first two are live and move with the patient.
+_OTHER_LOCATIONS = (
+    ("pipeline_jobs", "live"),
+    ("exports", "live"),
+    ("portal_patients_archives", "history"),
+    ("portal_patients_precompress_backups", "history"),
+    ("_manual_rescue_archive", "history"),
+    ("_unsafe_partial_archive", "history"),
+    ("video_quarantine", "history"),
+)
+
+
+def sweep_other_id_named_locations(
+    data_root: Path, mapping: dict[str, str]
+) -> dict[str, Any]:
+    """Every directory besides the portal tree holding ID-named entries."""
+    found: dict[str, Any] = {}
+    for name, kind in _OTHER_LOCATIONS:
+        directory = data_root / name
+        if not directory.is_dir():
+            continue
+        hits = sorted(
+            entry.name
+            for entry in directory.iterdir()
+            if any(entry.name.startswith(old) for old in mapping)
+        )
+        if hits:
+            found[name] = {"kind": kind, "count": len(hits), "entries": hits[:40]}
+    return found
+
+
 def build_remote_manifest(
     sync_state: dict[str, Any], mapping: dict[str, str]
 ) -> list[dict[str, Any]]:
@@ -935,6 +986,34 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         if root
     }
 
+    # The pipeline worker's per-patient status files are live routing state and
+    # move with the patient.
+    jobs_dir = Path(args.pipeline_jobs_dir) if args.pipeline_jobs_dir else None
+    pipeline_jobs = (
+        {
+            old_id: f"{new_id}.json"
+            for old_id, new_id in sorted(mapping.items())
+            if (jobs_dir / f"{old_id}.json").is_file()
+        }
+        if jobs_dir and jobs_dir.is_dir()
+        else {}
+    )
+
+    # Uploaded blobs whose job marker never landed. The hub writes the file
+    # first, so a failed marker write leaves bytes nobody will ever claim.
+    pending_dir = Path(args.pending_uploads_dir) if args.pending_uploads_dir else None
+    orphan_pending = (
+        find_orphan_pending_prefixes(pending_dir, _live_upload_ids(jobs_dir))
+        if pending_dir
+        else []
+    )
+
+    # Anywhere else on disk still carrying a legacy ID in its name, so the
+    # manifest can say "these are the only places" and mean it.
+    other_locations = sweep_other_id_named_locations(portal_root.parent, mapping)
+
+    qa_bundle = qa_fixture_bundle(Path(args.db), portal_root)
+
     unresolved = [e for e in classified if e.bucket == BUCKET_UNRESOLVED]
     buckets: dict[str, int] = defaultdict(int)
     for entry in classified:
@@ -960,7 +1039,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "mapping": mapping,
         "identity_findings": [asdict(f) for f in findings],
         "orphan_portal_folders": orphan_folders,
+        "orphan_pending_prefixes": orphan_pending,
         "mixed_patient_folders": mixed,
+        "pipeline_job_files": pipeline_jobs,
+        "other_id_named_locations": other_locations,
+        "qa_fixture_bundle": qa_bundle,
         "remote_manifest": remote_items,
         "renderer_findings": renderer_findings,
         "estimate": estimate_window(
@@ -1058,6 +1141,142 @@ def reconcile_duplicate(
     return moved
 
 
+REQUIRED_IDENTITY_COLUMNS = ("birthdate", "first_initial", "last_initial")
+
+
+def assert_schema_ready(db_path: Path) -> None:
+    """Refuse to migrate into a database the new engine has not upgraded yet.
+
+    ``patient_id_reservations`` and the identity columns arrive with the new
+    engine code. Writing canonical labels into the old five-column shape would
+    leave every migrated patient with no reservation and no identity, which is
+    exactly the state the cutover exists to end.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "patient_id_reservations" not in tables:
+            raise MigrationStop(
+                "This database has no patient_id_reservations table. Start the "
+                "new engine against it once so the schema upgrades, then migrate."
+            )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(patients)")
+        }
+        missing = [c for c in REQUIRED_IDENTITY_COLUMNS if c not in columns]
+        if missing:
+            raise MigrationStop(
+                f"The patients table is missing {', '.join(missing)}. Start the "
+                f"new engine against this database once, then migrate."
+            )
+    finally:
+        conn.close()
+
+
+def qa_fixture_bundle(db_path: Path, portal_root: Path) -> dict[str, Any]:
+    """Everything the QA record owns, listed so the rollback bundle can hold it.
+
+    The synthetic record is removed from the roster during apply rather than
+    migrated, so this is the only place its rows and artifacts are written down.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    bundle: dict[str, Any] = {"patients": [], "reports": [], "runs": [],
+                              "patient_files": [], "portal_artifacts": []}
+    try:
+        for label in sorted(QA_FIXTURE_LABELS):
+            for row in conn.execute(
+                "SELECT id, label, created_at FROM patients WHERE label = ?", (label,)
+            ):
+                bundle["patients"].append(dict(row))
+                for table in ("reports", "runs", "patient_files"):
+                    bundle[table].extend(
+                        dict(r)
+                        for r in conn.execute(
+                            f"SELECT * FROM {table} WHERE patient_id = ?", (row["id"],)
+                        )
+                    )
+            folder = portal_root / label
+            if folder.is_dir():
+                bundle["portal_artifacts"].extend(
+                    {
+                        "path": str(path),
+                        "size": path.stat().st_size,
+                        "sha256": patient_rekey._sha256_file(path),
+                    }
+                    for path in sorted(folder.rglob("*"))
+                    if path.is_file()
+                )
+    finally:
+        conn.close()
+    return bundle
+
+
+def remove_qa_fixture(conn: sqlite3.Connection, portal_root: Path) -> dict[str, int]:
+    """Take the synthetic record off the active roster. Bundle it first."""
+    import shutil
+
+    removed = {"patients": 0, "rows": 0, "folders": 0}
+    for label in sorted(QA_FIXTURE_LABELS):
+        uuids = [
+            row[0]
+            for row in conn.execute("SELECT id FROM patients WHERE label = ?", (label,))
+        ]
+        for uuid in uuids:
+            for table in ("reports", "runs", "patient_files"):
+                removed["rows"] += conn.execute(
+                    f"DELETE FROM {table} WHERE patient_id = ?", (uuid,)
+                ).rowcount
+            removed["patients"] += conn.execute(
+                "DELETE FROM patients WHERE id = ?", (uuid,)
+            ).rowcount
+        folder = portal_root / label
+        if folder.is_dir():
+            shutil.rmtree(folder)
+            removed["folders"] += 1
+    conn.commit()
+    return removed
+
+
+def reserve_migrated_id(
+    db_path: Path,
+    new_id: str,
+    *,
+    uuid: str | None,
+    birthdate: str,
+    first_initial: str,
+    last_initial: str,
+) -> None:
+    """Relabel one patient through the identity module, not around it.
+
+    Goes through ``backend.storage``'s session so the reservation is written by
+    ``reserve_canonical_patient_id`` itself — the same code path the running
+    engine uses — and so the patient's identity columns are filled in from the
+    evidence the dry run already resolved. A migrated patient with NULL identity
+    would send the very next intake through name matching with nothing to match.
+    """
+    from backend import storage
+
+    storage.reset_engine(f"sqlite:///{db_path}")
+    with storage.session_scope() as session:
+        reserve_canonical_patient_id(session, new_id)
+        patient = session.get(storage.Patient, uuid) if uuid else None
+        if patient is None:
+            return
+        patient.label = new_id
+        if birthdate:
+            patient.birthdate = birthdate
+        if first_initial:
+            patient.first_initial = first_initial
+        if last_initial:
+            patient.last_initial = last_initial
+        session.commit()
+
+
 def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
     """Carry out the migration, one patient at a time, journalling as it goes."""
     if report["blockers"]:
@@ -1068,6 +1287,7 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
         return 1
 
     portal_root = Path(args.portal_root)
+    assert_schema_ready(Path(args.db))
     journal = Journal(Path(args.journal or "migration-journal.jsonl"))
     sync_paths = [
         portal_root / name
@@ -1120,10 +1340,24 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
                     portal_root=portal_root,
                     conversations_dir=Path(args.conversations_dir),
                     sync_state_paths=sync_paths,
+                    pipeline_jobs_dir=Path(args.pipeline_jobs_dir)
+                    if args.pipeline_jobs_dir
+                    else None,
                 )
-                uuid = (by_label.get(old_id) or {}).get("uuid")
-                conn.execute(
-                    "UPDATE patients SET label = ? WHERE id = ?", (new_id, uuid)
+                entry = by_label.get(old_id) or {}
+                uuid = entry.get("uuid")
+                initials = entry.get("initials") or ("", "")
+                # The reservation is the whole point of the identity module: an
+                # ID that is only worn by a live row becomes reissuable the
+                # moment that row is deleted or relabelled. Write it first, so a
+                # crash after this leaves the ID retired rather than free.
+                reserve_migrated_id(
+                    Path(args.db),
+                    new_id,
+                    uuid=uuid,
+                    birthdate=entry.get("birthdate") or "",
+                    first_initial=initials[0],
+                    last_initial=initials[1],
                 )
                 conn.commit()
                 result = patient_rekey.apply_patient_rekey(plan)
@@ -1146,6 +1380,17 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
             except Exception as error:  # noqa: BLE001 - collected and reported
                 failures.append(f"{old_id}: {error}")
                 print(f"  {old_id}: FAILED — {error}", file=sys.stderr)
+
+        # The synthetic QA record leaves the roster rather than migrating. Its
+        # rows and artifacts are listed in the manifest for the rollback bundle
+        # first, so this removal is recoverable.
+        if not journal.is_done("qa-fixture-removed"):
+            removed = remove_qa_fixture(conn, portal_root)
+            journal.record(
+                {"old_id": "qa-fixture-removed", "kind": "qa_fixture_removed",
+                 "removed": removed}
+            )
+            print(f"  removed the QA fixture from the roster: {removed}")
     finally:
         conn.close()
 
@@ -1178,10 +1423,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--explainer-root", default="")
     parser.add_argument("--manifest-out", default="")
     parser.add_argument("--journal", default="")
+    parser.add_argument("--pipeline-jobs-dir", default="")
+    parser.add_argument("--pending-uploads-dir", default="")
     parser.add_argument(
         "--window-confirmed",
         action="store_true",
         help="Required by --apply. Confirms every writer is stopped.",
+    )
+    parser.add_argument(
+        "--this-is-the-scheduled-cutover",
+        action="store_true",
+        help=(
+            "Also required to --apply against the live clinic data. Only the "
+            "scheduled maintenance window passes this."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -1194,11 +1449,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         for label, path in (("database", args.db), ("portal root", args.portal_root)):
-            if _under_production(Path(path)):
+            if _under_production(Path(path)) and not args.this_is_the_scheduled_cutover:
                 print(
                     f"Refusing to --apply against the live {label} at {path}. "
-                    f"The real cutover runs from the scheduled window runbook, "
-                    f"not from a development invocation.",
+                    f"Development invocations run against fixtures. The scheduled "
+                    f"cutover passes --this-is-the-scheduled-cutover as well.",
                     file=sys.stderr,
                 )
                 return 2
