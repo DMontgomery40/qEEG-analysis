@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
+# Historical content the brief requires to survive byte-identical.
+DELIVERABLE_SUFFIXES = frozenset({".pdf", ".mp4", ".md", ".docx", ".rtf", ".zip", ".txt"})
+
+
 class PatientRekeyError(RuntimeError):
     """A rekey that cannot proceed without someone deciding something."""
 
@@ -101,6 +105,7 @@ class RekeyPlan:
     sync_state_paths: tuple[Path, ...] = ()
     folder_move: tuple[Path, Path] | None = None
     file_renames: list[FileRename] = field(default_factory=list)
+    carried_files: list[FileRename] = field(default_factory=list)
     conversation_files: list[Path] = field(default_factory=list)
     pipeline_job_files: list[Path] = field(default_factory=list)
     remote_rekeys: list[dict[str, Any]] = field(default_factory=list)
@@ -114,6 +119,7 @@ class RekeyResult:
     folder_moved: bool = False
     files_renamed: int = 0
     files_already_renamed: int = 0
+    files_carried_verified: int = 0
     conversations_repointed: int = 0
     sync_entries_repointed: int = 0
     pipeline_jobs_repointed: int = 0
@@ -167,14 +173,35 @@ def plan_patient_rekey(
                 renamed = rename_in_name(path.name, old_id, new_id)
                 size = path.stat().st_size
                 plan.total_bytes += size
+                digest = (
+                    _sha256_file(path)
+                    if hash_files and path.suffix.lower() in DELIVERABLE_SUFFIXES
+                    else ""
+                )
                 if renamed == path.name:
+                    # A file whose name never carried the ID still crosses the
+                    # migration — inside the folder move, which is a copy when
+                    # the destination is on another filesystem. Original source
+                    # PDFs are exactly these files, and they are the ones a
+                    # byte check actually earns its keep on: `os.replace` on a
+                    # renamed file cannot change bytes, but a cross-device copy
+                    # can.
+                    if digest:
+                        plan.carried_files.append(
+                            FileRename(
+                                old_path=path,
+                                new_path=path,
+                                size=size,
+                                sha256=digest,
+                            )
+                        )
                     continue
                 plan.file_renames.append(
                     FileRename(
                         old_path=path,
                         new_path=path.with_name(renamed),
                         size=size,
-                        sha256=_sha256_file(path) if hash_files else "",
+                        sha256=digest,
                     )
                 )
 
@@ -382,6 +409,26 @@ def apply_patient_rekey(
                     f"({rename.sha256[:12]} -> {after[:12]})."
                 )
         result.files_renamed += 1
+
+    # Files that kept their names travelled inside the folder move. Prove they
+    # arrived intact — a cross-filesystem move is a copy, and a copy can fail
+    # halfway without raising.
+    for carried in plan.carried_files:
+        path = carried.old_path
+        if plan.folder_move is not None:
+            old_dir, new_dir = plan.folder_move
+            path = _reanchor(path, old_dir, new_dir)
+        if not path.is_file():
+            raise PatientRekeyError(
+                f"{path} did not survive the folder move for {plan.old_id}."
+            )
+        after = _sha256_file(path)
+        if after != carried.sha256:
+            raise PatientRekeyError(
+                f"{path.name} changed bytes crossing the folder move "
+                f"({carried.sha256[:12]} -> {after[:12]})."
+            )
+        result.files_carried_verified += 1
 
     if plan.portal_root is not None:
         folder = plan.portal_root / plan.new_id

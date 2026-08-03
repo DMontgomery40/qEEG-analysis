@@ -314,10 +314,17 @@ def _looks_like_test_row(row: PatientRow) -> bool:
 
 
 def classify_patient_rows(
-    rows: Iterable[PatientRow], *, portal_root: Path, qa_candidates_confirmed: bool = False
+    rows: Iterable[PatientRow],
+    *,
+    portal_root: Path,
+    qa_candidates_confirmed: bool = False,
+    qa_fixture_labels: Iterable[str] = QA_FIXTURE_LABELS,
+    qa_candidate_labels: Iterable[str] = QA_CANDIDATE_LABELS,
 ) -> list[Classified]:
     """Sort every database row into one bucket, explaining each decision."""
     rows = list(rows)
+    qa_fixture_labels = frozenset(qa_fixture_labels)
+    qa_candidate_labels = frozenset(qa_candidate_labels)
     by_label: dict[str, list[PatientRow]] = defaultdict(list)
     for row in rows:
         by_label[row.label].append(row)
@@ -356,7 +363,7 @@ def classify_patient_rows(
             )
             continue
 
-        if row.label in QA_CANDIDATE_LABELS and qa_candidates_confirmed:
+        if row.label in qa_candidate_labels and qa_candidates_confirmed:
             out.append(
                 Classified(
                     key=key,
@@ -372,7 +379,7 @@ def classify_patient_rows(
             )
             continue
 
-        if row.label in QA_FIXTURE_LABELS:
+        if row.label in qa_fixture_labels:
             out.append(
                 Classified(
                     key=key,
@@ -618,8 +625,37 @@ def _pair(identity: Any) -> tuple[str, str] | None:
     return None
 
 
+def already_taken_ids(db_path: Path) -> set[str]:
+    """Canonical IDs that exist already — worn by a row, or retired forever.
+
+    Once Tasks 1-4 deploy, patients can be created with canonical IDs before the
+    window opens. Allocating only against the rows being migrated would hand a
+    second patient an ID somebody is already wearing, and the uniqueness check
+    would not see it because it only compares inside the migrate set.
+    """
+    taken: set[str] = set()
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        for (label,) in conn.execute("SELECT label FROM patients"):
+            if parse_canonical_patient_id(label):
+                taken.add(label)
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "patient_id_reservations" in tables:
+            for (reserved,) in conn.execute(
+                "SELECT patient_id FROM patient_id_reservations"
+            ):
+                taken.add(str(reserved))
+    finally:
+        conn.close()
+    return taken
+
+
 def allocate_new_ids(
     entries: list[Classified],
+    taken: set[str] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Give every migrating patient its canonical ID, in a stable order.
 
@@ -636,13 +672,30 @@ def allocate_new_ids(
 
     mapping: dict[str, str] = {}
     problems: list[str] = []
+    # Seeded with every ID already worn or already retired, so a patient who
+    # arrived canonical before the window cannot be collided into.
+    claimed: set[str] = set(taken or ())
+
     for (first, last, birthdate), group in sorted(collisions.items()):
-        # Oldest patient keeps the unsuffixed ID.
-        for ordinal, entry in enumerate(
-            sorted(group, key=lambda e: (e.evidence.get("legacy_ordinal", 0), e.key)),
-            start=1,
+        # Lowest legacy ordinal first: `-0` was issued before `-1` for the same
+        # birthdate, so it keeps the unsuffixed ID. Sorted on the ordinal rather
+        # than created_at because the ordinal is what the legacy allocator
+        # actually incremented, and it makes the mapping stable across runs.
+        for entry in sorted(
+            group, key=lambda e: (e.evidence.get("legacy_ordinal", 0), e.key)
         ):
-            new_id = canonical_patient_id(first, last, birthdate, ordinal=ordinal)
+            ordinal = 1
+            while True:
+                new_id = canonical_patient_id(first, last, birthdate, ordinal=ordinal)
+                if new_id not in claimed:
+                    break
+                ordinal += 1
+                if ordinal > 999:
+                    problems.append(
+                        f"every ordinal up to 999 is taken for {first}{last}_{birthdate}"
+                    )
+                    break
+            claimed.add(new_id)
             entry.new_id = new_id
             if entry.label:
                 if mapping.get(entry.label) not in (None, new_id):
@@ -890,7 +943,9 @@ def estimate_window(
     remote_bytes = sum(int(item.get("size") or 0) for item in remote_items)
     mb = 1024 * 1024
 
-    hash_minutes = (local_bytes / mb) / ASSUMED_HASH_THROUGHPUT_MB_S / 60
+    # Every deliverable is hashed at plan time and again after it moves, so
+    # the bytes are read twice.
+    hash_minutes = (local_bytes / mb) * 2 / ASSUMED_HASH_THROUGHPUT_MB_S / 60
     # Copy up, read back to verify: the bytes cross the link twice.
     remote_minutes = (remote_bytes / mb) * 2 / ASSUMED_REMOTE_THROUGHPUT_MB_S / 60
     # Renames are metadata operations; the cost is per file, not per byte.
@@ -924,15 +979,24 @@ def estimate_window(
 
 
 class Journal:
-    """One line per finished patient, flushed before the next one starts.
+    """Two lines per patient: one before any writing, one after it finishes.
 
-    A crash costs at most the patient in flight. A resumed run reads this,
-    skips what is done, and so cannot rename a file twice or push a second copy
-    of a deliverable under a fresh version number.
+    The intent line is what makes a resumed run safe. A patient's database label
+    moves to the canonical ID before the folder does, so a crash in between
+    leaves a row that already looks migrated — on the next run it classifies as
+    ``already_canonical``, drops out of the mapping, and is never revisited. Its
+    deliverables keep their old names inside the new folder, its conversation
+    stays filed under the retired ID, and the run reports success. A crash that
+    leaves a patient half-migrated is recoverable; a resumed run that says it
+    finished is not, because nobody goes looking.
+
+    So the intent line is written first and carries everything needed to finish
+    the patient without re-deriving it from a database that has already moved.
     """
 
     def __init__(self, path: Path):
         self.path = path
+        self.started: dict[str, dict[str, Any]] = {}
         self.done: dict[str, dict[str, Any]] = {}
         if path.is_file():
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -943,11 +1007,23 @@ class Journal:
                     record = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(record, dict) and record.get("old_id"):
+                if not isinstance(record, dict) or not record.get("old_id"):
+                    continue
+                if record.get("kind") == "started":
+                    self.started[record["old_id"]] = record
+                else:
                     self.done[record["old_id"]] = record
 
     def is_done(self, old_id: str) -> bool:
         return old_id in self.done
+
+    def unfinished(self) -> list[dict[str, Any]]:
+        """Patients whose work began and never reported finishing."""
+        return [
+            record
+            for old_id, record in sorted(self.started.items())
+            if old_id not in self.done
+        ]
 
     def record(self, entry: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -955,7 +1031,10 @@ class Journal:
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        self.done[entry["old_id"]] = entry
+        if entry.get("kind") == "started":
+            self.started[entry["old_id"]] = entry
+        else:
+            self.done[entry["old_id"]] = entry
 
 
 # --------------------------------------------------------------------------- #
@@ -1038,11 +1117,20 @@ def _under_production(path: Path) -> bool:
 
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     portal_root = Path(args.portal_root)
+    # Overridable so a fixture world never has to wear real patients' labels.
+    qa_fixture_labels = frozenset(
+        getattr(args, "qa_fixture_labels", None) or QA_FIXTURE_LABELS
+    )
+    qa_candidate_labels = frozenset(
+        getattr(args, "qa_candidate_labels", None) or QA_CANDIDATE_LABELS
+    )
     rows = read_patient_rows(Path(args.db))
     classified = classify_patient_rows(
         rows,
         portal_root=portal_root,
         qa_candidates_confirmed=bool(getattr(args, "qa_candidates_confirmed", False)),
+        qa_fixture_labels=qa_fixture_labels,
+        qa_candidate_labels=qa_candidate_labels,
     )
     sync_state = read_sync_state(portal_root / ".qeeg_portal_sync_state.json")
     titles = read_conversation_titles(Path(args.conversations_dir))
@@ -1174,7 +1262,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     f"person"
                 )
 
-    mapping, collisions = allocate_new_ids(classified)
+    mapping, collisions = allocate_new_ids(classified, already_taken_ids(Path(args.db)))
 
     # Portal folders with no database row at all still have to be accounted for.
     known = {e.label for e in classified if e.label}
@@ -1271,7 +1359,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
     blockers: list[str] = []
     for entry in unresolved:
-        if entry.label in QA_CANDIDATE_LABELS:
+        if entry.label in qa_candidate_labels:
             entry.reason = (
                 "possibly the owner's own test data rather than a clinic patient "
                 "(he has described this date as his test file before) — "
@@ -1510,12 +1598,33 @@ def remove_qa_fixture(
     conn: sqlite3.Connection,
     portal_root: Path,
     labels: Iterable[str] = QA_FIXTURE_LABELS,
+    *,
+    bundle_dir: Path | None = None,
 ) -> dict[str, int]:
-    """Take the QA records off the active roster. Bundle them first."""
+    """Take the QA records off the active roster, keeping the files first.
+
+    A list of digests is not a rollback bundle. The database rows are captured
+    in full and are genuinely recoverable; the portal artifacts have to be
+    copied somewhere before the folder is removed, or all that survives a
+    deletion is proof of what used to be there.
+    """
     import shutil
 
-    removed = {"patients": 0, "rows": 0, "folders": 0}
+    if bundle_dir is None:
+        raise MigrationStop(
+            "Refusing to delete QA portal folders with nowhere to keep their "
+            "files. Pass --rollback-bundle so the bytes survive the removal."
+        )
+
+    removed = {"patients": 0, "rows": 0, "folders": 0, "files_kept": 0}
     for label in sorted(labels):
+        folder = portal_root / label
+        if folder.is_dir():
+            keep = Path(bundle_dir) / "qa-fixture-artifacts" / label
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            if not keep.exists():
+                shutil.copytree(folder, keep)
+            removed["files_kept"] += sum(1 for p in keep.rglob("*") if p.is_file())
         uuids = [
             row[0]
             for row in conn.execute("SELECT id FROM patients WHERE label = ?", (label,))
@@ -1582,6 +1691,13 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
 
     portal_root = Path(args.portal_root)
     assert_schema_ready(Path(args.db))
+    if report.get("qa_fixture_labels") and not args.rollback_bundle:
+        print(
+            "--apply removes the QA records, so it needs --rollback-bundle to "
+            "copy their portal files into first.",
+            file=sys.stderr,
+        )
+        return 1
     journal = Journal(Path(args.journal or "migration-journal.jsonl"))
     sync_paths = [
         portal_root / name
@@ -1622,12 +1738,40 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
             print(f"  reconciled duplicate {entry['uuid'][:8]} -> "
                   f"{entry['survivor_uuid'][:8]} {moved}")
 
+        # Work still owed from a previous run: its database label already moved,
+        # so build_report no longer sees it as a patient to migrate. Only the
+        # journal knows it was left half-done.
+        work: list[tuple[str, str, dict[str, Any]]] = []
+        for record in journal.unfinished():
+            work.append((record["old_id"], record["new_id"], record))
+            print(f"  {record['old_id']}: unfinished from an earlier run, resuming")
+        planned = {old for old, _, _ in work}
         for old_id, new_id in sorted(report["mapping"].items()):
+            if old_id not in planned:
+                work.append((old_id, new_id, by_label.get(old_id) or {}))
+
+        for old_id, new_id, entry in work:
             if journal.is_done(old_id):
                 print(f"  {old_id}: already done, skipping")
                 continue
             # One patient's failure must not abandon the rest of the work.
             try:
+                uuid = entry.get("uuid")
+                initials = entry.get("initials") or ("", "")
+                # Written before anything else, and carrying everything needed
+                # to finish this patient from a database whose label has already
+                # moved. Without it a crash in the next few lines is invisible.
+                if old_id not in journal.started:
+                    journal.record(
+                        {
+                            "old_id": old_id,
+                            "new_id": new_id,
+                            "kind": "started",
+                            "uuid": uuid,
+                            "birthdate": entry.get("birthdate") or "",
+                            "initials": list(initials),
+                        }
+                    )
                 plan = patient_rekey.plan_patient_rekey(
                     old_id,
                     new_id,
@@ -1638,13 +1782,9 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
                     if args.pipeline_jobs_dir
                     else None,
                 )
-                entry = by_label.get(old_id) or {}
-                uuid = entry.get("uuid")
-                initials = entry.get("initials") or ("", "")
                 # The reservation is the whole point of the identity module: an
                 # ID that is only worn by a live row becomes reissuable the
-                # moment that row is deleted or relabelled. Write it first, so a
-                # crash after this leaves the ID retired rather than free.
+                # moment that row is deleted or relabelled.
                 reserve_migrated_id(
                     Path(args.db),
                     new_id,
@@ -1683,7 +1823,10 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
 
         if not journal.is_done("qa-fixture-removed"):
             removed = remove_qa_fixture(
-                conn, portal_root, report.get("qa_fixture_labels") or ()
+                conn,
+                portal_root,
+                report.get("qa_fixture_labels") or (),
+                bundle_dir=Path(args.rollback_bundle) if args.rollback_bundle else None,
             )
             journal.record(
                 {"old_id": "qa-fixture-removed", "kind": "qa_fixture_removed",
@@ -1693,7 +1836,15 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
     finally:
         conn.close()
 
-    worklist = Path(args.journal or ".").parent / "remote-rekey-worklist.json"
+    # Beside the journal, or beside the rollback bundle — never silently in
+    # whatever directory the operator happened to be standing in.
+    worklist_dir = (
+        Path(args.journal).parent
+        if args.journal
+        else Path(args.rollback_bundle or portal_root)
+    )
+    worklist_dir.mkdir(parents=True, exist_ok=True)
+    worklist = worklist_dir / "remote-rekey-worklist.json"
     worklist.write_text(
         json.dumps(report["remote_manifest"], indent=2), encoding="utf-8"
     )
@@ -1725,6 +1876,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pipeline-jobs-dir", default="")
     parser.add_argument("--pending-uploads-dir", default="")
     parser.add_argument(
+        "--rollback-bundle",
+        default="",
+        help=(
+            "Directory the offline rollback bundle lives in. Required by "
+            "--apply: the QA records' portal files are copied here before "
+            "they are removed."
+        ),
+    )
+    parser.add_argument(
         "--qa-candidates-confirmed",
         action="store_true",
         help=(
@@ -1755,7 +1915,22 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        for label, path in (("database", args.db), ("portal root", args.portal_root)):
+        # Every path this run can write to, not just the two obvious ones.
+        # --conversations-dir defaults to a production root, so a fixtures apply
+        # that named only --db and --portal-root used to sail through the guard
+        # and then rewrite the clinic's live conversation files.
+        for label, path in (
+            ("database", args.db),
+            ("portal root", args.portal_root),
+            ("conversations directory", args.conversations_dir),
+            ("pipeline jobs directory", args.pipeline_jobs_dir),
+            ("pending uploads directory", args.pending_uploads_dir),
+            ("journal", args.journal),
+            ("rollback bundle", args.rollback_bundle),
+            ("manifest", args.manifest_out),
+        ):
+            if not path:
+                continue
             if _under_production(Path(path)) and not args.this_is_the_scheduled_cutover:
                 print(
                     f"Refusing to --apply against the live {label} at {path}. "

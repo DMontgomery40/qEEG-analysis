@@ -149,46 +149,46 @@ def world(tmp_path: Path):
     portal.mkdir(parents=True)
     db = tmp_path / "data" / "app.db"
 
-    _folder(portal, "01-19-1966-0", initials=("P", "G"),
+    _folder(portal, "07-07-1907-0", initials=("P", "G"),
             files=["PG_femal_TBI_Redacted.pdf",
-                   "01-19-1966-0__patient-facing__v1__2026-01-16.pdf"])
-    _folder(portal, "06-28-1977-0", files=["06-28-1977-0__patient-facing__v1__2026-07-01.pdf"])
-    _folder(portal, "12-11-1963-0", initials=("B", "T"),
-            files=["12-11-1963-0__patient-facing__v1__2026-06-22.pdf"])
-    _folder(portal, "08-10-1989-0", initials=("D", "K"),
+                   "07-07-1907-0__patient-facing__v1__2026-01-16.pdf"])
+    _folder(portal, "10-10-1910-0", files=["10-10-1910-0__patient-facing__v1__2026-07-01.pdf"])
+    _folder(portal, "08-08-1908-0", initials=("B", "T"),
+            files=["08-08-1908-0__patient-facing__v1__2026-06-22.pdf"])
+    _folder(portal, "09-09-1909-0", initials=("D", "K"),
             files=["DK_20Tx_toxic-brain-injury_Redacted.pdf"])
-    _folder(portal, "03-05-2010-0", initials=("R", "W"),
-            files=["03-05-2010-0__DK_20Tx_toxic-brain-injury__v1__2026-05-09.pdf",
-                   "03-05-2010-0__patient-facing__v1__2026-05-09.pdf"])
+    _folder(portal, "11-11-1911-0", initials=("R", "W"),
+            files=["11-11-1911-0__DK_20Tx_toxic-brain-injury__v1__2026-05-09.pdf",
+                   "11-11-1911-0__patient-facing__v1__2026-05-09.pdf"])
 
     _make_db(
         db,
         [
             {"uuid": "aaaaaaaa-0000-0000-0000-000000000001",
-             "label": "01-19-1966-0", "created_at": "2026-01-13",
+             "label": "07-07-1907-0", "created_at": "2026-01-13",
              "reports": ["data/reports/a/original.pdf"], "runs": 37, "files": 1},
             {"uuid": "bbbbbbbb-0000-0000-0000-000000000002",
-             "label": "01-19-1966-0", "created_at": "2026-01-14",
+             "label": "07-07-1907-0", "created_at": "2026-01-14",
              "reports": ["data/reports/b/original.pdf"], "runs": 1, "files": 3},
             {"uuid": "cccccccc-0000-0000-0000-000000000003",
-             "label": "06-28-1977-0", "reports": ["data/reports/c/original.pdf"]},
+             "label": "10-10-1910-0", "reports": ["data/reports/c/original.pdf"]},
             {"uuid": "dddddddd-0000-0000-0000-000000000004",
-             "label": "12-11-1963-0", "reports": ["data/reports/d/original.pdf"]},
+             "label": "08-08-1908-0", "reports": ["data/reports/d/original.pdf"]},
             {"uuid": "eeeeeeee-0000-0000-0000-000000000005",
-             "label": "08-10-1989-0", "reports": ["data/reports/e/original.pdf"]},
+             "label": "09-09-1909-0", "reports": ["data/reports/e/original.pdf"]},
             {"uuid": "ffffffff-0000-0000-0000-000000000006",
-             "label": "03-05-2010-0", "reports": ["data/reports/f/original.pdf"]},
+             "label": "11-11-1911-0", "reports": ["data/reports/f/original.pdf"]},
             {"uuid": "99999999-0000-0000-0000-000000000007",
-             "label": "02-29-1984-0", "reports": ["data/reports/g/original.pdf"]},
+             "label": "12-12-1912-0", "reports": ["data/reports/g/original.pdf"]},
             {"uuid": "88888888-0000-0000-0000-000000000008",
-             "label": "08-10-1989-1",
+             "label": "09-09-1909-1",
              "reports": ["/private/var/pytest-of-davidmontgomery/pytest-15/t/report.pdf"]},
             {"uuid": "77777777-0000-0000-0000-000000000009",
              "label": "diag-175b76e4", "reports": ["data/reports/h/original.pdf"]},
             # An unpadded twin holding a byte-identical copy of PG's report:
             # answerable from the bytes, so it should reduce to a confirmation.
             {"uuid": "66666666-0000-0000-0000-000000000010",
-             "label": "1-19-1966",
+             "label": "7-7-1907",
              "reports": ["data/reports/i/original.pdf"],
              "report_names": ["PG_femal_TBI_Redacted.pdf"],
              "report_bytes": ["%PDF-1.4 aaaaaaaa-0000-0000-0000-000000000001-0"]},
@@ -198,8 +198,8 @@ def world(tmp_path: Path):
 
     jobs = tmp_path / "pipeline_jobs"
     jobs.mkdir()
-    (jobs / "01-19-1966-0.json").write_text(
-        json.dumps({"patient_id": "01-19-1966-0", "status": "complete"})
+    (jobs / "07-07-1907-0.json").write_text(
+        json.dumps({"patient_id": "07-07-1907-0", "status": "complete"})
     )
 
     convs = tmp_path / "conversations"
@@ -208,7 +208,7 @@ def world(tmp_path: Path):
         json.dumps(
             {
                 "id": "conv_1",
-                "patient_label": "12-11-1963-0",
+                "patient_label": "08-08-1908-0",
                 "title": "L, Connor final qeeg.pdf",
                 "messages": [{"role": "user", "content": "hello"}],
                 "artifacts": [],
@@ -220,19 +220,19 @@ def world(tmp_path: Path):
         json.dumps(
             {
                 "patients": {
-                    "01-19-1966-0": {
+                    "07-07-1907-0": {
                         "identity": {"schemaVersion": 2, "firstInitial": "P",
                                      "lastInitial": "G"}
                     },
                 },
                 "files": {
-                    "01-19-1966-0/01-19-1966-0__patient-facing__v1__2026-01-16.pdf": {
+                    "07-07-1907-0/07-07-1907-0__patient-facing__v1__2026-01-16.pdf": {
                         "size": 1024,
                         "version": 1,
                         "uploadedAt": 1700000000,
-                        "logicalName": "01-19-1966-0__patient-facing__v1__2026-01-16.pdf",
+                        "logicalName": "07-07-1907-0__patient-facing__v1__2026-01-16.pdf",
                         "remoteFileKey":
-                            "01-19-1966-0__patient-facing__v1__2026-01-16.pdf",
+                            "07-07-1907-0__patient-facing__v1__2026-01-16.pdf",
                     }
                 },
             }
@@ -251,6 +251,12 @@ def world(tmp_path: Path):
         pending_uploads_dir="",
         this_is_the_scheduled_cutover=False,
         qa_candidates_confirmed=False,
+        # Synthetic label sets: a fixture world must never wear a real
+        # patient's ID, or an --apply pointed at a live directory would
+        # match one.
+        qa_fixture_labels=["12-12-1912-0"],
+        qa_candidate_labels=["03-03-1903-0", "13-13-1913-0"],
+        rollback_bundle=str(tmp_path / "rollback-bundle"),
         apply=False,
         dry_run=True,
         window_confirmed=True,
@@ -277,8 +283,8 @@ def test_a_row_written_by_a_test_run_is_never_migrated(world):
         e for e in report["classified"]
         if e["bucket"] == migrator.BUCKET_TEST_POLLUTION
     ]
-    assert [e["label"] for e in polluted] == ["08-10-1989-1"]
-    assert "08-10-1989-1" not in report["mapping"]
+    assert [e["label"] for e in polluted] == ["09-09-1909-1"]
+    assert "09-09-1909-1" not in report["mapping"]
 
 
 def test_the_qa_fixture_is_carved_out_of_the_production_mapping(world):
@@ -287,10 +293,10 @@ def test_the_qa_fixture_is_carved_out_of_the_production_mapping(world):
     fixture = [
         e for e in report["classified"] if e["bucket"] == migrator.BUCKET_QA_FIXTURE
     ]
-    assert [e["label"] for e in fixture] == ["02-29-1984-0"]
+    assert [e["label"] for e in fixture] == ["12-12-1912-0"]
     # Bundled for rollback, but never given a canonical ID or a reservation.
-    assert "02-29-1984-0" not in report["mapping"]
-    assert "DM_02-29-1984" not in report["mapping"].values()
+    assert "12-12-1912-0" not in report["mapping"]
+    assert "DM_12-12-1912" not in report["mapping"].values()
 
 
 def test_a_scratch_row_is_not_mistaken_for_a_patient(world):
@@ -313,7 +319,7 @@ def test_the_duplicate_label_names_the_survivor_that_holds_the_work(world):
     assert dupes[0]["uuid"].startswith("bbbbbbbb")
     assert dupes[0]["survivor_uuid"].startswith("aaaaaaaa")
     # And the label still migrates exactly once.
-    assert report["mapping"]["01-19-1966-0"] == "PG_01-19-1966"
+    assert report["mapping"]["07-07-1907-0"] == "PG_07-07-1907"
 
 
 # --------------------------------------------------------------------------- #
@@ -325,42 +331,42 @@ def test_a_folder_with_no_initials_blocks_the_run_by_name(world):
     report = migrator.build_report(world)
 
     assert any(
-        b.startswith("06-28-1977-0:") and "no initials on file" in b
+        b.startswith("10-10-1910-0:") and "no initials on file" in b
         for b in report["blockers"]
     )
-    assert "06-28-1977-0" not in report["mapping"]
+    assert "10-10-1910-0" not in report["mapping"]
 
 
 def test_placeholder_initials_are_caught_by_the_name_on_the_report(world):
     report = migrator.build_report(world)
 
-    blocker = next(b for b in report["blockers"] if b.startswith("12-11-1963-0:"))
+    blocker = next(b for b in report["blockers"] if b.startswith("08-08-1908-0:"))
     assert "BT" in blocker and "L, Connor final qeeg.pdf" in blocker
     assert "placeholder" in blocker
-    assert "12-11-1963-0" not in report["mapping"]
+    assert "08-08-1908-0" not in report["mapping"]
 
 
 def test_initials_written_into_the_filename_are_not_a_false_alarm(world):
     report = migrator.build_report(world)
 
     # DK_20Tx… agrees with the stored DK by construction.
-    assert not any(b.startswith("08-10-1989-0:") for b in report["blockers"])
-    assert report["mapping"]["08-10-1989-0"] == "DK_08-10-1989"
+    assert not any(b.startswith("09-09-1909-0:") for b in report["blockers"])
+    assert report["mapping"]["09-09-1909-0"] == "DK_09-09-1909"
 
 
 def test_a_folder_holding_another_patients_reports_stops_the_run(world):
     report = migrator.build_report(world)
 
-    blocker = next(b for b in report["blockers"] if b.startswith("03-05-2010-0:"))
-    assert "08-10-1989-0" in blocker and "DK" in blocker
-    assert "03-05-2010-0" not in report["mapping"]
-    assert report["mixed_patient_folders"][0]["patient_id"] == "03-05-2010-0"
+    blocker = next(b for b in report["blockers"] if b.startswith("11-11-1911-0:"))
+    assert "09-09-1909-0" in blocker and "DK" in blocker
+    assert "11-11-1911-0" not in report["mapping"]
+    assert report["mixed_patient_folders"][0]["patient_id"] == "11-11-1911-0"
 
 
 def test_a_clean_patient_gets_an_unsuffixed_canonical_id(world):
     report = migrator.build_report(world)
 
-    assert report["mapping"]["01-19-1966-0"] == "PG_01-19-1966"
+    assert report["mapping"]["07-07-1907-0"] == "PG_07-07-1907"
 
 
 def test_the_legacy_ordinal_is_never_carried_across():
@@ -412,9 +418,9 @@ def test_the_remote_manifest_carries_version_and_upload_date_across(world):
     report = migrator.build_report(world)
 
     item = next(
-        i for i in report["remote_manifest"] if i["patientIdOld"] == "01-19-1966-0"
+        i for i in report["remote_manifest"] if i["patientIdOld"] == "07-07-1907-0"
     )
-    assert item["newFileKey"] == "PG_01-19-1966__patient-facing__v1__2026-01-16.pdf"
+    assert item["newFileKey"] == "PG_07-07-1907__patient-facing__v1__2026-01-16.pdf"
     assert item["version"] == 1
     assert item["uploadedAt"] == 1700000000
 
@@ -453,8 +459,8 @@ def _unblock(world):
     """Supply the identities the dry run asks for, so apply has something to do."""
     portal = Path(world.portal_root)
     for patient_id, initials in (
-        ("06-28-1977-0", ("J", "M")),
-        ("12-11-1963-0", ("C", "L")),
+        ("10-10-1910-0", ("J", "M")),
+        ("08-08-1908-0", ("C", "L")),
     ):
         meta = json.loads((portal / patient_id / "$meta.json").read_text()) if (
             portal / patient_id / "$meta.json"
@@ -468,7 +474,7 @@ def _unblock(world):
     # The mixed-patient folder is a decision, not something apply can invent.
     import shutil
 
-    shutil.rmtree(portal / "03-05-2010-0")
+    shutil.rmtree(portal / "11-11-1911-0")
     conn = sqlite3.connect(world.db)
     conn.execute("DELETE FROM reports WHERE patient_id LIKE 'ffffffff%'")
     conn.execute("DELETE FROM patients WHERE id LIKE 'ffffffff%'")
@@ -494,18 +500,18 @@ def test_apply_renames_the_world_and_the_journal_records_each_patient(world):
     assert migrator.run_apply(world, report) == 0
 
     portal = Path(world.portal_root)
-    assert (portal / "PG_01-19-1966").is_dir()
-    assert not (portal / "01-19-1966-0").exists()
+    assert (portal / "PG_07-07-1907").is_dir()
+    assert not (portal / "07-07-1907-0").exists()
     assert (
-        portal / "PG_01-19-1966" / "PG_01-19-1966__patient-facing__v1__2026-01-16.pdf"
+        portal / "PG_07-07-1907" / "PG_07-07-1907__patient-facing__v1__2026-01-16.pdf"
     ).is_file()
     # The source PDF that never carried the ID keeps its own name.
-    assert (portal / "PG_01-19-1966" / "PG_femal_TBI_Redacted.pdf").is_file()
+    assert (portal / "PG_07-07-1907" / "PG_femal_TBI_Redacted.pdf").is_file()
 
     conn = sqlite3.connect(world.db)
     labels = {r[0] for r in conn.execute("SELECT label FROM patients")}
     # The duplicate row is gone and its work moved to the survivor.
-    assert "PG_01-19-1966" in labels
+    assert "PG_07-07-1907" in labels
     survivor_runs = conn.execute(
         "SELECT COUNT(*) FROM runs WHERE patient_id = ?",
         ("aaaaaaaa-0000-0000-0000-000000000001",),
@@ -514,7 +520,7 @@ def test_apply_renames_the_world_and_the_journal_records_each_patient(world):
     conn.close()
 
     journal = Journal_lines(Path(world.journal))
-    assert any(j.get("new_id") == "PG_01-19-1966" for j in journal)
+    assert any(j.get("new_id") == "PG_07-07-1907" for j in journal)
 
 
 def Journal_lines(path: Path) -> list[dict]:
@@ -637,7 +643,7 @@ def test_apply_refuses_a_database_the_new_engine_has_not_upgraded(tmp_path: Path
     """Writing canonical labels into the old shape leaves every patient with no
     reservation and no identity — the exact state the cutover exists to end."""
     db = tmp_path / "old.db"
-    _make_db(db, [{"uuid": "a" * 8, "label": "01-19-1966-0"}], upgraded=False)
+    _make_db(db, [{"uuid": "a" * 8, "label": "07-07-1907-0"}], upgraded=False)
 
     with pytest.raises(migrator.MigrationStop, match="patient_id_reservations"):
         migrator.assert_schema_ready(db)
@@ -651,16 +657,16 @@ def test_migrated_patients_get_a_reservation_and_their_identity_columns(world):
     conn = sqlite3.connect(world.db)
     reserved = {r[0] for r in conn.execute("SELECT patient_id FROM patient_id_reservations")}
     # Without this the ID becomes reissuable the moment the row is deleted.
-    assert "PG_01-19-1966" in reserved
-    assert "DK_08-10-1989" in reserved
+    assert "PG_07-07-1907" in reserved
+    assert "DK_09-09-1909" in reserved
 
     row = conn.execute(
         "SELECT birthdate, first_initial, last_initial FROM patients WHERE label = ?",
-        ("PG_01-19-1966",),
+        ("PG_07-07-1907",),
     ).fetchone()
     # A migrated patient with NULL identity sends the next intake through name
     # matching with nothing to match.
-    assert row == ("01-19-1966", "P", "G")
+    assert row == ("07-07-1907", "P", "G")
     conn.close()
 
 
@@ -668,7 +674,7 @@ def test_the_qa_fixture_is_bundled_before_it_is_removed(world):
     report = migrator.build_report(world)
 
     bundle = report["qa_fixture_bundle"]
-    assert [p["label"] for p in bundle["patients"]] == ["02-29-1984-0"]
+    assert [p["label"] for p in bundle["patients"]] == ["12-12-1912-0"]
     assert bundle["reports"], "its rows have to be recoverable from the bundle"
 
     _unblock(world)
@@ -676,7 +682,7 @@ def test_the_qa_fixture_is_bundled_before_it_is_removed(world):
 
     conn = sqlite3.connect(world.db)
     remaining = conn.execute(
-        "SELECT COUNT(*) FROM patients WHERE label = ?", ("02-29-1984-0",)
+        "SELECT COUNT(*) FROM patients WHERE label = ?", ("12-12-1912-0",)
     ).fetchone()[0]
     conn.close()
     assert remaining == 0
@@ -687,10 +693,10 @@ def test_the_pipeline_job_file_moves_with_the_patient(world):
     assert migrator.run_apply(world, migrator.build_report(world)) == 0
 
     jobs = Path(world.pipeline_jobs_dir)
-    assert not (jobs / "01-19-1966-0.json").exists()
-    moved = json.loads((jobs / "PG_01-19-1966.json").read_text())
+    assert not (jobs / "07-07-1907-0.json").exists()
+    moved = json.loads((jobs / "PG_07-07-1907.json").read_text())
     # The worker keys its status on this; left behind it reports on a dead ID.
-    assert moved["patient_id"] == "PG_01-19-1966"
+    assert moved["patient_id"] == "PG_07-07-1907"
     assert moved["status"] == "complete"
 
 
@@ -742,10 +748,10 @@ def test_placeholder_initials_come_with_a_correction_to_confirm(world):
     report = migrator.build_report(world)
 
     finding = next(
-        f for f in report["identity_findings"] if f["patient_id"] == "12-11-1963-0"
+        f for f in report["identity_findings"] if f["patient_id"] == "08-08-1908-0"
     )
     assert [p["initials"] for p in finding["proposed"]] == ["CL", "LC"]
-    blocker = next(b for b in report["blockers"] if b.startswith("12-11-1963-0:"))
+    blocker = next(b for b in report["blockers"] if b.startswith("08-08-1908-0:"))
     assert "CL" in blocker and "confirm" in blocker
 
 
@@ -766,20 +772,20 @@ def test_a_candidate_qa_row_is_not_removed_without_the_owner_saying_so(world):
     conn = sqlite3.connect(world.db)
     conn.execute(
         "INSERT INTO patients (id, label, notes, created_at, updated_at) "
-        "VALUES ('qa-cand', '01-01-1983-0', '', '2026-01-01', '2026-01-01')"
+        "VALUES ('qa-cand', '03-03-1903-0', '', '2026-01-01', '2026-01-01')"
     )
     conn.commit()
     conn.close()
 
     report = migrator.build_report(world)
-    blocker = next(b for b in report["blockers"] if b.startswith("01-01-1983-0:"))
+    blocker = next(b for b in report["blockers"] if b.startswith("03-03-1903-0:"))
     assert "is this your test data?" in blocker
-    assert "01-01-1983-0" not in report["mapping"]
+    assert "03-03-1903-0" not in report["mapping"]
 
     world.qa_candidates_confirmed = True
     confirmed = migrator.build_report(world)
-    assert not any(b.startswith("01-01-1983-0:") for b in confirmed["blockers"])
-    assert "01-01-1983-0" not in confirmed["mapping"]
+    assert not any(b.startswith("03-03-1903-0:") for b in confirmed["blockers"])
+    assert "03-03-1903-0" not in confirmed["mapping"]
 
 
 def test_the_share_folder_readme_stops_teaching_the_retired_format(tmp_path: Path):
@@ -805,11 +811,11 @@ def test_an_unpadded_twin_reduces_to_a_confirmation_when_the_bytes_agree(world):
     """Do not hand the operator a question the data already answers."""
     report = migrator.build_report(world)
 
-    blocker = next(b for b in report["blockers"] if b.startswith("1-19-1966:"))
-    assert "byte-identical to one already filed under 01-19-1966-0" in blocker
+    blocker = next(b for b in report["blockers"] if b.startswith("7-7-1907:"))
+    assert "byte-identical to one already filed under 07-07-1907-0" in blocker
     assert "confirmation only" in blocker
     entry = next(
-        e for e in report["classified"] if e["label"] == "1-19-1966"
+        e for e in report["classified"] if e["label"] == "7-7-1907"
     )
     assert entry["evidence"]["report_byte_match"]["conclusive"] is True
 
@@ -820,7 +826,7 @@ def test_two_patients_sharing_initials_are_both_named_not_one_of_them(world):
     attributed to whichever happened to be classified last — on the one
     decision where files get moved between patients."""
     portal = Path(world.portal_root)
-    # A second patient with the same initials as 12-11-1963-0's neighbour.
+    # A second patient with the same initials as 08-08-1908-0's neighbour.
     _folder(portal, "01-02-1970-0", initials=("S", "F"), files=["SF_one.pdf"])
     _folder(portal, "03-04-1970-0", initials=("S", "F"), files=["SF_two.pdf"])
     _folder(portal, "05-06-1990-0", initials=("Q", "Z"),
@@ -859,7 +865,7 @@ def test_a_confirmed_qa_candidate_is_bundled_and_actually_removed(world):
     conn = sqlite3.connect(world.db)
     conn.execute(
         "INSERT INTO patients (id, label, notes, created_at, updated_at) "
-        "VALUES ('qa-cand', '01-01-1983-0', '', '2026-01-01', '2026-01-01')"
+        "VALUES ('qa-cand', '03-03-1903-0', '', '2026-01-01', '2026-01-01')"
     )
     conn.execute(
         "INSERT INTO reports (id, patient_id, filename, stored_path) "
@@ -871,9 +877,9 @@ def test_a_confirmed_qa_candidate_is_bundled_and_actually_removed(world):
     _unblock(world)
 
     report = migrator.build_report(world)
-    assert set(report["qa_fixture_labels"]) == {"02-29-1984-0", "01-01-1983-0"}
+    assert set(report["qa_fixture_labels"]) == {"12-12-1912-0", "03-03-1903-0"}
     bundled = {p["label"] for p in report["qa_fixture_bundle"]["patients"]}
-    assert bundled == {"02-29-1984-0", "01-01-1983-0"}
+    assert bundled == {"12-12-1912-0", "03-03-1903-0"}
     assert any(
         r["filename"] == "synthetic.pdf"
         for r in report["qa_fixture_bundle"]["reports"]
@@ -883,7 +889,7 @@ def test_a_confirmed_qa_candidate_is_bundled_and_actually_removed(world):
 
     conn = sqlite3.connect(world.db)
     left = conn.execute(
-        "SELECT COUNT(*) FROM patients WHERE label IN ('01-01-1983-0','02-29-1984-0')"
+        "SELECT COUNT(*) FROM patients WHERE label IN ('03-03-1903-0','12-12-1912-0')"
     ).fetchone()[0]
     orphan_reports = conn.execute(
         "SELECT COUNT(*) FROM reports WHERE patient_id = 'qa-cand'"
@@ -891,3 +897,128 @@ def test_a_confirmed_qa_candidate_is_bundled_and_actually_removed(world):
     conn.close()
     assert left == 0
     assert orphan_reports == 0
+
+
+# --------------------------------------------------------------------------- #
+# Crashing, resuming, and the guard on live data
+# --------------------------------------------------------------------------- #
+
+
+def test_a_crash_between_the_relabel_and_the_folder_move_is_finished_on_resume(
+    world, monkeypatch
+):
+    """The database label moves before the folder does. A crash in between
+    leaves a row that already looks migrated: on the next run it classifies
+    already_canonical, drops out of the mapping, and is never revisited — its
+    deliverables keep their old names inside the new folder and the run reports
+    success. Only the journal knows the work was left half-done."""
+    _unblock(world)
+    report = migrator.build_report(world)
+
+    real_apply = migrator.patient_rekey.apply_patient_rekey
+    crashed = {"done": False}
+
+    def crash_on_the_first_patient(plan, **kwargs):
+        if not crashed["done"] and plan.old_id == "07-07-1907-0":
+            crashed["done"] = True
+            # Move the folder, then die before the journal line is written.
+            if plan.folder_move:
+                plan.folder_move[0].rename(plan.folder_move[1])
+            raise RuntimeError("power cut")
+        return real_apply(plan, **kwargs)
+
+    monkeypatch.setattr(
+        migrator.patient_rekey, "apply_patient_rekey", crash_on_the_first_patient
+    )
+    assert migrator.run_apply(world, report) == 1
+
+    portal = Path(world.portal_root)
+    stranded = sorted(
+        p.name for p in (portal / "PG_07-07-1907").iterdir()
+        if p.is_file() and p.name.startswith("07-07-1907-0")
+    )
+    assert stranded, "the crash should leave legacy-named files behind"
+
+    # Resume: build_report now sees a canonical label and no longer offers it.
+    monkeypatch.setattr(migrator.patient_rekey, "apply_patient_rekey", real_apply)
+    resumed = migrator.build_report(world)
+    assert "07-07-1907-0" not in resumed["mapping"]
+
+    assert migrator.run_apply(world, resumed) == 0
+
+    # The patient is actually finished, not merely reported as finished.
+    left = sorted(
+        p.name for p in (portal / "PG_07-07-1907").iterdir()
+        if p.is_file() and p.name.startswith("07-07-1907-0")
+    )
+    assert left == []
+    assert json.loads((portal / "PG_07-07-1907" / "$meta.json").read_text())[
+        "patientId"
+    ] == "PG_07-07-1907"
+
+
+def test_a_fixtures_apply_cannot_reach_the_live_conversations_directory(
+    world, capsys
+):
+    """--conversations-dir defaults to a production root, so an apply naming
+    only a fixture --db and --portal-root used to pass the guard and then
+    rewrite the clinic's live conversation files."""
+    exit_code = migrator.main(
+        [
+            "--apply",
+            "--window-confirmed",
+            "--db", world.db,
+            "--portal-root", world.portal_root,
+            # not passed: --conversations-dir, so it takes the production default
+        ]
+    )
+
+    assert exit_code == 2
+    assert "conversations directory" in capsys.readouterr().err
+
+
+def test_an_id_already_worn_or_reserved_is_never_handed_out_again(world):
+    """Once Tasks 1-4 deploy, a patient can arrive canonical before the window.
+    Allocating only within the migrate set would hand their ID to someone else."""
+    conn = sqlite3.connect(world.db)
+    conn.execute(
+        "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+        "VALUES ('early', 'PG_07-07-1907', '', '2026-01-01', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO patient_id_reservations (patient_id) VALUES ('PG_07-07-1907_2')"
+    )
+    conn.commit()
+    conn.close()
+
+    report = migrator.build_report(world)
+
+    # The migrating patient must not be given the ID somebody already wears,
+    # nor the one already retired behind it.
+    assert report["mapping"]["07-07-1907-0"] == "PG_07-07-1907_3"
+
+
+def test_the_qa_records_files_are_kept_before_the_folder_is_removed(world):
+    """A list of digests is not a rollback bundle."""
+    portal = Path(world.portal_root)
+    _folder(portal, "12-12-1912-0", initials=("D", "M"),
+            files=["12-12-1912-0__patient-facing__v1__2026-08-02.pdf"])
+    _unblock(world)
+
+    report = migrator.build_report(world)
+    assert migrator.run_apply(world, report) == 0
+
+    assert not (portal / "12-12-1912-0").exists()
+    kept = Path(world.rollback_bundle) / "qa-fixture-artifacts" / "12-12-1912-0"
+    survivor = kept / "12-12-1912-0__patient-facing__v1__2026-08-02.pdf"
+    # The bytes survive the removal, not just a record that they existed.
+    assert survivor.is_file()
+    assert survivor.read_bytes().startswith(b"%PDF-1.4")
+
+
+def test_apply_refuses_to_remove_qa_records_with_nowhere_to_keep_them(world, capsys):
+    _unblock(world)
+    world.rollback_bundle = ""
+
+    assert migrator.run_apply(world, migrator.build_report(world)) == 1
+    assert "--rollback-bundle" in capsys.readouterr().err
