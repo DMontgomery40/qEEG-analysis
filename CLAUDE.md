@@ -165,7 +165,10 @@ Important gotcha:
 
 In these routes a `{patient_uuid}` path segment is the internal SQLite key.
 The clinic-facing canonical ID is the patient's `label` column, returned as the
-`patient_id` field in responses — never a path segment.
+`patient_id` field in responses — never a path segment. `backend/main.py` still
+spells the parameter `patient_id` in its decorators and handler signatures, so
+grepping for `patient_uuid` there finds nothing; the name is the old one, the
+value is the UUID.
 
 - Health/models
   - `GET /api/health`

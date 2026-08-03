@@ -1,7 +1,7 @@
 """The canonical clinic patient ID: ``XX_MM-DD-YYYY[_N]``.
 
-Two initials, the date of birth, and a collision ordinal — ``BT_12-11-1963``,
-``BT_12-11-1963_2``, ``BT_12-11-1963_10``. Ordinal 1 is the unsuffixed form, so
+Two initials, the date of birth, and a collision ordinal — ``ZZ_01-01-1900``,
+``ZZ_01-01-1900_2``, ``ZZ_01-01-1900_10``. Ordinal 1 is the unsuffixed form, so
 ``_1`` never exists.
 
 This is the one identifier clinic staff, folders, filenames, and sync keys use.
