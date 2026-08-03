@@ -59,6 +59,7 @@ from .orchestration import (
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from . import pipeline_uploads
 from .patient_intake import (
     IdentityInput,
     IdentityNameConflict,
@@ -1412,6 +1413,70 @@ async def models() -> dict[str, Any]:
             "review": MODEL_ROLE_DEFAULTS.stage5_final_review,
             "final_draft": MODEL_ROLE_DEFAULTS.stage6_final_draft,
         },
+    }
+
+
+class UploadResolution(BaseModel):
+    """How the operator answers a parked upload's name conflict."""
+
+    attach_to: str | None = None
+    force_new: bool = False
+
+
+@app.get("/api/pipeline/uploads")
+async def list_pipeline_uploads() -> list[dict[str, Any]]:
+    """Hub uploads the worker has seen, including any waiting on an answer."""
+    return pipeline_uploads.list_uploads()
+
+
+@app.post("/api/pipeline/uploads/{upload_id}/resolution")
+async def resolve_pipeline_upload(
+    upload_id: str, req: UploadResolution
+) -> dict[str, Any]:
+    """Answer a parked upload. The worker acts on it next cycle."""
+    record = pipeline_uploads.read_upload(upload_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    if record.get("status") == pipeline_uploads.STATUS_REGISTERED:
+        # Answering twice, or answering after the worker got there first, is not
+        # an error — say where the report went.
+        return {
+            "ok": True,
+            "upload_id": upload_id,
+            "status": pipeline_uploads.STATUS_REGISTERED,
+            "patient_id": record.get("patientId"),
+            "detail": "This upload is already filed.",
+        }
+
+    attach_to = (req.attach_to or "").strip()
+    if bool(attach_to) == bool(req.force_new):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Say which patient this is with attach_to, or force_new if they "
+                "are two different people — one or the other."
+            ),
+        )
+    if attach_to and parse_canonical_patient_id(attach_to) is None:
+        raise HTTPException(
+            status_code=400, detail=f"{attach_to} is not a clinic patient id."
+        )
+
+    resolution = {"attachTo": attach_to} if attach_to else {"forceNew": True}
+    pipeline_uploads.write_upload(
+        {
+            **record,
+            "uploadId": upload_id,
+            "status": pipeline_uploads.STATUS_PENDING,
+            "resolution": resolution,
+        }
+    )
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "status": pipeline_uploads.STATUS_PENDING,
+        "resolution": resolution,
     }
 
 

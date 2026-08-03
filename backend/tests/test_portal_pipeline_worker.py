@@ -1326,3 +1326,131 @@ def test_new_patient_upload_without_a_resolution_parks_and_is_skipped_next_cycle
 
     with storage.session_scope() as session:
         assert [p.label for p in storage.list_patients(session)] == ["BT_12-11-1963"]
+
+
+# -------------------------------------------- the parked-upload queue surface
+
+
+def _uploads_app(temp_data_dir, monkeypatch):
+    monkeypatch.setenv("QEEG_MOCK_LLM", "1")
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
+    from fastapi.testclient import TestClient
+
+    from backend import main
+
+    monkeypatch.setattr(
+        main, "_ensure_project_clipr_config", lambda: Path(temp_data_dir) / "c.conf"
+    )
+    monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    return TestClient(main.app, raise_server_exceptions=False)
+
+
+def _park_an_upload(temp_data_dir, tmp_path, monkeypatch, worker):
+    from backend import storage
+
+    with storage.session_scope() as session:
+        storage.create_patient(
+            session,
+            label="BT_12-11-1963",
+            notes="",
+            first_name="Bella",
+            last_name="Turner",
+            birthdate="12-11-1963",
+            first_initial="B",
+            last_initial="T",
+        )
+    job_key = "pipeline/jobs/up-1/upload.json"
+    client = _UploadClient({job_key: _upload_job()})
+    worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=_upload_job(),
+    )
+    return client, job_key
+
+
+def test_a_parked_upload_is_listed_with_its_conflict_candidates(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """An upload nobody can see is an upload nobody can rescue."""
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    _park_an_upload(temp_data_dir, tmp_path, monkeypatch, worker)
+
+    with _uploads_app(temp_data_dir, monkeypatch) as api:
+        listed = api.get("/api/pipeline/uploads")
+
+    assert listed.status_code == 200
+    body = listed.json()
+    assert [row["uploadId"] for row in body] == ["up-1"]
+    assert body[0]["status"] == "needs_operator_answer"
+    assert body[0]["identity"]["firstName"] == "Barto"
+    assert body[0]["conflict"]["candidates"] == [
+        {"patient_id": "BT_12-11-1963", "name": "Bella Turner"}
+    ]
+
+
+def test_resolving_an_unknown_upload_is_a_404(temp_data_dir, monkeypatch):
+    with _uploads_app(temp_data_dir, monkeypatch) as api:
+        response = api.post(
+            "/api/pipeline/uploads/nope/resolution", json={"force_new": True}
+        )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected_label"),
+    [
+        ({"attach_to": "BT_12-11-1963"}, "BT_12-11-1963"),
+        ({"force_new": True}, "BT_12-11-1963_2"),
+    ],
+)
+def test_an_answered_upload_is_filed_on_the_next_worker_cycle(
+    resolution, expected_label, temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """The operator answers; the worker files it through the same path."""
+    from backend import storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    client, job_key = _park_an_upload(temp_data_dir, tmp_path, monkeypatch, worker)
+
+    with _uploads_app(temp_data_dir, monkeypatch) as api:
+        answered = api.post("/api/pipeline/uploads/up-1/resolution", json=resolution)
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["status"] == "pending"
+
+    # Next cycle: the parked marker is picked up again, now carrying the answer.
+    jobs = worker.load_new_patient_upload_jobs(client)
+    assert [key for key, _ in jobs] == [job_key]
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=jobs[0][1],
+    )
+
+    assert result.patient_id == expected_label
+    assert result.ran_batch is False
+    with storage.session_scope() as session:
+        patient = next(
+            p for p in storage.list_patients(session) if p.label == expected_label
+        )
+        assert [r.filename for r in storage.list_reports(session, patient.id)] == [
+            "scan.pdf"
+        ]
+
+    # Answering again after it is filed says so rather than failing.
+    with _uploads_app(temp_data_dir, monkeypatch) as api:
+        again = api.post("/api/pipeline/uploads/up-1/resolution", json=resolution)
+    assert again.status_code == 200
+    assert again.json()["status"] == "registered"
+    assert again.json()["patient_id"] == expected_label

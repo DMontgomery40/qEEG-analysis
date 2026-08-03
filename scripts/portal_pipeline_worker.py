@@ -30,6 +30,7 @@ from backend.patient_identity import (  # noqa: E402
     allocate_canonical_patient_id,
     parse_canonical_patient_id,
 )
+from backend import pipeline_uploads  # noqa: E402
 from backend.patient_intake import (  # noqa: E402
     IdentityInput,
     IdentityNameConflict,
@@ -719,7 +720,16 @@ def load_new_patient_upload_jobs(
         payload = client.get_json(key) or {}
         if payload.get("kind") != NEW_PATIENT_UPLOAD_KIND:
             continue
-        if payload.get("status") == "needs_operator_answer":
+        upload_id = str(payload.get("uploadId") or "").strip()
+        answer = pipeline_uploads.pending_resolution(upload_id)
+        if answer:
+            # The operator answered a parked upload. Their resolution wins over
+            # whatever the hub originally sent, and the job runs again.
+            payload = {
+                **payload,
+                "resolution": {**(payload.get("resolution") or {}), **answer},
+            }
+        elif payload.get("status") == "needs_operator_answer":
             continue
         jobs.append((key, payload))
     return jobs
@@ -848,6 +858,12 @@ def process_new_patient_upload(
             note="upload job is missing uploadId or fileKey",
         )
 
+    identity_payload = payload.get("identity")
+    pipeline_uploads.record_seen(
+        upload_id=upload_id,
+        identity=identity_payload if isinstance(identity_payload, dict) else {},
+    )
+
     try:
         patient_label = _allocate_patient_for_upload(identity)
     except IdentityNameConflict as exc:
@@ -856,6 +872,11 @@ def process_new_patient_upload(
         client.set_json(
             job_key,
             {**payload, "status": "needs_operator_answer", "conflict": exc.payload},
+        )
+        pipeline_uploads.record_parked(
+            upload_id=upload_id,
+            identity=identity_payload if isinstance(identity_payload, dict) else {},
+            conflict=exc.payload,
         )
         result = PatientWorkerResult(
             patient_id=upload_id,
@@ -897,6 +918,7 @@ def process_new_patient_upload(
     # above keeps that from registering the report twice.
     client.delete(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/{file_key}")
     client.delete(job_key)
+    pipeline_uploads.record_registered(upload_id=upload_id, patient_id=patient_label)
 
     result = PatientWorkerResult(
         patient_id=patient_label,
