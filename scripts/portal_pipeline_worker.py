@@ -960,11 +960,23 @@ def main() -> int:
     portal_dir = Path(args.portal_dir).expanduser()
     status_dir = Path(args.status_dir).expanduser()
     status_dir.mkdir(parents=True, exist_ok=True)
-    include_labels = {
-        str(label).strip().lower()
+    unusable_labels = [
+        str(label).strip()
         for label in args.include_label
-        if is_valid_patient_id(str(label).strip())
-    }
+        if not is_valid_patient_id(str(label).strip())
+    ]
+    if unusable_labels:
+        # Dropping these silently would empty include_labels and turn a
+        # single-patient audit into full-portal discovery. A clinic id is
+        # case-strict, which it never used to be, so say so.
+        print(
+            "Not clinic patient ids: "
+            + ", ".join(unusable_labels)
+            + ". Use XX_MM-DD-YYYY, matching case.",
+            file=sys.stderr,
+        )
+        return 2
+    include_labels = {str(label).strip().lower() for label in args.include_label}
     allow_paid_runs = paid_runs_are_authorized(
         include_labels=include_labels,
         allow_paid_runs=args.allow_paid_runs,

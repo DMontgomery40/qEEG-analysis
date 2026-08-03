@@ -874,21 +874,41 @@ def test_update_patient_to_a_taken_identity_allocates_the_next_ordinal(
     assert updated.json()["patient_id"] == "BT_12-11-1963_2"
 
 
-def test_legacy_label_create_still_works_and_reports_no_canonical_id(
+def test_creating_a_patient_from_a_legacy_label_is_refused(
     temp_data_dir, monkeypatch
 ):
-    """Legacy DOB-keyed patients predate the cutover; Task 5 migrates them."""
+    """A label that routes nowhere is worse than no patient at all.
+
+    Legacy DOB-keyed patients still in the database predate the cutover and Task
+    5 migrates them, but nothing may mint a new one: every portal path now
+    rejects that key, so the patient would be created, appear in the roster, and
+    silently have no folder, no publishing, no sync, and no batch work.
+    """
     app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
             "/api/patients", json={"label": "09-05-1954-0", "notes": ""}
         )
 
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["label"] == "09-05-1954-0"
-    assert body["patient_id"] is None
+    assert response.status_code == 400, response.text
+    assert "09-05-1954-0" in response.json()["detail"]
+
+    with storage.session_scope() as session:
+        assert storage.list_patients(session) == []
+
+
+def test_creating_a_patient_from_a_free_text_label_is_refused(
+    temp_data_dir, monkeypatch
+):
+    """The only label a patient can be created with is a clinic id."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/api/patients", json={"label": "Barto T", "notes": ""})
+
+    assert response.status_code == 400, response.text
 
 
 def test_create_patient_requires_identity_or_a_label(temp_data_dir, monkeypatch):

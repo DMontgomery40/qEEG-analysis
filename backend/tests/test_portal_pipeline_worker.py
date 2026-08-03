@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +31,9 @@ def test_sync_remote_patient_identity_writes_versioned_local_metadata(tmp_path: 
     assert result == {"schemaVersion": 1, "firstInitial": "A", "lastInitial": "B"}
     assert stored["patientId"] == patient_id
     assert stored["birthdate"] == "03-05-2010"
+    # The ordinal is the canonical one, so an unsuffixed id writes 1. The legacy
+    # MM-DD-YYYY-N world started this field at 0; that contract is retired.
+    assert stored["index"] == 1
     assert stored["identity"] == result
     assert "name" not in json.dumps(stored).lower()
 
@@ -1076,3 +1080,28 @@ def test_sync_remote_patient_identity_rejects_initials_the_id_contradicts(
                 "identity": {"schemaVersion": 1, "firstInitial": "C", "lastInitial": "D"}
             },
         )
+
+
+def test_worker_refuses_an_include_label_that_is_not_a_clinic_id(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Dropping it silently would widen the run to the whole portal."""
+    from scripts import portal_pipeline_worker as worker
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "portal_pipeline_worker.py",
+            "--once",
+            "--include-label",
+            "bt_12-11-1963",
+            "--portal-dir",
+            str(tmp_path / "portal"),
+            "--status-dir",
+            str(tmp_path / "status"),
+        ],
+    )
+
+    assert worker.main() == 2
+    assert "bt_12-11-1963" in capsys.readouterr().err

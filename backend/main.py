@@ -1431,8 +1431,10 @@ def _resolve_patient_identity(
     """Turn a request body into the patient fields to store.
 
     Structured identity wins: it allocates the canonical clinic ID and that ID
-    becomes the label. A bare label is stored as given, and is reserved when it
-    is already canonical so the same ID can never be issued to anyone else.
+    becomes the label. A bare label has to already be a canonical ID; it is
+    reserved on the way through so the same ID can never be issued to anyone
+    else. Anything else is refused, because a label the portal cannot route on
+    would leave the patient with no folder, no publishing, and no sync.
     """
     identity_fields = ("first_name", "last_name", "birthdate", "first_initial", "last_initial")
     has_identity = any((getattr(req, name) or "").strip() for name in identity_fields)
@@ -1478,7 +1480,18 @@ def _resolve_patient_identity(
 
     parsed = reserve_canonical_patient_id(session, label)
     if parsed is None:
-        return {"label": label}
+        # A label that is not a clinic id routes nowhere: every portal path
+        # rejects it, so the patient would be created, show up in the roster,
+        # and silently have no folder, no publishing, no sync, and no batch
+        # work. Refuse it here instead. Patients already carrying a pre-cutover
+        # label keep it; Task 5 migrates them.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{label} is not a clinic patient id. Give the patient's name "
+                "and date of birth, or an id written as XX_MM-DD-YYYY."
+            ),
+        )
     return {
         "label": parsed.value,
         "birthdate": parsed.birthdate,
@@ -1570,9 +1583,13 @@ def _find_patient_by_identity(
 ) -> storage.Patient | None:
     """Return the patient this identity already belongs to, if there is one.
 
-    Same initials, same date of birth, and the same name on file is the same
-    person — a second report must land on that chart rather than allocating a
-    `_2` and splitting the patient into two families.
+    Same initials, same date of birth, and no name on file that contradicts the
+    one given is the same person — a second report must land on that chart
+    rather than allocating a `_2` and splitting the patient into two families.
+
+    A chart created from a bare canonical label carries initials and a date of
+    birth but no names, so an absent stored name matches anything and gets
+    filled in. Only a stored name that differs marks a different patient.
 
     Raises `PatientIdentityError` when two charts already answer to one
     identity, because picking between them is the operator's call. The caller
@@ -1582,6 +1599,11 @@ def _find_patient_by_identity(
     first_initial, last_initial, birthdate = _identity_key(req)
     first_name = (req.first_name or "").strip().lower()
     last_name = (req.last_name or "").strip().lower()
+
+    def name_fits(stored: str | None, given: str) -> bool:
+        on_file = (stored or "").strip().lower()
+        return not on_file or on_file == given
+
     matches = [
         patient
         for patient in session.scalars(
@@ -1591,8 +1613,8 @@ def _find_patient_by_identity(
                 storage.Patient.birthdate == birthdate,
             )
         ).all()
-        if (patient.first_name or "").strip().lower() == first_name
-        and (patient.last_name or "").strip().lower() == last_name
+        if name_fits(patient.first_name, first_name)
+        and name_fits(patient.last_name, last_name)
     ]
     if len(matches) > 1:
         raise PatientIdentityError(
@@ -1601,6 +1623,43 @@ def _find_patient_by_identity(
             + ". Say which one this report belongs to."
         )
     return matches[0] if matches else None
+
+
+def _discard_half_created_patient(patient_uuid: str | None, patient_label: str) -> None:
+    """Undo a patient created for a report that then failed to file.
+
+    Identity has to be committed before the upload can be read, so a failure
+    after that point leaves a patient with a real person's name, no reports, and
+    an empty portal folder that batch discovery would go on to enumerate.
+
+    The reservation row is deliberately left behind. IDs are issued once and
+    never reused, so this ordinal is spent even though nobody ended up wearing
+    it — the same rule that stops a relabel from freeing an ID for the next
+    patient.
+    """
+    if patient_uuid is None:
+        return
+
+    portal_dir = _portal_patients_dir() / patient_label if patient_label else None
+    if portal_dir is not None and portal_dir.is_dir():
+        try:
+            portal_dir.rmdir()
+        except OSError:
+            # Files landed in it after all; leave the folder and its contents.
+            pass
+
+    try:
+        with storage.session_scope() as session:
+            patient = storage.get_patient(session, patient_uuid)
+            if patient is not None:
+                session.delete(patient)
+                session.commit()
+    except Exception:
+        LOGGER.exception(
+            "bulk_upload_patient_cleanup_failed",
+            patient_label=patient_label,
+            operatorHint="A patient row created for a report that failed to file could not be removed; delete it from the roster before re-uploading.",
+        )
 
 
 @app.post("/api/patients/bulk_upload")
@@ -1639,6 +1698,7 @@ async def bulk_upload_patients(
         report_id = str(uuid.uuid4())
         report_folder: Path | None = None
         patient_label = ""
+        created_patient_uuid: str | None = None
         try:
             with storage.session_scope() as session:
                 existing = _find_patient_by_identity(session, identity)
@@ -1649,13 +1709,19 @@ async def bulk_upload_patients(
                 )
                 patient_label = fields["label"]
                 if existing is not None:
+                    # Never blank a name already on file: an identity given as
+                    # bare initials carries empty name strings.
                     patient = storage.update_patient(
-                        session, existing.id, notes=existing.notes, **fields
+                        session,
+                        existing.id,
+                        notes=existing.notes,
+                        **{key: value or None for key, value in fields.items()},
                     )
                 else:
                     patient = storage.create_patient(
                         session, notes=identity.notes, **fields
                     )
+                    created_patient_uuid = patient.id
                 patient_uuid = patient.id
                 _ensure_portal_patient_folder(patient_label)
 
@@ -1693,6 +1759,7 @@ async def bulk_upload_patients(
         except Exception as exc:
             if report_folder is not None:
                 shutil.rmtree(report_folder, ignore_errors=True)
+            _discard_half_created_patient(created_patient_uuid, patient_label)
             errors.append(
                 {
                     "filename": filename,
