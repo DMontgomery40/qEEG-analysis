@@ -28,6 +28,7 @@ from backend.orchestration import (  # noqa: E402
     summarize_run_progress,
 )
 from backend.patient_facing_pdf import render_patient_facing_markdown_to_pdf  # noqa: E402
+from backend.portal_files import normalize_portal_patient_id  # noqa: E402
 from backend.portal_sync import sync_patient_to_thrylen  # noqa: E402
 from backend.storage import (  # noqa: E402
     Artifact,
@@ -109,15 +110,21 @@ async def _chat_with_retries(
 
 
 def _discover_portal_patient_labels(portal_dir: Path) -> list[str]:
+    """List the clinic patient ids with a portal folder.
+
+    Only canonical ids qualify: a folder named something else is not a patient
+    and must never draw paid model work.
+    """
     if not portal_dir.exists():
         return []
     labels: list[str] = []
     for p in sorted(portal_dir.iterdir()):
         if not p.is_dir():
             continue
-        if p.name.startswith("_"):
+        patient_id = normalize_portal_patient_id(p.name)
+        if patient_id is None:
             continue
-        labels.append(p.name)
+        labels.append(patient_id)
     return labels
 
 

@@ -24,9 +24,9 @@ from backend.orchestration import (  # noqa: E402
     run_downstream_delivery_gaps,
     summarize_run_progress,
 )
+from backend.patient_identity import parse_canonical_patient_id  # noqa: E402
 from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
 
-PATIENT_RE = re.compile(r"^\d{2}-\d{2}-\d{4}-\d{1,3}$")
 META_NAME = "$meta.json"
 INDEX_NAME = "$index.json"
 JOB_PREFIX = "pipeline/jobs"
@@ -69,7 +69,7 @@ def _now_ms() -> int:
 
 
 def is_valid_patient_id(value: str) -> bool:
-    return bool(PATIENT_RE.fullmatch(str(value or "").strip()))
+    return parse_canonical_patient_id(str(value or "").strip()) is not None
 
 
 def patient_id_from_meta_key(key: str) -> str | None:
@@ -116,7 +116,8 @@ def sync_remote_patient_identity(
     remote_meta: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Persist hub initials beside the immutable local patient folder."""
-    if not is_valid_patient_id(patient_id):
+    parsed = parse_canonical_patient_id(str(patient_id or "").strip())
+    if parsed is None:
         raise ValueError("Invalid patient storage identifier")
     remote_identity = _normalized_patient_identity(
         remote_meta.get("identity") if isinstance(remote_meta, dict) else None
@@ -142,12 +143,17 @@ def sync_remote_patient_identity(
     ):
         raise ValueError("Remote patient initials conflict with local identity metadata")
 
+    if (remote_identity["firstInitial"], remote_identity["lastInitial"]) != (
+        parsed.first_initial,
+        parsed.last_initial,
+    ):
+        raise ValueError("Remote patient initials conflict with the clinic patient id")
+
     patient_dir.mkdir(parents=True, exist_ok=True)
-    birthdate, index_raw = patient_id.rsplit("-", 1)
     payload = {
-        "patientId": patient_id,
-        "birthdate": birthdate,
-        "index": int(index_raw),
+        "patientId": parsed.value,
+        "birthdate": parsed.birthdate,
+        "index": parsed.ordinal,
         "identity": remote_identity,
     }
     temp_path = meta_path.with_name(f".{META_NAME}.partial")

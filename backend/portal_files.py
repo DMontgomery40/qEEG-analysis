@@ -5,28 +5,19 @@ import re
 from pathlib import Path
 from typing import Any
 
-
-_PORTAL_PATIENT_ID_RE = re.compile(
-    r"^\s*(?P<mm>\d{1,2})-(?P<dd>\d{1,2})-(?P<yyyy>\d{4})-(?P<n>\d{1,3})\s*$"
-)
+from .patient_identity import parse_canonical_patient_id
 
 
 def normalize_portal_patient_id(value: str) -> str | None:
-    match = _PORTAL_PATIENT_ID_RE.match(value or "")
-    if not match:
-        return None
-    mm = int(match.group("mm"))
-    dd = int(match.group("dd"))
-    yyyy = int(match.group("yyyy"))
-    n = int(match.group("n"))
-    if not (
-        1 <= mm <= 12
-        and 1 <= dd <= 31
-        and 1900 <= yyyy <= 2100
-        and 0 <= n <= 999
-    ):
-        return None
-    return f"{mm:02d}-{dd:02d}-{yyyy:04d}-{n}"
+    """Return the canonical clinic id a portal key routes on, or None.
+
+    Folders, blob keys, filenames, and job keys all pass through here, so this
+    is the single gate that keeps a date of birth from becoming a routing key.
+    Surrounding whitespace is tolerated; case is not, because the id is compared
+    case-insensitively in SQLite but lands on a case-preserving filesystem.
+    """
+    parsed = parse_canonical_patient_id(str(value or "").strip())
+    return parsed.value if parsed is not None else None
 
 
 def _portal_name(value: str | Path) -> str:
