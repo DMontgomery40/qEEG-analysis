@@ -65,6 +65,12 @@ TEST_PATH_MARKERS = ("pytest-of-", "/tmp/qeeg-hang-repro")
 # The synthetic record David built to exercise the identity path end to end.
 QA_FIXTURE_LABELS = frozenset({"02-29-1984-0"})
 
+# Rows David has previously described as his own test data rather than clinic
+# patients. They are NOT carved out on that basis alone — the dry run reports
+# them as candidates and keeps failing until he confirms, because getting this
+# wrong deletes a real patient. Confirm with --qa-candidates-confirmed.
+QA_CANDIDATE_LABELS = frozenset({"01-01-1983-0", "01-01-2013-0"})
+
 PRODUCTION_ROOTS = (
     Path("/Users/davidmontgomery/qEEG-analysis/data"),
     Path("/Users/davidmontgomery/thrylen"),
@@ -308,7 +314,7 @@ def _looks_like_test_row(row: PatientRow) -> bool:
 
 
 def classify_patient_rows(
-    rows: Iterable[PatientRow], *, portal_root: Path
+    rows: Iterable[PatientRow], *, portal_root: Path, qa_candidates_confirmed: bool = False
 ) -> list[Classified]:
     """Sort every database row into one bucket, explaining each decision."""
     rows = list(rows)
@@ -346,6 +352,22 @@ def classify_patient_rows(
                     reason="already wearing a canonical clinic ID; nothing to do",
                     uuid=row.uuid,
                     label=row.label,
+                )
+            )
+            continue
+
+        if row.label in QA_CANDIDATE_LABELS and qa_candidates_confirmed:
+            out.append(
+                Classified(
+                    key=key,
+                    bucket=BUCKET_QA_FIXTURE,
+                    reason=(
+                        "confirmed by the owner as his own test data, not a clinic "
+                        "patient: bundled for rollback, then removed from the roster"
+                    ),
+                    uuid=row.uuid,
+                    label=row.label,
+                    evidence={"reports": row.report_count, "runs": row.run_count},
                 )
             )
             continue
@@ -457,6 +479,7 @@ class IdentityFinding:
     patient_id: str
     resolved: tuple[str, str] | None
     sources: dict[str, Any]
+    proposed: list[dict[str, str]] = field(default_factory=list)
     problem: str | None = None
     needs: str | None = None
 
@@ -543,18 +566,23 @@ def resolve_identity(
         letters = title_name_initials(title)
         if not letters:
             continue
+        proposed = propose_initials_from_title(title)
+        options = " or ".join(f"{p['initials']} ({p['reading']})" for p in proposed)
         if not ({resolved[0], resolved[1]} & letters):
             return IdentityFinding(
                 patient_id=patient_id,
                 resolved=None,
                 sources=sources,
+                proposed=proposed,
                 problem=(
                     f"stored initials {''.join(resolved)} match nothing in the name on "
-                    f"the uploaded report ({title!r})"
+                    f"the uploaded report ({title!r}) — the stored pair looks like a "
+                    f"placeholder"
                 ),
                 needs=(
-                    "confirmation of which initials are this patient's — the stored "
-                    "pair looks like a placeholder"
+                    f"confirm the correction: {options}"
+                    if options
+                    else "the patient's first and last initial"
                 ),
             )
         if not ({resolved[0], resolved[1]} <= letters):
@@ -562,11 +590,16 @@ def resolve_identity(
                 patient_id=patient_id,
                 resolved=None,
                 sources=sources,
+                proposed=proposed,
                 problem=(
                     f"stored initials {''.join(resolved)} only partly match the name on "
                     f"the uploaded report ({title!r})"
                 ),
-                needs="the patient's first and last initial, confirmed",
+                needs=(
+                    f"confirm which is right: keep {''.join(resolved)}, or {options}"
+                    if options
+                    else "the patient's first and last initial, confirmed"
+                ),
             )
 
     return IdentityFinding(patient_id=patient_id, resolved=resolved, sources=sources)
@@ -640,6 +673,125 @@ def find_orphan_pending_prefixes(
         for entry in pending_root.iterdir()
         if entry.is_dir() and entry.name not in live
     )
+
+
+def report_evidence(db_path: Path, data_root: Path) -> dict[str, list[dict[str, Any]]]:
+    """Every patient's reports with the digest of the file behind each one.
+
+    Two rows holding the same bytes are the same report, whatever they are
+    labelled — which is how a row filed under a mistyped ID is matched back to
+    the patient it belongs to without anyone guessing.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    out: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    try:
+        for row in conn.execute(
+            "SELECT p.label, r.id, r.filename, r.stored_path "
+            "FROM patients p JOIN reports r ON r.patient_id = p.id"
+        ):
+            stored = str(row["stored_path"])
+            path = Path(stored) if stored.startswith("/") else data_root / stored
+            digest = ""
+            try:
+                if path.is_file():
+                    digest = patient_rekey._sha256_file(path)
+            except OSError:
+                digest = ""
+            out[row["label"]].append(
+                {
+                    "report_id": row["id"],
+                    "filename": row["filename"],
+                    "stored_path": stored,
+                    "sha256": digest,
+                }
+            )
+    finally:
+        conn.close()
+
+    # A wrong data root reads as "no evidence anywhere", which would quietly
+    # turn every answerable question back into one for the operator.
+    hashed = sum(1 for reports in out.values() for r in reports if r["sha256"])
+    total = sum(len(reports) for reports in out.values())
+    if total and not hashed:
+        raise MigrationStop(
+            f"None of the {total} report files were readable under {data_root}. "
+            f"Point --db and --portal-root at the same installation."
+        )
+    return out
+
+
+def match_row_by_report_bytes(
+    label: str, evidence: dict[str, list[dict[str, Any]]], *, candidates: set[str]
+) -> dict[str, Any]:
+    """Which other patients hold byte-identical copies of this row's reports.
+
+    A row whose every report is already filed under exactly one other patient
+    is that patient's, and the operator only has to confirm it. A row whose
+    reports point at two different people is a filing accident that someone has
+    to unpick — this says so rather than picking one.
+
+    ``candidates`` is the set of settled patients worth matching against. Two
+    unresolved rows holding each other's copies would otherwise each name the
+    other and neither would be answered.
+    """
+    mine = evidence.get(label, [])
+    per_report: list[dict[str, Any]] = []
+    owners: set[str] = set()
+    for report in mine:
+        matches = sorted(
+            other
+            for other, reports in evidence.items()
+            if other != label
+            and other in candidates
+            and report["sha256"]
+            and any(r["sha256"] == report["sha256"] for r in reports)
+        )
+        owners.update(matches)
+        per_report.append(
+            {
+                "filename": report["filename"],
+                "sha256": report["sha256"][:16],
+                "byte_identical_under": matches,
+            }
+        )
+
+    conclusive = len(owners) == 1 and all(
+        len(r["byte_identical_under"]) == 1 for r in per_report
+    )
+    return {
+        "reports": per_report,
+        "matched_patients": sorted(owners),
+        "conclusive": conclusive,
+    }
+
+
+# Clinic report filenames put the surname first — "Stubner Helga", "L, Connor".
+def propose_initials_from_title(title: str) -> list[dict[str, str]]:
+    """Initials this report's filename suggests, for the operator to confirm."""
+    stem = re.sub(r"\.(pdf|md|mp4|docx)$", "", title, flags=re.IGNORECASE)
+    words = [
+        word
+        for word in re.findall(r"[A-Za-z]+", stem)
+        if word.lower() not in _NON_NAME_WORDS
+    ]
+    if len(words) < 2:
+        return (
+            [{"initials": f"?{words[0][0].upper()}", "reading": f"surname {words[0]}"}]
+            if words
+            else []
+        )
+    surname, given = words[0], words[1]
+    return [
+        {
+            "initials": f"{given[0].upper()}{surname[0].upper()}",
+            "reading": f"{given} {surname} (surname first, as the clinic names files)",
+        },
+        {
+            "initials": f"{surname[0].upper()}{given[0].upper()}",
+            "reading": f"{surname} {given} (given name first)",
+        },
+    ]
 
 
 def _live_upload_ids(jobs_dir: Path | None) -> list[str]:
@@ -867,7 +1019,11 @@ def _under_production(path: Path) -> bool:
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     portal_root = Path(args.portal_root)
     rows = read_patient_rows(Path(args.db))
-    classified = classify_patient_rows(rows, portal_root=portal_root)
+    classified = classify_patient_rows(
+        rows,
+        portal_root=portal_root,
+        qa_candidates_confirmed=bool(getattr(args, "qa_candidates_confirmed", False)),
+    )
     sync_state = read_sync_state(portal_root / ".qeeg_portal_sync_state.json")
     titles = read_conversation_titles(Path(args.conversations_dir))
 
@@ -889,6 +1045,18 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             entry.reason = finding.problem or "identity cannot be trusted"
             entry.needs = finding.needs
             entry.evidence["identity_sources"] = finding.sources
+
+    # `reports.stored_path` is written relative to the repository root
+    # (`data/reports/…`), not to the data directory.
+    evidence = report_evidence(Path(args.db), portal_root.parent.parent)
+    settled_patients = {
+        e.label for e in classified if e.label and e.bucket == BUCKET_MIGRATE
+    }
+    qa_and_pollution = {
+        e.label
+        for e in classified
+        if e.label and e.bucket in (BUCKET_QA_FIXTURE, BUCKET_TEST_POLLUTION)
+    }
 
     # A folder is only trustworthy if everything in it belongs to one person.
     owned_initials = {
@@ -946,13 +1114,43 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         twin = f"{legacy[0]}-{legacy[1]}"
         if twin in padded_labels and twin != entry.label:
             entry.bucket = BUCKET_UNRESOLVED
-            entry.reason = (
-                f"an unpadded label sitting next to {twin}, which is a real patient "
-                f"with the same date of birth"
+            # Do not stop at "this looks odd" when the bytes can answer it.
+            match = match_row_by_report_bytes(
+                entry.label, evidence, candidates=settled_patients
             )
-            entry.needs = (
-                f"whether this row's work belongs to {twin} or to a different person"
-            )
+            entry.evidence["report_byte_match"] = match
+            if match["conclusive"]:
+                entry.reason = (
+                    f"an unpadded label whose every report is byte-identical to one "
+                    f"already filed under {match['matched_patients'][0]}"
+                )
+                entry.needs = (
+                    f"confirmation only: fold this row's work into "
+                    f"{match['matched_patients'][0]} and retire the label"
+                )
+            elif match["matched_patients"]:
+                entry.reason = (
+                    "an unpadded label holding reports that belong to more than one "
+                    "patient: "
+                    + "; ".join(
+                        f"{r['filename']} is already under "
+                        f"{', '.join(r['byte_identical_under']) or 'nobody else'}"
+                        for r in match["reports"]
+                    )
+                )
+                entry.needs = (
+                    "a decision per report — these are copies of files already filed "
+                    "elsewhere, so the row itself may simply be retired"
+                )
+            else:
+                entry.reason = (
+                    f"an unpadded label sitting next to {twin}, which is a real "
+                    f"patient with the same date of birth"
+                )
+                entry.needs = (
+                    f"whether this row's work belongs to {twin} or to a different "
+                    f"person"
+                )
 
     mapping, collisions = allocate_new_ids(classified)
 
@@ -1014,6 +1212,31 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
     qa_bundle = qa_fixture_bundle(Path(args.db), portal_root)
 
+    # The renderers keep a project directory per patient, named for the patient.
+    # They are on-disk paths like any other, so they belong in the inventory.
+    renderer_projects: dict[str, Any] = {}
+    for name, root in (
+        ("cathode", args.cathode_root),
+        ("local-explainer-video", args.explainer_root),
+    ):
+        if not root:
+            continue
+        for subdir in ("projects", "_bettube_studio_migration"):
+            directory = Path(root) / subdir
+            if not directory.is_dir():
+                continue
+            legacy = sorted(
+                entry.name
+                for entry in directory.iterdir()
+                if entry.is_dir()
+                and any(entry.name.startswith(old) for old in mapping)
+            )
+            if legacy:
+                renderer_projects[f"{name}/{subdir}"] = {
+                    "count": len(legacy),
+                    "entries": legacy[:40],
+                }
+
     unresolved = [e for e in classified if e.bucket == BUCKET_UNRESOLVED]
     buckets: dict[str, int] = defaultdict(int)
     for entry in classified:
@@ -1021,6 +1244,17 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
     blockers: list[str] = []
     for entry in unresolved:
+        if entry.label in QA_CANDIDATE_LABELS:
+            entry.reason = (
+                "possibly the owner's own test data rather than a clinic patient "
+                "(he has described this date as his test file before) — "
+                + entry.reason
+            )
+            entry.needs = (
+                "a yes or no: is this your test data? Yes removes it from the "
+                "roster with --qa-candidates-confirmed; no needs the patient's "
+                "initials"
+            )
         blockers.append(f"{entry.label}: {entry.reason} — needs {entry.needs}")
     blockers.extend(collisions)
     if orphan_folders:
@@ -1043,7 +1277,31 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "mixed_patient_folders": mixed,
         "pipeline_job_files": pipeline_jobs,
         "other_id_named_locations": other_locations,
+        "renderer_project_dirs": renderer_projects,
         "qa_fixture_bundle": qa_bundle,
+        "notes": {
+            "ordinal_rule": (
+                "Legacy `-N` counts collisions on the birthdate alone and starts "
+                "at 0. Canonical `_N` counts collisions on initials AND birthdate, "
+                "starts at 1, and omits the suffix for 1 — so `_1` never exists. "
+                "The two never correspond and the legacy ordinal is never carried "
+                "across: every canonical ID here is allocated fresh from the "
+                "initials-and-birthdate collisions, and --apply reserves each one "
+                "through backend.patient_identity.reserve_canonical_patient_id."
+            ),
+            "renderer_ground_truth_dependency": (
+                "local-explainer-video's qc_publish loads qEEG ground truth by "
+                "querying patients.label in the engine database. Those labels "
+                "become canonical in the same step as everything else, so the "
+                "renderers must not be run against the engine between the label "
+                "migration and their own deploy."
+            ),
+            "schema_prerequisite": (
+                "--apply refuses a database without patient_id_reservations and "
+                "the patients identity columns. Start the new engine against the "
+                "database once before migrating."
+            ),
+        },
         "remote_manifest": remote_items,
         "renderer_findings": renderer_findings,
         "estimate": estimate_window(
@@ -1384,6 +1642,9 @@ def run_apply(args: argparse.Namespace, report: dict[str, Any]) -> int:
         # The synthetic QA record leaves the roster rather than migrating. Its
         # rows and artifacts are listed in the manifest for the rollback bundle
         # first, so this removal is recoverable.
+        if patient_rekey.rewrite_portal_readme(portal_root):
+            print("  rewrote the share folder README onto the clinic ID format")
+
         if not journal.is_done("qa-fixture-removed"):
             removed = remove_qa_fixture(conn, portal_root)
             journal.record(
@@ -1425,6 +1686,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--journal", default="")
     parser.add_argument("--pipeline-jobs-dir", default="")
     parser.add_argument("--pending-uploads-dir", default="")
+    parser.add_argument(
+        "--qa-candidates-confirmed",
+        action="store_true",
+        help=(
+            "The owner has confirmed the candidate QA rows are his own test data. "
+            "Without this they stay unresolved and the dry run keeps failing."
+        ),
+    )
     parser.add_argument(
         "--window-confirmed",
         action="store_true",

@@ -441,6 +441,49 @@ def _reanchor(path: Path, old_dir: Path, new_dir: Path) -> Path:
         return path
 
 
+PORTAL_README = """Local clinician-portal share folder (gitignored)
+
+One folder per patient, named with the clinic patient ID:
+  XX_MM-DD-YYYY[_N]   two initials, date of birth, collision ordinal from 2
+Example:
+  BT_12-11-1963       and BT_12-11-1963_2 for a second patient with the same
+                      initials and date of birth
+
+This is the only patient identifier the engine, the folders, the filenames, the
+sync keys, and the hub all use. The engine's internal UUID never appears here.
+
+Put any deliverables the clinic should be able to download inside that folder:
+  - PDF, MD, MP4, DOCX, RTF, TXT, ZIP
+  - Revisions are fine (keep multiple versions)
+
+How this maps to the Netlify portal:
+- The hub (https://thrylen.com/qeeg/) does not read this folder directly; the
+  sync pushes from here.
+
+Filename convention:
+  <PATIENT_ID>__<name>__v<version>__YYYY-MM-DD.<ext>
+Example:
+  BT_12-11-1963__analysis__v2__2026-01-16.md
+"""
+
+
+def rewrite_portal_readme(portal_root: Path) -> bool:
+    """Stop the share folder's own README teaching the retired ID format.
+
+    It is documentation, not a clinical record, and it is the first thing anyone
+    reads before dropping a file in here.
+    """
+    readme = portal_root / "_README.txt"
+    if not readme.is_file():
+        return False
+    if readme.read_text(encoding="utf-8") == PORTAL_README:
+        return False
+    tmp = readme.with_name("_README.txt.rekey-tmp")
+    tmp.write_text(PORTAL_README, encoding="utf-8")
+    os.replace(tmp, readme)
+    return True
+
+
 def remote_rekey_worklist(
     sync_state: dict[str, Any], old_id: str, new_id: str
 ) -> list[dict[str, Any]]:

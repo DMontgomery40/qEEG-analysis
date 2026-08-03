@@ -24,7 +24,9 @@ from scripts import migrate_canonical_patient_ids as migrator
 # --------------------------------------------------------------------------- #
 
 
-def _make_db(path: Path, patients: list[dict], *, upgraded: bool = True) -> None:
+def _make_db(
+    path: Path, patients: list[dict], *, upgraded: bool = True, data_root: Path | None = None
+) -> None:
     """A database in the shape the new engine leaves behind.
 
     ``upgraded=False`` gives the pre-cutover five-column shape, which is what
@@ -80,9 +82,25 @@ def _make_db(path: Path, patients: list[dict], *, upgraded: bool = True) -> None
         )
         for index, stored in enumerate(entry.get("reports", [])):
             conn.execute(
-                "INSERT INTO reports (id, patient_id, stored_path) VALUES (?, ?, ?)",
-                (f"{entry['uuid']}-r{index}", entry["uuid"], stored),
+                "INSERT INTO reports (id, patient_id, filename, stored_path) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    f"{entry['uuid']}-r{index}",
+                    entry["uuid"],
+                    entry.get("report_names", [None] * (index + 1))[index]
+                    or Path(stored).name,
+                    stored,
+                ),
             )
+            # Real bytes behind the row: the migrator matches misfiled rows back
+            # to their patient by digest, so a fixture without files tests nothing.
+            if not stored.startswith("/") and data_root is not None:
+                target = data_root / stored
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(
+                    (entry.get("report_bytes", [None] * (index + 1))[index]
+                     or f"%PDF-1.4 {entry['uuid']}-{index}").encode()
+                )
         for index in range(entry.get("runs", 0)):
             conn.execute(
                 "INSERT INTO runs (id, patient_id) VALUES (?, ?)",
@@ -121,10 +139,15 @@ def _folder(portal: Path, patient_id: str, *, initials=None, files=()) -> Path:
 
 @pytest.fixture
 def world(tmp_path: Path):
-    """One small clinic containing every awkward shape the real one has."""
-    portal = tmp_path / "portal_patients"
-    portal.mkdir()
-    db = tmp_path / "app.db"
+    """One small clinic containing every awkward shape the real one has.
+
+    Laid out like the real installation — ``<repo>/data/portal_patients`` with
+    report files under ``<repo>/data/reports`` — because the migrator resolves
+    stored paths relative to the repository root.
+    """
+    portal = tmp_path / "data" / "portal_patients"
+    portal.mkdir(parents=True)
+    db = tmp_path / "data" / "app.db"
 
     _folder(portal, "01-19-1966-0", initials=("P", "G"),
             files=["PG_femal_TBI_Redacted.pdf",
@@ -162,7 +185,15 @@ def world(tmp_path: Path):
              "reports": ["/private/var/pytest-of-davidmontgomery/pytest-15/t/report.pdf"]},
             {"uuid": "77777777-0000-0000-0000-000000000009",
              "label": "diag-175b76e4", "reports": ["data/reports/h/original.pdf"]},
+            # An unpadded twin holding a byte-identical copy of PG's report:
+            # answerable from the bytes, so it should reduce to a confirmation.
+            {"uuid": "66666666-0000-0000-0000-000000000010",
+             "label": "1-19-1966",
+             "reports": ["data/reports/i/original.pdf"],
+             "report_names": ["PG_femal_TBI_Redacted.pdf"],
+             "report_bytes": ["%PDF-1.4 aaaaaaaa-0000-0000-0000-000000000001-0"]},
         ],
+        data_root=tmp_path,
     )
 
     jobs = tmp_path / "pipeline_jobs"
@@ -219,6 +250,7 @@ def world(tmp_path: Path):
         pipeline_jobs_dir=str(jobs),
         pending_uploads_dir="",
         this_is_the_scheduled_cutover=False,
+        qa_candidates_confirmed=False,
         apply=False,
         dry_run=True,
         window_confirmed=True,
@@ -440,6 +472,10 @@ def _unblock(world):
     conn = sqlite3.connect(world.db)
     conn.execute("DELETE FROM reports WHERE patient_id LIKE 'ffffffff%'")
     conn.execute("DELETE FROM patients WHERE id LIKE 'ffffffff%'")
+    # The operator confirmed the unpadded twin is a duplicate of the padded row
+    # and retired it, which is what the dry run asked for.
+    conn.execute("DELETE FROM reports WHERE patient_id LIKE '66666666%'")
+    conn.execute("DELETE FROM patients WHERE id LIKE '66666666%'")
     conn.commit()
     conn.close()
 
@@ -656,3 +692,122 @@ def test_the_pipeline_job_file_moves_with_the_patient(world):
     # The worker keys its status on this; left behind it reports on a dead ID.
     assert moved["patient_id"] == "PG_01-19-1966"
     assert moved["status"] == "complete"
+
+
+# --------------------------------------------------------------------------- #
+# Evidence instead of a shrug
+# --------------------------------------------------------------------------- #
+
+
+def test_a_mistyped_label_is_matched_back_by_the_bytes_it_holds(tmp_path: Path):
+    """`10-7-1963` sits next to `10-07-1963-0` holding the same report file.
+    That is answerable from the bytes, so it should reduce to a confirmation."""
+    evidence = {
+        "10-7-1963": [{"filename": "BB_male.pdf", "sha256": "aaa"}],
+        "10-07-1963-0": [
+            {"filename": "BB_male.pdf", "sha256": "aaa"},
+            {"filename": "10-07-1963-0__BB_male__v1.pdf", "sha256": "aaa"},
+        ],
+    }
+
+    match = migrator.match_row_by_report_bytes("10-7-1963", evidence, candidates={"10-07-1963-0"})
+
+    assert match["conclusive"] is True
+    assert match["matched_patients"] == ["10-07-1963-0"]
+
+
+def test_a_row_holding_two_patients_reports_is_never_called_conclusive(tmp_path: Path):
+    """`4-8-1997` holds one report belonging to BB and one belonging to LJ.
+    Folding it into either would move the other patient's file with it."""
+    evidence = {
+        "4-8-1997": [
+            {"filename": "BB_male.pdf", "sha256": "aaa"},
+            {"filename": "LJ_TBI.pdf", "sha256": "bbb"},
+        ],
+        "10-07-1963-0": [{"filename": "BB_male.pdf", "sha256": "aaa"}],
+        "04-08-1997-0": [{"filename": "LJ_TBI.pdf", "sha256": "bbb"}],
+    }
+
+    match = migrator.match_row_by_report_bytes(
+        "4-8-1997", evidence, candidates={"10-07-1963-0", "04-08-1997-0"}
+    )
+
+    assert match["conclusive"] is False
+    assert match["matched_patients"] == ["04-08-1997-0", "10-07-1963-0"]
+
+
+def test_placeholder_initials_come_with_a_correction_to_confirm(world):
+    """A bare failure makes the operator do the reading. The report's own
+    filename already says who this is — propose it and ask."""
+    report = migrator.build_report(world)
+
+    finding = next(
+        f for f in report["identity_findings"] if f["patient_id"] == "12-11-1963-0"
+    )
+    assert [p["initials"] for p in finding["proposed"]] == ["CL", "LC"]
+    blocker = next(b for b in report["blockers"] if b.startswith("12-11-1963-0:"))
+    assert "CL" in blocker and "confirm" in blocker
+
+
+def test_initials_are_proposed_surname_first_as_the_clinic_names_files():
+    assert migrator.propose_initials_from_title("Stubner Helga, initial qeeg.pdf")[0] == {
+        "initials": "HS",
+        "reading": "Helga Stubner (surname first, as the clinic names files)",
+    }
+    # One name is not enough to place both initials.
+    assert migrator.propose_initials_from_title("Snyder mid qeeg.pdf") == [
+        {"initials": "?S", "reading": "surname Snyder"}
+    ]
+
+
+def test_a_candidate_qa_row_is_not_removed_without_the_owner_saying_so(world):
+    """Guessing wrong here deletes a real patient, so the default is to ask."""
+    conn = sqlite3.connect(world.db)
+    conn.execute(
+        "INSERT INTO patients (id, label, notes, created_at, updated_at) "
+        "VALUES ('qa-cand', '01-01-1983-0', '', '2026-01-01', '2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+
+    report = migrator.build_report(world)
+    blocker = next(b for b in report["blockers"] if b.startswith("01-01-1983-0:"))
+    assert "is this your test data?" in blocker
+    assert "01-01-1983-0" not in report["mapping"]
+
+    world.qa_candidates_confirmed = True
+    confirmed = migrator.build_report(world)
+    assert not any(b.startswith("01-01-1983-0:") for b in confirmed["blockers"])
+    assert "01-01-1983-0" not in confirmed["mapping"]
+
+
+def test_the_share_folder_readme_stops_teaching_the_retired_format(tmp_path: Path):
+    from backend import patient_rekey
+
+    portal = tmp_path / "portal_patients"
+    portal.mkdir()
+    readme = portal / "_README.txt"
+    readme.write_text(
+        "Create one folder per patient using the standardized ID:\n  MM-DD-YYYY-N\n"
+    )
+
+    assert patient_rekey.rewrite_portal_readme(portal) is True
+
+    text = readme.read_text()
+    assert "MM-DD-YYYY-N" not in text
+    assert "XX_MM-DD-YYYY[_N]" in text
+    # Running it twice is not a change.
+    assert patient_rekey.rewrite_portal_readme(portal) is False
+
+
+def test_an_unpadded_twin_reduces_to_a_confirmation_when_the_bytes_agree(world):
+    """Do not hand the operator a question the data already answers."""
+    report = migrator.build_report(world)
+
+    blocker = next(b for b in report["blockers"] if b.startswith("1-19-1966:"))
+    assert "byte-identical to one already filed under 01-19-1966-0" in blocker
+    assert "confirmation only" in blocker
+    entry = next(
+        e for e in report["classified"] if e["label"] == "1-19-1966"
+    )
+    assert entry["evidence"]["report_byte_match"]["conclusive"] is True
