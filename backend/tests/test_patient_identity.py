@@ -412,9 +412,10 @@ def test_allocate_survives_losing_the_race_to_another_writer(db, monkeypatch):
 def test_confirming_an_unreserved_id_a_patient_already_wears_reserves_it(db):
     """A canonical-looking label can reach the database without a reservation.
 
-    Bulk upload mints a label from the filename stem, so `BT_12-11-1963.pdf`
-    produces a patient wearing that ID with nothing reserved behind it.
-    Confirming that patient's identity has to close the gap.
+    Pre-cutover bulk upload minted a label from the filename stem, so a
+    `ZZ_01-01-1900.pdf` of that era produced a patient wearing that ID with
+    nothing reserved behind it. Intake refuses an unidentified file now, but
+    those rows survive, so confirming such a patient's identity closes the gap.
     """
     with db.session_scope() as session:
         patient = db.create_patient(session, label="BT_12-11-1963", notes="")

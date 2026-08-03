@@ -280,9 +280,10 @@ def allocate_canonical_patient_id(
 
         if already_held is not None and already_held == candidate.lower():
             # A label can reach the database without ever passing through
-            # allocation — bulk upload mints one from a filename stem. Reserve it
-            # here too, or the ID goes unreserved and a later patient with the
-            # same initials and birthdate could be issued this person's ID.
+            # allocation: pre-cutover bulk upload minted one from the filename
+            # stem, and those rows are still here. Reserve it here too, or the ID
+            # goes unreserved and a later patient with the same initials and
+            # birthdate could be issued this person's ID.
             reserve_canonical_patient_id(session, candidate)
             return candidate
 
