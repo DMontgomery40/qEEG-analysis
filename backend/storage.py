@@ -41,14 +41,41 @@ class Patient(Base):
     __tablename__ = "patients"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_new_id)
+    # The canonical clinic ID (XX_MM-DD-YYYY[_N]) lives here. `id` above stays an
+    # internal relational key and never reaches a folder, filename, or clinic screen.
     label: Mapped[str] = mapped_column(String, nullable=False)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Nullable so patients created before the identity columns existed still read back.
+    birthdate: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
+    first_name: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
+    last_name: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
+    first_initial: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
+    last_initial: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     reports: Mapped[list["Report"]] = relationship(back_populates="patient")
     files: Mapped[list["PatientFile"]] = relationship(back_populates="patient")
     runs: Mapped[list["Run"]] = relationship(back_populates="patient")
+
+
+class PatientIdReservation(Base):
+    """Every canonical clinic ID ever issued, keyed by the ID itself.
+
+    Rows are never deleted or compacted. A patient being deleted or relabelled
+    retires its ID; it must never be handed to a different person afterwards.
+    This is operational state: it belongs in database backups and no rebuild
+    command may clear it.
+    """
+
+    __tablename__ = "patient_id_reservations"
+
+    patient_id: Mapped[str] = mapped_column(String, primary_key=True)
+    first_initial: Mapped[str] = mapped_column(String, nullable=False)
+    last_initial: Mapped[str] = mapped_column(String, nullable=False)
+    birthdate: Mapped[str] = mapped_column(String, nullable=False)
+    ordinal: Mapped[int] = mapped_column(nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class Report(Base):
@@ -141,9 +168,36 @@ def reset_engine(db_url: str) -> None:
     engine = create_engine(db_url, future=True, connect_args={"check_same_thread": False})
 
 
+# Added to `patients` after the table shipped, so they need an in-place upgrade.
+# All nullable: existing rows keep their values and read back as unset identity.
+_PATIENT_IDENTITY_COLUMNS = {
+    "birthdate": "VARCHAR",
+    "first_name": "VARCHAR",
+    "last_name": "VARCHAR",
+    "first_initial": "VARCHAR",
+    "last_initial": "VARCHAR",
+}
+
+
+def _ensure_patient_identity_columns() -> None:
+    """Add identity columns to a `patients` table created before they existed.
+
+    `create_all` only creates missing tables, so the clinic's live database
+    would otherwise keep the old five-column shape forever.
+    """
+    with engine.begin() as conn:
+        present = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(patients)")}
+        for column, sql_type in _PATIENT_IDENTITY_COLUMNS.items():
+            if column not in present:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE patients ADD COLUMN {column} {sql_type}"
+                )
+
+
 def init_db() -> None:
     ensure_data_dirs()
     Base.metadata.create_all(engine)
+    _ensure_patient_identity_columns()
 
 
 @contextmanager
@@ -174,20 +228,59 @@ def get_patient(session: Session, patient_id: str) -> Patient | None:
     return session.get(Patient, patient_id)
 
 
-def create_patient(session: Session, *, label: str, notes: str = "") -> Patient:
-    patient = Patient(label=label, notes=notes)
+def create_patient(
+    session: Session,
+    *,
+    label: str,
+    notes: str = "",
+    birthdate: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    first_initial: str | None = None,
+    last_initial: str | None = None,
+) -> Patient:
+    patient = Patient(
+        label=label,
+        notes=notes,
+        birthdate=birthdate,
+        first_name=first_name,
+        last_name=last_name,
+        first_initial=first_initial,
+        last_initial=last_initial,
+    )
     session.add(patient)
     session.commit()
     session.refresh(patient)
     return patient
 
 
-def update_patient(session: Session, patient_id: str, *, label: str, notes: str) -> Patient | None:
+def update_patient(
+    session: Session,
+    patient_id: str,
+    *,
+    label: str,
+    notes: str,
+    birthdate: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    first_initial: str | None = None,
+    last_initial: str | None = None,
+) -> Patient | None:
+    """Update a patient. Identity fields left as None keep their stored value."""
     patient = session.get(Patient, patient_id)
     if patient is None:
         return None
     patient.label = label
     patient.notes = notes
+    for field, value in (
+        ("birthdate", birthdate),
+        ("first_name", first_name),
+        ("last_name", last_name),
+        ("first_initial", first_initial),
+        ("last_initial", last_initial),
+    ):
+        if value is not None:
+            setattr(patient, field, value)
     _touch_updated_at(patient)
     session.commit()
     session.refresh(patient)
