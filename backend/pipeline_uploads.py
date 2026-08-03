@@ -27,6 +27,7 @@ UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 STATUS_PENDING = "pending"
 STATUS_NEEDS_OPERATOR_ANSWER = "needs_operator_answer"
 STATUS_REGISTERED = "registered"
+STATUS_FAILED = "failed"
 
 
 def uploads_dir() -> Path:
@@ -137,3 +138,25 @@ def pending_resolution(upload_id: str) -> dict[str, Any] | None:
     record = read_upload(upload_id) or {}
     resolution = record.get("resolution")
     return resolution if isinstance(resolution, dict) and resolution else None
+
+
+def record_failed(*, upload_id: str, error: str) -> None:
+    """Note an upload that fell over, so it is visible rather than just gone.
+
+    Best effort: recording a failure must never raise on top of the failure it
+    is recording.
+    """
+    if not is_valid_upload_id(upload_id):
+        return
+    try:
+        existing = read_upload(upload_id) or {}
+        write_upload(
+            {
+                **existing,
+                "uploadId": upload_id,
+                "status": STATUS_FAILED,
+                "error": error,
+            }
+        )
+    except OSError:
+        return

@@ -1454,3 +1454,98 @@ def test_an_answered_upload_is_filed_on_the_next_worker_cycle(
     assert again.status_code == 200
     assert again.json()["status"] == "registered"
     assert again.json()["patient_id"] == expected_label
+
+
+def test_one_broken_upload_does_not_abandon_the_rest_of_the_cycle(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """A failing upload records and steps aside; the queue keeps moving."""
+    from backend import pipeline_uploads, storage
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+
+    broken = {**_upload_job(), "uploadId": "up-broken"}
+    healthy = {
+        **_upload_job(),
+        "uploadId": "up-ok",
+        "identity": {
+            "firstName": "Cara",
+            "lastName": "Dale",
+            "firstInitial": "C",
+            "lastInitial": "D",
+            "birthdate": "04-02-1975",
+        },
+    }
+
+    class _HalfBrokenClient(_UploadClient):
+        def download(self, key, dest):
+            if "up-broken" in key:
+                raise RuntimeError("netlify blobs:get exited 1")
+            return super().download(key, dest)
+
+    client = _HalfBrokenClient(
+        {
+            "pipeline/jobs/up-broken/upload.json": broken,
+            "pipeline/jobs/up-ok/upload.json": healthy,
+        }
+    )
+
+    results = [
+        worker.process_new_patient_upload(
+            client=client,
+            portal_dir=tmp_path / "portal",
+            status_dir=tmp_path / "status",
+            job_key=key,
+            payload=payload,
+        )
+        for key, payload in worker.load_new_patient_upload_jobs(client)
+    ]
+
+    by_upload = {result.patient_id: result for result in results}
+    assert by_upload["up-broken"].status == "failed"
+    assert "netlify blobs:get exited 1" in by_upload["up-broken"].note
+    assert by_upload["CD_04-02-1975"].status == "registered"
+
+    # The failure is visible on the queue surface, not just swallowed.
+    failed = pipeline_uploads.read_upload("up-broken")
+    assert failed["status"] == "failed"
+    assert "netlify blobs:get exited 1" in failed["error"]
+
+    # Only the healthy upload was cleaned up; the broken one keeps its pending
+    # blob and its marker so the next cycle retries it.
+    assert client.deleted == [
+        "uploads/pending/up-ok/scan.pdf",
+        "pipeline/jobs/up-ok/upload.json",
+    ]
+
+    # The broken upload's chart was allocated before the download failed, and it
+    # stays: the retry matches it by name and files the report there instead of
+    # burning a second ordinal on the same person.
+    with storage.session_scope() as session:
+        labels = sorted(p.label for p in storage.list_patients(session))
+        assert labels == ["BT_12-11-1963", "CD_04-02-1975"]
+        barto = next(p for p in storage.list_patients(session) if p.label == "BT_12-11-1963")
+        assert storage.list_reports(session, barto.id) == []
+
+
+def test_a_malformed_upload_id_fails_that_job_without_raising(
+    temp_data_dir, tmp_path: Path, monkeypatch
+):
+    """An id that cannot name a file is that job's problem, not the cycle's."""
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    result = worker.process_new_patient_upload(
+        client=_UploadClient({}),
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key="pipeline/jobs/../upload.json",
+        payload={**_upload_job(), "uploadId": "../../etc/passwd"},
+    )
+
+    assert result.status == "failed"
+    assert "uploadId" in result.note

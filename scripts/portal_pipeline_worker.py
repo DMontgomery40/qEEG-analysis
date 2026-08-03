@@ -38,7 +38,7 @@ from backend.patient_intake import (  # noqa: E402
     identity_key,
 )
 from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
-from backend.reports import save_report_upload  # noqa: E402
+from backend.reports import report_dir, save_report_upload  # noqa: E402
 
 META_NAME = "$meta.json"
 INDEX_NAME = "$index.json"
@@ -762,23 +762,29 @@ def _register_new_patient_report(
             return existing.id, False
 
     report_id = str(uuid.uuid4())
-    original_path, extracted_path, mime_type, _preview = save_report_upload(
-        patient_id=patient_uuid,
-        report_id=report_id,
-        filename=filename,
-        provided_mime_type="application/pdf",
-        file_bytes=file_bytes,
-    )
-    with storage.session_scope() as session:
-        storage.create_report(
-            session,
-            report_id=report_id,
+    try:
+        original_path, extracted_path, mime_type, _preview = save_report_upload(
             patient_id=patient_uuid,
+            report_id=report_id,
             filename=filename,
-            mime_type=mime_type,
-            stored_path=original_path,
-            extracted_text_path=extracted_path,
+            provided_mime_type="application/pdf",
+            file_bytes=file_bytes,
         )
+        with storage.session_scope() as session:
+            storage.create_report(
+                session,
+                report_id=report_id,
+                patient_id=patient_uuid,
+                filename=filename,
+                mime_type=mime_type,
+                stored_path=original_path,
+                extracted_text_path=extracted_path,
+            )
+    except Exception:
+        # A retry mints a fresh report id, so the extracted files this attempt
+        # wrote would sit there unreferenced forever. Take them with it.
+        shutil.rmtree(report_dir(patient_uuid, report_id), ignore_errors=True)
+        raise
     # The raw-sync watcher publishes whatever is in the patient folder, so
     # dropping the file there is the whole publication step.
     portal_patient_dir = portal_dir / patient_label
@@ -848,21 +854,64 @@ def process_new_patient_upload(
     file_key = str(payload.get("fileKey") or "").strip()
     identity = _identity_from_job(payload)
 
-    if not upload_id or not file_key:
+    if not file_key or not pipeline_uploads.is_valid_upload_id(upload_id):
         return PatientWorkerResult(
             patient_id=upload_id or "unknown-upload",
             status="failed",
             downloaded=[],
             report_count=0,
             ran_batch=False,
-            note="upload job is missing uploadId or fileKey",
+            note="upload job is missing a usable uploadId or fileKey",
         )
 
     identity_payload = payload.get("identity")
-    pipeline_uploads.record_seen(
-        upload_id=upload_id,
-        identity=identity_payload if isinstance(identity_payload, dict) else {},
-    )
+    try:
+        return _file_new_patient_upload(
+            client=client,
+            portal_dir=portal_dir,
+            status_dir=status_dir,
+            job_key=job_key,
+            payload=payload,
+            upload_id=upload_id,
+            file_key=file_key,
+            identity=identity,
+            identity_payload=(
+                identity_payload if isinstance(identity_payload, dict) else {}
+            ),
+        )
+    except Exception as exc:
+        # One upload must never take the cycle down with it: the rest of the
+        # queue and the per-patient pass still have to run. The store is remote
+        # and the disk is not ours, so this is where a subprocess failure, a
+        # write error, or anything else unforeseen stops.
+        note = str(exc).strip() or exc.__class__.__name__
+        pipeline_uploads.record_failed(upload_id=upload_id, error=note)
+        result = PatientWorkerResult(
+            patient_id=upload_id,
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=note,
+        )
+        _write_local_status(status_dir, result)
+        return result
+
+
+def _file_new_patient_upload(
+    *,
+    client: NetlifyBlobClient,
+    portal_dir: Path,
+    status_dir: Path,
+    job_key: str,
+    payload: dict[str, Any],
+    upload_id: str,
+    file_key: str,
+    identity: IdentityInput,
+    identity_payload: dict[str, Any],
+) -> PatientWorkerResult:
+    """The upload's happy path. Its caller owns every failure."""
+    pipeline_uploads.record_seen(upload_id=upload_id, identity=identity_payload)
 
     try:
         patient_label = _allocate_patient_for_upload(identity)
@@ -875,7 +924,7 @@ def process_new_patient_upload(
         )
         pipeline_uploads.record_parked(
             upload_id=upload_id,
-            identity=identity_payload if isinstance(identity_payload, dict) else {},
+            identity=identity_payload,
             conflict=exc.payload,
         )
         result = PatientWorkerResult(
