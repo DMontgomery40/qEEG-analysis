@@ -43,6 +43,44 @@ def test_discover_batch_tasks_filters_generated_outputs(tmp_path: Path):
     ]
 
 
+def test_discover_batch_tasks_deduplicates_identical_sync_echoes(tmp_path: Path):
+    from scripts import run_portal_council_batch as script
+
+    patient_id = "01-01-2001-0"
+    patient_dir = tmp_path / patient_id
+    patient_dir.mkdir(parents=True)
+    original = patient_dir / "source-report.pdf"
+    original.write_bytes(b"%PDF-1.4\nsource-a")
+    for version in (1, 598):
+        echo = patient_dir / (
+            f"{patient_id}__source-report__v{version}__2026-08-02.pdf"
+        )
+        echo.write_bytes(original.read_bytes())
+    legacy_echo = patient_dir / (
+        f"{patient_id}_source_report_v4_2026-01-24.pdf"
+    )
+    legacy_echo.write_bytes(original.read_bytes())
+    nested_echo = patient_dir / (
+        f"{patient_id}__{patient_id}_source_report_v4_2026-01-24"
+        "__v1__2026-04-12.pdf"
+    )
+    nested_echo.write_bytes(b"%PDF-1.4\nremote-sync-metadata-revision")
+    (patient_dir / "different-session.pdf").write_bytes(
+        b"%PDF-1.4\nsource-b"
+    )
+
+    tasks = script._discover_batch_tasks(
+        portal_dir=tmp_path,
+        exclude_labels=set(),
+        skip_manifest_special_cases=True,
+    )
+
+    assert [task.pdf_path.name for task in tasks] == [
+        "different-session.pdf",
+        "source-report.pdf",
+    ]
+
+
 def test_dry_run_does_not_require_cliproxy(tmp_path: Path, temp_data_dir, monkeypatch):
     import asyncio
     import sys

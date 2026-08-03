@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -199,6 +201,54 @@ def _is_source_pdf(patient_label: str, path: Path) -> bool:
     return is_source_report_pdf(patient_label, path)
 
 
+_SYNC_ECHO_VERSION_RE = re.compile(
+    r"(?P<suffix>__v\d+__\d{4}-\d{2}-\d{2}(?:__[^.]*)?)\.pdf$",
+    re.IGNORECASE,
+)
+_LEGACY_SYNC_ECHO_VERSION_RE = re.compile(
+    r"(?P<suffix>_v\d+_\d{4}-\d{2}-\d{2}(?:_[^.]*)?)\.pdf$",
+    re.IGNORECASE,
+)
+
+
+def _source_content_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source_file:
+        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_path_preference(path: Path) -> tuple[int, int, str]:
+    is_sync_echo = bool(
+        _SYNC_ECHO_VERSION_RE.search(path.name)
+        or _LEGACY_SYNC_ECHO_VERSION_RE.search(path.name)
+    )
+    return (int(is_sync_echo), len(path.name), path.name.lower())
+
+
+def _source_logical_key(patient_label: str, path: Path) -> str:
+    stem = path.stem
+    version_match = _SYNC_ECHO_VERSION_RE.search(
+        path.name
+    ) or _LEGACY_SYNC_ECHO_VERSION_RE.search(path.name)
+    if version_match is not None:
+        stem = path.name[: version_match.start()]
+        for patient_prefix in (f"{patient_label}__", f"{patient_label}_"):
+            if stem.lower().startswith(patient_prefix.lower()):
+                stem = stem[len(patient_prefix) :]
+                break
+    return re.sub(r"[^a-z0-9]+", "", stem.lower())
+
+
+def _is_nested_sync_echo(patient_label: str, path: Path) -> bool:
+    if _SYNC_ECHO_VERSION_RE.search(path.name) is None:
+        return False
+    lower_name = path.name.lower()
+    lower_label = patient_label.lower()
+    return lower_name.startswith(f"{lower_label}__{lower_label}_")
+
+
 def _discover_batch_tasks(
     *,
     portal_dir: Path,
@@ -221,15 +271,30 @@ def _discover_batch_tasks(
             continue
         if skip_manifest_special_cases and _is_special_manifest_patient(patient_dir):
             continue
+        unique_sources: dict[tuple[str, str], Path] = {}
         for pdf_path in sorted(patient_dir.glob("*.pdf")):
-            if _is_source_pdf(label, pdf_path):
-                tasks.append(
-                    BatchTask(
-                        patient_label=normalized,
-                        patient_dir=patient_dir,
-                        pdf_path=pdf_path,
-                    )
+            if not _is_source_pdf(label, pdf_path):
+                continue
+            if _is_nested_sync_echo(normalized, pdf_path):
+                continue
+            identity = (
+                _source_content_digest(pdf_path),
+                _source_logical_key(normalized, pdf_path),
+            )
+            current = unique_sources.get(identity)
+            if current is None or _source_path_preference(
+                pdf_path
+            ) < _source_path_preference(current):
+                unique_sources[identity] = pdf_path
+
+        for pdf_path in sorted(unique_sources.values()):
+            tasks.append(
+                BatchTask(
+                    patient_label=normalized,
+                    patient_dir=patient_dir,
+                    pdf_path=pdf_path,
                 )
+            )
     return tasks
 
 

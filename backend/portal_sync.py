@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -206,13 +207,35 @@ def _sync_command(*, temp_root_dir: Path) -> tuple[list[str], Path] | None:
 
 
 @contextmanager
-def _sync_lock(root_dir: Path) -> Iterator[None]:
+def _sync_lock(root_dir: Path) -> Iterator[bool]:
     lock_path = root_dir / ".qeeg_portal_netlify_sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        timeout_s = float(
+            os.getenv("QEEG_PORTAL_SYNC_LOCK_TIMEOUT_S", "30") or "30"
+        )
+    except Exception:
+        timeout_s = 30.0
+    if timeout_s < 0:
+        timeout_s = 30.0
+
     with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(
+                    lock_file.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+            except BlockingIOError:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    yield False
+                    return
+                time.sleep(min(0.1, remaining_s))
         try:
-            yield
+            yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -248,7 +271,14 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
         )
         return False
 
-    with _sync_lock(root_dir):
+    with _sync_lock(root_dir) as lock_acquired:
+        if not lock_acquired:
+            LOGGER.warning(
+                "portal_sync_lock_timed_out",
+                patient_label=patient_id,
+                operatorHint="Another portal sync exceeded the bounded lock wait; this patient remains retryable after the active sync releases the reservation.",
+            )
+            return False
         state_path = _sync_state_path(root_dir)
         base_state = _load_sync_state(state_path)
         scoped_state = _filter_sync_state_for_patient(base_state, patient_id)

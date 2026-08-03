@@ -8,6 +8,50 @@ from pathlib import Path
 import pytest
 
 
+def test_sync_lock_acquires_nonblocking_and_releases(tmp_path: Path, monkeypatch):
+    from backend import portal_sync
+
+    operations: list[int] = []
+
+    def fake_flock(_fd: int, operation: int) -> None:
+        operations.append(operation)
+
+    monkeypatch.setattr(portal_sync.fcntl, "flock", fake_flock)
+
+    with portal_sync._sync_lock(tmp_path) as acquired:
+        assert acquired is True
+
+    assert operations == [
+        portal_sync.fcntl.LOCK_EX | portal_sync.fcntl.LOCK_NB,
+        portal_sync.fcntl.LOCK_UN,
+    ]
+
+
+def test_sync_lock_times_out_instead_of_waiting_forever(
+    tmp_path: Path, monkeypatch
+):
+    from backend import portal_sync
+
+    monotonic_values = iter((10.0, 10.0, 10.02))
+    sleeps: list[float] = []
+
+    def always_busy(_fd: int, operation: int) -> None:
+        assert operation == portal_sync.fcntl.LOCK_EX | portal_sync.fcntl.LOCK_NB
+        raise BlockingIOError
+
+    monkeypatch.setenv("QEEG_PORTAL_SYNC_LOCK_TIMEOUT_S", "0.01")
+    monkeypatch.setattr(portal_sync.fcntl, "flock", always_busy)
+    monkeypatch.setattr(
+        portal_sync.time, "monotonic", lambda: next(monotonic_values)
+    )
+    monkeypatch.setattr(portal_sync.time, "sleep", sleeps.append)
+
+    with portal_sync._sync_lock(tmp_path) as acquired:
+        assert acquired is False
+
+    assert sleeps == [pytest.approx(0.01)]
+
+
 def test_filter_and_merge_sync_state_preserve_other_patients():
     from backend import portal_sync
 
@@ -278,8 +322,12 @@ def test_source_pdf_classifier_allows_clinic_analysis_report_names(tmp_path: Pat
     patient_id = "08-10-1989-0"
     source_path = tmp_path / f"{patient_id}__analysis_report__v1__2026-02-09.pdf"
     generated_path = tmp_path / f"{patient_id}__analysis__v1__2026-02-09.pdf"
+    generated_sync_echo = (
+        tmp_path / f"{patient_id}__{patient_id}__v2897__2026-08-03__retry.pdf"
+    )
     source_path.write_bytes(b"%PDF-1.4")
     generated_path.write_bytes(b"%PDF-1.4")
+    generated_sync_echo.write_bytes(b"%PDF-1.4")
 
     assert portal_sync._is_source_pdf(patient_id, source_path)
     assert run_portal_council_batch._is_source_pdf(patient_id, source_path)
@@ -287,11 +335,15 @@ def test_source_pdf_classifier_allows_clinic_analysis_report_names(tmp_path: Pat
 
     assert not portal_sync._is_source_pdf(patient_id, generated_path)
     assert not run_portal_council_batch._is_source_pdf(patient_id, generated_path)
+    assert not portal_sync._is_source_pdf(patient_id, generated_sync_echo)
+    assert not run_portal_council_batch._is_source_pdf(
+        patient_id, generated_sync_echo
+    )
     assert portal_pipeline_worker._looks_generated_pdf(patient_id, generated_path.name)
 
 
 def test_source_pdfs_missing_complete_runs_keeps_fresh_created_rows_active(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, temp_data_dir: Path, monkeypatch
 ):
     from backend import portal_sync
     from backend import storage
@@ -329,7 +381,7 @@ def test_source_pdfs_missing_complete_runs_keeps_fresh_created_rows_active(
 
 
 def test_source_pdfs_missing_complete_runs_ignores_stale_running_rows(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, temp_data_dir: Path, monkeypatch
 ):
     from backend import portal_sync
     from backend import storage
