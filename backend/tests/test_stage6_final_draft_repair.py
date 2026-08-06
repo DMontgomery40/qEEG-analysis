@@ -377,3 +377,111 @@ async def test_stage6_rejects_final_content_missing_required_sections(
 
     with pytest.raises(RuntimeError, match="All models failed during Stage 6"):
         await workflow._stage6(run_id, ["deepseek-v4-pro"], emit)
+
+
+@pytest.mark.asyncio
+async def test_stage6_completion_counts_drafts_not_the_fallback_chain(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    # 2026-08-05: every healthy run reported success 1 / requested 2, because the
+    # completion event counted `writer_candidates` — the ordered fallback chain,
+    # which the loop abandons after the first success — instead of the single
+    # final draft the stage exists to produce. orchestration reads that as
+    # "partial council output 1/2" and withholds the patient-facing document, so
+    # from 2026-08-02 no analysis could publish. Michelle Rosen-Camp's and Gianna
+    # Rutherford's PDFs both blocked on it with a full, valid draft on disk.
+    import backend.council.workflow.stages as stages_module
+    from backend.council import QEEGCouncilWorkflow
+    from backend.storage import list_artifacts, session_scope
+
+    council_model = "deepseek-v4-pro"
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id=council_model,
+    )
+    # Discovery is populated in the live app, which is what grows the fallback
+    # chain to writer + kimi-k3. The autouse fixture empties it, so without this
+    # the chain is one entry long and the regression cannot reproduce.
+    monkeypatch.setattr(
+        stages_module,
+        "DISCOVERED_MODEL_IDS",
+        {"z-ai/glm-5.2", "moonshotai/kimi-k3", council_model},
+    )
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        return _complete_stage6()
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    payloads: list[dict] = []
+
+    async def emit(payload):
+        payloads.append(payload)
+
+    await workflow._stage6(run_id, [council_model], emit)
+
+    start = [p for p in payloads if p.get("status") == "start"][0]
+    assert start["candidate_count"] > 1, "the fallback chain must be live for this test to bite"
+
+    completion = [p for p in payloads if p.get("status") == "complete"][-1]
+    assert completion["success_count"] == completion["requested_count"], (
+        "a stage 6 that produced its final draft must not report a shortfall: "
+        f"{completion['success_count']}/{completion['requested_count']}"
+    )
+    assert completion["requested_count"] == 1
+
+    # The draft that count describes really is on disk.
+    with session_scope() as session:
+        stage6 = [a for a in list_artifacts(session, run_id) if a.stage_num == 6]
+    assert len(stage6) == 1
+
+
+@pytest.mark.asyncio
+async def test_stage6_success_survives_orchestration_partial_check(
+    temp_data_dir, mock_llm_client, monkeypatch
+):
+    # The counts above only matter because orchestration turns a shortfall into a
+    # delivery gap. Assert the real consumer, not just the numbers: a completed
+    # stage 6 must leave no "partial council output" gap behind.
+    import backend.council.workflow.stages as stages_module
+    from backend.council import QEEGCouncilWorkflow
+
+    council_model = "deepseek-v4-pro"
+    run_id = _create_stage6_ready_run(
+        report_id=str(uuid.uuid4()),
+        council_model_id=council_model,
+    )
+    monkeypatch.setattr(
+        stages_module,
+        "DISCOVERED_MODEL_IDS",
+        {"z-ai/glm-5.2", "moonshotai/kimi-k3", council_model},
+    )
+
+    async def fake_call_model_chat(
+        *, model_id: str, prompt_text: str, temperature: float, max_tokens: int
+    ) -> str:
+        return _complete_stage6()
+
+    workflow = QEEGCouncilWorkflow(llm=mock_llm_client)
+    monkeypatch.setattr(workflow, "_call_model_chat", fake_call_model_chat)
+
+    payloads: list[dict] = []
+
+    async def emit(payload):
+        payloads.append(payload)
+
+    await workflow._stage6(run_id, [council_model], emit)
+
+    completion = [p for p in payloads if p.get("status") == "complete"][-1]
+    success = completion["success_count"]
+    requested = completion["requested_count"]
+    partial = (
+        isinstance(success, int)
+        and isinstance(requested, int)
+        and requested > 0
+        and success < requested
+    )
+    assert not partial, "a finished stage 6 must not read as partial council output"

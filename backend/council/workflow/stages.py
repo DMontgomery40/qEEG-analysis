@@ -1924,6 +1924,14 @@ class _StagesMixin:
                 run_id=run_id, stage=stage, model_id=model_id, text=text
             )
 
+        # Stage 6 wants exactly one final draft; `writer_candidates` is a
+        # fallback chain tried in order until one works, not a fan-out. Counting
+        # the chain length here reported 1/2 on every healthy run, which
+        # `run_council_completion_gaps` reads as "partial council output" and
+        # `run_downstream_delivery_gaps` then treats as a reason to withhold the
+        # patient-facing document — so from 2026-08-02 no run could publish at
+        # all. The chain length is already reported as `candidate_count` on this
+        # stage's start event.
         await emit(
             {
                 "run_id": run_id,
@@ -1931,6 +1939,6 @@ class _StagesMixin:
                 "stage_name": stage.name,
                 "status": "complete",
                 "success_count": len(successes),
-                "requested_count": len(writer_candidates),
+                "requested_count": 1,
             }
         )
