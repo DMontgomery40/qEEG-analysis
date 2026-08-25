@@ -238,7 +238,7 @@ async def test_stage6_compacts_oversized_longitudinal_context(
 
 
 @pytest.mark.asyncio
-async def test_stage6_routes_only_glm52_writer(
+async def test_stage6_routes_ox_alpha_as_the_primary_writer(
     temp_data_dir, mock_llm_client, monkeypatch
 ):
     from backend.council import QEEGCouncilWorkflow
@@ -265,10 +265,10 @@ async def test_stage6_routes_only_glm52_writer(
 
     await workflow._stage6(run_id, [council_model], emit)
 
-    assert called_models == ["z-ai/glm-5.2"]
+    assert called_models == ["stealth/ox-alpha"]
     with session_scope() as session:
         stage6 = [a for a in list_artifacts(session, run_id) if a.stage_num == 6]
-    assert [artifact.model_id for artifact in stage6] == ["z-ai/glm-5.2"]
+    assert [artifact.model_id for artifact in stage6] == ["stealth/ox-alpha"]
 
 
 @pytest.mark.asyncio
@@ -316,8 +316,8 @@ async def test_stage6_falls_back_when_discovered_writer_fails_at_call_time(
     from backend.council import QEEGCouncilWorkflow
     from backend.storage import list_artifacts, session_scope
 
-    preferred_model = "z-ai/glm-5.2"
-    fallback_model = "kimi-k3"
+    preferred_model = "stealth/ox-alpha"
+    fallback_model = "z-ai/glm-5.2"
     analytical_model = "gpt-5.6-terra"
     run_id = _create_stage6_ready_run(
         report_id=str(uuid.uuid4()),
@@ -405,7 +405,7 @@ async def test_stage6_completion_counts_drafts_not_the_fallback_chain(
     monkeypatch.setattr(
         stages_module,
         "DISCOVERED_MODEL_IDS",
-        {"z-ai/glm-5.2", "moonshotai/kimi-k3", council_model},
+        {"stealth/ox-alpha", "z-ai/glm-5.2", council_model},
     )
 
     async def fake_call_model_chat(

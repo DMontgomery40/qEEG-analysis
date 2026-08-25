@@ -10,6 +10,8 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
+from .model_selection import resolve_model_preference
+
 load_dotenv()
 
 CLIPROXY_BASE_URL = os.getenv("CLIPROXY_BASE_URL", "http://127.0.0.1:8317").rstrip("/")
@@ -89,31 +91,37 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 
 MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
     stage1_vision=os.getenv(
-        "DEFAULT_STAGE1_VISION_MODEL", "openai/gpt-5.6-sol"
+        "DEFAULT_STAGE1_VISION_MODEL", "stealth/ox-alpha"
     ),
-    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "openai/gpt-5.6-sol"),
+    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "stealth/ox-alpha"),
     stage4_consolidator=os.getenv(
         "DEFAULT_STAGE4_CONSOLIDATOR",
-        os.getenv("DEFAULT_CONSOLIDATOR", "z-ai/glm-5.2"),
+        os.getenv("DEFAULT_CONSOLIDATOR", "stealth/ox-alpha"),
     ),
     stage5_final_review=os.getenv(
-        "DEFAULT_STAGE5_REVIEW_MODEL", "openai/gpt-5.6-sol"
+        "DEFAULT_STAGE5_REVIEW_MODEL", "stealth/ox-alpha"
     ),
     stage6_final_draft=os.getenv(
-        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "z-ai/glm-5.2"
+        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "stealth/ox-alpha"
     ),
     patient_facing_rewrite=os.getenv(
-        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "z-ai/glm-5.2"
+        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "stealth/ox-alpha"
     ),
 )
 
 
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     CouncilModelConfig(
-        id=MODEL_ROLE_DEFAULTS.stage2_review,
-        name="GPT-5.6 Sol",
-        source="Subscription via CLIProxyAPI",
-        endpoint_preference="responses",
+        id="deepseek-v4-flash",
+        name="DeepSeek V4 Flash",
+        source="CLIProxyAPI",
+        endpoint_preference="chat",
+    ),
+    CouncilModelConfig(
+        id="stealth/ox-alpha",
+        name="Ox Alpha",
+        source="OpenRouter via CLIProxyAPI",
+        endpoint_preference="chat",
     ),
     CouncilModelConfig(
         id="openai/gpt-5.6-terra",
@@ -128,6 +136,7 @@ DEFAULT_CONSOLIDATOR = MODEL_ROLE_DEFAULTS.stage4_consolidator
 # Models that support vision/multimodal input (can process images)
 # These will receive page images in addition to text for Stage 1 analysis
 VISION_CAPABLE_MODELS: set[str] = {
+    "stealth/ox-alpha",
     # OpenAI vision models (GPT-4o, GPT-4-turbo, GPT-5+ all support vision)
     "gpt-4o",
     "gpt-4o-mini",
@@ -202,6 +211,20 @@ VISION_CAPABLE_MODELS: set[str] = {
     "gemini-pro-vision",
     "google/gemini-pro-vision",
 }
+
+
+def resolve_role_model(
+    primary: str, fallback: str, discovered_model_ids: list[str] | set[str]
+) -> str:
+    """Choose a role model from live discovery, preserving isolated test runs."""
+    discovered = list(discovered_model_ids)
+    if not discovered:
+        return primary
+    resolved_primary = resolve_model_preference(primary, discovered)
+    if resolved_primary:
+        return resolved_primary
+    resolved_fallback = resolve_model_preference(fallback, discovered)
+    return resolved_fallback or primary
 
 
 def is_vision_capable(model_id: str) -> bool:

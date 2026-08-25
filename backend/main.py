@@ -552,6 +552,11 @@ async def _auto_generate_patient_facing_for_run(
         )
         or MODEL_ROLE_DEFAULTS.patient_facing_rewrite
     ).strip()
+    preferred_model = cfg.resolve_role_model(
+        preferred_model,
+        "z-ai/glm-5.2",
+        DISCOVERED_MODEL_IDS,
+    )
     version_prefix = (
         os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto"
     ).strip() or "auto"

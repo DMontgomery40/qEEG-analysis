@@ -1763,8 +1763,8 @@ class _StagesMixin:
         writer_candidates: list[str] = []
         if DISCOVERED_MODEL_IDS:
             fallback_writer = (
-                os.getenv("QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "kimi-k3")
-                or "kimi-k3"
+                os.getenv("QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2")
+                or "z-ai/glm-5.2"
             ).strip()
             candidate_preferences = [writer_model, fallback_writer]
             for preference in candidate_preferences:
