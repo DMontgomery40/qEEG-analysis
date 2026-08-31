@@ -66,10 +66,10 @@ def test_patient_facing_writeups_can_opt_into_portal_markdown_fallback(
     assert "GENERATE RS_01-01-2001: 1 source reports" in out
 
 
-def test_patient_facing_regeneration_uses_ox_alpha_role_default():
+def test_patient_facing_regeneration_uses_glm_53_flash_role_default():
     from scripts import generate_patient_facing_writeups as script
 
-    assert script.DEFAULT_PATIENT_FACING_MODEL == "stealth/ox-alpha"
+    assert script.DEFAULT_PATIENT_FACING_MODEL == "z-ai/glm-5.3-flash"
 
 
 def test_patient_facing_writer_validates_all_required_sections():

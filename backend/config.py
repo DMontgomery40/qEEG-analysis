@@ -91,21 +91,21 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 
 MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
     stage1_vision=os.getenv(
-        "DEFAULT_STAGE1_VISION_MODEL", "stealth/ox-alpha"
+        "DEFAULT_STAGE1_VISION_MODEL", "z-ai/glm-5.3-flash"
     ),
-    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "stealth/ox-alpha"),
+    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "z-ai/glm-5.3-flash"),
     stage4_consolidator=os.getenv(
         "DEFAULT_STAGE4_CONSOLIDATOR",
-        os.getenv("DEFAULT_CONSOLIDATOR", "stealth/ox-alpha"),
+        os.getenv("DEFAULT_CONSOLIDATOR", "z-ai/glm-5.3-flash"),
     ),
     stage5_final_review=os.getenv(
-        "DEFAULT_STAGE5_REVIEW_MODEL", "stealth/ox-alpha"
+        "DEFAULT_STAGE5_REVIEW_MODEL", "z-ai/glm-5.3-flash"
     ),
     stage6_final_draft=os.getenv(
-        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "stealth/ox-alpha"
+        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "z-ai/glm-5.3-flash"
     ),
     patient_facing_rewrite=os.getenv(
-        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "stealth/ox-alpha"
+        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "z-ai/glm-5.3-flash"
     ),
 )
 
@@ -118,8 +118,8 @@ COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
         endpoint_preference="chat",
     ),
     CouncilModelConfig(
-        id="stealth/ox-alpha",
-        name="Ox Alpha",
+        id="z-ai/glm-5.3-flash",
+        name="GLM 5.3 Flash",
         source="OpenRouter via CLIProxyAPI",
         endpoint_preference="chat",
     ),
@@ -136,7 +136,7 @@ DEFAULT_CONSOLIDATOR = MODEL_ROLE_DEFAULTS.stage4_consolidator
 # Models that support vision/multimodal input (can process images)
 # These will receive page images in addition to text for Stage 1 analysis
 VISION_CAPABLE_MODELS: set[str] = {
-    "stealth/ox-alpha",
+    "z-ai/glm-5.3-flash",
     # OpenAI vision models (GPT-4o, GPT-4-turbo, GPT-5+ all support vision)
     "gpt-4o",
     "gpt-4o-mini",
