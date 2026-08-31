@@ -269,10 +269,10 @@ def _openrouter_reasoning_config(model_id: str) -> dict[str, Any] | None:
             break
 
     config: dict[str, Any] = {}
-    is_glm52_writer = (model_id or "").strip().lower() == "z-ai/glm-5.2"
-    if not effort and is_glm52_writer:
+    is_glm_writer = _is_glm_writer(model_id)
+    if not effort and is_glm_writer:
         effort = "high"
-    if exclude is None and is_glm52_writer:
+    if exclude is None and is_glm_writer:
         exclude = True
     if effort in {"none", "minimal", "low", "medium", "high", "xhigh"}:
         config["effort"] = effort
@@ -281,8 +281,11 @@ def _openrouter_reasoning_config(model_id: str) -> dict[str, Any] | None:
     return config or None
 
 
-def _is_glm52_writer(model_id: str) -> bool:
-    return (model_id or "").strip().lower() == "z-ai/glm-5.2"
+def _is_glm_writer(model_id: str) -> bool:
+    return (model_id or "").strip().lower() in {
+        "z-ai/glm-5.2",
+        "z-ai/glm-5.3-flash",
+    }
 
 
 def _looks_like_reasoning_leak(content: str, message: dict[str, Any]) -> bool:
@@ -595,7 +598,7 @@ class AsyncOpenAICompatClient:
             payload["reasoning_effort"] = reasoning_effort
         openrouter_reasoning = (
             _openrouter_reasoning_config(model_id)
-            if use_openrouter or _is_glm52_writer(model_id)
+            if use_openrouter or _is_glm_writer(model_id)
             else None
         )
         if openrouter_reasoning:
@@ -671,14 +674,14 @@ class AsyncOpenAICompatClient:
             ) from e
 
         content_text = _chat_content_text(message.get("content"))
-        if not isinstance(content_text, str) and not _is_glm52_writer(model_id):
+        if not isinstance(content_text, str) and not _is_glm_writer(model_id):
             raise UpstreamError(
                 "CLIProxyAPI /v1/chat/completions returned non-text content",
                 operator_hint=_operator_hint("/v1/chat/completions", "non_text"),
             )
         if not isinstance(content_text, str):
             content_text = ""
-        needs_glm_retry = _is_glm52_writer(model_id) and (
+        needs_glm_retry = _is_glm_writer(model_id) and (
             not content_text.strip()
             or _looks_like_reasoning_leak(content_text, message)
         )

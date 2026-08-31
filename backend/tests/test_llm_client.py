@@ -181,8 +181,10 @@ async def test_chat_completions_routes_openrouter_extra_through_cliproxy_by_defa
 
 
 @pytest.mark.asyncio
-async def test_glm52_writer_uses_high_reasoning_and_returns_only_final_content(
+@pytest.mark.parametrize("model_id", ["z-ai/glm-5.2", "z-ai/glm-5.3-flash"])
+async def test_glm_writer_uses_high_reasoning_and_returns_only_final_content(
     monkeypatch: pytest.MonkeyPatch,
+    model_id: str,
 ):
     monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -215,7 +217,7 @@ async def test_glm52_writer_uses_high_reasoning_and_returns_only_final_content(
     )
     try:
         output = await client.chat_completions(
-            model_id="z-ai/glm-5.2",
+            model_id=model_id,
             messages=[{"role": "user", "content": "Write the report."}],
             max_tokens=100,
         )
@@ -228,8 +230,10 @@ async def test_glm52_writer_uses_high_reasoning_and_returns_only_final_content(
 
 
 @pytest.mark.asyncio
-async def test_glm52_empty_content_retries_once_without_reasoning(
+@pytest.mark.parametrize("model_id", ["z-ai/glm-5.2", "z-ai/glm-5.3-flash"])
+async def test_glm_empty_content_retries_once_without_reasoning(
     monkeypatch: pytest.MonkeyPatch,
+    model_id: str,
 ):
     monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -273,7 +277,7 @@ async def test_glm52_empty_content_retries_once_without_reasoning(
     )
     try:
         output = await client.chat_completions(
-            model_id="z-ai/glm-5.2",
+            model_id=model_id,
             messages=[{"role": "user", "content": "Write the report."}],
             max_tokens=100,
         )
@@ -295,9 +299,11 @@ async def test_glm52_empty_content_retries_once_without_reasoning(
         {"reasoning": "Unpublished reasoning."},
     ],
 )
-async def test_glm52_null_or_missing_content_retries_once(
+@pytest.mark.parametrize("model_id", ["z-ai/glm-5.2", "z-ai/glm-5.3-flash"])
+async def test_glm_null_or_missing_content_retries_once(
     monkeypatch: pytest.MonkeyPatch,
     empty_message: dict,
+    model_id: str,
 ):
     monkeypatch.delenv("QEEG_OPENROUTER_EXTRA_MODELS", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -321,7 +327,7 @@ async def test_glm52_null_or_missing_content_retries_once(
     )
     try:
         output = await client.chat_completions(
-            model_id="z-ai/glm-5.2",
+            model_id=model_id,
             messages=[{"role": "user", "content": "Write the report."}],
             max_tokens=100,
         )
