@@ -73,18 +73,24 @@ def test_create_run_rejects_report_from_different_patient(temp_data_dir, monkeyp
 
 def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
     app, main = _test_app(temp_data_dir, monkeypatch)
-    from backend import storage
+    from backend import runtime_identity, storage
+    from backend.tests.fixtures.mock_llm import MOCK_MODEL_IDS
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="P", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     with storage.session_scope() as session:
+        runtime = runtime_identity.current_runtime_identity(MOCK_MODEL_IDS)
         run = storage.create_run(
             session,
             patient_id=patient.id,
             report_id=report.id,
             council_model_ids=["mock-council-a"],
             consolidator_model_id="mock-consolidator",
+            requested_model_ids=["mock-council-a", "mock-consolidator"],
+            resolved_model_ids=["mock-council-a", "mock-consolidator"],
+            creating_instance_id=str(runtime["instance_id"]),
+            model_catalogue_fingerprint=str(runtime["model_catalogue_fingerprint"]),
         )
 
     scheduled: list[str | None] = []
@@ -109,6 +115,104 @@ def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
     assert second.status_code == 200
     assert second.json()["status"] == "running"
     assert scheduled == [f"qeeg-run-{run.id}"]
+
+
+def test_run_creation_echoes_exact_models_and_runtime_before_start(temp_data_dir, monkeypatch):
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a", "mock-council-b"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        )
+        health = client.get("/api/health").json()
+
+    assert response.status_code == 200
+    created = response.json()
+    assert created["status"] == "created"
+    assert created["requested_model_ids"] == [
+        "mock-council-a",
+        "mock-council-b",
+        "mock-consolidator",
+    ]
+    assert created["resolved_model_ids"] == created["requested_model_ids"]
+    assert created["creating_instance_id"] == health["runtime"]["instance_id"]
+    assert created["model_catalogue_fingerprint"] == health["runtime"]["model_catalogue_fingerprint"]
+
+
+def test_start_refuses_runtime_or_catalogue_drift_without_scheduling_work(temp_data_dir, monkeypatch):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import config, storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled: list[str] = []
+    monkeypatch.setattr(main, "_spawn_task", lambda *_args, **_kwargs: scheduled.append("called"))
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
+        config.DISCOVERED_MODEL_IDS.remove("mock-council-a")
+        response = client.post(f"/api/runs/{created['id']}/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+    assert scheduled == []
+    with storage.session_scope() as session:
+        assert storage.get_run(session, created["id"]).status == "created"
+
+
+def test_run_creation_allows_only_an_explicit_available_fallback(temp_data_dir, monkeypatch):
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        implicit = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["retired-model"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        )
+        explicit = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["retired-model"],
+                "consolidator_model_id": "mock-consolidator",
+                "allowed_model_fallbacks": {"retired-model": "mock-council-a"},
+            },
+        )
+
+    assert implicit.status_code == 409
+    assert implicit.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+    assert explicit.status_code == 200
+    assert explicit.json()["requested_model_ids"][0] == "retired-model"
+    assert explicit.json()["resolved_model_ids"][0] == "mock-council-a"
 
 
 def test_select_rejects_artifact_from_different_run(temp_data_dir, monkeypatch):

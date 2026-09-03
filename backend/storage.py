@@ -116,6 +116,10 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, default="created")
     council_model_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     consolidator_model_id: Mapped[str] = mapped_column(String, nullable=False, default="")
+    requested_model_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    resolved_model_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    creating_instance_id: Mapped[str] = mapped_column(String, nullable=False, default="")
+    model_catalogue_fingerprint: Mapped[str] = mapped_column(String, nullable=False, default="")
     label_map_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -178,6 +182,13 @@ _PATIENT_IDENTITY_COLUMNS = {
     "last_initial": "VARCHAR",
 }
 
+_RUN_ATTESTATION_COLUMNS = {
+    "requested_model_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+    "resolved_model_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+    "creating_instance_id": "VARCHAR NOT NULL DEFAULT ''",
+    "model_catalogue_fingerprint": "VARCHAR NOT NULL DEFAULT ''",
+}
+
 
 def _ensure_patient_identity_columns() -> None:
     """Add identity columns to a `patients` table created before they existed.
@@ -194,10 +205,19 @@ def _ensure_patient_identity_columns() -> None:
                 )
 
 
+def _ensure_run_attestation_columns() -> None:
+    with engine.begin() as conn:
+        present = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(runs)")}
+        for column, sql_type in _RUN_ATTESTATION_COLUMNS.items():
+            if column not in present:
+                conn.exec_driver_sql(f"ALTER TABLE runs ADD COLUMN {column} {sql_type}")
+
+
 def init_db() -> None:
     ensure_data_dirs()
     Base.metadata.create_all(engine)
     _ensure_patient_identity_columns()
+    _ensure_run_attestation_columns()
 
 
 @contextmanager
@@ -392,13 +412,23 @@ def create_run(
     report_id: str,
     council_model_ids: list[str],
     consolidator_model_id: str,
+    requested_model_ids: list[str] | None = None,
+    resolved_model_ids: list[str] | None = None,
+    creating_instance_id: str = "",
+    model_catalogue_fingerprint: str = "",
 ) -> Run:
+    requested = list(requested_model_ids or [])
+    resolved = list(resolved_model_ids or [])
     run = Run(
         patient_id=patient_id,
         report_id=report_id,
         status="created",
         council_model_ids_json=json.dumps(council_model_ids),
         consolidator_model_id=consolidator_model_id,
+        requested_model_ids_json=json.dumps(requested),
+        resolved_model_ids_json=json.dumps(resolved),
+        creating_instance_id=creating_instance_id,
+        model_catalogue_fingerprint=model_catalogue_fingerprint,
         label_map_json="{}",
         started_at=None,
         completed_at=None,

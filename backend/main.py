@@ -19,7 +19,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 
 from . import storage
@@ -41,6 +41,7 @@ from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient
 from .logging_utils import configure_logging, get_logger, log_context, new_request_id
 from .model_selection import resolve_model_preference
+from . import runtime_identity
 from .orchestration import (
     build_patient_orchestration_detail,
     build_patient_orchestration_summary,
@@ -222,6 +223,7 @@ class RunCreate(BaseModel):
     report_id: str
     council_model_ids: list[str]
     consolidator_model_id: str
+    allowed_model_fallbacks: dict[str, str] = Field(default_factory=dict)
 
 
 class SelectRequest(BaseModel):
@@ -1267,24 +1269,31 @@ async def health() -> dict[str, Any]:
                 error=None,
             ),
             "mock_mode": True,
+            "runtime": runtime_identity.current_runtime_identity(MOCK_MODEL_IDS),
         }
 
     try:
         discovered = await llm.list_models()
         set_discovered_model_ids(discovered)
-        return status_payload(
-            base_url=CLIPROXY_BASE_URL,
-            reachable=True,
-            discovered_model_count=len(discovered),
-            error=None,
-        )
+        return {
+            **status_payload(
+                base_url=CLIPROXY_BASE_URL,
+                reachable=True,
+                discovered_model_count=len(discovered),
+                error=None,
+            ),
+            "runtime": runtime_identity.current_runtime_identity(discovered),
+        }
     except Exception as e:
-        return status_payload(
-            base_url=CLIPROXY_BASE_URL,
-            reachable=False,
-            discovered_model_count=0,
-            error=e,
-        )
+        return {
+            **status_payload(
+                base_url=CLIPROXY_BASE_URL,
+                reachable=False,
+                discovered_model_count=0,
+                error=e,
+            ),
+            "runtime": runtime_identity.current_runtime_identity(DISCOVERED_MODEL_IDS),
+        }
 
 
 @app.post("/api/cliproxy/start")
@@ -2567,6 +2576,29 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
     if not req.consolidator_model_id:
         raise HTTPException(status_code=400, detail="consolidator_model_id is required")
 
+    requested_model_ids = [
+        *[str(model_id).strip() for model_id in req.council_model_ids],
+        str(req.consolidator_model_id).strip(),
+    ]
+    discovered = sorted(DISCOVERED_MODEL_IDS)
+    resolved_model_ids: list[str] = []
+    for requested in requested_model_ids:
+        if requested in discovered:
+            resolved_model_ids.append(requested)
+            continue
+        fallback = str(req.allowed_model_fallbacks.get(requested) or "").strip()
+        if fallback and fallback in discovered:
+            resolved_model_ids.append(fallback)
+            continue
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ANALYSIS_MODEL_MISMATCH",
+                "message": f"Requested model is not currently available: {requested}",
+            },
+        )
+    runtime = runtime_identity.current_runtime_identity(discovered)
+
     with storage.session_scope() as session:
         if storage.get_patient(session, req.patient_id) is None:
             raise HTTPException(status_code=404, detail="Patient not found")
@@ -2581,8 +2613,12 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
             session,
             patient_id=req.patient_id,
             report_id=req.report_id,
-            council_model_ids=req.council_model_ids,
-            consolidator_model_id=req.consolidator_model_id,
+            council_model_ids=resolved_model_ids[:-1],
+            consolidator_model_id=resolved_model_ids[-1],
+            requested_model_ids=requested_model_ids,
+            resolved_model_ids=resolved_model_ids,
+            creating_instance_id=str(runtime["instance_id"]),
+            model_catalogue_fingerprint=str(runtime["model_catalogue_fingerprint"]),
         )
         return _run_out(run)
 
@@ -2593,6 +2629,36 @@ async def start_run(run_id: str) -> dict[str, Any]:
         run = storage.get_run(session, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+        try:
+            requested_model_ids = json.loads(run.requested_model_ids_json or "[]")
+            resolved_model_ids = json.loads(run.resolved_model_ids_json or "[]")
+            persisted_execution_models = [
+                *json.loads(run.council_model_ids_json or "[]"),
+                run.consolidator_model_id,
+            ]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            requested_model_ids = []
+            resolved_model_ids = []
+            persisted_execution_models = []
+        current_runtime = runtime_identity.current_runtime_identity(DISCOVERED_MODEL_IDS)
+        mismatch = (
+            not isinstance(requested_model_ids, list)
+            or not isinstance(resolved_model_ids, list)
+            or not requested_model_ids
+            or resolved_model_ids != persisted_execution_models
+            or run.creating_instance_id != current_runtime["instance_id"]
+            or run.model_catalogue_fingerprint
+            != current_runtime["model_catalogue_fingerprint"]
+            or any(model_id not in DISCOVERED_MODEL_IDS for model_id in resolved_model_ids)
+        )
+        if mismatch:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ANALYSIS_MODEL_MISMATCH",
+                    "message": "The engine runtime or resolved model catalogue changed before start.",
+                },
+            )
         started = storage.claim_run_start(session, run_id)
 
     with storage.session_scope() as session:
@@ -2982,6 +3048,14 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         label_map = json.loads(r.label_map_json or "{}")
     except Exception:
         label_map = {}
+    try:
+        requested_model_ids = json.loads(r.requested_model_ids_json or "[]")
+    except Exception:
+        requested_model_ids = []
+    try:
+        resolved_model_ids = json.loads(r.resolved_model_ids_json or "[]")
+    except Exception:
+        resolved_model_ids = []
 
     return {
         "id": r.id,
@@ -2995,6 +3069,10 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "error_message": r.error_message,
         "council_model_ids": council_model_ids,
         "consolidator_model_id": r.consolidator_model_id,
+        "requested_model_ids": requested_model_ids,
+        "resolved_model_ids": resolved_model_ids,
+        "creating_instance_id": r.creating_instance_id,
+        "model_catalogue_fingerprint": r.model_catalogue_fingerprint,
         "label_map": label_map,
         "started_at": r.started_at.isoformat() if r.started_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
