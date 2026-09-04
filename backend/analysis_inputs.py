@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 import uuid
@@ -227,6 +228,59 @@ def _measurements(source: ExtractedSource, local: int) -> dict[str, set[str]]:
     return result
 
 
+def _observed_session_evidence(
+    source: ExtractedSource, local: int
+) -> tuple[bool, tuple[tuple[str, ...], ...]]:
+    """Compare all observed text, without pretending our clinical parsers are exhaustive.
+
+    Whole single-session sources and pages explicitly belonging to one session
+    can be attributed safely. Mixed-session tables or unlabeled pages in a
+    multi-session report leave attribution incomplete and need operator mapping.
+    Preserve every OCR stream and every unsupported observation in comparisons.
+    """
+    page_evidence = []
+    for index, body in enumerate(source.page_sections):
+        streams = (
+            source.per_page_sources[index]
+            if index < len(source.per_page_sources)
+            else {}
+        )
+        texts = [body, *[streams.get(field, "") for field in _ENGINES.values()]]
+        indices = {
+            row["local_session_index"]
+            for text in texts
+            for row in _session_evidence(text)
+        }
+        page_evidence.append((texts, indices))
+    source_indices = set().union(*(indices for _, indices in page_evidence))
+    date = r"(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
+    legend = re.compile(
+        rf"^Session\s+\d+(?:\s*\((?:{date}|[^\d)]+)\)|\s*(?:Date\s*:|:|-)\s*{date}|\s+{date})?\s*$",
+        re.I,
+    )
+
+    def normalized(text: str) -> str:
+        return "\n".join(
+            " ".join(line.split())
+            for line in text.splitlines()
+            if line.strip() and not legend.fullmatch(line.strip())
+        )
+
+    complete = True
+    observations = []
+    for texts, indices in page_evidence:
+        if source_indices == {local}:
+            belongs = True
+        elif len(indices) == 1:
+            belongs = indices == {local}
+        else:
+            complete = False
+            continue
+        if belongs:
+            observations.append(tuple(normalized(text) for text in texts))
+    return complete and bool(observations), tuple(sorted(observations))
+
+
 def _mapping_error(snapshots: list[dict], reason: str) -> None:
     raise HTTPException(
         409,
@@ -285,8 +339,24 @@ def resolve_aliases(
         aliases = {
             (i, r["local_session_index"]): r["local_session_index"] for i, r in rows
         }
-    # A repeated date is corroborated with shared measured values. Different
-    # measurements remain distinct visits unless the operator supplies a map.
+    # Operator labels can resolve unknown dates or separate same-day visits;
+    # every known earlier/later relation must still agree with global ordering.
+    if explicit:
+        dated = [
+            (row["dates"][0], aliases[i, row["local_session_index"]])
+            for i, row in rows
+            if len(row["dates"]) == 1 and not row["invalid_dates"]
+        ]
+        for date, label in dated:
+            if any(
+                earlier < date and earlier_label >= label
+                for earlier, earlier_label in dated
+            ):
+                _mapping_error(
+                    snapshots, "Explicit aliases contradict known chronological order"
+                )
+    # Parsed facts detect definite conflicts; their matching intersection alone
+    # cannot establish that all the source's observed measurements agree.
     groups: dict[int, list[tuple[int, dict]]] = {}
     for i, row in rows:
         groups.setdefault(aliases[i, row["local_session_index"]], []).append((i, row))
@@ -317,10 +387,35 @@ def resolve_aliases(
                         snapshots,
                         "A shared global session has conflicting measured values",
                     )
-                if not shared and not explicit:
+                left_complete, left_observed = _observed_session_evidence(
+                    extracted[i], row["local_session_index"]
+                )
+                right_complete, right_observed = _observed_session_evidence(
+                    extracted[j], other["local_session_index"]
+                )
+                identical_source_session = (
+                    snapshots[i]["original_sha256"] == snapshots[j]["original_sha256"]
+                    and row["local_session_index"] == other["local_session_index"]
+                    and snapshots[i]["asset_digests"] == snapshots[j]["asset_digests"]
+                )
+                if left_observed and right_observed and left_observed != right_observed:
                     _mapping_error(
                         snapshots,
-                        "A repeated date lacks consistent shared measurements to establish one visit",
+                        "A shared global session has differing attributable source evidence; resolve the source observations before merging visits",
+                    )
+                if (
+                    not explicit
+                    and not identical_source_session
+                    and not (
+                        shared
+                        and left_complete
+                        and right_complete
+                        and left_observed == right_observed
+                    )
+                ):
+                    _mapping_error(
+                        snapshots,
+                        "A repeated date has only partial measurement evidence; an explicit session mapping is required",
                     )
     result = []
     for i, (snap, src) in enumerate(zip(snapshots, extracted)):
@@ -482,6 +577,7 @@ def admit_run(
     with _operation_lock(key):
         with storage.session_scope() as session:
             prior = session.get(storage.AnalysisInputReservation, key)
+            prior_run = storage.get_run(session, prior.run_id) if prior else None
             if prior and prior.envelope_fingerprint != envelope_fingerprint:
                 raise _operation_conflict()
             if storage.get_patient(session, patient_id) is None:
@@ -502,7 +598,47 @@ def admit_run(
             if prior:
                 raise _operation_conflict() from exc
             raise
-        extracted = resolve_aliases(snapshots, extracted, source_session_aliases)
+        if prior_run:
+            # Reconciliation rules govern new admission, not a historical receipt.
+            # Verify every current source byte/asset/evidence and the requested
+            # aliases against the frozen manifest before returning banked work.
+            saved = json.loads(prior.manifest_json)["sources"]
+            saved_aliases = {
+                source["report_id"]: source["session_aliases"] for source in saved
+            }
+            if source_session_aliases and source_session_aliases != saved_aliases:
+                raise _operation_conflict()
+            if not source_session_aliases and any(
+                source["mapping_provenance"] == "operator" for source in saved
+            ):
+                # Dropping an explicit map is a changed request unless the
+                # source evidence now resolves to the same canonical aliases.
+                try:
+                    resolve_aliases(snapshots, extracted, {})
+                except HTTPException as exc:
+                    raise _operation_conflict() from exc
+                if {
+                    source["report_id"]: source["session_aliases"]
+                    for source in snapshots
+                } != saved_aliases:
+                    raise _operation_conflict()
+            restored = [
+                {
+                    **current,
+                    "session_aliases": original["session_aliases"],
+                    "mapping_provenance": original["mapping_provenance"],
+                }
+                for current, original in zip(snapshots, saved)
+            ]
+            if restored != saved:
+                raise _operation_conflict()
+            return prior_run
+        try:
+            extracted = resolve_aliases(snapshots, extracted, source_session_aliases)
+        except HTTPException as exc:
+            if prior:
+                raise _operation_conflict() from exc
+            raise
         # Resolution provenance is descriptive, not a different immutable mapping.
         fingerprint = _fingerprint(
             {

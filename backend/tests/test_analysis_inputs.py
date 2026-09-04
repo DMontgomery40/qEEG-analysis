@@ -572,3 +572,158 @@ def test_concurrent_same_operation_creates_one_report_and_run(admission, monkeyp
     with storage.session_scope() as session:
         assert len(list(session.scalars(select(storage.Run)))) == 1
         assert len(list(session.scalars(select(storage.Report)))) == 3
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize(
+    "left_observation,right_observation,expected",
+    [
+        ("Alpha power at Cz: 5 uV2", "Alpha power at Cz: 40 uV2", 409),
+        ("Coherence F3-F4: 0.20", "Coherence F3-F4: 0.95", 409),
+        ("Theta peak at Fz: 4 Hz", "Theta peak at Fz: 7 Hz", 409),
+        ("Alpha power at Cz: 5 uV2", "Alpha power at Cz: 5 uV2", 200),
+        ("Alpha power at Cz: 5 uV2", "", 409),
+    ],
+)
+def test_same_date_merge_checks_complete_observed_evidence(
+    admission, explicit, left_observation, right_observation, expected
+):
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    for original, observation in zip(originals, [left_observation, right_observation]):
+        directory = Path(original.stored_path).parent
+        for path in [
+            directory / "extracted_enhanced.txt",
+            *sorted((directory / "sources").glob("*.txt")),
+        ]:
+            path.write_text(path.read_text() + "\n" + observation)
+    request = {**payload, "report_ids": [r.id for r in originals]}
+    if explicit:
+        request["source_session_aliases"] = {r.id: {"1": 1} for r in originals}
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == expected, response.text
+    if expected == 409:
+        assert response.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
+        with storage.session_scope() as session:
+            assert not list(session.scalars(select(storage.Run)))
+
+
+@pytest.mark.parametrize("stream", ["pypdf", "pymupdf", "apple_vision", "tesseract"])
+def test_merge_preserves_conflicting_evidence_from_every_ocr_stream(admission, stream):
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    for original, value in zip(originals, [5, 40]):
+        path = Path(original.stored_path).parent / "sources" / f"page-1.{stream}.txt"
+        path.write_text(path.read_text() + f"\nAlpha power at Cz: {value} uV2\n")
+    response = client.post(
+        "/api/runs", json={**payload, "report_ids": [r.id for r in originals]}
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
+
+
+@pytest.mark.parametrize(
+    "dates,labels,expected",
+    [
+        (["2026-01-02", "2026-02-02"], [2, 1], 409),
+        (["2026-01-02", "2026-02-02"], [1, 2], 200),
+        (["2026-02-02", "2026-01-02"], [2, 1], 200),
+        (["2026-01-02", "2026-01-02"], [2, 1], 200),
+        (["unknown", "2026-02-02"], [2, 1], 200),
+        (["2026-01-02", "unknown", "2026-02-02"], [3, 2, 1], 409),
+        (["2026-01-02", "unknown", "2026-02-02"], [1, 3, 2], 200),
+    ],
+)
+def test_explicit_mapping_preserves_every_known_chronological_relation(
+    admission, dates, labels, expected
+):
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"], date=date) for date in dates]
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "source_session_aliases": {
+            r.id: {"1": label} for r, label in zip(originals, labels)
+        },
+    }
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == expected, response.text
+    if expected == 409:
+        assert response.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_partial_multisession_evidence_needs_operator_mapping(admission, explicit):
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    for report, dates, values in zip(
+        originals,
+        [("2026-01-02", "2026-02-02"), ("2026-02-02", "2026-03-02")],
+        [(280, 290), (290, 300)],
+    ):
+        directory = Path(report.stored_path).parent
+        body = f"Session 1 ({dates[0]})\nSession 2 ({dates[1]})\nPhysical Reaction Time {values[0]} ms {values[1]} ms 250-360 ms\n"
+        (directory / "extracted_enhanced.txt").write_text("=== PAGE 1 / 1 ===\n" + body)
+        for path in (directory / "sources").glob("*.txt"):
+            path.write_text(body)
+    request = {**payload, "report_ids": [r.id for r in originals]}
+    if explicit:
+        request["source_session_aliases"] = {
+            originals[0].id: {"1": 1, "2": 2},
+            originals[1].id: {"1": 2, "2": 3},
+        }
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == (200 if explicit else 409), response.text
+
+
+def test_stricter_admission_preserves_identical_banked_operation_receipt(
+    admission, monkeypatch
+):
+    from backend import analysis_inputs as inputs
+
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    for original, value in zip(originals, [5, 40]):
+        path = Path(original.stored_path).parent / "extracted_enhanced.txt"
+        path.write_text(path.read_text() + f"\nAlpha power at Cz: {value} uV2\n")
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "operation_id": "pre-fix-receipt",
+    }
+    # Model the prior admission version's partial-evidence decision, then restore
+    # current validation. The underlying stored source snapshots stay exact.
+    observed = inputs._observed_session_evidence
+    monkeypatch.setattr(
+        inputs,
+        "_observed_session_evidence",
+        lambda *args: (True, (("prior matching subset",),)),
+    )
+    first = client.post("/api/runs", json=request)
+    assert first.status_code == 200, first.text
+    monkeypatch.setattr(inputs, "_observed_session_evidence", observed)
+    repeated = client.post("/api/runs", json=request)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["id"] == first.json()["id"]
+    assert repeated.json()["source_manifest"] == first.json()["source_manifest"]
+    new = client.post("/api/runs", json={**request, "operation_id": "new-admission"})
+    assert new.status_code == 409
+    assert new.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
+
+
+def test_banked_receipt_does_not_ignore_removed_explicit_aliases(admission):
+    client, payload, tmp, _ = admission
+    original = source(tmp, payload["patient_id"])
+    request = {
+        **payload,
+        "report_ids": [original.id],
+        "operation_id": "explicit-original",
+        "source_session_aliases": {original.id: {"1": 3}},
+    }
+    first = client.post("/api/runs", json=request)
+    assert first.status_code == 200, first.text
+    assert client.post("/api/runs", json=request).json()["id"] == first.json()["id"]
+    request.pop("source_session_aliases")
+    changed = client.post("/api/runs", json=request)
+    assert changed.status_code == 409, changed.text
+    assert changed.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
