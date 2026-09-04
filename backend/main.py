@@ -3085,6 +3085,25 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
             artifacts = storage.list_artifacts(session, r.id)
     except Exception:
         artifacts = None
+    try:
+        with storage.session_scope() as session:
+            postprocessing = [
+                {
+                    "kind": row.kind,
+                    "state": row.state,
+                    "blocked_reason": row.blocked_reason,
+                    "next_check_at": row.next_check_at.isoformat()
+                    if row.next_check_at
+                    else None,
+                }
+                for row in session.scalars(
+                    sa_select(storage.PostObligation)
+                    .where(storage.PostObligation.run_id == r.id)
+                    .order_by(storage.PostObligation.kind)
+                )
+            ]
+    except Exception:
+        postprocessing = None
     liveness = derive_run_liveness(r, progress=progress, artifacts=artifacts)
     try:
         council_model_ids = json.loads(r.council_model_ids_json)
@@ -3113,6 +3132,19 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "analysis_input_fingerprint": r.analysis_input_fingerprint or "",
         "operation_id": r.operation_id,
         "status": r.status,
+        "start_requested_at": r.start_requested_at.isoformat()
+        if r.start_requested_at
+        else None,
+        "execution_state": r.execution_state,
+        "owner_generation": r.owner_generation,
+        "owner_pid": r.owner_pid,
+        "owner_started_at": r.owner_started_at.isoformat()
+        if r.owner_started_at
+        else None,
+        "next_check_at": r.next_check_at.isoformat() if r.next_check_at else None,
+        "blocked_reason": r.blocked_reason,
+        "execution_manifest_hash": r.execution_manifest_hash,
+        "postprocessing": postprocessing,
         "raw_status": liveness["raw_status"],
         "display_status": liveness["display_status"],
         "display_label": liveness["display_label"],

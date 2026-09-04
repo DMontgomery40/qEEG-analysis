@@ -13,11 +13,13 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    event,
     func,
     select,
     update,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+from sqlalchemy.engine import make_url
 
 from .config import DATA_DIR, ensure_data_dirs
 
@@ -133,9 +135,108 @@ class Run(Base):
     analysis_input_fingerprint: Mapped[str] = mapped_column(String, nullable=False, default="")
     operation_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
 
+    # Durable execution is explicitly admitted; historical rows remain inactive.
+    start_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    execution_state: Mapped[str | None] = mapped_column(String, nullable=True)
+    owner_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    owner_generation: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
+    owner_pid: Mapped[int | None] = mapped_column(nullable=True)
+    owner_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    execution_manifest_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    execution_manifest_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+
     patient: Mapped[Patient] = relationship(back_populates="runs")
     report: Mapped[Report] = relationship(back_populates="runs")
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="run")
+
+
+class PaidRequest(Base):
+    """E2 journal metadata; exact bodies remain immutable files, never row blobs.
+
+    E2 owns dispatch classification/file reconciliation. All writes must run in
+    RunOwner.transaction(), including orphan-file reconciliation after takeover.
+    """
+
+    __tablename__ = "paid_requests"
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String, primary_key=True)
+    dispatch_ordinal: Mapped[int] = mapped_column(primary_key=True)
+    request_path: Mapped[str] = mapped_column(String, nullable=False)
+    request_hash: Mapped[str] = mapped_column(String, nullable=False)
+    route_json: Mapped[str] = mapped_column(Text, nullable=False)
+    execution_manifest_hash: Mapped[str] = mapped_column(String, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    owner_generation: Mapped[int] = mapped_column(nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False, default="prepared")
+    response_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    response_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    http_status: Mapped[int | None] = mapped_column(nullable=True)
+    response_metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_classification: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    response_saved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class StageReceipt(Base):
+    """E4 verified stage policy/member/artifact receipt stored in a hashed file.
+
+    Insertion is E4's commit of the unchanged clinical policy, after checking all
+    member terminal outcomes and artifact hashes. No legacy artifact inference.
+    """
+
+    __tablename__ = "stage_receipts"
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), primary_key=True)
+    stage_num: Mapped[int] = mapped_column(primary_key=True)
+    receipt_path: Mapped[str] = mapped_column(String, nullable=False)
+    receipt_hash: Mapped[str] = mapped_column(String, nullable=False)
+    execution_manifest_hash: Mapped[str] = mapped_column(String, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    policy_version: Mapped[str] = mapped_column(String, nullable=False)
+    owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    owner_generation: Mapped[int] = mapped_column(nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
+class PostObligation(Base):
+    """One pinned post-run obligation per kind, independent of clinical status."""
+
+    __tablename__ = "post_obligations"
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String, primary_key=True)
+    manifest_path: Mapped[str] = mapped_column(String, nullable=False)
+    manifest_hash: Mapped[str] = mapped_column(String, nullable=False)
+    owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    owner_generation: Mapped[int] = mapped_column(nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    receipt_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    receipt_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
 
 class AnalysisInputReservation(Base):
@@ -174,11 +275,36 @@ def get_db_path() -> Path:
     return DATA_DIR / "app.db"
 
 
-engine = create_engine(
-    f"sqlite:///{get_db_path()}",
-    future=True,
-    connect_args={"check_same_thread": False},
-)
+def create_sqlite_engine(db_url: str):
+    """Identical durability for production and scratch; retain sqlite3 transaction mode.
+
+    The installed SQLAlchemy pysqlite dialect passes timeout to sqlite3 and
+    supports per-connection listeners. No isolation_level/BEGIN/pool/WAL change.
+    """
+    url = make_url(db_url)
+    if url.database and url.database != ":memory:" and not url.query:
+        # pysqlite resolves filenames when creating its connection closure. Keep
+        # the URL equally stable for ownership stores constructed after chdir.
+        url = url.set(database=str(Path(url.database).resolve()))
+    db_engine = create_engine(
+        url,
+        future=True,
+        connect_args={"check_same_thread": False, "timeout": 5.0},
+    )
+
+    @event.listens_for(db_engine, "connect")
+    def configure_connection(connection, _record):
+        cursor = connection.cursor()
+        try:
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA synchronous=FULL")
+        finally:
+            cursor.close()
+
+    return db_engine
+
+
+engine = create_sqlite_engine(f"sqlite:///{get_db_path()}")
 
 
 def reset_engine(db_url: str) -> None:
@@ -190,7 +316,7 @@ def reset_engine(db_url: str) -> None:
         engine.dispose()
     except Exception:
         pass
-    engine = create_engine(db_url, future=True, connect_args={"check_same_thread": False})
+    engine = create_sqlite_engine(db_url)
 
 
 # Added to `patients` after the table shipped, so they need an in-place upgrade.
@@ -274,12 +400,33 @@ def _ensure_analysis_input_columns() -> None:
             )
 
 
+def _ensure_run_execution_columns() -> None:
+    columns = {
+        "start_requested_at": "DATETIME",
+        "execution_state": "VARCHAR",
+        "owner_token": "VARCHAR",
+        "owner_generation": "INTEGER NOT NULL DEFAULT 0",
+        "owner_pid": "INTEGER",
+        "owner_started_at": "DATETIME",
+        "next_check_at": "DATETIME",
+        "blocked_reason": "TEXT",
+        "execution_manifest_path": "VARCHAR",
+        "execution_manifest_hash": "VARCHAR",
+    }
+    with engine.begin() as conn:
+        present = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(runs)")}
+        for column, sql_type in columns.items():
+            if column not in present:
+                conn.exec_driver_sql(f"ALTER TABLE runs ADD COLUMN {column} {sql_type}")
+
+
 def init_db() -> None:
     ensure_data_dirs()
     Base.metadata.create_all(engine)
     _ensure_patient_identity_columns()
     _ensure_run_attestation_columns()
     _ensure_analysis_input_columns()
+    _ensure_run_execution_columns()
 
 
 @contextmanager
