@@ -102,15 +102,17 @@ class _DataPackMixin:
         cls, facts: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         deduped: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for fact in facts:
             key = cls._fact_semantic_key(fact)
-            if not key:
+            signature = cls._fact_numeric_signature(fact)
+            if not key or signature is None:
                 deduped.append(fact)
                 continue
-            if key in seen:
+            identity = (key, json.dumps(signature, sort_keys=True))
+            if identity in seen:
                 continue
-            seen.add(key)
+            seen.add(identity)
             deduped.append(fact)
         return deduped
 
@@ -120,25 +122,52 @@ class _DataPackMixin:
         facts: list[dict[str, Any]],
         *,
         page_session_aliases: dict[int, dict[int, int]],
+        input_namespace: str = "local",
     ) -> list[dict[str, Any]]:
-        if not page_session_aliases:
-            return facts
+        """Canonicalize explicit local facts; global facts are never remapped.
 
+        input_namespace is the producer contract for unmarked facts. Model output
+        and existing data-pack caches use global indices; deterministic page
+        parsers use local indices and mark their canonical output themselves.
+        """
         normalized: list[dict[str, Any]] = []
         for fact in facts:
             if not isinstance(fact, dict):
                 continue
             new_fact = dict(fact)
+            namespace = new_fact.get("session_index_namespace", input_namespace)
+            if namespace not in {"local", "global"}:
+                raise ValueError(f"Unknown session index namespace: {namespace!r}")
             page = new_fact.get("source_page")
             session_index = new_fact.get("session_index")
-            if isinstance(page, int) and isinstance(session_index, int):
-                mapped = page_session_aliases.get(page, {}).get(session_index)
-                if isinstance(mapped, int):
-                    if mapped != session_index:
-                        new_fact.setdefault("local_session_index", session_index)
-                    new_fact["session_index"] = mapped
+            if isinstance(session_index, int):
+                if namespace == "local":
+                    new_fact.setdefault("local_session_index", session_index)
+                    new_fact["session_index"] = page_session_aliases.get(page, {}).get(
+                        session_index, session_index
+                    )
+                elif "local_session_index" not in new_fact:
+                    # The namespace is already known from the producer contract.
+                    # Only an unambiguous inverse alias supplies local provenance.
+                    aliases = page_session_aliases.get(page, {})
+                    local_indices = [
+                        local
+                        for local, glob in aliases.items()
+                        if glob == session_index
+                    ]
+                    if len(local_indices) == 1:
+                        new_fact["local_session_index"] = local_indices[0]
+                    elif not aliases:
+                        new_fact["local_session_index"] = session_index
+                new_fact["session_index_namespace"] = "global"
             normalized.append(new_fact)
-        return cls._dedupe_facts_semantic(normalized)
+        # Repeated visits can agree or conflict. Preserve different values so the
+        # strict numeric conflict gate can reject them after canonicalization.
+        return (
+            cls._dedupe_facts_semantic(normalized)
+            if page_session_aliases
+            else normalized
+        )
 
     @staticmethod
     def _fact_key(fact: dict[str, Any]) -> str | None:
@@ -218,7 +247,7 @@ class _DataPackMixin:
         for f in facts:
             if not isinstance(f, dict):
                 continue
-            key = cls._fact_key(f)
+            key = cls._fact_semantic_key(f)
             if not key:
                 continue
             by_key.setdefault(key, []).append(f)
@@ -277,14 +306,13 @@ class _DataPackMixin:
         )
 
         def apply_page_session_aliases(merged: dict[str, Any]) -> None:
-            if not page_session_aliases:
-                return
             facts = merged.get("facts")
             if not isinstance(facts, list):
                 return
             merged["facts"] = self._normalize_facts_for_page_session_aliases(
                 [f for f in facts if isinstance(f, dict)],
                 page_session_aliases=page_session_aliases,
+                input_namespace="global",
             )
             merged["page_session_aliases"] = {
                 str(page): {
@@ -334,6 +362,7 @@ class _DataPackMixin:
                     base_facts = self._normalize_facts_for_page_session_aliases(
                         base_facts,
                         page_session_aliases=page_session_aliases,
+                        input_namespace="global",
                     )
                     add_facts: list[dict[str, Any]] = []
                     add_facts.extend(
@@ -463,6 +492,7 @@ class _DataPackMixin:
             if combined:
                 # Deterministic facts come first so they override duplicates from model output.
                 merged["facts"] = self._dedupe_facts(combined)
+                apply_page_session_aliases(merged)
             return self._find_fact_conflicts(combined)
 
         # Multi-pass extraction across all pages.
