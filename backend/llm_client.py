@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import httpx
+
+from .paid_transport import (
+    PaidAsyncClient,
+    PaidClient,
+    PaidOutcomeUnknown,
+    owned_to_thread,
+)
+from .run_execution import ExecutionConflict, StaleOwner
 
 
 class UpstreamError(RuntimeError):
@@ -461,7 +468,7 @@ class AsyncOpenAICompatClient:
             headers: dict[str, str] = {"Content-Type": "application/json"}
             if self._api_key:
                 headers["Authorization"] = f"Bearer {self._api_key}"
-            self._client = httpx.AsyncClient(
+            self._client = PaidAsyncClient(
                 base_url=self._base_url,
                 headers=headers,
                 timeout=httpx.Timeout(self._timeout_s),
@@ -490,7 +497,7 @@ class AsyncOpenAICompatClient:
                 headers["HTTP-Referer"] = referer
             if title:
                 headers["X-Title"] = title
-            self._openrouter_client = httpx.AsyncClient(
+            self._openrouter_client = PaidAsyncClient(
                 base_url=base_url,
                 headers=headers,
                 timeout=httpx.Timeout(self._timeout_s),
@@ -502,7 +509,7 @@ class AsyncOpenAICompatClient:
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        with httpx.Client(
+        with PaidClient(
             base_url=self._base_url,
             headers=headers,
             timeout=httpx.Timeout(self._timeout_s),
@@ -614,9 +621,11 @@ class AsyncOpenAICompatClient:
                 and self._transport is None
                 and not use_openrouter
             ):
-                resp = await asyncio.to_thread(self._chat_completions_sync, payload)
+                resp = await owned_to_thread(self._chat_completions_sync, payload)
             else:
                 resp = await client.post("/v1/chat/completions", json=payload)
+        except (PaidOutcomeUnknown, ExecutionConflict, StaleOwner):
+            raise
         except Exception as e:
             raise UpstreamError(
                 f"CLIProxyAPI request failed: {e}",
@@ -702,6 +711,8 @@ class AsyncOpenAICompatClient:
                 retry_response = await client.post(
                     "/v1/chat/completions", json=retry_payload
                 )
+            except (PaidOutcomeUnknown, ExecutionConflict, StaleOwner):
+                raise
             except Exception as e:
                 raise UpstreamError(
                     f"OpenRouter GLM final-content retry failed: {e}",
@@ -777,6 +788,8 @@ class AsyncOpenAICompatClient:
 
         try:
             resp = await client.post("/v1/responses", json=payload)
+        except (PaidOutcomeUnknown, ExecutionConflict, StaleOwner):
+            raise
         except Exception as e:
             raise UpstreamError(
                 f"CLIProxyAPI request failed: {e}",

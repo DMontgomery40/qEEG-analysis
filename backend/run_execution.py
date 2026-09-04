@@ -227,6 +227,19 @@ class RunOwner:
                     self._assert_active()
                     session.flush()
 
+    @contextmanager
+    def file_guard(self):
+        """Keep close/release serialized with a short immutable file publication.
+
+        Fenced checkpoints surround file work under the real handle mutex. No
+        SQLite transaction spans the file operation; no provider call or await
+        belongs here. The flock remains held until this guard has exited.
+        """
+        with self._mutex:
+            self.checkpoint()
+            yield
+            self.checkpoint()
+
     def checkpoint(self):
         """Verify durable ownership without using elapsed time as lock authority."""
         with self.transaction():
