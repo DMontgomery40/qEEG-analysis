@@ -145,6 +145,8 @@ class AnalysisInputReservation(Base):
     operation_id: Mapped[str] = mapped_column(String, primary_key=True)
     request_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
     envelope_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    immutable_request_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_fields_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     manifest_json: Mapped[str] = mapped_column(Text, nullable=False)
     report_id: Mapped[str] = mapped_column(String, nullable=False)
     run_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
@@ -248,6 +250,19 @@ def _ensure_analysis_input_columns() -> None:
         conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_runs_operation_id ON runs(operation_id)"
         )
+        # Nullable snapshots distinguish legacy reservations without inventing their
+        # original authorization or resolution. Repeated startup preserves every row.
+        reservation_columns = {
+            row[1]
+            for row in conn.exec_driver_sql(
+                "PRAGMA table_info(analysis_input_reservations)"
+            )
+        }
+        for column in ("immutable_request_json", "model_fields_json"):
+            if column not in reservation_columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE analysis_input_reservations ADD COLUMN {column} TEXT"
+                )
         # Existing runs retain their original report, provenance, and empty instructions.
         rows = conn.exec_driver_sql(
             "SELECT id, report_id FROM runs WHERE source_report_ids_json = '[]'"

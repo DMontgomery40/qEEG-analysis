@@ -2597,31 +2597,54 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
         *[str(model_id).strip() for model_id in req.council_model_ids],
         str(req.consolidator_model_id).strip(),
     ]
-    discovered = sorted(DISCOVERED_MODEL_IDS)
-    resolved_model_ids: list[str] = []
-    for requested in requested_model_ids:
-        if requested in discovered:
-            resolved_model_ids.append(requested)
-            continue
-        fallback = str(req.allowed_model_fallbacks.get(requested) or "").strip()
-        if fallback and fallback in discovered:
-            resolved_model_ids.append(fallback)
-            continue
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "ANALYSIS_MODEL_MISMATCH",
-                "message": f"Requested model is not currently available: {requested}",
-            },
-        )
-    runtime = runtime_identity.current_runtime_identity(discovered)
-
     from .analysis_inputs import admit_run, normalize_source_ids
 
     source_ids = normalize_source_ids(
-        req.report_id, req.report_ids,
+        req.report_id,
+        req.report_ids,
         list_supplied="report_ids" in req.model_fields_set,
     )
+    immutable_request = {
+        "patient_id": req.patient_id,
+        "source_ids": source_ids,
+        "special_instructions": req.special_instructions,
+        "source_session_aliases": req.source_session_aliases,
+        "requested_model_ids": requested_model_ids,
+        "allowed_model_fallbacks": {
+            key: value.strip() for key, value in req.allowed_model_fallbacks.items()
+        },
+    }
+
+    def resolve_model_fields() -> dict[str, Any]:
+        # Called under the admission operation lock only when no saved resolution
+        # can establish the request. Rejoining acknowledged work is entirely free.
+        discovered = sorted(DISCOVERED_MODEL_IDS)
+        resolved_model_ids: list[str] = []
+        for requested in requested_model_ids:
+            if requested in discovered:
+                resolved_model_ids.append(requested)
+                continue
+            fallback = immutable_request["allowed_model_fallbacks"].get(requested, "")
+            if fallback and fallback in discovered:
+                resolved_model_ids.append(fallback)
+                continue
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ANALYSIS_MODEL_MISMATCH",
+                    "message": f"Requested model is not currently available: {requested}",
+                },
+            )
+        runtime = runtime_identity.current_runtime_identity(discovered)
+        return {
+            "council_model_ids": resolved_model_ids[:-1],
+            "consolidator_model_id": resolved_model_ids[-1],
+            "requested_model_ids": requested_model_ids,
+            "resolved_model_ids": resolved_model_ids,
+            "creating_instance_id": str(runtime["instance_id"]),
+            "model_catalogue_fingerprint": str(runtime["model_catalogue_fingerprint"]),
+        }
+
     run = await asyncio.to_thread(
         admit_run,
         patient_id=req.patient_id,
@@ -2629,14 +2652,8 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
         special_instructions=req.special_instructions,
         source_session_aliases=req.source_session_aliases,
         operation_id=req.operation_id,
-        model_fields={
-            "council_model_ids": resolved_model_ids[:-1],
-            "consolidator_model_id": resolved_model_ids[-1],
-            "requested_model_ids": requested_model_ids,
-            "resolved_model_ids": resolved_model_ids,
-            "creating_instance_id": str(runtime["instance_id"]),
-            "model_catalogue_fingerprint": str(runtime["model_catalogue_fingerprint"]),
-        },
+        immutable_request=immutable_request,
+        model_fields=resolve_model_fields,
     )
     return _run_out(run)
 
@@ -2647,6 +2664,8 @@ async def start_run(run_id: str) -> dict[str, Any]:
         run = storage.get_run(session, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+        if run.status in ("running", "complete"):
+            return _run_out(run)
         try:
             requested_model_ids = json.loads(run.requested_model_ids_json or "[]")
             resolved_model_ids = json.loads(run.resolved_model_ids_json or "[]")

@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 from fastapi import HTTPException
@@ -553,6 +553,29 @@ def _operation_conflict() -> HTTPException:
     )
 
 
+def lookup_admitted_operation(
+    operation_id: str, immutable_request: dict[str, Any]
+) -> tuple[storage.AnalysisInputReservation | None, storage.Run | None]:
+    """Look up the saved receipt while the caller owns the operation flock.
+
+    Null snapshots deliberately retain legacy strict admission checks. They do
+    not prove the original fallback authorization and cannot acquire one on retry.
+    """
+    with storage.session_scope() as session:
+        prior = session.get(storage.AnalysisInputReservation, operation_id)
+        if prior is None:
+            return None, None
+        if prior.immutable_request_json is not None:
+            if (
+                prior.immutable_request_json != _canonical(immutable_request)
+                or prior.model_fields_json is None
+            ):
+                raise _operation_conflict()
+        elif immutable_request["allowed_model_fallbacks"]:
+            raise _operation_conflict()
+        return prior, storage.get_run(session, prior.run_id)
+
+
 def admit_run(
     *,
     patient_id: str,
@@ -560,24 +583,30 @@ def admit_run(
     special_instructions: str,
     source_session_aliases: dict[str, dict[str, int]],
     operation_id: str | None,
-    model_fields: dict[str, Any],
+    model_fields: Callable[[], dict[str, Any]],
+    immutable_request: dict[str, Any],
 ) -> storage.Run:
     if operation_id is not None and not operation_id.strip():
         raise HTTPException(400, "operation_id must be non-empty when supplied")
     key = operation_id if operation_id is not None else str(uuid.uuid4())
-    envelope_fingerprint = _fingerprint(
-        {
-            "patient_id": patient_id,
-            "source_ids": source_ids,
-            "special_instructions": special_instructions,
-            "requested_model_ids": model_fields["requested_model_ids"],
-            "resolved_model_ids": model_fields["resolved_model_ids"],
-        }
-    )
     with _operation_lock(key):
+        prior, prior_run = lookup_admitted_operation(key, immutable_request)
+        exact_prior = prior is not None and prior.immutable_request_json is not None
+        if exact_prior and prior_run:
+            return prior_run
+        model_fields = (
+            json.loads(prior.model_fields_json) if exact_prior else model_fields()
+        )
+        envelope_fingerprint = _fingerprint(
+            {
+                "patient_id": patient_id,
+                "source_ids": source_ids,
+                "special_instructions": special_instructions,
+                "requested_model_ids": model_fields["requested_model_ids"],
+                "resolved_model_ids": model_fields["resolved_model_ids"],
+            }
+        )
         with storage.session_scope() as session:
-            prior = session.get(storage.AnalysisInputReservation, key)
-            prior_run = storage.get_run(session, prior.run_id) if prior else None
             if prior and prior.envelope_fingerprint != envelope_fingerprint:
                 raise _operation_conflict()
             if storage.get_patient(session, patient_id) is None:
@@ -633,12 +662,50 @@ def admit_run(
             if restored != saved:
                 raise _operation_conflict()
             return prior_run
-        try:
-            extracted = resolve_aliases(snapshots, extracted, source_session_aliases)
-        except HTTPException as exc:
-            if prior:
-                raise _operation_conflict() from exc
-            raise
+        if exact_prior:
+            # Finish free registration from the frozen manifest. Revalidate bytes
+            # needed for composition, while retaining the original mapping policy.
+            saved_manifest = json.loads(prior.manifest_json)
+            saved_sources = saved_manifest["sources"]
+            restored = [
+                {
+                    **current,
+                    "session_aliases": saved["session_aliases"],
+                    "mapping_provenance": saved["mapping_provenance"],
+                }
+                for current, saved in zip(snapshots, saved_sources)
+            ]
+            if restored != saved_sources:
+                raise _operation_conflict()
+            snapshots = saved_sources
+            extracted = [
+                replace(
+                    src,
+                    spec=replace(
+                        src.spec,
+                        session_aliases={
+                            int(k): v for k, v in saved["session_aliases"].items()
+                        },
+                    ),
+                    session_dates={
+                        evidence["local_session_index"]: evidence["dates"][0]
+                        for evidence in saved["session_evidence"]
+                        if len(evidence["dates"]) == 1 and not evidence["invalid_dates"]
+                    },
+                )
+                if src
+                else None
+                for src, saved in zip(extracted, saved_sources)
+            ]
+        else:
+            try:
+                extracted = resolve_aliases(
+                    snapshots, extracted, source_session_aliases
+                )
+            except HTTPException as exc:
+                if prior:
+                    raise _operation_conflict() from exc
+                raise
         # Resolution provenance is descriptive, not a different immutable mapping.
         fingerprint = _fingerprint(
             {
@@ -693,6 +760,8 @@ def admit_run(
                     operation_id=key,
                     request_fingerprint=request_hash,
                     envelope_fingerprint=envelope_fingerprint,
+                    immutable_request_json=_canonical(immutable_request),
+                    model_fields_json=_canonical(model_fields),
                     manifest_json=_canonical(manifest),
                     report_id=report_id,
                     run_id=str(uuid.uuid4()),

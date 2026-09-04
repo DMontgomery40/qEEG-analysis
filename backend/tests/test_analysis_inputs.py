@@ -290,15 +290,28 @@ def test_combined_asset_recovery_uses_original_sources(admission, monkeypatch, d
     "change",
     ["order", "original", "extraction", "page", "alias", "instructions", "models"],
 )
-def test_operation_rejects_every_immutable_input_change(admission, change):
+@pytest.mark.parametrize("reserved_only", [False, True])
+def test_operation_rejects_every_immutable_input_change(
+    admission, monkeypatch, change, reserved_only
+):
     client, payload, tmp, _ = admission
     originals = [
         source(tmp, payload["patient_id"], date=d) for d in ["2026-02-02", "2026-01-02"]
     ]
     req = {**payload, "report_ids": [r.id for r in originals], "operation_id": "frozen"}
+    create = storage.create_run
+    if reserved_only:
+
+        def crash(*args, **kwargs):
+            raise RuntimeError("exit before run registration")
+
+        monkeypatch.setattr(storage, "create_run", crash)
     first = client.post("/api/runs", json=req)
-    assert first.status_code == 200
-    created = first.json()
+    assert first.status_code == (500 if reserved_only else 200)
+    monkeypatch.setattr(storage, "create_run", create)
+    with storage.session_scope() as session:
+        reservation = session.get(storage.AnalysisInputReservation, "frozen")
+        saved_manifest = reservation.manifest_json
     if change == "order":
         req["report_ids"].reverse()
     elif change == "instructions":
@@ -324,12 +337,20 @@ def test_operation_rejects_every_immutable_input_change(admission, change):
         pixmap.clear_with(0)
         pixmap.save(Path(originals[0].stored_path).parent / "pages/page-1.png")
     response = client.post("/api/runs", json=req)
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
-    assert (
-        client.get("/api/runs/" + created["id"]).json()["source_manifest"]
-        == created["source_manifest"]
-    )
+    if not reserved_only and change in ["original", "extraction", "page"]:
+        # The receipt survives source drift; starting new generation still validates it.
+        assert response.status_code == 200, response.text
+        assert response.json() == first.json()
+        assert client.post(f"/api/runs/{reservation.run_id}/start").status_code == 409
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
+    with storage.session_scope() as session:
+        assert (
+            session.get(storage.AnalysisInputReservation, "frozen").manifest_json
+            == saved_manifest
+        )
+        assert bool(storage.get_run(session, reservation.run_id)) is not reserved_only
 
 
 @pytest.mark.parametrize(
@@ -496,7 +517,7 @@ def test_legacy_storage_migration_preserves_banked_run(temp_data_dir):
 
 
 @pytest.mark.parametrize(
-    "change", ["missing-source", "different-patient", "unreadable-original"]
+    "change", ["missing-source", "different-patient"]
 )
 def test_reserved_operation_conflicts_before_repairing_changed_input(admission, change):
     client, payload, tmp, _ = admission
@@ -507,8 +528,6 @@ def test_reserved_operation_conflicts_before_repairing_changed_input(admission, 
         req["report_ids"] = ["missing"]
     elif change == "different-patient":
         req["patient_id"] = "another"
-    else:
-        Path(report.stored_path).unlink()
     response = client.post("/api/runs", json=req)
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
@@ -727,3 +746,292 @@ def test_banked_receipt_does_not_ignore_removed_explicit_aliases(admission):
     changed = client.post("/api/runs", json=request)
     assert changed.status_code == 409, changed.text
     assert changed.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("status", ["created", "running", "complete"])
+def test_exact_rejoin_survives_catalogue_and_asset_loss(
+    admission, monkeypatch, count, status
+):
+    from backend import analysis_inputs as inputs, runtime_identity
+
+    client, payload, tmp, main = admission
+    originals = [
+        source(tmp, payload["patient_id"], date=f"2026-0{i+1}-02") for i in range(count)
+    ]
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "special_instructions": "  exact café\n",
+        "operation_id": "lost-create",
+    }
+    first = client.post("/api/runs", json=request).json()
+    with storage.session_scope() as s:
+        run = storage.get_run(s, first["id"])
+        run.status = status
+        s.commit()
+    expected = client.get(f"/api/runs/{first['id']}").json()
+    import shutil
+
+    for original in originals:
+        shutil.rmtree(Path(original.stored_path).parent)
+    main.DISCOVERED_MODEL_IDS.clear()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "A banked receipt must not read sources, runtime, or schedule work"
+        )
+
+    monkeypatch.setattr(inputs, "_source_snapshot", forbidden)
+    monkeypatch.setattr(runtime_identity, "current_runtime_identity", forbidden)
+    monkeypatch.setattr(main, "_spawn_task", forbidden)
+    storage.reset_engine(f"sqlite:///{tmp / 'app.db'}")
+    storage.init_db()
+    repeated = client.post("/api/runs", json=request)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json() == expected
+
+
+@pytest.mark.parametrize("reappears", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_exact_rejoin_preserves_fallback_and_reserved_models(
+    admission, monkeypatch, reappears, interrupted
+):
+    from backend import analysis_inputs as inputs
+
+    client, payload, tmp, main = admission
+    originals = [
+        source(tmp, payload["patient_id"], date=d) for d in ["2026-02-02", "2026-01-02"]
+    ]
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "operation_id": "saved-fallback",
+        "council_model_ids": ["preferred"],
+        "allowed_model_fallbacks": {"preferred": "mock-council-a"},
+    }
+    compose = inputs._compose
+
+    def crash(*args):
+        raise RuntimeError("exit after reservation")
+
+    if interrupted:
+        monkeypatch.setattr(inputs, "_compose", crash)
+    first = client.post("/api/runs", json=request)
+    assert first.status_code == (500 if interrupted else 200)
+    with storage.session_scope() as s:
+        reservation = s.get(storage.AnalysisInputReservation, request["operation_id"])
+        manifest = reservation.manifest_json
+    monkeypatch.setattr(inputs, "_compose", compose)
+    main.DISCOVERED_MODEL_IDS.clear()
+    if reappears:
+        main.DISCOVERED_MODEL_IDS.update(["preferred", "mock-consolidator"])
+    repeated = client.post("/api/runs", json=request)
+    assert repeated.status_code == 200, repeated.text
+    run = repeated.json()
+    assert run["id"] == reservation.run_id
+    assert run["report_id"] == reservation.report_id
+    assert run["source_manifest"] == json.loads(manifest)
+    assert run["resolved_model_ids"] == ["mock-council-a", "mock-consolidator"]
+    with storage.session_scope() as s:
+        assert len(list(s.scalars(select(storage.Run)))) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "add-alias",
+        "remove-alias",
+        "change-alias",
+        "add-fallback",
+        "remove-fallback",
+        "change-fallback",
+        "models",
+        "instructions",
+        "order",
+        "patient",
+    ],
+)
+def test_exact_operation_rejects_changed_authorization_before_catalogue(
+    admission, change
+):
+    client, payload, tmp, main = admission
+    originals = [
+        source(tmp, payload["patient_id"], date=d) for d in ["2026-01-02", "2026-02-02"]
+    ]
+    ids = [r.id for r in originals]
+    request = {
+        **payload,
+        "report_ids": ids,
+        "operation_id": "immutable-request",
+        "allowed_model_fallbacks": {"mock-council-a": "mock-council-b"},
+    }
+    aliases = {rid: {"1": i + 1} for i, rid in enumerate(ids)}
+    if change in ["remove-alias", "change-alias"]:
+        request["source_session_aliases"] = aliases
+    first = client.post("/api/runs", json=request)
+    assert first.status_code == 200, first.text
+    if change == "add-alias":
+        request["source_session_aliases"] = aliases
+    elif change == "remove-alias":
+        request.pop("source_session_aliases")
+    elif change == "change-alias":
+        request["source_session_aliases"] = {ids[0]: {"1": 3}, ids[1]: {"1": 4}}
+    elif change == "add-fallback":
+        request["allowed_model_fallbacks"]["unused"] = "mock-council-b"
+    elif change == "remove-fallback":
+        request.pop("allowed_model_fallbacks")
+    elif change == "change-fallback":
+        request["allowed_model_fallbacks"]["mock-council-a"] = "mock-consolidator"
+    elif change == "models":
+        request["council_model_ids"] = ["unknown"]
+    elif change == "instructions":
+        request["special_instructions"] = " "
+    elif change == "order":
+        request["report_ids"] = ids[::-1]
+    else:
+        request["patient_id"] = "other"
+    main.DISCOVERED_MODEL_IDS.clear()
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
+    assert client.get(f"/api/runs/{first.json()['id']}").json() == first.json()
+
+
+@pytest.mark.parametrize(
+    "status", ["created", "failed", "needs_auth", "running", "complete"]
+)
+def test_start_availability_gate_only_for_new_dispatch(admission, monkeypatch, status):
+    client, payload, tmp, main = admission
+    original = source(tmp, payload["patient_id"])
+    first = client.post("/api/runs", json={**payload, "report_id": original.id}).json()
+    with storage.session_scope() as s:
+        run = storage.get_run(s, first["id"])
+        run.status = status
+        s.commit()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No generation may be scheduled")
+
+    monkeypatch.setattr(main, "_spawn_task", forbidden)
+    main.DISCOVERED_MODEL_IDS.clear()
+    response = client.post(f"/api/runs/{first['id']}/start")
+    if status in ["running", "complete"]:
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == status
+    else:
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+
+
+def test_admission_snapshot_migration_preserves_legacy_reservation_twice(temp_data_dir):
+    from sqlalchemy import create_engine
+
+    path = temp_data_dir / "legacy-reservation.db"
+    legacy = create_engine(f"sqlite:///{path}")
+    with legacy.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE analysis_input_reservations (operation_id VARCHAR PRIMARY KEY, request_fingerprint VARCHAR NOT NULL, envelope_fingerprint VARCHAR NOT NULL, manifest_json TEXT NOT NULL, report_id VARCHAR NOT NULL, run_id VARCHAR NOT NULL UNIQUE, created_at DATETIME)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO analysis_input_reservations VALUES ('old-op', 'request-hash', 'envelope-hash', '{\"legacy\":false}', 'old-report', 'old-run', '2026-01-01')"
+        )
+        original = conn.exec_driver_sql(
+            "SELECT * FROM analysis_input_reservations"
+        ).one()
+    storage.reset_engine(f"sqlite:///{path}")
+    for _ in range(2):
+        storage.init_db()
+        with storage.engine.begin() as conn:
+            migrated = conn.exec_driver_sql(
+                "SELECT * FROM analysis_input_reservations"
+            ).one()
+        assert tuple(migrated[:7]) == tuple(original)
+        assert tuple(migrated[7:]) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "change", ["same", "assets", "aliases", "fallback", "catalogue", "models"]
+)
+def test_legacy_reservation_remains_strict_without_invented_snapshot(admission, change):
+    client, payload, tmp, main = admission
+    report = source(tmp, payload["patient_id"])
+    request = {**payload, "report_id": report.id, "operation_id": "legacy-snapshot"}
+    first = client.post("/api/runs", json=request).json()
+    # Reproduce a real pre-migration reservation: original fingerprints/manifest
+    # remain available, while the new exact request/resolution fields are unknown.
+    with storage.session_scope() as s:
+        reservation = s.get(storage.AnalysisInputReservation, request["operation_id"])
+        reservation.immutable_request_json = None
+        reservation.model_fields_json = None
+        s.commit()
+        original_identity = (
+            reservation.run_id,
+            reservation.report_id,
+            reservation.manifest_json,
+            reservation.envelope_fingerprint,
+            reservation.request_fingerprint,
+        )
+    if change == "assets":
+        Path(report.stored_path).unlink()
+    elif change == "aliases":
+        request["source_session_aliases"] = {report.id: {"1": 2}}
+    elif change == "fallback":
+        request["allowed_model_fallbacks"] = {"mock-council-a": "mock-council-b"}
+    elif change == "catalogue":
+        main.DISCOVERED_MODEL_IDS.clear()
+    elif change == "models":
+        request["council_model_ids"] = ["mock-council-b"]
+    repeated = client.post("/api/runs", json=request)
+    assert repeated.status_code == (200 if change == "same" else 409), repeated.text
+    if change == "same":
+        assert repeated.json() == first
+    with storage.session_scope() as s:
+        reservation = s.get(storage.AnalysisInputReservation, request["operation_id"])
+        assert (
+            reservation.run_id,
+            reservation.report_id,
+            reservation.manifest_json,
+            reservation.envelope_fingerprint,
+            reservation.request_fingerprint,
+        ) == original_identity
+        assert reservation.immutable_request_json is None
+        assert reservation.model_fields_json is None
+
+
+def test_reserved_recovery_keeps_saved_mapping_despite_policy_change(
+    admission, monkeypatch
+):
+    from backend import analysis_inputs as inputs
+
+    client, payload, tmp, main = admission
+    originals = [
+        source(tmp, payload["patient_id"], date=d) for d in ["2026-02-02", "2026-01-02"]
+    ]
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "operation_id": "saved-mapping",
+    }
+    compose = inputs._compose
+
+    def crash(*args):
+        raise RuntimeError("exit after reservation")
+
+    monkeypatch.setattr(inputs, "_compose", crash)
+    assert client.post("/api/runs", json=request).status_code == 500
+    with storage.session_scope() as s:
+        prior = s.get(storage.AnalysisInputReservation, request["operation_id"])
+        saved_models = json.loads(prior.model_fields_json)
+    monkeypatch.setattr(inputs, "_compose", compose)
+
+    def forbidden(*args):
+        raise AssertionError("Mapping already reserved")
+
+    monkeypatch.setattr(inputs, "resolve_aliases", forbidden)
+    main.DISCOVERED_MODEL_IDS.clear()
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == 200, response.text
+    assert response.json()["source_manifest"] == json.loads(prior.manifest_json)
+    for key, value in saved_models.items():
+        assert response.json()[key] == value
