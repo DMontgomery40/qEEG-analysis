@@ -435,6 +435,9 @@ class _StagesMixin:
         prompt = _load_prompt("stage1_analysis.md")
         end_sentinel = "<!-- END STAGE1 ANALYSIS -->"
         report_dir = _derive_report_dir(report)
+        from ...analysis_inputs import repair_combined_report
+
+        repair_combined_report(report, run_id=run_id)
         report_text = _load_best_report_text(report, report_dir)
 
         # Prefer a single "checker" vision model for multimodal extraction + verification.
@@ -728,8 +731,12 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
 
         base_prompt_text = (
@@ -1009,8 +1016,12 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1164,8 +1175,12 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1394,8 +1409,12 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1636,8 +1655,12 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1805,8 +1828,12 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():

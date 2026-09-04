@@ -19,7 +19,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from sqlalchemy import select as sa_select
 
 from . import storage
@@ -220,7 +220,11 @@ class PatientUpdate(PatientCreate):
 
 class RunCreate(BaseModel):
     patient_id: str
-    report_id: str
+    report_id: str | None = None
+    report_ids: list[str] = Field(default_factory=list)
+    special_instructions: str = ""
+    source_session_aliases: dict[str, dict[str, StrictInt]] = Field(default_factory=dict)
+    operation_id: str | None = None
     council_model_ids: list[str]
     consolidator_model_id: str
     allowed_model_fallbacks: dict[str, str] = Field(default_factory=dict)
@@ -2344,6 +2348,19 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
             status_code=400, detail="Re-extract only supported for PDFs"
         )
 
+    from .analysis_inputs import repair_combined_report
+
+    if await asyncio.to_thread(repair_combined_report, report):
+        directory = original_path.parent
+        enhanced_text = (directory / "extracted_enhanced.txt").read_text(encoding="utf-8")
+        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        return {
+            "ok": True,
+            "chars": len(enhanced_text),
+            "enhanced_chars": len(enhanced_text),
+            "page_images_written": metadata["page_count"],
+        }
+
     # Best-effort: also regenerate enhanced OCR text + page images for multimodal Stage 1.
     # IMPORTANT: write into the same folder as extracted_path (some older reports used a
     # different folder id than report_id).
@@ -2599,28 +2616,29 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
         )
     runtime = runtime_identity.current_runtime_identity(discovered)
 
-    with storage.session_scope() as session:
-        if storage.get_patient(session, req.patient_id) is None:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        report = storage.get_report(session, req.report_id)
-        if report is None:
-            raise HTTPException(status_code=404, detail="Report not found")
-        if report.patient_id != req.patient_id:
-            raise HTTPException(
-                status_code=400, detail="Report does not belong to patient"
-            )
-        run = storage.create_run(
-            session,
-            patient_id=req.patient_id,
-            report_id=req.report_id,
-            council_model_ids=resolved_model_ids[:-1],
-            consolidator_model_id=resolved_model_ids[-1],
-            requested_model_ids=requested_model_ids,
-            resolved_model_ids=resolved_model_ids,
-            creating_instance_id=str(runtime["instance_id"]),
-            model_catalogue_fingerprint=str(runtime["model_catalogue_fingerprint"]),
-        )
-        return _run_out(run)
+    from .analysis_inputs import admit_run, normalize_source_ids
+
+    source_ids = normalize_source_ids(
+        req.report_id, req.report_ids,
+        list_supplied="report_ids" in req.model_fields_set,
+    )
+    run = await asyncio.to_thread(
+        admit_run,
+        patient_id=req.patient_id,
+        source_ids=source_ids,
+        special_instructions=req.special_instructions,
+        source_session_aliases=req.source_session_aliases,
+        operation_id=req.operation_id,
+        model_fields={
+            "council_model_ids": resolved_model_ids[:-1],
+            "consolidator_model_id": resolved_model_ids[-1],
+            "requested_model_ids": requested_model_ids,
+            "resolved_model_ids": resolved_model_ids,
+            "creating_instance_id": str(runtime["instance_id"]),
+            "model_catalogue_fingerprint": str(runtime["model_catalogue_fingerprint"]),
+        },
+    )
+    return _run_out(run)
 
 
 @app.post("/api/runs/{run_id}/start")
@@ -2664,6 +2682,10 @@ async def start_run(run_id: str) -> dict[str, Any]:
                     "message": "The saved model envelope is invalid or a selected model is unavailable.",
                 },
             )
+        if run.status in ("created", "failed", "needs_auth"):
+            from .analysis_inputs import validate_admitted_run
+
+            await asyncio.to_thread(validate_admitted_run, run)
         started = storage.claim_run_start(session, run_id)
 
     with storage.session_scope() as session:
@@ -3066,6 +3088,11 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "id": r.id,
         "patient_id": r.patient_id,
         "report_id": r.report_id,
+        "source_report_ids": json.loads(r.source_report_ids_json or "[]") or [r.report_id],
+        "source_manifest": json.loads(r.source_manifest_json or '{"legacy":true}'),
+        "special_instructions": r.special_instructions or "",
+        "analysis_input_fingerprint": r.analysis_input_fingerprint or "",
+        "operation_id": r.operation_id,
         "status": r.status,
         "raw_status": liveness["raw_status"],
         "display_status": liveness["display_status"],

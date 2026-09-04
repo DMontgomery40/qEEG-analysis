@@ -127,9 +127,28 @@ class Run(Base):
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
+    source_report_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    source_manifest_json: Mapped[str] = mapped_column(Text, nullable=False, default='{"legacy":true}')
+    special_instructions: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    analysis_input_fingerprint: Mapped[str] = mapped_column(String, nullable=False, default="")
+    operation_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+
     patient: Mapped[Patient] = relationship(back_populates="runs")
     report: Mapped[Report] = relationship(back_populates="runs")
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="run")
+
+
+class AnalysisInputReservation(Base):
+    """Stable identities survive a crash before free composition or run registration."""
+
+    __tablename__ = "analysis_input_reservations"
+    operation_id: Mapped[str] = mapped_column(String, primary_key=True)
+    request_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    envelope_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    manifest_json: Mapped[str] = mapped_column(Text, nullable=False)
+    report_id: Mapped[str] = mapped_column(String, nullable=False)
+    run_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class Artifact(Base):
@@ -213,11 +232,39 @@ def _ensure_run_attestation_columns() -> None:
                 conn.exec_driver_sql(f"ALTER TABLE runs ADD COLUMN {column} {sql_type}")
 
 
+def _ensure_analysis_input_columns() -> None:
+    columns = {
+        "source_report_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "source_manifest_json": "TEXT NOT NULL DEFAULT '{\"legacy\":true}'",
+        "special_instructions": "TEXT NOT NULL DEFAULT ''",
+        "analysis_input_fingerprint": "VARCHAR NOT NULL DEFAULT ''",
+        "operation_id": "VARCHAR",
+    }
+    with engine.begin() as conn:
+        present = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(runs)")}
+        for column, sql_type in columns.items():
+            if column not in present:
+                conn.exec_driver_sql(f"ALTER TABLE runs ADD COLUMN {column} {sql_type}")
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_runs_operation_id ON runs(operation_id)"
+        )
+        # Existing runs retain their original report, provenance, and empty instructions.
+        rows = conn.exec_driver_sql(
+            "SELECT id, report_id FROM runs WHERE source_report_ids_json = '[]'"
+        ).fetchall()
+        for row in rows:
+            conn.exec_driver_sql(
+                "UPDATE runs SET source_report_ids_json = ? WHERE id = ?",
+                (json.dumps([row[1]]), row[0]),
+            )
+
+
 def init_db() -> None:
     ensure_data_dirs()
     Base.metadata.create_all(engine)
     _ensure_patient_identity_columns()
     _ensure_run_attestation_columns()
+    _ensure_analysis_input_columns()
 
 
 @contextmanager
@@ -416,10 +463,22 @@ def create_run(
     resolved_model_ids: list[str] | None = None,
     creating_instance_id: str = "",
     model_catalogue_fingerprint: str = "",
+    source_report_ids: list[str] | None = None,
+    source_manifest: dict[str, Any] | None = None,
+    special_instructions: str = "",
+    analysis_input_fingerprint: str = "",
+    operation_id: str | None = None,
+    run_id: str | None = None,
 ) -> Run:
     requested = list(requested_model_ids or [])
     resolved = list(resolved_model_ids or [])
     run = Run(
+        id=run_id or _new_id(),
+        source_report_ids_json=json.dumps(source_report_ids or [report_id]),
+        source_manifest_json=json.dumps(source_manifest or {"legacy": True}),
+        special_instructions=special_instructions,
+        analysis_input_fingerprint=analysis_input_fingerprint,
+        operation_id=operation_id,
         patient_id=patient_id,
         report_id=report_id,
         status="created",
