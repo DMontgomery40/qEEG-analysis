@@ -10,6 +10,7 @@ from backend.tests.test_data_pack_timeouts import (
     _create_run_with_report,
 )
 
+
 def test_filter_shadowed_facts_prefers_deterministic_and_avoids_conflicts():
     det = [
         {
@@ -315,3 +316,171 @@ def test_global_facts_preserve_source_local_index_without_remapping():
     assert normalized[0]["local_session_index"] == 1
     assert normalized[0]["source_page"] == 7
     assert normalized[0]["value"] == 290
+
+
+_NUMERIC_DETAIL_CASES = [
+    pytest.param(
+        dict(
+            fact_type="performance_metric", metric="physical_reaction_time", value=280
+        ),
+        "sd_plus_minus",
+        20,
+        id="reaction-sd",
+    ),
+    pytest.param(
+        dict(fact_type="n100_central_frontal_average", uv=-4.4, ms=120),
+        "yield",
+        36,
+        id="n100-yield",
+    ),
+    pytest.param(
+        dict(fact_type="p300_cp_site", site="C3", uv=8.1, ms=285),
+        "yield",
+        40,
+        id="p300-yield",
+    ),
+    pytest.param(
+        dict(
+            fact_type="n100_central_frontal_average", uv=None, ms=None, shown_as="N/A"
+        ),
+        "yield",
+        36,
+        id="n100-na-yield",
+    ),
+    pytest.param(
+        dict(fact_type="p300_cp_site", site="C3", uv=None, ms=None, shown_as="N/A"),
+        "yield",
+        40,
+        id="p300-na-yield",
+    ),
+]
+
+
+@pytest.mark.parametrize("base,field,value", _NUMERIC_DETAIL_CASES)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("different", [False, True])
+def test_semantic_duplicates_compare_sd_and_yield(
+    base, field, value, reverse, different
+):
+    facts = [
+        dict(
+            base,
+            session_index=1,
+            session_index_namespace="local",
+            source_page=page,
+            **{field: number},
+        )
+        for page, number in [(1, value), (2, value + 1 if different else str(value))]
+    ]
+    if reverse:
+        facts.reverse()
+    aliases = {1: {1: 2}, 2: {1: 2}}
+    normalize = _DataPackMixin._normalize_facts_for_page_session_aliases
+    canonical = normalize(facts, page_session_aliases=aliases)
+    assert [f[field] for f in canonical] == [
+        f[field] for f in (facts if different else facts[:1])
+    ]
+    assert len(_DataPackMixin._find_fact_conflicts(canonical)) == int(different)
+    assert normalize(canonical, page_session_aliases=aliases) == canonical
+    assert all(f["session_index"] == 2 for f in canonical)
+
+
+class _NumericDetailPackHarness(_TimeoutCapturingDataPack):
+    def __init__(self, facts):
+        super().__init__()
+        self.facts = facts
+
+    async def _call_model_multimodal(self, **kwargs):
+        return json.dumps(
+            {
+                "schema_version": DATA_PACK_SCHEMA_VERSION,
+                "pages_seen": [1, 2],
+                "facts": self.facts,
+            }
+        )
+
+
+@pytest.mark.parametrize("base,field,value", _NUMERIC_DETAIL_CASES)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("different", [False, True])
+@pytest.mark.asyncio
+async def test_sd_yield_preservation_in_fresh_and_cached_packs(
+    temp_data_dir,
+    base,
+    field,
+    value,
+    reverse,
+    different,
+):
+    # The known-global model boundary supplies facts from two sources. The real
+    # pack/cache pipeline decides equality and strict conflict handling.
+    facts = [
+        dict(base, source_page=page, session_index=2, **{field: number})
+        for page, number in [(1, value), (2, value + int(different))]
+    ]
+    if reverse:
+        facts.reverse()
+    text = (
+        "=== PAGE 1 / 2 ===\n[[QEEG_SESSION_ALIAS local=1 global=2]]\n"
+        "=== PAGE 2 / 2 ===\n[[QEEG_SESSION_ALIAS local=1 global=2]]\n"
+    )
+    run_id, report = _create_run_with_report(text)
+    workflow = _NumericDetailPackHarness(facts)
+    args = dict(
+        run_id=run_id,
+        report=report,
+        report_text=text,
+        page_images=[
+            PageImage(page=1, base64_png="ZmFrZQ=="),
+            PageImage(page=2, base64_png="ZmFrZQ=="),
+        ],
+        candidate_extractor_model_ids=["vision-model"],
+    )
+    pack = await workflow._ensure_data_pack(**args, strict=False)
+    assert [f[field] for f in pack["facts"]] == [
+        f[field] for f in (facts if different else facts[:1])
+    ]
+    for _ in range(2):
+        assert await workflow._ensure_data_pack(**args, strict=False) == pack
+    if different:
+        with pytest.raises(RuntimeError, match="(?i)conflict"):
+            await workflow._ensure_data_pack(**args, strict=True)
+    else:
+        assert await workflow._ensure_data_pack(**args, strict=True) == pack
+
+
+@pytest.mark.parametrize("base,field,value", _NUMERIC_DETAIL_CASES)
+def test_deterministic_same_page_precedence_keeps_sd_yield_conflicts_out(
+    base, field, value
+):
+    deterministic = dict(
+        base,
+        session_index=2,
+        source_page=1,
+        extraction_method="deterministic_report_text",
+        **{field: value},
+    )
+    model = dict(deterministic, extraction_method="vision_llm", **{field: value + 1})
+    assert len(_DataPackMixin._find_fact_conflicts([deterministic, model])) == 1
+    kept = _DataPackMixin._filter_shadowed_facts([deterministic], [model])
+    assert kept == []
+    assert _DataPackMixin._find_fact_conflicts([deterministic] + kept) == []
+
+
+@pytest.mark.parametrize("base,field,value", _NUMERIC_DETAIL_CASES)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_missing_optional_detail_retains_recorded_value_without_inventing_conflict(
+    base, field, value, reverse
+):
+    facts = [
+        dict(base, session_index=2, source_page=1),
+        dict(base, session_index=2, source_page=2, **{field: value}),
+    ]
+    if reverse:
+        facts.reverse()
+    canonical = _DataPackMixin._normalize_facts_for_page_session_aliases(
+        facts, page_session_aliases={1: {1: 2}, 2: {1: 2}}, input_namespace="global"
+    )
+    assert len(canonical) == 2
+    assert [f[field] for f in canonical if field in f] == [value]
+    assert _DataPackMixin._find_fact_conflicts(canonical) == []

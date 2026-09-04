@@ -188,7 +188,8 @@ class _DataPackMixin:
         """
         Return a tuple representing the numeric payload of a fact for conflict detection.
 
-        We intentionally ignore incidental fields (e.g., labels, units, target ranges) and focus on required numbers.
+        Include measured values and their SD/yield details. Labels, units, and target
+        ranges are metadata, not observed clinical numbers.
         """
 
         def coerce(val: Any) -> Any:
@@ -208,9 +209,20 @@ class _DataPackMixin:
                     return int(num) if num.is_integer() else num
             return val
 
+        details = tuple(
+            (field, coerce(fact[field]))
+            for field in ("sd_plus_minus", "yield")
+            if fact.get(field) is not None
+        )
         shown_as = fact.get("shown_as")
         if isinstance(shown_as, str) and shown_as.strip().upper() == "N/A":
-            return ("NA",)
+            # A missing measurement can still carry a recorded yield or latency.
+            measured = tuple(
+                (field, coerce(fact[field]))
+                for field in ("value", "uv", "ms")
+                if fact.get(field) is not None
+            )
+            return ("NA",) + measured + details
         ftype = fact.get("fact_type")
         if ftype in {
             "performance_metric",
@@ -221,22 +233,22 @@ class _DataPackMixin:
             val = coerce(fact.get("value"))
             if val is None:
                 return None
-            return ("value", val)
+            return ("value", val) + details
         if ftype == "p300_cp_site":
             uv = coerce(fact.get("uv"))
             ms = coerce(fact.get("ms"))
             if uv is None or ms is None:
                 return None
-            return ("uv_ms", uv, ms)
+            return ("uv_ms", uv, ms) + details
         if ftype == "n100_central_frontal_average":
             uv = coerce(fact.get("uv"))
             ms = coerce(fact.get("ms"))
             if uv is None or ms is None:
                 return None
-            return ("uv_ms", uv, ms)
+            return ("uv_ms", uv, ms) + details
         # Default: best-effort, include common numeric fields if present.
         payload: list[Any] = ["generic"]
-        for k in ("value", "uv", "ms", "yield"):
+        for k in ("value", "uv", "ms", "sd_plus_minus", "yield"):
             if k in fact:
                 payload.append(coerce(fact.get(k)))
         return tuple(payload)
@@ -262,7 +274,20 @@ class _DataPackMixin:
                 if sig is None:
                     continue
                 sigs.setdefault(sig, []).append(f)
-            if len(sigs) > 1:
+            # Optional recorded details participate in equality, so deduplication
+            # preserves a richer source. Absence is not a contradictory number:
+            # only different recorded values for the same detail are conflicts.
+            cores: set[tuple[Any, ...]] = set()
+            details: dict[str, set[Any]] = {}
+            for signature in sigs:
+                cores.add(
+                    tuple(item for item in signature if not isinstance(item, tuple))
+                )
+                for item in signature:
+                    if isinstance(item, tuple):
+                        field, value = item
+                        details.setdefault(field, set()).add(value)
+            if len(cores) > 1 or any(len(values) > 1 for values in details.values()):
                 conflicts.append(
                     {
                         "key": key,
