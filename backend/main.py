@@ -2632,23 +2632,28 @@ async def start_run(run_id: str) -> dict[str, Any]:
         try:
             requested_model_ids = json.loads(run.requested_model_ids_json or "[]")
             resolved_model_ids = json.loads(run.resolved_model_ids_json or "[]")
-            persisted_execution_models = [
-                *json.loads(run.council_model_ids_json or "[]"),
-                run.consolidator_model_id,
-            ]
-        except (TypeError, ValueError, json.JSONDecodeError):
+            council_model_ids = json.loads(run.council_model_ids_json or "[]")
+        except (TypeError, ValueError):
             requested_model_ids = []
             resolved_model_ids = []
-            persisted_execution_models = []
-        current_runtime = runtime_identity.current_runtime_identity(DISCOVERED_MODEL_IDS)
+            council_model_ids = []
+        # Creation provenance is historical. Admission depends on the pinned
+        # execution models still being well formed and available today.
+        valid_envelopes = all(
+            isinstance(model_ids, list)
+            and bool(model_ids)
+            and all(
+                isinstance(model_id, str)
+                and bool(model_id.strip())
+                and model_id == model_id.strip()
+                for model_id in model_ids
+            )
+            for model_ids in (requested_model_ids, resolved_model_ids, council_model_ids)
+        )
         mismatch = (
-            not isinstance(requested_model_ids, list)
-            or not isinstance(resolved_model_ids, list)
-            or not requested_model_ids
-            or resolved_model_ids != persisted_execution_models
-            or run.creating_instance_id != current_runtime["instance_id"]
-            or run.model_catalogue_fingerprint
-            != current_runtime["model_catalogue_fingerprint"]
+            not valid_envelopes
+            or len(requested_model_ids) != len(resolved_model_ids)
+            or resolved_model_ids != [*council_model_ids, run.consolidator_model_id]
             or any(model_id not in DISCOVERED_MODEL_IDS for model_id in resolved_model_ids)
         )
         if mismatch:
@@ -2656,7 +2661,7 @@ async def start_run(run_id: str) -> dict[str, Any]:
                 status_code=409,
                 detail={
                     "code": "ANALYSIS_MODEL_MISMATCH",
-                    "message": "The engine runtime or resolved model catalogue changed before start.",
+                    "message": "The saved model envelope is invalid or a selected model is unavailable.",
                 },
             )
         started = storage.claim_run_start(session, run_id)

@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import re
 import uuid
+
+import pytest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
@@ -1008,3 +1011,148 @@ def test_saving_a_patient_without_notes_keeps_the_notes_on_file(
     assert untouched["notes"] == "sleeps badly before sessions"
     assert replaced["notes"] == "sleep improved after week three"
     assert cleared["notes"] == ""
+
+
+@pytest.mark.parametrize("catalogue_change", ["restart", "addition", "removal"])
+@pytest.mark.parametrize("initial_status", ["created", "failed", "running", "complete"])
+def test_saved_model_envelope_survives_restart_and_unrelated_catalogue_changes(
+    temp_data_dir, monkeypatch, catalogue_change, initial_status
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import runtime_identity, storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled = []
+
+    def capture_task(coro, *, name=None):
+        scheduled.append(name)
+        coro.close()
+
+    monkeypatch.setattr(main, "_spawn_task", capture_task)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post("/api/runs", json={
+            "patient_id": patient.id, "report_id": report.id,
+            "council_model_ids": ["mock-council-a"],
+            "consolidator_model_id": "mock-consolidator",
+        }).json()
+        with storage.session_scope() as session:
+            storage.update_run_status(session, created["id"], status=initial_status)
+        if catalogue_change == "restart":
+            monkeypatch.setattr(runtime_identity, "INSTANCE_ID", "restarted-engine")
+        elif catalogue_change == "addition":
+            main.DISCOVERED_MODEL_IDS.add("unrelated-model")
+        else:
+            main.DISCOVERED_MODEL_IDS.remove("mock-council-b")
+        response = client.post(f"/api/runs/{created['id']}/start")
+        repeated = client.post(f"/api/runs/{created['id']}/start")
+        saved = client.get(f"/api/runs/{created['id']}").json()
+        monkeypatch.setattr(app.state, "mock_mode", False)
+        monkeypatch.setattr(app.state.llm, "list_models", AsyncMock(return_value=sorted(main.DISCOVERED_MODEL_IDS)))
+        health = client.get("/api/health").json()
+
+    assert response.status_code == 200
+    assert repeated.status_code == 200
+    expected_tasks = [] if initial_status in {"running", "complete"} else [f"qeeg-run-{created['id']}"]
+    assert scheduled == expected_tasks
+    for field in ("id", "requested_model_ids", "resolved_model_ids", "creating_instance_id", "model_catalogue_fingerprint"):
+        assert saved[field] == created[field]
+    assert health["runtime"]["available_model_ids"] == sorted(main.DISCOVERED_MODEL_IDS)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("requested_model_ids_json", "[]"),
+    ("requested_model_ids_json", '"mock-council-a"'),
+    ("requested_model_ids_json", '["mock-council-a"]'),
+    ("requested_model_ids_json", '["", "mock-consolidator"]'),
+    ("requested_model_ids_json", '[null, "mock-consolidator"]'),
+    ("requested_model_ids_json", '[{}, "mock-consolidator"]'),
+    ("requested_model_ids_json", '[" mock-council-a", "mock-consolidator"]'),
+    ("resolved_model_ids_json", '["mock-consolidator", "mock-council-a"]'),
+    ("resolved_model_ids_json", "[]"),
+    ("resolved_model_ids_json", "null"),
+    ("resolved_model_ids_json", "{"),
+    ("resolved_model_ids_json", '[{}, "mock-consolidator"]'),
+    ("council_model_ids_json", '{"mock-council-a": 1}'),
+    ("council_model_ids_json", '["mock-council-b"]'),
+    ("consolidator_model_id", "mock-council-b"),
+])
+def test_start_rejects_malformed_or_modified_saved_execution_models(
+    temp_data_dir, monkeypatch, field, value
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled = []
+
+    def capture_task(coro, *, name=None):
+        scheduled.append(name)
+        coro.close()
+
+    monkeypatch.setattr(main, "_spawn_task", capture_task)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post("/api/runs", json={
+            "patient_id": patient.id, "report_id": report.id,
+            "council_model_ids": ["mock-council-a"],
+            "consolidator_model_id": "mock-consolidator",
+        }).json()
+        with storage.session_scope() as session:
+            setattr(storage.get_run(session, created["id"]), field, value)
+            session.commit()
+        response = client.post(f"/api/runs/{created['id']}/start")
+        with storage.session_scope() as session:
+            assert storage.get_run(session, created["id"]).status == "created"
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+    assert scheduled == []
+
+
+@pytest.mark.parametrize("fallback_available", [True, False])
+def test_saved_explicit_fallback_stays_pinned_after_restart(
+    temp_data_dir, monkeypatch, fallback_available
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import runtime_identity, storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled = []
+
+    def capture_task(coro, *, name=None):
+        scheduled.append(name)
+        coro.close()
+
+    monkeypatch.setattr(main, "_spawn_task", capture_task)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post("/api/runs", json={
+            "patient_id": patient.id, "report_id": report.id,
+            "council_model_ids": ["retired-model"],
+            "consolidator_model_id": "mock-consolidator",
+            "allowed_model_fallbacks": {"retired-model": "mock-council-a"},
+        }).json()
+        monkeypatch.setattr(runtime_identity, "INSTANCE_ID", "restarted-engine")
+        main.DISCOVERED_MODEL_IDS.add("retired-model")
+        if not fallback_available:
+            main.DISCOVERED_MODEL_IDS.remove("mock-council-a")
+        response = client.post(f"/api/runs/{created['id']}/start")
+        saved = client.get(f"/api/runs/{created['id']}").json()
+
+    assert response.status_code == (200 if fallback_available else 409)
+    assert scheduled == ([f"qeeg-run-{created['id']}"] if fallback_available else [])
+    assert saved["requested_model_ids"] == ["retired-model", "mock-consolidator"]
+    assert saved["resolved_model_ids"] == ["mock-council-a", "mock-consolidator"]
+    assert saved["creating_instance_id"] == created["creating_instance_id"]
+
+
+def test_runtime_identity_reports_unique_sorted_available_model_ids():
+    from backend.runtime_identity import current_runtime_identity
+
+    identity = current_runtime_identity(["writer", "a", "writer", "b"])
+    assert identity["available_model_ids"] == ["a", "b", "writer"]
+    assert identity["model_contract_version"] == 1

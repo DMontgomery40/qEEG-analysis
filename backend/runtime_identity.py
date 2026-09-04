@@ -45,5 +45,6 @@ def current_runtime_identity(model_ids: list[str] | set[str]) -> dict[str, objec
         "process_started_at": PROCESS_STARTED_AT,
         "instance_id": INSTANCE_ID,
         "model_contract_version": MODEL_CONTRACT_VERSION,
+        "available_model_ids": sorted(set(model_ids)),
         "model_catalogue_fingerprint": model_catalogue_fingerprint(model_ids),
     }
