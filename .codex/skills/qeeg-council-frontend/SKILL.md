@@ -24,8 +24,13 @@ metadata:
 - Patient list with search
 - Bulk upload page:
   - upload multiple report files
-  - create a new patient per file (label = filename stem) and upload that file as the initial report
-  - skip/report existing labels and batch duplicates
+  - send each file's patient name and date of birth with it (read them from
+    `POST /api/reports/preview`, which files nothing); the backend finds that
+    person's existing chart or allocates their canonical clinic ID
+    `XX_MM-DD-YYYY[_N]` and registers the report against it
+  - one patient per person, not one per file; a 409 on a name that disagrees
+    with an existing chart is the operator's question to answer, not a new patient
+  - report duplicates and per-file errors in the batch summary
 - Patient detail showing reports and run history
 - Patient files in the patient detail:
   - upload/list/delete supporting files (PDF/Markdown/MP4)
@@ -48,8 +53,8 @@ metadata:
 - Model list: GET /api/models
 - Patients:
   - POST /api/patients/bulk_upload
-  - GET /api/patients/{patient_id}/files
-  - POST /api/patients/{patient_id}/files
+  - GET /api/patients/{patient_uuid}/files
+  - POST /api/patients/{patient_uuid}/files
   - GET /api/patient_files/{file_id}
   - DELETE /api/patient_files/{file_id}
 - Runs:

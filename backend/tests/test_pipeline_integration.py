@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -101,6 +102,90 @@ async def test_full_6_stage_pipeline(temp_data_dir, mock_llm_client, example_pdf
         assert content_path.exists(), f"Artifact file should exist: {content_path}"
         content = content_path.read_text()
         assert len(content) > 100, f"Artifact should have content: {artifact.stage_name}"
+
+
+@pytest.mark.asyncio
+async def test_failed_run_resumes_at_first_missing_saved_stage(
+    temp_data_dir, mock_llm_client, example_pdf_bytes: bytes, monkeypatch
+):
+    from backend.council import QEEGCouncilWorkflow
+    from backend.reports import save_report_upload
+    from backend.storage import (
+        create_patient,
+        create_report,
+        create_run,
+        get_run,
+        list_artifacts,
+        session_scope,
+        update_run_status,
+    )
+
+    with session_scope() as session:
+        patient = create_patient(session, label="Resume Test", notes="")
+        patient_id = patient.id
+
+    report_id = str(uuid.uuid4())
+    original_path, extracted_path, mime_type, _ = save_report_upload(
+        patient_id=patient_id,
+        report_id=report_id,
+        filename="resume-test.pdf",
+        provided_mime_type="application/pdf",
+        file_bytes=example_pdf_bytes,
+    )
+    with session_scope() as session:
+        create_report(
+            session,
+            report_id=report_id,
+            patient_id=patient_id,
+            filename="resume-test.pdf",
+            mime_type=mime_type,
+            stored_path=original_path,
+            extracted_text_path=extracted_path,
+        )
+        run = create_run(
+            session,
+            patient_id=patient_id,
+            report_id=report_id,
+            council_model_ids=["mock-council-a", "mock-council-b"],
+            consolidator_model_id="mock-consolidator",
+        )
+        run_id = run.id
+
+    await QEEGCouncilWorkflow(llm=mock_llm_client).run_pipeline(run_id)
+
+    with session_scope() as session:
+        for artifact in list_artifacts(session, run_id):
+            if artifact.stage_num == 6:
+                Path(artifact.content_path).unlink(missing_ok=True)
+                session.delete(artifact)
+        session.commit()
+        update_run_status(
+            session,
+            run_id,
+            status="failed",
+            error_message="Stage 6 provider unavailable",
+        )
+
+    resumed = QEEGCouncilWorkflow(llm=mock_llm_client)
+    should_not_run = AsyncMock(side_effect=AssertionError("completed stage reran"))
+    resumed_stage6 = AsyncMock()
+    for stage_name in ("_stage1", "_stage2", "_stage3", "_stage4", "_stage5"):
+        monkeypatch.setattr(resumed, stage_name, should_not_run)
+    monkeypatch.setattr(resumed, "_stage6", resumed_stage6)
+    events: list[dict] = []
+
+    async def collect_event(payload: dict) -> None:
+        events.append(payload)
+
+    await resumed.run_pipeline(run_id, on_event=collect_event)
+
+    should_not_run.assert_not_awaited()
+    resumed_stage6.assert_awaited_once()
+    assert any(event.get("resuming_at_stage") == 6 for event in events)
+    with session_scope() as session:
+        repaired_run = get_run(session, run_id)
+        assert repaired_run is not None
+        assert repaired_run.status == "complete"
 
 
 @pytest.mark.asyncio

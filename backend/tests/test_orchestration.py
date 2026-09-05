@@ -25,7 +25,7 @@ def test_summarize_run_progress_uses_real_chunk_progress(temp_data_dir):
     from backend.orchestration import progress_jsonl_path, summarize_run_progress
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-1"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -85,7 +85,7 @@ def test_summarize_run_progress_keeps_partial_success_visible_on_complete(
     from backend.orchestration import progress_jsonl_path, summarize_run_progress
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-partial"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -147,7 +147,7 @@ def test_summarize_run_progress_keeps_peer_review_skip_visible_on_later_complete
     from backend.orchestration import progress_jsonl_path, summarize_run_progress
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-skipped"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -217,7 +217,7 @@ def test_partial_complete_run_is_not_delivery_complete(temp_data_dir):
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = (
             Path(temp_data_dir) / "reports" / patient.id / "report-partial-delivery"
         )
@@ -285,7 +285,7 @@ def test_liveness_uses_artifacts_to_mark_incomplete_delivery_run(temp_data_dir):
     from backend.orchestration import derive_run_liveness
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report = storage.create_report(
             session,
             report_id="report-no-review-artifacts",
@@ -320,7 +320,7 @@ def test_majority_peer_review_complete_run_is_delivery_eligible(temp_data_dir):
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-partial-pr"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -425,7 +425,7 @@ def test_below_majority_peer_review_complete_run_is_not_delivery_complete(
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = (
             Path(temp_data_dir) / "reports" / patient.id / "report-below-majority-pr"
         )
@@ -525,7 +525,7 @@ def test_patient_facing_regeneration_action_requires_stage6_final_draft(
     from backend.orchestration import build_patient_orchestration_detail
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report = storage.create_report(
             session,
             report_id="report-patient-facing-action",
@@ -603,10 +603,10 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
     temp_data_dir,
     monkeypatch,
 ):
-    from backend import main, storage
+    from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report = storage.create_report(
             session,
             report_id="report-patient-facing-ready-fallback",
@@ -709,23 +709,12 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
         ready_run_id = ready_run.id
         newer_run_id = newer_run.id
 
-    scheduled: dict[str, object] = {}
+    from backend.run_runtime import RunRuntime
+    from unittest.mock import AsyncMock
 
-    def fake_patient_facing_task(run_id, broker, *, sync_outputs=True):
-        scheduled["run_id"] = run_id
-        scheduled["sync_outputs"] = sync_outputs
-        return "patient-facing-task"
-
-    def fake_spawn_task(task, *, name=None):
-        scheduled["task"] = task
-        scheduled["name"] = name
-        return object()
-
-    monkeypatch.setattr(
-        main, "_auto_generate_patient_facing_for_run", fake_patient_facing_task
-    )
-    monkeypatch.setattr(main, "_spawn_task", fake_spawn_task)
-
+    monkeypatch.setattr(RunRuntime, "start", AsyncMock())
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
+    scheduled = {}
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
@@ -744,13 +733,14 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
     assert response.json()["run_id"] != newer_run_id
     assert requested_response.status_code == 409
     assert "No delivery-ready complete run" in requested_response.text
-    assert first_scheduled == {
-        "run_id": ready_run_id,
-        "sync_outputs": True,
-        "task": "patient-facing-task",
-        "name": f"patient-facing-{ready_run_id}",
-    }
-    assert scheduled == {}
+    assert first_scheduled == scheduled == {}
+    assert response.json()["postprocessing"]["state"] == "pending"
+    with storage.session_scope() as session:
+        assert (
+            session.get(storage.PostObligation, (ready_run_id, "patient_facing"))
+            is not None
+        )
+        assert session.get(storage.Run, ready_run_id).analysis_input_fingerprint == ""
 
 
 def test_peer_review_artifact_majority_is_checked_without_progress_counts(
@@ -760,7 +750,7 @@ def test_peer_review_artifact_majority_is_checked_without_progress_counts(
     from backend.orchestration import run_council_completion_gaps
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report = storage.create_report(
             session,
             report_id="report-artifact-majority-pr",
@@ -847,7 +837,7 @@ def test_derive_run_liveness_marks_old_running_heartbeat_stale(
     monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-stale"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -907,7 +897,7 @@ def test_derive_run_liveness_keeps_fresh_created_runs_blocking_duplicate_work(
     monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-created"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -950,7 +940,7 @@ def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
     monkeypatch.setenv("QEEG_CATHODE_PROJECTS_DIR", str(cathode_root))
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-2"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1028,20 +1018,20 @@ def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
         )
         storage.select_artifact(session, run.id, artifact.id)
 
-    portal_dir = Path(temp_data_dir) / "portal_patients" / "03-05-2010-0"
+    portal_dir = Path(temp_data_dir) / "portal_patients" / "AB_03-05-2010"
     portal_dir.mkdir(parents=True, exist_ok=True)
     (
-        portal_dir / "03-05-2010-0__patient-facing__auto-test__2026-04-12.pdf"
+        portal_dir / "AB_03-05-2010__patient-facing__auto-test__2026-04-12.pdf"
     ).write_bytes(b"%PDF-1.4")
     status_dir = Path(temp_data_dir) / "pipeline_jobs"
     status_dir.mkdir(parents=True, exist_ok=True)
-    (status_dir / "03-05-2010-0.json").write_text(
+    (status_dir / "AB_03-05-2010.json").write_text(
         json.dumps(
-            {"patient_id": "03-05-2010-0", "status": "complete", "note": "all good"}
+            {"patient_id": "AB_03-05-2010", "status": "complete", "note": "all good"}
         ),
         encoding="utf-8",
     )
-    cathode_project = cathode_root / "03-05-2010-0"
+    cathode_project = cathode_root / "AB_03-05-2010"
     cathode_project.mkdir(parents=True, exist_ok=True)
     (cathode_project / "qeeg_handoff_payload.json").write_text(
         json.dumps({"ready_for_handoff": True}),
@@ -1069,7 +1059,7 @@ def test_patient_orchestration_endpoint_surfaces_stale_running_rows(
     monkeypatch.setenv("QEEG_RUN_STALE_AFTER_S", "300")
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="12-02-1985-0", notes="")
+        patient = storage.create_patient(session, label="YZ_12-02-1985", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-stale-ui"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1131,7 +1121,7 @@ def test_patient_orchestration_summary_liveness_tracks_the_run_being_summarized(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="01-18-1991-0", notes="")
+        patient = storage.create_patient(session, label="TV_01-18-1991", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-mixed"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1172,7 +1162,7 @@ def test_patient_orchestration_summary_liveness_tracks_the_run_being_summarized(
 
     assert response.status_code == 200
     payload = response.json()
-    match = next(item for item in payload if item["label"] == "01-18-1991-0")
+    match = next(item for item in payload if item["label"] == "TV_01-18-1991")
     summary = match["orchestration_summary"]
     assert summary["state"] == "running"
     assert summary["status"] == "running"
@@ -1186,8 +1176,10 @@ def test_patient_orchestration_detail_exposes_current_run_over_newer_failed_run(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="01-18-1991-1", notes="")
-        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-mixed-detail"
+        patient = storage.create_patient(session, label="TV_01-18-1991_2", notes="")
+        report_dir = (
+            Path(temp_data_dir) / "reports" / patient.id / "report-mixed-detail"
+        )
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
         extracted_path = report_dir / "extracted.txt"
@@ -1217,7 +1209,9 @@ def test_patient_orchestration_detail_exposes_current_run_over_newer_failed_run(
             council_model_ids=["gpt-5.4"],
             consolidator_model_id="claude-sonnet-4-6",
         )
-        storage.update_run_status(session, failed_run.id, status="failed", error_message="boom")
+        storage.update_run_status(
+            session, failed_run.id, status="failed", error_message="boom"
+        )
 
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -1236,7 +1230,7 @@ def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="02-28-1978-0", notes="")
+        patient = storage.create_patient(session, label="LW_02-28-1978", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-complete"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1291,12 +1285,12 @@ def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
             content_type="text/markdown",
         )
 
-    portal_dir = Path(temp_data_dir) / "portal_patients" / "02-28-1978-0"
+    portal_dir = Path(temp_data_dir) / "portal_patients" / "LW_02-28-1978"
     portal_dir.mkdir(parents=True, exist_ok=True)
     (
-        portal_dir / "02-28-1978-0__patient-facing__auto-test__2026-05-09.pdf"
+        portal_dir / "LW_02-28-1978__patient-facing__auto-test__2026-05-09.pdf"
     ).write_bytes(b"%PDF-1.4\n")
-    cathode_dir = Path(temp_data_dir) / "cathode_projects" / "02-28-1978-0"
+    cathode_dir = Path(temp_data_dir) / "cathode_projects" / "LW_02-28-1978"
     cathode_dir.mkdir(parents=True, exist_ok=True)
     (cathode_dir / "qeeg_handoff_payload.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv(
@@ -1305,10 +1299,10 @@ def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
 
     status_dir = Path(temp_data_dir) / "pipeline_jobs"
     status_dir.mkdir(parents=True, exist_ok=True)
-    (status_dir / "02-28-1978-0.json").write_text(
+    (status_dir / "LW_02-28-1978.json").write_text(
         json.dumps(
             {
-                "patient_id": "02-28-1978-0",
+                "patient_id": "LW_02-28-1978",
                 "status": "failed",
                 "note": "worker saw duplicate legacy PDFs",
             }
@@ -1322,7 +1316,7 @@ def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
 
     assert response.status_code == 200
     payload = response.json()
-    match = next(item for item in payload if item["label"] == "02-28-1978-0")
+    match = next(item for item in payload if item["label"] == "LW_02-28-1978")
     summary = match["orchestration_summary"]
     assert summary["state"] == "ready"
     assert summary["status"] == "complete"
@@ -1337,7 +1331,7 @@ def test_prepare_cathode_handoff_action_writes_payload_and_source(
     monkeypatch.setenv("QEEG_CATHODE_PROJECTS_DIR", str(cathode_root))
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-3"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1445,7 +1439,7 @@ def test_prepare_cathode_handoff_action_falls_back_to_peer_reviewed_source(
     monkeypatch.setenv("QEEG_CATHODE_PROJECTS_DIR", str(cathode_root))
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-cathode"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1573,7 +1567,7 @@ def test_choose_cathode_source_artifact_prefers_stage4_then_stage3(
     from backend.orchestration import choose_cathode_source_artifact
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-4"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1655,7 +1649,7 @@ def test_export_council_artifacts_action_exports_selected_final_draft(
     from backend import main
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-5"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1748,7 +1742,7 @@ def test_export_council_artifacts_action_falls_back_to_export_ready_run(
     from backend import main, storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="03-05-2010-0", notes="")
+        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
         report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-export"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
@@ -1880,8 +1874,7 @@ def test_export_council_artifacts_action_falls_back_to_export_ready_run(
 
     assert detail_response.status_code == 200
     assert (
-        detail_response.json()["actions"]["export_council_artifacts"]["enabled"]
-        is True
+        detail_response.json()["actions"]["export_council_artifacts"]["enabled"] is True
     )
     assert response.status_code == 200
     payload = response.json()

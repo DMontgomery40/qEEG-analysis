@@ -1,5 +1,6 @@
 # Python-generated files
 __pycache__/
+.agent*
 *.py[oc]
 build/
 dist/
@@ -37,3 +38,4 @@ frontend/test-results/
 
 # Local deployment/operator notes
 LOCAL_LIVE_DEPLOYMENT_NOTES.md
+.gitnexus/

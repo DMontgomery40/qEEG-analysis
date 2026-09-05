@@ -15,6 +15,20 @@ import pytest
 # Import backend modules AFTER patching in fixtures
 
 
+@pytest.fixture(autouse=True)
+def isolate_discovered_model_ids():
+    """Prevent runtime model discovery state from leaking between tests."""
+    from backend import config
+
+    saved = set(config.DISCOVERED_MODEL_IDS)
+    config.DISCOVERED_MODEL_IDS.clear()
+    try:
+        yield
+    finally:
+        config.DISCOVERED_MODEL_IDS.clear()
+        config.DISCOVERED_MODEL_IDS.update(saved)
+
+
 @pytest.fixture
 def temp_data_dir(tmp_path: Path, monkeypatch):
     """Redirect all data paths to a temporary directory.
@@ -61,7 +75,7 @@ def temp_data_dir(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture
-def mock_llm_client(temp_data_dir):
+def mock_llm_client(temp_data_dir, monkeypatch):
     """Create AsyncOpenAICompatClient with mock CLIProxyAPI transport.
 
     Depends on temp_data_dir to ensure proper isolation.
@@ -70,6 +84,7 @@ def mock_llm_client(temp_data_dir):
     from backend.llm_client import AsyncOpenAICompatClient
     from backend.tests.fixtures.mock_llm import create_mock_transport
 
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     return AsyncOpenAICompatClient(
         base_url="http://mock-cliproxy:8317",
         api_key="",

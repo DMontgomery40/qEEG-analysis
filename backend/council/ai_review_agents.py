@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Literal
 
 import httpx
+from openai import AsyncOpenAI
+from ..paid_transport import PaidAsyncClient
+from .execution import (
+    raise_if_execution_blocked,
+    current_semantic_key,
+    execute_unit,
+    require_semantic_scope,
+)
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
@@ -23,7 +33,9 @@ from .utils import _sleep_backoff
 
 def _strip_text(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string")
+        # Pydantic turns ValueError into model-output validation feedback;
+        # TypeError escapes the SDK without entering its bounded output repair.
+        raise ValueError(f"{field_name} must be a string")
     text = value.strip()
     if not text:
         raise ValueError(f"{field_name} must not be empty")
@@ -32,7 +44,7 @@ def _strip_text(value: Any, *, field_name: str) -> str:
 
 def _strip_string_list(value: Any, *, field_name: str) -> list[str]:
     if not isinstance(value, list):
-        raise TypeError(f"{field_name} must be a list")
+        raise ValueError(f"{field_name} must be a list")
     cleaned: list[str] = []
     for item in value:
         text = _strip_text(item, field_name=field_name)
@@ -87,7 +99,7 @@ class Stage2PeerReviewPayload(BaseModel):
     @classmethod
     def _validate_ranking(cls, value: Any) -> list[str]:
         if not isinstance(value, list):
-            raise TypeError("ranking_best_to_worst must be a list")
+            raise ValueError("ranking_best_to_worst must be a list")
         return [_normalize_label(item) for item in value]
 
     @field_validator("overall_notes", mode="before")
@@ -226,34 +238,82 @@ def _chat_unsupported_http_error(err: ModelHTTPError) -> bool:
 async def _provider_for_call(
     llm_client: AsyncOpenAICompatClient | None,
 ) -> AsyncIterator[OpenAIProvider]:
-    http_client: httpx.AsyncClient | None = None
-
-    if llm_client is not None:
-        transport = getattr(llm_client, "_transport", None)
-        timeout_s = getattr(llm_client, "_timeout_s", 120.0)
-        base_url = _cliproxy_openai_base_url(getattr(llm_client, "_base_url", None))
-        api_key = getattr(llm_client, "_api_key", "") or CLIPROXY_API_KEY
-        if transport is not None:
-            http_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout_s),
-                transport=transport,
-            )
-        provider = OpenAIProvider(
-            base_url=base_url,
-            api_key=api_key or None,
-            http_client=http_client,
-        )
-    else:
-        provider = OpenAIProvider(
-            base_url=_cliproxy_openai_base_url(None),
-            api_key=CLIPROXY_API_KEY or None,
-        )
-
+    require_semantic_scope()
+    transport = getattr(llm_client, "_transport", None)
+    timeout_s = getattr(llm_client, "_timeout_s", 120.0)
+    base_url = _cliproxy_openai_base_url(getattr(llm_client, "_base_url", None))
+    api_key = getattr(llm_client, "_api_key", "") or CLIPROXY_API_KEY
+    http_client = PaidAsyncClient(
+        timeout=httpx.Timeout(timeout_s)
+        if transport is not None
+        else httpx.Timeout(600, connect=5),
+        transport=_BorrowedTransport(transport) if transport is not None else None,
+    )
+    openai_client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key or os.environ.get("OPENAI_API_KEY", "api-key-not-set"),
+        max_retries=0,
+        http_client=http_client,
+    )
     try:
-        yield provider
+        yield OpenAIProvider(openai_client=openai_client)
     finally:
-        if http_client is not None:
-            await http_client.aclose()
+        await openai_client.close()
+
+
+class _BorrowedTransport(httpx.AsyncBaseTransport):
+    """Each provider owns its client while the compat owner retains transport."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def handle_async_request(self, request):
+        return await self.inner.handle_async_request(request)
+
+
+class _ReviewRequests:
+    """One ordered request sequence across validation, backoff and endpoint fallback."""
+
+    def __init__(self):
+        self.key = current_semantic_key()
+        self.index = 0
+        self.blocked = None
+        self.active = False
+
+    def wrap(self, model):
+        return _OwnedReviewModel(model, self) if self.key is not None else model
+
+
+class _OwnedReviewModel(WrapperModel):
+    def __init__(self, wrapped, sequence):
+        super().__init__(wrapped)
+        self.sequence = sequence
+
+    async def request(self, messages, model_settings, model_request_parameters):
+        from ..run_execution import ExecutionConflict
+        from ..paid_transport import PaidOutcomeUnknown
+
+        sequence = self.sequence
+        if sequence.blocked is not None:
+            raise sequence.blocked
+        if sequence.active:
+            sequence.blocked = ExecutionConflict("review requests must remain ordered")
+            raise sequence.blocked
+        index = sequence.index
+        sequence.index += 1
+        sequence.active = True
+        try:
+            return await execute_unit(
+                f"{sequence.key}/sdk-request/{index}",
+                self.wrapped.request(
+                    messages, model_settings, model_request_parameters
+                ),
+            )
+        except (PaidOutcomeUnknown, ExecutionConflict) as error:
+            sequence.blocked = error
+            raise
+        finally:
+            sequence.active = False
 
 
 async def _run_agent_with_backoff(
@@ -275,12 +335,14 @@ async def _run_agent_with_backoff(
             )
             return result.output
         except ModelHTTPError as err:
+            raise_if_execution_blocked(err)
             if err.status_code in {429, 500, 502, 503, 504} and attempts < 4:
                 await _sleep_backoff(attempts)
                 attempts += 1
                 continue
             raise
-        except ModelAPIError:
+        except ModelAPIError as err:
+            raise_if_execution_blocked(err)
             if attempts < 4:
                 await _sleep_backoff(attempts)
                 attempts += 1
@@ -306,8 +368,9 @@ async def run_stage2_peer_review(
             model_settings=_model_settings(model_id, temperature=0.1, max_tokens=4000),
         )
 
+    sequence = _ReviewRequests()
     async with _provider_for_call(llm_client) as provider:
-        chat_model = OpenAIChatModel(model_id, provider=provider)
+        chat_model = sequence.wrap(OpenAIChatModel(model_id, provider=provider))
         try:
             return await _run_agent_with_backoff(
                 agent=_STAGE2_REVIEW_AGENT,
@@ -319,9 +382,12 @@ async def run_stage2_peer_review(
                 ),
             )
         except ModelHTTPError as err:
+            raise_if_execution_blocked(err)
             if not _chat_unsupported_http_error(err):
                 raise
-            responses_model = OpenAIResponsesModel(model_id, provider=provider)
+            responses_model = sequence.wrap(
+                OpenAIResponsesModel(model_id, provider=provider)
+            )
             return await _run_agent_with_backoff(
                 agent=_STAGE2_REVIEW_AGENT,
                 prompt_text=prompt_text,
@@ -366,8 +432,9 @@ async def run_stage5_final_review(
             model_settings=_model_settings(model_id, temperature=0.1, max_tokens=2500),
         )
 
+    sequence = _ReviewRequests()
     async with _provider_for_call(llm_client) as provider:
-        chat_model = OpenAIChatModel(model_id, provider=provider)
+        chat_model = sequence.wrap(OpenAIChatModel(model_id, provider=provider))
         try:
             return await _run_agent_with_backoff(
                 agent=_STAGE5_REVIEW_AGENT,
@@ -378,11 +445,14 @@ async def run_stage5_final_review(
                 ),
             )
         except ModelHTTPError as err:
+            raise_if_execution_blocked(err)
             if not (
                 _is_openai_gpt5_model(model_id) or _chat_unsupported_http_error(err)
             ):
                 raise
-            responses_model = OpenAIResponsesModel(model_id, provider=provider)
+            responses_model = sequence.wrap(
+                OpenAIResponsesModel(model_id, provider=provider)
+            )
             return await _run_agent_with_backoff(
                 agent=_STAGE5_REVIEW_AGENT,
                 prompt_text=prompt_text,

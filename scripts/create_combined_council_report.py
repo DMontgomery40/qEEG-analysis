@@ -3,16 +3,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import shutil
 import sys
 import uuid
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-import re
-from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -25,16 +20,11 @@ from backend.config import (  # noqa: E402
     set_discovered_model_ids,
 )
 from backend.council import QEEGCouncilWorkflow  # noqa: E402
-from backend.council.report_text import _iter_page_sections, _page_section_body  # noqa: E402
 from backend.llm_client import AsyncOpenAICompatClient  # noqa: E402
 from backend.reports import (  # noqa: E402
     report_dir,
-    report_enhanced_path,
     report_extracted_path,
-    report_metadata_path,
     report_original_path,
-    report_pages_dir,
-    extract_pdf_full,
 )
 from backend.storage import (  # noqa: E402
     create_report,
@@ -49,30 +39,12 @@ from backend.storage import (  # noqa: E402
 )
 
 
-@dataclass(frozen=True)
-class SourceSpec:
-    path: Path
-    session_aliases: dict[int, int]
-
-
-@dataclass(frozen=True)
-class Manifest:
-    patient_label: str
-    combined_filename: str
-    notes: str
-    sources: list[SourceSpec]
-    council_model_ids: list[str]
-    consolidator_model_id: str | None
-
-
-@dataclass(frozen=True)
-class ExtractedSource:
-    spec: SourceSpec
-    page_sections: list[str]
-    page_images: list[dict[str, Any]]
-    per_page_sources: list[dict[str, Any]]
-    metadata: dict[str, Any]
-    session_dates: dict[int, str]
+from backend.report_composition import (  # noqa: E402
+    SourceSpec,
+    Manifest,
+    _extract_source,
+    _write_combined_report,
+)
 
 
 def _load_manifest(path: Path) -> Manifest:
@@ -184,250 +156,6 @@ def _default_model_selection(patient_id: str) -> tuple[list[str], str] | None:
         if not consolidator_model_id:
             return None
         return ([mid.strip() for mid in council_model_ids], consolidator_model_id)
-
-
-def _extract_session_dates(text: str) -> dict[int, str]:
-    out: dict[int, str] = {}
-    for match in re.finditer(
-        r"Session\s+(\d+)\s*\((\d{1,2}/\d{1,2}/\d{4})\)", text or ""
-    ):
-        try:
-            local_idx = int(match.group(1))
-            iso_date = datetime.strptime(match.group(2), "%m/%d/%Y").date().isoformat()
-        except Exception:
-            continue
-        out.setdefault(local_idx, iso_date)
-    return out
-
-
-def _label_for_page(
-    *,
-    source_name: str,
-    source_page: int,
-    session_aliases: dict[int, int],
-    session_dates: dict[int, str],
-) -> str:
-    alias_parts: list[str] = []
-    for local_idx, global_idx in sorted(session_aliases.items()):
-        date_part = (
-            f" ({session_dates[local_idx]})" if local_idx in session_dates else ""
-        )
-        alias_parts.append(
-            f"local Session {local_idx}{date_part} => global Session {global_idx}"
-        )
-    aliases = "; ".join(alias_parts) if alias_parts else "no aliases"
-    return f"source PDF: {source_name}; source page: {source_page}; {aliases}"
-
-
-def _merged_pdf_bytes(source_paths: list[Path]) -> bytes:
-    import fitz
-
-    merged = fitz.open()
-    try:
-        for source_path in source_paths:
-            src = fitz.open(str(source_path))
-            try:
-                merged.insert_pdf(src)
-            finally:
-                src.close()
-        return merged.tobytes()
-    finally:
-        merged.close()
-
-
-def _extract_source(spec: SourceSpec) -> ExtractedSource:
-    if not spec.path.exists():
-        raise RuntimeError(f"Source PDF not found: {spec.path}")
-    extraction = extract_pdf_full(spec.path)
-    page_sections = [
-        _page_section_body(section)
-        for _page, section in _iter_page_sections(extraction.enhanced_text)
-    ]
-    if len(page_sections) != len(extraction.page_images):
-        raise RuntimeError(
-            f"Page split mismatch for {spec.path.name}: text has {len(page_sections)} sections, "
-            f"images has {len(extraction.page_images)} pages"
-        )
-    return ExtractedSource(
-        spec=spec,
-        page_sections=page_sections,
-        page_images=extraction.page_images,
-        per_page_sources=extraction.per_page_sources,
-        metadata=extraction.metadata,
-        session_dates=_extract_session_dates(extraction.enhanced_text),
-    )
-
-
-def _write_combined_report(
-    *,
-    patient_id: str,
-    report_id: str,
-    manifest: Manifest,
-    manifest_path: Path,
-    extracted_sources: list[ExtractedSource],
-) -> None:
-    out_dir = report_dir(patient_id, report_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    total_pages = sum(len(source.page_sections) for source in extracted_sources)
-    combined_sections: list[str] = []
-    combined_pages_meta: list[dict[str, Any]] = []
-    page_labels: dict[str, str] = {}
-    page_map: list[dict[str, Any]] = []
-
-    combined_page_num = 0
-    pages_dir = report_pages_dir(patient_id, report_id)
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    sources_dir = out_dir / "sources"
-    sources_dir.mkdir(parents=True, exist_ok=True)
-
-    for source in extracted_sources:
-        source_name = source.spec.path.name
-        source_pages_meta = source.metadata.get("pages")
-        source_pages_meta = (
-            source_pages_meta if isinstance(source_pages_meta, list) else []
-        )
-
-        for idx, section_body in enumerate(source.page_sections, start=1):
-            combined_page_num += 1
-
-            alias_lines: list[str] = []
-            for local_idx, global_idx in sorted(source.spec.session_aliases.items()):
-                alias_line = (
-                    f"[[QEEG_SESSION_ALIAS local={local_idx} global={global_idx}"
-                )
-                date_value = source.session_dates.get(local_idx)
-                if date_value:
-                    alias_line += f" date={date_value}"
-                alias_line += "]]"
-                alias_lines.append(alias_line)
-
-            combined_sections.append(
-                "\n".join(
-                    [
-                        f"=== PAGE {combined_page_num} / {total_pages} ===",
-                        *alias_lines,
-                        section_body.strip() or "[NO TEXT EXTRACTED]",
-                    ]
-                ).strip()
-            )
-
-            page_label = _label_for_page(
-                source_name=source_name,
-                source_page=idx,
-                session_aliases=source.spec.session_aliases,
-                session_dates=source.session_dates,
-            )
-            page_labels[str(combined_page_num)] = page_label
-            page_map.append(
-                {
-                    "combined_page": combined_page_num,
-                    "source_file": source_name,
-                    "source_page": idx,
-                    "session_aliases": {
-                        str(local): global_idx
-                        for local, global_idx in source.spec.session_aliases.items()
-                    },
-                    "session_dates": {
-                        str(local): value
-                        for local, value in source.session_dates.items()
-                    },
-                }
-            )
-
-            image_item = source.page_images[idx - 1]
-            image_bytes = base64.b64decode(image_item["base64_png"])
-            (pages_dir / f"page-{combined_page_num}.png").write_bytes(image_bytes)
-
-            source_payload = source.per_page_sources[idx - 1]
-            (sources_dir / f"page-{combined_page_num}.pypdf.txt").write_text(
-                source_payload.get("pypdf_text", ""),
-                encoding="utf-8",
-            )
-            (sources_dir / f"page-{combined_page_num}.pymupdf.txt").write_text(
-                source_payload.get("pymupdf_text", ""),
-                encoding="utf-8",
-            )
-            (sources_dir / f"page-{combined_page_num}.apple_vision.txt").write_text(
-                source_payload.get("vision_ocr_text", ""),
-                encoding="utf-8",
-            )
-            (sources_dir / f"page-{combined_page_num}.tesseract.txt").write_text(
-                source_payload.get("tesseract_ocr_text", ""),
-                encoding="utf-8",
-            )
-
-            meta_payload = (
-                source_pages_meta[idx - 1] if idx - 1 < len(source_pages_meta) else {}
-            )
-            combined_pages_meta.append(
-                {
-                    **(meta_payload if isinstance(meta_payload, dict) else {}),
-                    "page": combined_page_num,
-                    "source_file": source_name,
-                    "source_page": idx,
-                }
-            )
-
-    combined_text = "\n\n".join(combined_sections).strip() + "\n"
-    report_extracted_path(patient_id, report_id).write_text(
-        combined_text, encoding="utf-8"
-    )
-    report_enhanced_path(patient_id, report_id).write_text(
-        combined_text, encoding="utf-8"
-    )
-
-    merged_pdf = _merged_pdf_bytes([source.spec.path for source in extracted_sources])
-    report_original_path(patient_id, report_id, manifest.combined_filename).write_bytes(
-        merged_pdf
-    )
-
-    engine_keys = ("pypdf", "pymupdf", "apple_vision", "tesseract")
-    metadata = {
-        "schema_version": 2,
-        "page_count": total_pages,
-        "render_zoom": max(
-            [
-                float(source.metadata.get("render_zoom", 0.0) or 0.0)
-                for source in extracted_sources
-            ]
-            or [0.0]
-        ),
-        "engines": {
-            key: all(
-                bool(source.metadata.get("engines", {}).get(key))
-                for source in extracted_sources
-            )
-            for key in engine_keys
-        },
-        "pages": combined_pages_meta,
-        "has_enhanced_ocr": True,
-        "has_page_images": total_pages > 0,
-        "page_images_written": total_pages,
-        "sources_dir": "sources",
-        "synthetic_combined": {
-            "manifest_path": str(manifest_path),
-            "source_files": [
-                {
-                    "path": str(source.spec.path),
-                    "session_aliases": {
-                        str(local): global_idx
-                        for local, global_idx in source.spec.session_aliases.items()
-                    },
-                    "session_dates": {
-                        str(local): value
-                        for local, value in source.session_dates.items()
-                    },
-                }
-                for source in extracted_sources
-            ],
-            "page_labels": page_labels,
-            "page_map": page_map,
-        },
-    }
-    report_metadata_path(patient_id, report_id).write_text(
-        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
-    )
 
 
 def _register_report(*, patient_id: str, report_id: str, manifest: Manifest) -> None:

@@ -40,18 +40,20 @@ If missing/garbled, use `POST /api/reports/{report_id}/reextract` (or trigger it
 The patient-facing “explainer video” pipeline lives in `../local-explainer-video`, but it depends on this repo as the
 ground truth + publishing target.
 
-- Patient mapping is by **patient label**: `MM-DD-YYYY-N` (must match across repos)
+- Patient mapping is by the **canonical clinic ID**: `XX_MM-DD-YYYY[_N]` (e.g. `ZZ_01-01-1900`).
+  This engine allocates it; every repo uses that same string for the patient's folder, filenames,
+  and portal/hub keys. The SQLite UUID stays internal to this repo.
 - Narrative ground truth: **Stage 4 consolidation** artifact
 - Numeric ground truth: **Stage 1 `_data_pack.json`** artifact
 - Publish target folder (watched by `thrylen`): `data/portal_patients/<PATIENT_ID>/`
 - Visual QC default is **check-only** (no automated image edits). When issues are found, the explainer repo writes:
   - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`
-- In the explainer repo, **Generate/Regenerate** uses `qwen/qwen-image-2512` and **Edit Image** uses `qwen/qwen-image-edit-2511` (or DashScope `qwen-image-edit-max` when configured).
+- Current video asset generation uses Cathode with Codex/OpenAI native image generation (`gpt-image-2`) for both generation and edits. Do not use Qwen for qEEG explainer assets that include or may include text.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **qEEG-analysis** (5903 symbols, 14667 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **qEEG-analysis** (4894 symbols, 13485 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

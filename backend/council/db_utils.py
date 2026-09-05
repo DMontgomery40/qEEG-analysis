@@ -10,13 +10,24 @@ from ..storage import Artifact
 def _stage_artifacts(session, run_id: str, stage_num: int, *, kind: str) -> list[Artifact]:
     from sqlalchemy import select
 
-    return list(
+    artifacts = list(
         session.scalars(
             select(Artifact)
-            .where(Artifact.run_id == run_id, Artifact.stage_num == stage_num, Artifact.kind == kind)
+            .where(
+                Artifact.run_id == run_id,
+                Artifact.stage_num == stage_num,
+                Artifact.kind == kind,
+            )
             .order_by(Artifact.created_at.asc())
         )
     )
+    from .execution import current_execution
+
+    if current_execution() is not None:
+        from .completion import artifact_order
+
+        artifacts.sort(key=artifact_order)
+    return artifacts
 
 
 def _validate_stage5(payload: Any) -> None:

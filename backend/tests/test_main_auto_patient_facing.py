@@ -11,7 +11,7 @@ import pytest
 async def test_auto_patient_facing_runs_for_completed_run(temp_data_dir, monkeypatch):
     from backend import main, storage
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -97,40 +97,31 @@ async def test_auto_patient_facing_runs_for_completed_run(temp_data_dir, monkeyp
         async def publish(self, _run_id: str, payload: dict) -> None:
             self.events.append(payload)
 
-    class _Proc:
-        returncode = 0
-
-        async def communicate(self):
-            return b"ok", b""
-
-    called: dict[str, tuple] = {}
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        called["args"] = args
-        called["kwargs"] = kwargs
-        return _Proc()
+    async def forbidden_subprocess(*args, **kwargs):
+        pytest.fail("Legacy helper must use original owned post admission")
 
     monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "1")
-    monkeypatch.setenv("QEEG_PATIENT_FACING_MODEL", "claude-opus-4-6")
-    monkeypatch.setattr(
-        main.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
-    )
-
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", forbidden_subprocess)
+    with storage.session_scope() as session:
+        consolidation_path = Path(temp_data_dir) / "consolidation.md"
+        consolidation_path.write_text("# Original consolidation", encoding="utf-8")
+        storage.create_artifact(
+            session,
+            run_id=run_id,
+            stage_num=4,
+            stage_name="consolidation",
+            model_id="mock-council-a",
+            kind="consolidation",
+            content_path=consolidation_path,
+            content_type="text/markdown",
+        )
     broker = _DummyBroker()
     completed = await main._auto_generate_patient_facing_for_run(run_id, broker)
-
-    assert completed is True
-    assert "args" in called
-    assert "--patient-label" in called["args"]
-    assert patient_label in called["args"]
-    assert any(
-        e.get("stage_name") == "patient_facing" and e.get("status") == "start"
-        for e in broker.events
-    )
-    assert any(
-        e.get("stage_name") == "patient_facing" and e.get("status") == "complete"
-        for e in broker.events
-    )
+    assert completed is False  # Admission is pending, never fabricated completion.
+    with storage.session_scope() as session:
+        obligation = session.get(storage.PostObligation, (run_id, "patient_facing"))
+        assert obligation is not None and obligation.state == "pending"
+    assert any(e.get("status")=="pending" for e in broker.events)
 
 
 @pytest.mark.asyncio
@@ -140,7 +131,7 @@ async def test_auto_patient_facing_skips_unreviewed_partial_run(
     from backend import main, storage
     from backend.orchestration import progress_jsonl_path
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -226,7 +217,7 @@ async def test_auto_patient_facing_returns_false_on_subprocess_failure(
 ):
     from backend import main, storage
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -312,17 +303,13 @@ async def test_auto_patient_facing_returns_false_on_subprocess_failure(
         async def publish(self, _run_id: str, payload: dict) -> None:
             self.events.append(payload)
 
-    class _Proc:
-        returncode = 7
+    from backend import patient_postprocessing
 
-        async def communicate(self):
-            return b"", b"model unavailable"
-
-    async def fake_create_subprocess_exec(*_args, **_kwargs):
-        return _Proc()
+    def admission_unavailable(*args, **kwargs):
+        raise RuntimeError("Original owned admission unavailable")
 
     monkeypatch.setattr(
-        main.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        patient_postprocessing, "admit_patient_facing", admission_unavailable
     )
 
     broker = _DummyBroker()
@@ -341,7 +328,7 @@ async def test_auto_cathode_video_prepares_handoff_and_spawns_queue(
 ):
     from backend import main, storage
 
-    patient_label = "09-05-1954-0"
+    patient_label = "HT_09-05-1954"
     report_id = str(uuid.uuid4())
 
     with storage.session_scope() as session:
@@ -469,3 +456,42 @@ async def test_auto_cathode_video_prepares_handoff_and_spawns_queue(
         e.get("stage_name") == "cathode_video" and e.get("status") == "queued"
         for e in broker.events
     )
+
+
+def test_owned_completion_retires_automatic_cathode_without_dispatch(
+    temp_data_dir, monkeypatch
+):
+    from types import SimpleNamespace
+    from backend import main, patient_postprocessing as post, storage
+    from backend.council import completion
+    from backend.tests.test_patient_postprocessing import ready as ready_fixture
+    from sqlalchemy import select
+
+    store, run_id, cfg = ready_fixture.__wrapped__(temp_data_dir, monkeypatch)
+    cfg["retired_cathode_flag"] = "1"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "new owned completion launched a legacy automatic dispatcher"
+        )
+
+    monkeypatch.setattr(main, "_auto_generate_cathode_video_for_run", forbidden)
+    store.request_run_start(run_id)
+    owner = store.claim_run_owner(run_id)
+    monkeypatch.setattr(
+        completion,
+        "current_execution",
+        lambda: SimpleNamespace(owner=owner, manifest={"postprocessing": cfg}),
+    )
+    try:
+        completion.project_run_status(None, run_id, status="complete")
+        with owner.transaction() as session:
+            cathode = session.get(storage.PostObligation, (run_id, "cathode"))
+            assert cathode.state == "skipped"
+            assert not list(session.scalars(select(storage.PaidRequest)))
+        assert (
+            post._load(cathode.manifest_path)["diagnostic"]
+            == "automatic_cathode_routing_retired"
+        )
+    finally:
+        owner.release()

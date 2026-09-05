@@ -868,7 +868,7 @@ async def main() -> int:
     )
     ap.add_argument(
         "--manifest",
-        default="data/portal_patients/01-01-2013-0/combined_5sessions.manifest.json",
+        default="data/portal_patients/MK_01-01-2013/combined_5sessions.manifest.json",
         help="Combined manifest path",
     )
     ap.add_argument(

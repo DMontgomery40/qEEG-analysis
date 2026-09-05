@@ -19,6 +19,21 @@ DEFAULT_THRYLEN_REPO="$PROJECT_ROOT/../thrylen"
 QEEG_PORTAL_AUTO_SYNC="${QEEG_PORTAL_AUTO_SYNC:-1}"
 QEEG_PORTAL_SYNC_DIR="${QEEG_PORTAL_SYNC_DIR:-$PROJECT_ROOT/data/portal_patients}"
 QEEG_PORTAL_SYNC_REPO="${QEEG_PORTAL_SYNC_REPO:-$DEFAULT_THRYLEN_REPO}"
+RUNTIME_GUARD="$PROJECT_ROOT/scripts/qeeg_runtime_guard.sh"
+
+# shellcheck disable=SC1090
+source "$RUNTIME_GUARD"
+
+if [ "${QEEG_START_PREFLIGHT_ONLY:-0}" = "1" ]; then
+  for component in portal_watcher pipeline_worker backend frontend; do
+    if qeeg_component_is_running "$component" "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
+      printf '%s=running\n' "$component"
+    else
+      printf '%s=absent\n' "$component"
+    fi
+  done
+  exit 0
+fi
 
 CLIPROXY_PID=""
 PORTAL_SYNC_PID=""
@@ -206,17 +221,21 @@ fi
 if [ "$QEEG_PORTAL_AUTO_SYNC" != "0" ]; then
   if [ -d "$QEEG_PORTAL_SYNC_REPO" ] && [ -f "$QEEG_PORTAL_SYNC_REPO/scripts/qeeg_patients_watch.mjs" ]; then
     if command -v npm >/dev/null 2>&1; then
-      echo "Starting portal auto-sync watcher..."
-      (
-        cd "$QEEG_PORTAL_SYNC_REPO" || exit 1
-        npm run qeeg:patients:watch -- --dir "$QEEG_PORTAL_SYNC_DIR"
-      ) >/tmp/qeeg_patients_watch.log 2>&1 &
-      PORTAL_SYNC_PID=$!
-      sleep 1
-      if ps -p "$PORTAL_SYNC_PID" >/dev/null 2>&1; then
-        echo "✓ Portal watcher started (pid $PORTAL_SYNC_PID)"
+      if qeeg_component_is_running portal_watcher "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
+        echo "✓ Portal watcher already running"
       else
-        echo "⚠ Portal watcher failed to start. See /tmp/qeeg_patients_watch.log"
+        echo "Starting portal auto-sync watcher..."
+        (
+          cd "$QEEG_PORTAL_SYNC_REPO" || exit 1
+          npm run qeeg:patients:watch -- --dir "$QEEG_PORTAL_SYNC_DIR"
+        ) >/tmp/qeeg_patients_watch.log 2>&1 &
+        PORTAL_SYNC_PID=$!
+        sleep 1
+        if ps -p "$PORTAL_SYNC_PID" >/dev/null 2>&1; then
+          echo "✓ Portal watcher started (pid $PORTAL_SYNC_PID)"
+        else
+          echo "⚠ Portal watcher failed to start. See /tmp/qeeg_patients_watch.log"
+        fi
       fi
     else
       echo "⚠ npm not found; skipping portal auto-sync watcher."
@@ -226,16 +245,20 @@ fi
 
 if [ "${QEEG_PORTAL_PIPELINE_WORKER:-1}" != "0" ]; then
   if command -v netlify >/dev/null 2>&1; then
-    echo "Starting portal pipeline worker..."
-    (
-      uv run python scripts/portal_pipeline_worker.py --poll-seconds "${QEEG_PORTAL_PIPELINE_POLL_S:-60}"
-    ) >/tmp/qeeg_portal_pipeline_worker.log 2>&1 &
-    PORTAL_PIPELINE_PID=$!
-    sleep 1
-    if ps -p "$PORTAL_PIPELINE_PID" >/dev/null 2>&1; then
-      echo "✓ Portal pipeline worker started (pid $PORTAL_PIPELINE_PID)"
+    if qeeg_component_is_running pipeline_worker "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
+      echo "✓ Portal pipeline worker already running"
     else
-      echo "⚠ Portal pipeline worker failed to start. See /tmp/qeeg_portal_pipeline_worker.log"
+      echo "Starting portal pipeline worker..."
+      (
+        uv run python scripts/portal_pipeline_worker.py --poll-seconds "${QEEG_PORTAL_PIPELINE_POLL_S:-60}"
+      ) >/tmp/qeeg_portal_pipeline_worker.log 2>&1 &
+      PORTAL_PIPELINE_PID=$!
+      sleep 1
+      if ps -p "$PORTAL_PIPELINE_PID" >/dev/null 2>&1; then
+        echo "✓ Portal pipeline worker started (pid $PORTAL_PIPELINE_PID)"
+      else
+        echo "⚠ Portal pipeline worker failed to start. See /tmp/qeeg_portal_pipeline_worker.log"
+      fi
     fi
   else
     echo "⚠ netlify CLI not found; portal pipeline worker cannot watch clinic uploads."
@@ -243,18 +266,31 @@ if [ "${QEEG_PORTAL_PIPELINE_WORKER:-1}" != "0" ]; then
 fi
 
 # Start backend
-echo "Starting backend on http://localhost:8000..."
-uv run python -m backend.main &
-BACKEND_PID=$!
+if qeeg_component_is_running backend "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
+  echo "✓ Backend already running on http://localhost:8000"
+elif lsof -ti tcp:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port 8000 belongs to another process; backend checkout could not be verified." >&2
+  exit 1
+else
+  echo "Starting backend on http://localhost:8000..."
+  uv run python -m backend.main &
+  BACKEND_PID=$!
+fi
 
 # Wait a bit for backend to start
 sleep 2
 
 # Start frontend
-echo "Starting frontend on http://localhost:5173..."
-cd frontend
-npm run dev &
-FRONTEND_PID=$!
+if qeeg_component_is_running frontend "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
+  echo "✓ Frontend already running on http://localhost:5173"
+else
+  echo "Starting frontend on http://localhost:5173..."
+  (
+    cd frontend || exit 1
+    npm run dev
+  ) &
+  FRONTEND_PID=$!
+fi
 
 echo ""
 echo "✓ qEEG Council is running!"

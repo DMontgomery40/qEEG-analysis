@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import mimetypes
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -24,9 +25,15 @@ from backend.orchestration import (  # noqa: E402
     run_downstream_delivery_gaps,
     summarize_run_progress,
 )
+from backend.patient_identity import (  # noqa: E402
+    parse_canonical_patient_id,
+)
+from backend import pipeline_uploads  # noqa: E402
+from backend.patient_intake import (  # noqa: E402
+    IdentityInput,
+)
 from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
 
-PATIENT_RE = re.compile(r"^\d{2}-\d{2}-\d{4}-\d{1,3}$")
 META_NAME = "$meta.json"
 INDEX_NAME = "$index.json"
 JOB_PREFIX = "pipeline/jobs"
@@ -69,7 +76,7 @@ def _now_ms() -> int:
 
 
 def is_valid_patient_id(value: str) -> bool:
-    return bool(PATIENT_RE.fullmatch(str(value or "").strip()))
+    return parse_canonical_patient_id(str(value or "").strip()) is not None
 
 
 def patient_id_from_meta_key(key: str) -> str | None:
@@ -94,6 +101,75 @@ def patient_id_from_file_key(key: str) -> str | None:
         return None
     patient_id = match.group(1)
     return patient_id if is_valid_patient_id(patient_id) else None
+
+
+def _normalized_patient_identity(value: Any) -> dict[str, Any] | None:
+    identity = value if isinstance(value, dict) else {}
+    first = str(identity.get("firstInitial") or "").strip().upper()
+    last = str(identity.get("lastInitial") or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]", first) or not re.fullmatch(r"[A-Z]", last):
+        return None
+    return {
+        "schemaVersion": int(identity.get("schemaVersion") or 1),
+        "firstInitial": first,
+        "lastInitial": last,
+    }
+
+
+def sync_remote_patient_identity(
+    *,
+    portal_dir: Path,
+    patient_id: str,
+    remote_meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Persist hub initials beside the immutable local patient folder."""
+    parsed = parse_canonical_patient_id(str(patient_id or "").strip())
+    if parsed is None:
+        raise ValueError("Invalid patient storage identifier")
+    remote_identity = _normalized_patient_identity(
+        remote_meta.get("identity") if isinstance(remote_meta, dict) else None
+    )
+    if remote_identity is None:
+        return None
+
+    patient_dir = portal_dir / patient_id
+    meta_path = patient_dir / META_NAME
+    try:
+        existing = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    local_identity = _normalized_patient_identity(
+        existing.get("identity") if isinstance(existing, dict) else None
+    )
+    if local_identity and (
+        local_identity["firstInitial"],
+        local_identity["lastInitial"],
+    ) != (
+        remote_identity["firstInitial"],
+        remote_identity["lastInitial"],
+    ):
+        raise ValueError("Remote patient initials conflict with local identity metadata")
+
+    if (remote_identity["firstInitial"], remote_identity["lastInitial"]) != (
+        parsed.first_initial,
+        parsed.last_initial,
+    ):
+        raise ValueError("Remote patient initials conflict with the clinic patient id")
+
+    patient_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "patientId": parsed.value,
+        "birthdate": parsed.birthdate,
+        "index": parsed.ordinal,
+        "identity": remote_identity,
+    }
+    temp_path = meta_path.with_name(f".{META_NAME}.partial")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(meta_path)
+    return remote_identity
 
 
 def parse_blob_keys(payload: str) -> list[str]:
@@ -512,14 +588,32 @@ class NetlifyBlobClient:
             raise RuntimeError((proc.stderr or proc.stdout or "").strip())
         return parse_blob_keys(proc.stdout)
 
-    def get_json(self, key: str) -> dict[str, Any] | None:
+    def get_json(self, key: str, *, strict: bool = False) -> dict[str, Any] | None:
         proc = self._run(["blobs:get", self.store, key])
         if proc.returncode != 0:
+            if strict:
+                # Netlify CLI blobs-get distinguishes store.get() null from a
+                # thrown retrieval error. Only its exact missing message is
+                # absence; auth, transport and unrecognized CLI output retry.
+                output = re.sub(
+                    r"\x1b\[[0-9;]*m", "", proc.stderr or proc.stdout or ""
+                ).strip()
+                missing = f"Blob {key} does not exist in store {self.store}"
+                if not re.fullmatch(
+                    r"(?:[›»]\s*)?(?:Error:\s*)?" + re.escape(missing), output
+                ):
+                    raise RuntimeError(
+                        "Submission receipt retrieval failed; retry before filing"
+                    )
             return None
         try:
             parsed = json.loads(proc.stdout or "{}")
-        except Exception:
+        except ValueError as error:
+            if strict:
+                raise RuntimeError("Submission receipt JSON is unreadable") from error
             return None
+        if strict and (not isinstance(parsed, dict) or not parsed):
+            raise RuntimeError("Submission receipt is not an object")
         return parsed if isinstance(parsed, dict) else None
 
     def download(self, key: str, dest: Path) -> None:
@@ -536,6 +630,11 @@ class NetlifyBlobClient:
         proc = self._run(
             ["blobs:set", self.store, key, json.dumps(payload, sort_keys=True), "--force"]
         )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "").strip())
+
+    def delete(self, key: str) -> None:
+        proc = self._run(["blobs:delete", self.store, key, "--force"])
         if proc.returncode != 0:
             raise RuntimeError((proc.stderr or proc.stdout or "").strip())
 
@@ -567,6 +666,20 @@ def discover_patient_ids(
     return sorted(ids)
 
 
+def should_discover_all_patients(
+    *, once: bool, include_labels: set[str]
+) -> bool:
+    """Keep the continuous worker scoped to explicit upload job markers."""
+    return bool(once or include_labels)
+
+
+def paid_runs_are_authorized(
+    *, include_labels: set[str], allow_paid_runs: bool
+) -> bool:
+    """A patient selection or explicit flag is the confirmation boundary."""
+    return bool(include_labels or allow_paid_runs)
+
+
 def load_job_reports_by_patient(
     client: NetlifyBlobClient, *, include_labels: set[str]
 ) -> dict[str, list[PortalReport]]:
@@ -582,6 +695,330 @@ def load_job_reports_by_patient(
         if reports:
             reports_by_patient.setdefault(patient_id, []).extend(reports)
     return reports_by_patient
+
+
+NEW_PATIENT_UPLOAD_KIND = "new_patient_upload"
+PENDING_UPLOAD_PREFIX = "uploads/pending"
+
+
+def _identity_from_job(payload: dict[str, Any]) -> IdentityInput:
+    """Read the hub's identity block into the shape both intake paths use."""
+    identity = payload.get("identity") if isinstance(payload, dict) else None
+    identity = identity if isinstance(identity, dict) else {}
+    resolution = payload.get("resolution") if isinstance(payload, dict) else None
+    resolution = resolution if isinstance(resolution, dict) else {}
+    return IdentityInput(
+        first_name=identity.get("firstName"),
+        last_name=identity.get("lastName"),
+        birthdate=identity.get("birthdate"),
+        first_initial=identity.get("firstInitial"),
+        last_initial=identity.get("lastInitial"),
+        attach_to=resolution.get("attachTo"),
+        force_new=bool(resolution.get("forceNew")),
+    )
+
+
+def load_new_patient_upload_jobs(
+    client: NetlifyBlobClient,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Job markers for uploads that have no patient yet.
+
+    These cannot be keyed by patient id — allocating it is the job — so they are
+    found by reading each marker rather than by parsing the key. Markers already
+    parked for an operator answer are skipped without downloading anything.
+    """
+    jobs: list[tuple[str, dict[str, Any]]] = []
+    for key in client.list_keys(f"{JOB_PREFIX}/"):
+        payload = client.get_json(key) or {}
+        if payload.get("kind") != NEW_PATIENT_UPLOAD_KIND:
+            continue
+        upload_id = str(payload.get("uploadId") or "").strip()
+        answer = pipeline_uploads.pending_resolution(upload_id)
+        if answer:
+            # The operator answered a parked upload. Their resolution wins over
+            # whatever the hub originally sent, and the job runs again.
+            payload = {
+                **payload,
+                "resolution": {**(payload.get("resolution") or {}), **answer},
+            }
+        elif payload.get("status") == "needs_operator_answer":
+            continue
+        jobs.append((key, payload))
+    return jobs
+
+
+def _delete_quietly(client: NetlifyBlobClient, key: str) -> str | None:
+    """Drop a blob we are finished with, reporting rather than raising.
+
+    The work these blobs describe is already durable by the time we get here, so
+    a delete that fails — or one that already happened on an earlier attempt —
+    must not undo it or stop the rest of the submission.
+    """
+    try:
+        client.delete(key)
+    except Exception as exc:
+        return f"{key}: {str(exc).strip() or exc.__class__.__name__}"
+    return None
+
+
+def process_new_patient_upload(
+    *,
+    client: NetlifyBlobClient,
+    portal_dir: Path,
+    status_dir: Path,
+    job_key: str,
+    payload: dict[str, Any],
+) -> PatientWorkerResult:
+    """Give a hub upload a chart and a report. No paid analysis happens here.
+
+    Creating the patient and registering the report are free, so they run
+    without the paid-run approval flag. Analysis for the new patient stays
+    behind the existing gate and is picked up by the normal per-patient pass.
+    """
+    upload_id = str(payload.get("uploadId") or "").strip()
+    file_key = str(payload.get("fileKey") or "").strip()
+    identity = _identity_from_job(payload)
+
+    if not file_key or not pipeline_uploads.is_valid_upload_id(upload_id):
+        return PatientWorkerResult(
+            patient_id=upload_id or "unknown-upload",
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note="upload job is missing a usable uploadId or fileKey",
+        )
+
+    # The hub stores the file and names it by its full blob key. Anything else
+    # is a job this worker cannot honour, and saying so beats reaching for a
+    # key that was never going to exist.
+    expected_prefix = f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"
+    if not file_key.startswith(expected_prefix):
+        return PatientWorkerResult(
+            patient_id=upload_id,
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=(
+                f"upload job names {file_key!r}, which is not under "
+                f"{expected_prefix!r}"
+            ),
+        )
+
+    identity_payload = payload.get("identity")
+    try:
+        return _file_new_patient_upload(
+            client=client,
+            portal_dir=portal_dir,
+            status_dir=status_dir,
+            job_key=job_key,
+            payload=payload,
+            upload_id=upload_id,
+            file_key=file_key,
+            identity=identity,
+            identity_payload=(
+                identity_payload if isinstance(identity_payload, dict) else {}
+            ),
+        )
+    except Exception as exc:
+        # One upload must never take the cycle down with it: the rest of the
+        # queue and the per-patient pass still have to run. The store is remote
+        # and the disk is not ours, so this is where a subprocess failure, a
+        # write error, or anything else unforeseen stops.
+        note = str(exc).strip() or exc.__class__.__name__
+        pipeline_uploads.record_failed(upload_id=upload_id, error=note)
+        result = PatientWorkerResult(
+            patient_id=upload_id,
+            status="failed",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=note,
+        )
+        _write_local_status(status_dir, result)
+        return result
+
+
+def _file_new_patient_upload(
+    *,
+    client: NetlifyBlobClient,
+    portal_dir: Path,
+    status_dir: Path,
+    job_key: str,
+    payload: dict[str, Any],
+    upload_id: str,
+    file_key: str,
+    identity: IdentityInput,
+    identity_payload: dict[str, Any],
+) -> PatientWorkerResult:
+    """Import original pending bytes, then consume the common free filing receipts."""
+    from backend import clinic_intake
+    from backend.clinic_models import CatalogueNotFound
+    from backend.clinic_upload_import import import_submission_evidence
+
+    try:
+        previous = clinic_intake.get_upload(upload_id)["upload"]
+    except CatalogueNotFound:
+        previous = None
+    if previous and previous.get("legacy"):
+        if previous.get("patientId") or previous.get("status") == "uncertain":
+            raise RuntimeError(
+                "Original registered upload needs exact source reconciliation"
+            )
+        previous = None
+    if previous:
+        # A consumed/recreated marker never replaces the original byte manifest.
+        if previous["identity"] != identity_payload:
+            raise ValueError("Original upload identity changed")
+        if previous["uploadedBy"] != payload.get("uploadedBy") or previous[
+            "uploadedAt"
+        ] != payload.get("uploadedAt"):
+            raise ValueError("Original upload attribution changed")
+        import hashlib
+
+        originals = {i["metadata"]["originalFileKey"]: i for i in previous["items"]}
+        present = client.list_keys(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/")
+        if set(present) - set(originals):
+            raise ValueError("Original ordered upload inventory changed")
+        for key in present:
+            with tempfile.TemporaryDirectory(prefix="qeeg-upload-replay-") as scratch:
+                local = Path(scratch) / "bytes"
+                client.download(key, local)
+                if (
+                    hashlib.sha256(local.read_bytes()).hexdigest()
+                    != originals[key]["sha256"]
+                ):
+                    raise ValueError("Original upload bytes changed")
+        answer = pipeline_uploads.pending_resolution(upload_id)
+        if answer and previous["patientId"] is None:
+            import hashlib
+
+            answer_key = hashlib.sha256(
+                json.dumps(
+                    {"uploadId": upload_id, "answer": answer}, sort_keys=True
+                ).encode()
+            ).hexdigest()
+            result_upload = clinic_intake.resolve_upload(
+                upload_id, key="legacy-resolution:" + answer_key, resolution=answer
+            )["upload"]
+        else:
+            result_upload = clinic_intake.resume_upload(upload_id)["upload"]
+    else:
+        receipt = client.get_json(f"uploads/submissions/{upload_id}.json", strict=True)
+        if receipt:
+            evidence = import_submission_evidence(receipt, marker=payload)
+            if evidence.get("status") == "uncertain":
+                raise RuntimeError("Original upload publication needs reconciliation")
+            ordered = receipt["response"]["uploaded"]
+            keys = [f["fileKey"] for f in ordered]
+        else:
+            keys = sorted(
+                set(
+                    [
+                        file_key,
+                        *client.list_keys(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"),
+                    ]
+                )
+            )
+        cache = Path(storage.DATA_DIR) / "clinic_intake" / "legacy" / upload_id
+        # The original complete inventory is durable before each independent read.
+        clinic_intake._immutable(cache / "keys.json", json.dumps(keys).encode())
+        files = []
+        failures = []
+        for index, key in enumerate(keys):
+            if not key.startswith(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"):
+                raise ValueError("Original item key is outside this upload")
+            name = _safe_filename(Path(key).name, "upload.bin")
+            cached = cache / (str(index) + ".bytes")
+            try:
+                if not cached.exists():
+                    with tempfile.TemporaryDirectory(
+                        prefix="qeeg-pending-upload-"
+                    ) as scratch:
+                        local_path = Path(scratch) / name
+                        client.download(key, local_path)
+                        clinic_intake._immutable(cached, local_path.read_bytes())
+                files.append(
+                    (
+                        name,
+                        cached.read_bytes(),
+                        mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    )
+                )
+            except Exception as error:
+                failures.append(f"{name}: {error}")
+        if failures:
+            raise RuntimeError("Upload bytes remain unfinished: " + "; ".join(failures))
+        if receipt:
+            result_upload = import_submission_evidence(
+                receipt, marker=payload, files=files
+            )["upload"]
+        else:
+            result_upload = clinic_intake.submit_upload(
+                key=upload_id,
+                upload_id=upload_id,
+                identity=identity_payload,
+                resolution=payload.get("resolution"),
+                actor=payload.get("uploadedBy"),
+                uploaded_at=payload.get("uploadedAt"),
+                files=files,
+                file_meta=[
+                    dict(
+                        documentKind="report" if key == file_key else None,
+                        originalFileKey=key,
+                    )
+                    for key in keys
+                ],
+            )["upload"]
+    if result_upload["status"] == "needs_operator_answer":
+        client.set_json(
+            job_key,
+            {
+                **payload,
+                "status": "needs_operator_answer",
+                "conflict": result_upload["conflict"],
+            },
+        )
+        result = PatientWorkerResult(
+            patient_id=upload_id,
+            status="needs_operator_answer",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note=result_upload["conflict"]["detail"],
+        )
+    elif result_upload["status"] != "registered":
+        raise RuntimeError(
+            "Some upload items remain unfinished; their bytes and receipts are preserved"
+        )
+    else:
+        outputs = clinic_intake.promote_upload(upload_id, portal_dir)
+        keys = [i["metadata"]["originalFileKey"] for i in result_upload["items"]]
+        failures = [
+            failure for key in keys if (failure := _delete_quietly(client, key))
+        ]
+        if not failures:
+            failure = _delete_quietly(client, job_key)
+            if failure:
+                failures.append(failure)
+        result = PatientWorkerResult(
+            patient_id=result_upload["patientId"],
+            status="already_registered"
+            if previous and previous["status"] == "registered"
+            else "registered",
+            downloaded=outputs,
+            report_count=sum(
+                i["metadata"].get("documentKind") == "report"
+                for i in result_upload["items"]
+            ),
+            ran_batch=False,
+            note="Upload filed: "
+            + ", ".join(i["originalName"] for i in result_upload["items"])
+            + ("; left for retry: " + "; ".join(failures) if failures else ""),
+        )
+    _write_local_status(status_dir, result)
+    return result
 
 
 def download_missing_reports(
@@ -666,11 +1103,33 @@ def process_patient(
     patient_id: str,
     job_reports: list[PortalReport],
     dry_run: bool,
+    allow_paid_runs: bool = False,
 ) -> PatientWorkerResult:
+    from backend.clinic_execution_cutover import shared_execution_enabled
+
+    if shared_execution_enabled():
+        return PatientWorkerResult(
+            patient_id=patient_id,
+            status="retired",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note="Common confirmed execution owns this work",
+        )
     downloaded: list[str] = []
     reports: list[PortalReport] = []
     temp_batch_dir: Path | None = None
     try:
+        if not dry_run:
+            try:
+                remote_meta = client.get_json(f"patients/{patient_id}/{META_NAME}")
+            except Exception:
+                remote_meta = None
+            sync_remote_patient_identity(
+                portal_dir=portal_dir,
+                patient_id=patient_id,
+                remote_meta=remote_meta,
+            )
         index = client.get_json(f"patients/{patient_id}/{INDEX_NAME}") or {}
         index_reports = reports_from_index(patient_id, index)
         file_reports = reports_from_file_keys(
@@ -709,9 +1168,8 @@ def process_patient(
         if dry_run and would_download and note == "downloaded missing report PDFs":
             note = "would download missing report PDFs"
         if active_filenames and runnable_reports:
-            note = (
-                f"{note}; active report(s) skipped this cycle: "
-                + ", ".join(sorted(active_filenames))
+            note = f"{note}; active report(s) skipped this cycle: " + ", ".join(
+                sorted(active_filenames)
             )
         if dry_run:
             result = PatientWorkerResult(
@@ -722,6 +1180,16 @@ def process_patient(
                 report_count=len(reports),
                 ran_batch=False,
                 note=note,
+            )
+        elif should_run and not allow_paid_runs:
+            approval_note = "paid analysis requires explicit approval"
+            result = PatientWorkerResult(
+                patient_id=patient_id,
+                status="awaiting_confirmation",
+                downloaded=downloaded,
+                report_count=len(reports),
+                ran_batch=False,
+                note=f"{note}; {approval_note}" if note else approval_note,
             )
         elif should_run:
             running_payload = {
@@ -837,6 +1305,11 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Run one audit pass and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Plan work without downloading or running jobs.")
     parser.add_argument("--include-label", action="append", default=[], help="Only process this patient label. Repeatable.")
+    parser.add_argument(
+        "--allow-paid-runs",
+        action="store_true",
+        help="Allow paid analysis for discovered upload jobs. A selected patient label also authorizes that patient.",
+    )
     parser.add_argument("--poll-seconds", type=float, default=float(os.getenv("QEEG_PORTAL_PIPELINE_POLL_S", "60") or "60"))
     parser.add_argument("--store", default=os.getenv("QEEG_BLOBS_STORE", "qeeg-portal"))
     parser.add_argument("--netlify-bin", default=os.getenv("NETLIFY_BIN", "netlify"))
@@ -851,11 +1324,27 @@ def main() -> int:
     portal_dir = Path(args.portal_dir).expanduser()
     status_dir = Path(args.status_dir).expanduser()
     status_dir.mkdir(parents=True, exist_ok=True)
-    include_labels = {
-        str(label).strip().lower()
+    unusable_labels = [
+        str(label).strip()
         for label in args.include_label
-        if is_valid_patient_id(str(label).strip())
-    }
+        if not is_valid_patient_id(str(label).strip())
+    ]
+    if unusable_labels:
+        # Dropping these silently would empty include_labels and turn a
+        # single-patient audit into full-portal discovery. A clinic id is
+        # case-strict, which it never used to be, so say so.
+        print(
+            "Not clinic patient ids: "
+            + ", ".join(unusable_labels)
+            + ". Use XX_MM-DD-YYYY, matching case.",
+            file=sys.stderr,
+        )
+        return 2
+    include_labels = {str(label).strip().lower() for label in args.include_label}
+    allow_paid_runs = paid_runs_are_authorized(
+        include_labels=include_labels,
+        allow_paid_runs=args.allow_paid_runs,
+    )
 
     storage.init_db()
     client = NetlifyBlobClient(netlify_bin=args.netlify_bin, store=args.store, cwd=Path(args.thrylen_repo).expanduser())
@@ -869,11 +1358,21 @@ def main() -> int:
 
         while True:
             try:
+                new_patient_jobs = (
+                    [] if args.dry_run else load_new_patient_upload_jobs(client)
+                )
                 job_reports_by_patient = load_job_reports_by_patient(
                     client, include_labels=include_labels
                 )
-                labels = discover_patient_ids(client, include_labels=include_labels)
-                labels = sorted(set(labels) | set(job_reports_by_patient))
+                if should_discover_all_patients(
+                    once=args.once, include_labels=include_labels
+                ):
+                    labels = discover_patient_ids(
+                        client, include_labels=include_labels
+                    )
+                    labels = sorted(set(labels) | set(job_reports_by_patient))
+                else:
+                    labels = sorted(job_reports_by_patient)
             except Exception as exc:
                 message = f"portal discovery failed: {exc}"
                 _write_worker_failure(status_dir, message)
@@ -884,6 +1383,23 @@ def main() -> int:
                 continue
             print(f"Portal pipeline worker found {len(labels)} patient label(s).", flush=True)
             failures = 0
+            for job_key, payload in new_patient_jobs:
+                # Giving a hub upload its chart is free, so it runs regardless
+                # of the paid-run gate. Analysis waits for the pass below.
+                upload_result = process_new_patient_upload(
+                    client=client,
+                    portal_dir=portal_dir,
+                    status_dir=status_dir,
+                    job_key=job_key,
+                    payload=payload,
+                )
+                if upload_result.status == "failed":
+                    failures += 1
+                print(
+                    f"- {upload_result.patient_id}: {upload_result.status} "
+                    f"({upload_result.note})",
+                    flush=True,
+                )
             for patient_id in labels:
                 result = process_patient(
                     client=client,
@@ -892,6 +1408,7 @@ def main() -> int:
                     patient_id=patient_id,
                     job_reports=job_reports_by_patient.get(patient_id, []),
                     dry_run=args.dry_run,
+                    allow_paid_runs=allow_paid_runs,
                 )
                 if result.status == "failed":
                     failures += 1

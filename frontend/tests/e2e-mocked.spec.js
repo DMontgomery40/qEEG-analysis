@@ -143,6 +143,7 @@ const MOCK_ARTIFACTS = [
  */
 async function setupMockApi(page, options = {}) {
   const {
+    resetStorage = true,
     health = MOCK_HEALTH,
     models = MOCK_MODELS,
     patients = cloneJson(MOCK_PATIENTS),
@@ -153,7 +154,7 @@ async function setupMockApi(page, options = {}) {
     orchestration = cloneJson(MOCK_ORCHESTRATION),
   } = options;
 
-  await page.addInitScript(() => {
+  if (resetStorage) await page.addInitScript(() => {
     window.localStorage.clear();
     window.sessionStorage.clear();
   });
@@ -1045,3 +1046,195 @@ test.describe('Gemini login', () => {
     await expect(page.getByPlaceholder('project_id (optional)')).toBeVisible();
   });
 });
+
+for (const duplicateNames of [false, true]) {
+  test(`bulk retry retains only unsuccessful File objects (duplicate names: ${duplicateNames})`, async ({ page }) => {
+    await setupMockApi(page);
+    const requests = [];
+    await page.route(/\/api\/patients\/bulk_upload(?:\?.*)?$/, async (route) => {
+      requests.push(route.request().postDataBuffer().toString());
+      const created = requests.length === 1
+        ? [{ file_index: 0, filename: 'same.txt', report: { id: 'first' } }, { file_index: 2, filename: 'third.txt', report: { id: 'third' } }]
+        : [{ file_index: 0, filename: 'same.txt', report: { id: 'second' } }];
+      await route.fulfill({ json: {
+        created, skipped: [], errors: requests.length === 1 ? [{ file_index: 1, filename: duplicateNames ? 'same.txt' : 'second.txt', error: 'Choose chart', conflict: 'identity_name_mismatch', candidates: [{ patient_id: 'SE_01-01-1900', name: 'Synthetic Example' }] }] : [],
+        counts: { created: created.length, skipped: 0, errors: requests.length === 1 ? 1 : 0 },
+      } });
+    });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Bulk Upload', exact: true }).click();
+    await page.locator('.bulk-hidden-input').setInputFiles([
+      { name: 'same.txt', mimeType: 'text/plain', buffer: Buffer.from('FIRST-BYTES') },
+      { name: duplicateNames ? 'same.txt' : 'second.txt', mimeType: 'text/plain', buffer: Buffer.from('SECOND-BYTES') },
+      { name: 'third.txt', mimeType: 'text/plain', buffer: Buffer.from('THIRD-BYTES') },
+    ]);
+    for (const row of await page.locator('.bulk-file-row').all()) {
+      await row.getByPlaceholder('First name').fill('Synthetic');
+      await row.getByPlaceholder('Last name').fill('Example');
+      await row.getByPlaceholder('MM-DD-YYYY').fill('01-01-1900');
+    }
+    await page.getByRole('button', { name: 'Upload', exact: true }).click();
+    await expect(page.locator('.bulk-file-row')).toHaveCount(1);
+    await page.getByRole('button', { name: /Same as Synthetic Example/ }).click();
+    await page.getByRole('button', { name: 'Upload', exact: true }).click();
+    await expect(page.locator('.bulk-file-row')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Upload', exact: true })).toBeDisabled();
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toContain('SECOND-BYTES');
+    expect(requests[1]).not.toContain('FIRST-BYTES');
+    expect(requests[1]).not.toContain('THIRD-BYTES');
+  });
+}
+
+test('same basename reports retain separate names and preview text', async ({ page }) => {
+  await setupMockApi(page);
+  const requests = [];
+  await page.route(/\/api\/reports\/preview(?:\?.*)?$/, async (route) => {
+    const body = route.request().postDataBuffer().toString();
+    await route.fulfill({ json: { text: body.includes('ALICE-BYTES') ? 'Alice report preview' : 'Bob report preview' } });
+  });
+  await page.route(/\/api\/patients\/bulk_upload(?:\?.*)?$/, async (route) => {
+    requests.push(route.request().postDataBuffer().toString());
+    await route.fulfill({ json: { created: [{ file_index: 0 }], errors: [{ file_index: 1, filename: 'report.txt', conflict: 'identity_name_mismatch', candidates: [{ patient_id: 'BE_01-01-1900', name: 'Bob Example' }] }], counts: { created: 1, errors: 1 } } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Bulk Upload', exact: true }).click();
+  await page.locator('.bulk-hidden-input').setInputFiles(['ALICE', 'BOB'].map((name) => ({ name: 'report.txt', mimeType: 'text/plain', buffer: Buffer.from(`${name}-BYTES`) })));
+  const rows = page.locator('.bulk-file-row');
+  for (let i = 0; i < 2; i += 1) {
+    await rows.nth(i).getByPlaceholder('First name').fill(['Alice', 'Bob'][i]);
+    await rows.nth(i).getByPlaceholder('Last name').fill('Example');
+    await rows.nth(i).getByPlaceholder('MM-DD-YYYY').fill('01-01-1900');
+    await rows.nth(i).getByRole('button', { name: 'Read report', exact: true }).click();
+  }
+  await expect(rows.nth(0).getByPlaceholder('First name')).toHaveValue('Alice');
+  await expect(rows.nth(0)).toContainText('Alice report preview');
+  await expect(rows.nth(1)).toContainText('Bob report preview');
+  await page.getByRole('button', { name: 'Upload', exact: true }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first().getByPlaceholder('First name')).toHaveValue('Bob');
+  await expect(rows.first()).toContainText('Bob report preview');
+  expect(requests[0]).toContain('"file_index":0');
+  expect(requests[0]).toContain('"file_index":1');
+  await rows.first().getByRole('button', { name: /Same as Bob Example/ }).click();
+  await page.getByRole('button', { name: 'Upload', exact: true }).click();
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1]).toContain('"file_index":0');
+  expect(requests[1]).toContain('"first_name":"Bob"');
+  expect(requests[1]).not.toContain('ALICE-BYTES');
+});
+
+
+for (const failure of ['create', 'start']) {
+  test(`Create + Start retains its operation after lost ${failure} response and reload`, async ({ page }) => {
+    const runs = cloneJson(MOCK_RUNS);
+    await setupMockApi(page, { runs, resetStorage: false });
+    const requests = [], admitted = new Map(), started = new Set();
+    let lost = false;
+    await page.route(/\/api\/runs(?:\?.*)?$/, async route => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON(); requests.push(body);
+      const key = body.operation_id || `missing-${requests.length}`;
+      if (!admitted.has(key)) {
+        const run = { ...cloneJson(MOCK_RUNS[0]), id: `retained-${admitted.size}`, ...body };
+        admitted.set(key, run); runs.push(run);
+      }
+      if (failure === 'create' && !lost) { lost = true; return route.abort('failed'); }
+      return route.fulfill({ json: admitted.get(key) });
+    });
+    await page.route(/\/api\/runs\/[^/]+\/start(?:\?.*)?$/, async route => {
+      started.add(new URL(route.request().url()).pathname.split('/')[3]);
+      if (failure === 'start' && !lost) { lost = true; return route.abort('failed'); }
+      return route.fulfill({ json: { ok: true } });
+    });
+    const fill = async () => {
+      await page.locator('label:has-text("Report") select').selectOption(MOCK_REPORT_ID);
+      await page.locator('.multi-select').selectOption(['mock-model-a', 'mock-model-b']);
+      await page.locator('label:has-text("Consolidator") select:not(.multi-select)').selectOption('mock-model-a');
+    };
+    await page.goto('/'); await fill();
+    const button = page.getByRole('button', { name: 'Create + Start' });
+    await button.click(); await expect(button).toBeEnabled();
+    await page.reload(); await fill(); await button.click();
+    await expect.poll(() => page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('qeeg-create-start:')).length)).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(requests[0].operation_id).toBeTruthy();
+    expect(requests[1]).toEqual(requests[0]);
+    expect(admitted.size).toBe(1); expect(started.size).toBe(1);
+    // Once the full action is acknowledged, a deliberate new action is distinct.
+    await page.reload(); await fill(); await button.click();
+    await expect.poll(() => requests.length).toBe(3);
+    await expect.poll(() => page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('qeeg-create-start:')).length)).toBe(0);
+    expect(requests[2].operation_id).not.toBe(requests[0].operation_id);
+    expect(admitted.size).toBe(2);
+  });
+}
+
+test('concurrent tabs share the pending Create + Start operation under the browser lock', async ({ page, context }) => {
+  const second = await context.newPage();
+  const requests = [], admitted = new Map();
+  let releaseResponses;
+  const responses = new Promise(resolve => { releaseResponses = resolve; });
+  for (const tab of [page, second]) {
+    const runs = cloneJson(MOCK_RUNS);
+    await setupMockApi(tab, { runs, resetStorage: false });
+    await tab.route(/\/api\/runs(?:\?.*)?$/, async route => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const body = route.request().postDataJSON(); requests.push(body);
+      if (!admitted.has(body.operation_id)) admitted.set(body.operation_id, { ...cloneJson(MOCK_RUNS[0]), ...body, id: 'concurrent-run' });
+      const run = admitted.get(body.operation_id); runs.push(run);
+      await responses;
+      return route.fulfill({ json: run });
+    });
+    await tab.goto('/');
+    await tab.locator('label:has-text("Report") select').selectOption(MOCK_REPORT_ID);
+    await tab.locator('.multi-select').selectOption(['mock-model-a', 'mock-model-b']);
+    await tab.locator('label:has-text("Consolidator") select:not(.multi-select)').selectOption('mock-model-a');
+  }
+  const payload = { patient_id: MOCK_PATIENT_ID, report_id: MOCK_REPORT_ID, council_model_ids: ['mock-model-a', 'mock-model-b'], consolidator_model_id: 'mock-model-a' };
+  await page.evaluate(async payload => {
+    let ready;
+    const acquired = new Promise(resolve => { ready = resolve; });
+    window.operationLock = navigator.locks.request('qeeg-create-start:' + JSON.stringify(payload), async () => {
+      ready(); await new Promise(resolve => { window.releaseOperationLock = resolve; });
+    });
+    await acquired;
+  }, payload);
+  try {
+    await Promise.all([page, second].map(tab => tab.getByRole('button', { name: 'Create + Start' }).click()));
+    // Neither tab may bypass the shared assignment lock and dispatch a paid admission.
+    await expect.poll(async () => (await page.evaluate(() => navigator.locks.query())).pending.length).toBe(2);
+    expect(requests).toHaveLength(0);
+    await page.evaluate(() => window.releaseOperationLock());
+    await expect.poll(() => requests.length).toBe(2);
+    expect(requests[0].operation_id).toBeTruthy();
+    expect(requests[1]).toEqual(requests[0]); expect(admitted.size).toBe(1);
+    releaseResponses();
+    await expect.poll(() => page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('qeeg-create-start:')).length)).toBe(0);
+  } finally {
+    await page.evaluate(() => window.releaseOperationLock()); releaseResponses();
+    await second.close();
+  }
+});
+
+for (const unavailable of ['locks', 'storage']) {
+  test(`Create + Start sends no admission when ${unavailable} cannot retain its identity`, async ({ page }) => {
+    await setupMockApi(page, { resetStorage: false });
+    let admissions = 0;
+    await page.route(/\/api\/runs(?:\?.*)?$/, route => {
+      if (route.request().method() === 'POST') admissions++;
+      return route.fallback();
+    });
+    await page.goto('/');
+    await page.evaluate(unavailable => {
+      if (unavailable === 'locks') Object.defineProperty(navigator, 'locks', { value: undefined });
+      else Storage.prototype.setItem = () => { throw new Error('Synthetic storage unavailable'); };
+    }, unavailable);
+    await page.locator('label:has-text("Report") select').selectOption(MOCK_REPORT_ID);
+    await page.locator('.multi-select').selectOption(['mock-model-a']);
+    await page.locator('label:has-text("Consolidator") select:not(.multi-select)').selectOption('mock-model-a');
+    await page.getByRole('button', { name: 'Create + Start' }).click();
+    await expect(page.getByText(unavailable === 'locks' ? /Web Locks support/ : /Synthetic storage unavailable/)).toBeVisible();
+    expect(admissions).toBe(0);
+  });
+}

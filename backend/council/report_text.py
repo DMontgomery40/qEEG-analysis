@@ -254,23 +254,80 @@ def _normalize_ratio_value_token(
     return min(candidates, key=lambda c: abs(c - 1.0))
 
 
+def _page_local_session_indices(
+    page_text: str, *, aliases: dict[int, int], expected_sessions: list[int]
+) -> list[int]:
+    """Use the source legend's column order, then its explicit alias order."""
+    labels = list(
+        dict.fromkeys(
+            int(match.group(1))
+            for match in re.finditer(r"\bSession\s+(\d+)\b", page_text)
+        )
+    )
+    if aliases:
+        return [local for local in labels if local in aliases] or list(aliases)
+    return labels or expected_sessions
+
+
+def _canonical_page_facts(
+    facts: list[dict[str, Any]], *, aliases: dict[int, int]
+) -> list[dict[str, Any]]:
+    """Convert deterministic page-local facts exactly once, retaining provenance."""
+    return [
+        dict(
+            fact,
+            local_session_index=fact["session_index"],
+            session_index=aliases.get(fact["session_index"], fact["session_index"]),
+            session_index_namespace="global",
+        )
+        for fact in facts
+    ]
+
+
 def _facts_from_report_text_summary(
     report_text: str, *, expected_sessions: list[int]
 ) -> list[dict[str, Any]]:
-    """
-    Deterministically extract key summary metrics from the OCR text (usually PAGE 1).
+    """Extract every source summary in its local columns, then emit global facts."""
+    aliases_by_page = _page_session_alias_map(report_text)
+    sections = _iter_page_sections(report_text)
+    summary_pages = set(
+        _find_summary_pages(
+            report_text,
+            page_count=_page_count_from_markers(report_text) or len(sections),
+        )
+    )
+    out: list[dict[str, Any]] = []
+    for page, section in sections:
+        # Preserve page-1 extraction for single-report summaries without a heading.
+        if page not in summary_pages and page != 1:
+            continue
+        page_text = _page_section_body(section)
+        aliases = aliases_by_page.get(page, {})
+        local_sessions = _page_local_session_indices(
+            page_text, aliases=aliases, expected_sessions=expected_sessions
+        )
+        out.extend(
+            _canonical_page_facts(
+                _summary_page_facts(
+                    page_text, source_page=page, expected_sessions=local_sessions
+                ),
+                aliases=aliases,
+            )
+        )
+    return out
 
-    This reduces nondeterminism in strict mode by not relying on a vision model to re-transcribe values that are
-    already present in extracted_enhanced.txt.
-    """
-    page1 = _page_section(report_text, page_num=1)
+
+def _summary_page_facts(
+    page_text: str, *, source_page: int, expected_sessions: list[int]
+) -> list[dict[str, Any]]:
+    """Parse numeric cells using only this source page's local session columns."""
 
     def find_line_contains(needle: str) -> str | None:
-        m = re.search(rf"(?im)^.*{re.escape(needle)}.*$", page1)
+        m = re.search(rf"(?im)^.*{re.escape(needle)}.*$", page_text)
         return m.group(0).strip() if m else None
 
     def find_line_startswith(label: str) -> str | None:
-        m = re.search(rf"(?im)^{re.escape(label)}\b.*$", page1)
+        m = re.search(rf"(?im)^{re.escape(label)}\b.*$", page_text)
         return m.group(0).strip() if m else None
 
     out: list[dict[str, Any]] = []
@@ -285,52 +342,37 @@ def _facts_from_report_text_summary(
             return h
         return h[idx + len(n) :]
 
-    # Physical Reaction Time (includes SDs).
+    # Each source can have a different number of columns, with or without SDs.
     rt_line = find_line_contains("Physical Reaction Time")
     if rt_line:
-        # Try a structured parse first.
-        m = re.search(
-            r"Physical Reaction Time\s+(\d+)\s*\(\s*\+?(\d+)\s*\)\s*ms\s+(\d+)\s*\(\s*\+?(\d+)\s*\)\s*ms\s+(\d+)\s*\(\s*\+?(\d+)\s*\)\s*ms\s+(\d+)\s*[-–]\s*(\d+)\s*ms",
-            rt_line,
-            flags=re.IGNORECASE,
+        value_part = tail_after(rt_line, "Physical Reaction Time")
+        target = None
+        m_range = re.search(r"(\d+)\s*[-–]\s*(\d+)\s*ms\s*$", value_part, re.I)
+        if m_range:
+            target = f"{m_range.group(1)}-{m_range.group(2)} ms"
+            value_part = value_part[: m_range.start()]
+        # OCR can omit units from some or all cells. Consume each value and
+        # its parenthesized SD together before advancing to the next column.
+        cells = re.findall(
+            r"(\d+)\s*(?:\(\s*\+?(\d+)\s*\))?(?:\s*ms)?", value_part, re.I
         )
-        if m:
-            vals = [int(m.group(1)), int(m.group(3)), int(m.group(5))]
-            sds = [int(m.group(2)), int(m.group(4)), int(m.group(6))]
-            target = f"{m.group(7)}-{m.group(8)} ms"
-            for sess, val, sd in zip(expected_sessions, vals, sds):
-                out.append(
-                    {
-                        "fact_type": "performance_metric",
-                        "metric": "physical_reaction_time",
-                        "session_index": sess,
-                        "value": val,
-                        "unit": "ms",
-                        "sd_plus_minus": sd,
-                        "target_range": target,
-                        "shown_as": None,
-                        "source_page": 1,
-                    }
-                )
-        else:
-            toks = _number_tokens(rt_line)
-            if len(toks) >= 3:
-                vals = [toks[0], toks[2], toks[4]] if len(toks) >= 5 else toks[:3]
-                for sess, tok in zip(expected_sessions, vals):
-                    val = _safe_int(tok)
-                    if val is None:
-                        continue
-                    out.append(
-                        {
-                            "fact_type": "performance_metric",
-                            "metric": "physical_reaction_time",
-                            "session_index": sess,
-                            "value": val,
-                            "unit": "ms",
-                            "shown_as": rt_line.strip(),
-                            "source_page": 1,
-                        }
-                    )
+        for sess, (token, sd) in zip(expected_sessions, cells):
+            val = _safe_int(token)
+            if val is None:
+                continue
+            fact = {
+                "fact_type": "performance_metric",
+                "metric": "physical_reaction_time",
+                "session_index": sess,
+                "value": val,
+                "unit": "ms",
+                "target_range": target,
+                "shown_as": None if sd else rt_line.strip(),
+                "source_page": source_page,
+            }
+            if sd:
+                fact["sd_plus_minus"] = _safe_int(sd)
+            out.append(fact)
 
     # Trail Making Test A/B.
     for label, metric in (
@@ -358,7 +400,7 @@ def _facts_from_report_text_summary(
                         "unit": "sec",
                         "target_range": target,
                         "shown_as": None,
-                        "source_page": 1,
+                        "source_page": source_page,
                     }
                 )
         else:
@@ -376,7 +418,7 @@ def _facts_from_report_text_summary(
                             "value": val,
                             "unit": "sec",
                             "shown_as": line.strip(),
-                            "source_page": 1,
+                            "source_page": source_page,
                         }
                     )
 
@@ -404,7 +446,7 @@ def _facts_from_report_text_summary(
                         "unit": "ms",
                         "target_range": target,
                         "shown_as": delay_line.strip(),
-                        "source_page": 1,
+                        "source_page": source_page,
                     }
                 )
 
@@ -431,7 +473,7 @@ def _facts_from_report_text_summary(
                         "unit": "µV",
                         "target_range": target,
                         "shown_as": volt_line.strip(),
-                        "source_page": 1,
+                        "source_page": source_page,
                     }
                 )
 
@@ -479,7 +521,7 @@ def _facts_from_report_text_summary(
                         "unit": unit,
                         "target_range": target,
                         "shown_as": "N/A",
-                        "source_page": 1,
+                        "source_page": source_page,
                     }
                 )
                 continue
@@ -502,7 +544,7 @@ def _facts_from_report_text_summary(
                     "unit": unit,
                     "target_range": target,
                     "shown_as": shown_as_value,
-                    "source_page": 1,
+                    "source_page": source_page,
                 }
             )
         # Avoid propagating known OCR-token artifacts (for example "11" repaired to "1.1")
@@ -554,7 +596,7 @@ def _facts_from_report_text_summary(
                         "unit": "Hz",
                         "target_range": target,
                         "shown_as": "N/A",
-                        "source_page": 1,
+                        "source_page": source_page,
                     }
                 )
                 continue
@@ -571,7 +613,7 @@ def _facts_from_report_text_summary(
                     "unit": "Hz",
                     "target_range": target,
                     "shown_as": None,
-                    "source_page": 1,
+                    "source_page": source_page,
                 }
             )
 
@@ -581,18 +623,31 @@ def _facts_from_report_text_summary(
 def _facts_from_report_text_n100_central_frontal(
     report_text: str, *, expected_sessions: list[int]
 ) -> list[dict[str, Any]]:
-    """
-    Deterministically extract CENTRAL-FRONTAL AVERAGE N100 values from OCR text (typically PAGE 2).
+    """Extract each source's N100 rows with global session provenance."""
+    aliases_by_page = _page_session_alias_map(report_text)
+    out: list[dict[str, Any]] = []
+    for page, section in _iter_page_sections(report_text):
+        page_text = _page_section_body(section)
+        aliases = aliases_by_page.get(page, {})
+        local_sessions = _page_local_session_indices(
+            page_text, aliases=aliases, expected_sessions=expected_sessions
+        )
+        out.extend(
+            _canonical_page_facts(
+                _n100_page_facts(
+                    page_text, source_page=page, expected_sessions=local_sessions
+                ),
+                aliases=aliases,
+            )
+        )
+    return out
 
-    Expected OCR shape (order corresponds to sessions):
-      CENTRAL-FRONTAL AVERAGE
-      N100-UV MS
-      36 -4.4 120
-      37 -5.4 120
-      36 N/A
-    """
-    page2 = _page_section(report_text, page_num=2)
-    lines = [ln.strip() for ln in page2.splitlines() if ln.strip()]
+
+def _n100_page_facts(
+    page_text: str, *, source_page: int, expected_sessions: list[int]
+) -> list[dict[str, Any]]:
+    """Parse local N100 rows with the existing report-defined latency checks."""
+    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
     if not lines:
         return []
 
@@ -640,7 +695,6 @@ def _facts_from_report_text_n100_central_frontal(
                 break
         elif value_lines:
             break
-
 
     # Reports typically state the N100 latency window (e.g., "Maximum N100 reported between 30-120 msec.").
     # We use this as a report-defined sanity check to avoid OCR artifacts like "1230" for a "120" latency.
@@ -700,7 +754,7 @@ def _facts_from_report_text_n100_central_frontal(
                     "uv": _safe_float(m.group("uv")),
                     "ms": ms_norm,
                     "shown_as": None,
-                    "source_page": 2,
+                    "source_page": source_page,
                 }
             )
             continue
@@ -719,7 +773,7 @@ def _facts_from_report_text_n100_central_frontal(
                     "uv": None,
                     "ms": _safe_int(m.group("ms")) if m.group("ms") else None,
                     "shown_as": "N/A",
-                    "source_page": 2,
+                    "source_page": source_page,
                 }
             )
             continue

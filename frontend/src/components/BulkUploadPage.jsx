@@ -2,14 +2,6 @@ import { useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import './BulkUploadPage.css';
 
-function filenameStem(name) {
-  const raw = String(name || '').trim();
-  if (!raw) return '';
-  const lastDot = raw.lastIndexOf('.');
-  if (lastDot <= 0) return raw;
-  return raw.slice(0, lastDot).trim();
-}
-
 function formatBytes(bytes) {
   const n = Number(bytes);
   if (!Number.isFinite(n) || n <= 0) return '';
@@ -23,52 +15,74 @@ function formatBytes(bytes) {
   return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
 }
 
-function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefreshPatients }) {
+const DOB_RE = /^\d{1,2}-\d{1,2}-\d{4}$/;
+
+function isComplete(identity) {
+  return Boolean(
+    identity
+      && String(identity.first_name || '').trim()
+      && String(identity.last_name || '').trim()
+      && DOB_RE.test(String(identity.birthdate || '').trim()),
+  );
+}
+
+function clinicId(identity) {
+  if (!isComplete(identity)) return '';
+  const [mm, dd, yyyy] = String(identity.birthdate).trim().split('-');
+  const first = String(identity.first_name).trim()[0].toUpperCase();
+  const last = String(identity.last_name).trim()[0].toUpperCase();
+  return `${first}${last}_${mm.padStart(2, '0')}-${dd.padStart(2, '0')}-${yyyy}`;
+}
+
+function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }) {
   const fileInputRef = useRef(null);
+  const fileIds = useRef(new WeakMap());
   const [selectedFiles, setSelectedFiles] = useState([]);
+  const [identities, setIdentities] = useState({});
+  const [readings, setReadings] = useState({});
+  const [conflicts, setConflicts] = useState({});
   const [uploading, setUploading] = useState(false);
   const [result, setResult] = useState(null);
 
-  const existingLabelSet = useMemo(() => {
-    const set = new Set();
-    for (const p of patients || []) {
-      const label = String(p?.label || '').trim().toLowerCase();
-      if (label) set.add(label);
-    }
-    return set;
-  }, [patients]);
+  const missingIdentity = useMemo(
+    () => selectedFiles.filter((f) => !isComplete(identities[fileIds.current.get(f)])).length,
+    [selectedFiles, identities],
+  );
 
-  const selectionPreview = useMemo(() => {
-    const items = [];
-    const seen = new Set();
-    for (const f of selectedFiles || []) {
-      const stem = filenameStem(f?.name);
-      const key = stem.toLowerCase();
-      const duplicateInBatch = Boolean(key && seen.has(key));
-      if (key) seen.add(key);
-      const exists = Boolean(key && existingLabelSet.has(key));
-      items.push({
-        name: f?.name || 'upload',
-        size: formatBytes(f?.size),
-        patientLabel: stem,
-        duplicateInBatch,
-        exists,
-      });
-    }
-    return items;
-  }, [selectedFiles, existingLabelSet]);
+  const setField = (filename, field, value) => {
+    setIdentities((prev) => ({
+      ...prev,
+      [filename]: { ...(prev[filename] || {}), [field]: value },
+    }));
+  };
 
-  const warnings = useMemo(() => {
-    let empty = 0;
-    let dupBatch = 0;
-    let exists = 0;
-    for (const item of selectionPreview) {
-      if (!item.patientLabel) empty += 1;
-      if (item.duplicateInBatch) dupBatch += 1;
-      if (item.exists) exists += 1;
+  // The operator answers a name conflict on the file it belongs to, then
+  // uploads again. Clearing the conflict takes the prompt off that row.
+  const resolveConflict = (filename, resolution) => {
+    setIdentities((prev) => ({
+      ...prev,
+      [filename]: { ...(prev[filename] || {}), ...resolution },
+    }));
+    setConflicts((prev) => {
+      const next = { ...prev };
+      delete next[filename];
+      return next;
+    });
+  };
+
+  const readReport = async (file) => {
+    setReadings((prev) => ({ ...prev, [fileIds.current.get(file)]: { loading: true, text: '' } }));
+    try {
+      const res = await api.previewReport(file);
+      setReadings((prev) => ({
+        ...prev,
+        [fileIds.current.get(file)]: { loading: false, text: res?.text || res?.preview || '' },
+      }));
+    } catch (e) {
+      setReadings((prev) => ({ ...prev, [fileIds.current.get(file)]: { loading: false, text: '' } }));
+      onError(e, { action: 'preview_report', filename: file.name });
     }
-    return { empty, dupBatch, exists };
-  }, [selectionPreview]);
+  };
 
   return (
     <div className="page">
@@ -81,8 +95,9 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
         </div>
 
         <div className="muted bulk-help">
-          Each file creates a new patient (label = filename without extension) and uploads that file as the
-          patient’s qEEG report. Existing patient labels are skipped and reported.
+          Read each report, then give the patient’s name and date of birth. That is what files the
+          report — under the clinic patient id, on the patient already on file when there is one.
+          Reading a report costs nothing and files nothing.
         </div>
 
         <div className="row bulk-controls">
@@ -102,8 +117,30 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
               setUploading(true);
               setResult(null);
               try {
-                const res = await api.bulkUploadPatients(selectedFiles);
+                const submittedFiles = selectedFiles;
+                const payload = submittedFiles.map((f, file_index) => ({
+                  filename: f.name,
+                  ...(identities[fileIds.current.get(f)] || {}),
+                  file_index,
+                }));
+                const res = await api.bulkUploadPatients(submittedFiles, payload);
+                const acceptedFiles = new Set(
+                  (res?.created || [])
+                    .filter((row) => Number.isInteger(row.file_index)
+                      && row.file_index >= 0 && row.file_index < submittedFiles.length)
+                    .map((row) => submittedFiles[row.file_index]),
+                );
+                setSelectedFiles((current) => current.filter((file) => !acceptedFiles.has(file)));
                 setResult(res);
+                setConflicts(
+                  Object.fromEntries(
+                    (res?.errors || [])
+                      .filter((e) => e?.conflict === 'identity_name_mismatch'
+                        && Number.isInteger(e.file_index) && e.file_index >= 0
+                        && e.file_index < submittedFiles.length)
+                      .map((e) => [fileIds.current.get(submittedFiles[e.file_index]), e]),
+                  ),
+                );
                 await onRefreshPatients?.();
               } catch (e) {
                 onError(e, { action: 'bulk_upload_patients', fileCount: selectedFiles.length });
@@ -111,7 +148,7 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
                 setUploading(false);
               }
             }}
-            disabled={!selectedFiles.length || uploading}
+            disabled={!selectedFiles.length || uploading || missingIdentity > 0}
           >
             {uploading ? 'Uploading…' : 'Upload'}
           </button>
@@ -124,7 +161,11 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
             multiple
             onChange={(e) => {
               const files = Array.from(e.target.files || []);
+              files.forEach((file) => fileIds.current.set(file, crypto.randomUUID()));
               setSelectedFiles(files);
+              setIdentities({});
+              setReadings({});
+              setConflicts({});
               setResult(null);
               // Allow selecting the same file again later
               e.target.value = '';
@@ -135,34 +176,88 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
         {selectedFiles.length ? (
           <div className="bulk-preview">
             <div className="bulk-preview-title">Selected</div>
-            {warnings.empty || warnings.dupBatch || warnings.exists ? (
+            {missingIdentity ? (
               <div className="bulk-warnings">
-                {warnings.empty ? (
-                  <div className="warn-banner">Some files have empty filename stems (will error).</div>
-                ) : null}
-                {warnings.dupBatch ? (
-                  <div className="warn-banner">Duplicate filename stems in selection (later ones will skip).</div>
-                ) : null}
-                {warnings.exists ? (
-                  <div className="warn-banner">
-                    Some filename stems match existing patient labels (will skip).
-                  </div>
-                ) : null}
+                <div className="warn-banner">
+                  {missingIdentity} file(s) still need a name and a date of birth as MM-DD-YYYY.
+                </div>
               </div>
             ) : null}
             <div className="list bulk-file-list">
-              {selectionPreview.map((item, idx) => (
-                <div key={`${item.name}-${item.patientLabel}-${idx}`} className="bulk-file-row">
-                  <div className="bulk-file-name">{item.name}</div>
-                  <div className="bulk-file-meta">
-                    <span className="muted">{item.size}</span>
-                    <span className="muted">→</span>
-                    <span className="bulk-file-label">{item.patientLabel || '[invalid]'}</span>
-                    {item.exists ? <span className="bulk-tag bulk-tag-skip">exists</span> : null}
-                    {item.duplicateInBatch ? <span className="bulk-tag bulk-tag-skip">dup</span> : null}
+              {selectedFiles.map((file) => {
+                const fileId = fileIds.current.get(file);
+                const identity = identities[fileIds.current.get(file)] || {};
+                const reading = readings[fileIds.current.get(file)];
+                const conflict = conflicts[fileIds.current.get(file)];
+                return (
+                  <div key={fileId} className="bulk-file-row">
+                    <div className="bulk-file-name">{file.name}</div>
+                    <div className="bulk-file-meta">
+                      <span className="muted">{formatBytes(file.size)}</span>
+                      <input
+                        placeholder="First name"
+                        value={identity.first_name || ''}
+                        onChange={(e) => setField(fileId, 'first_name', e.target.value)}
+                      />
+                      <input
+                        placeholder="Last name"
+                        value={identity.last_name || ''}
+                        onChange={(e) => setField(fileId, 'last_name', e.target.value)}
+                      />
+                      <input
+                        placeholder="MM-DD-YYYY"
+                        value={identity.birthdate || ''}
+                        onChange={(e) => setField(fileId, 'birthdate', e.target.value)}
+                      />
+                      <span className="bulk-file-label">{clinicId(identity) || '—'}</span>
+                      <button onClick={() => readReport(file)} disabled={reading?.loading}>
+                        {reading?.loading ? 'Reading…' : 'Read report'}
+                      </button>
+                    </div>
+                    {conflict ? (
+                      <div className="bulk-conflict">
+                        <div>
+                          Already on file with these initials and this date of birth:
+                        </div>
+                        <div className="bulk-conflict-actions">
+                          {(conflict.candidates || []).map((c) => (
+                            <button
+                              key={c.patient_id}
+                              onClick={() =>
+                                resolveConflict(fileId, {
+                                  attach_to: c.patient_id,
+                                  force_new: false,
+                                })
+                              }
+                            >
+                              Same as {c.name} ({c.patient_id})
+                            </button>
+                          ))}
+                          <button
+                            onClick={() =>
+                              resolveConflict(fileId, {
+                                attach_to: null,
+                                force_new: true,
+                              })
+                            }
+                          >
+                            Different person
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                    {identity.attach_to ? (
+                      <div className="muted">Filing under {identity.attach_to}.</div>
+                    ) : null}
+                    {identity.force_new ? (
+                      <div className="muted">Filing as a new patient.</div>
+                    ) : null}
+                    {reading && !reading.loading && reading.text ? (
+                      <pre className="bulk-report-text">{reading.text.slice(0, 4000)}</pre>
+                    ) : null}
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ) : null}
@@ -183,10 +278,8 @@ function BulkUploadPage({ patients, onSelectPatient, onClose, onError, onRefresh
                   {result.created.map((c) => (
                     <div key={c.report?.id || c.filename} className="bulk-created-row">
                       <div className="bulk-created-main">
-                        <div className="bulk-created-title">{c.patient?.label}</div>
-                        <div className="muted">
-                          {c.filename} ({c.patient?.id?.slice?.(0, 8)})
-                        </div>
+                        <div className="bulk-created-title">{c.patient?.patient_id}</div>
+                        <div className="muted">{c.filename}</div>
                       </div>
                       <button
                         onClick={() => {

@@ -99,7 +99,7 @@ def main():
     print("KNOWN ISSUE FOUND:")
     print("=" * 70)
     print()
-    print("Patient: 01-19-1966-0")
+    print("Patient: JP_01-19-1966")
     print("Metric: F3/F4 Eyes Closed Alpha (Power) - Session 3")
     print("PDF shows: ■ N/A (Low Yield, no value)")
     print("Vision transcript: ■ 1.6 (HALLUCINATED)")

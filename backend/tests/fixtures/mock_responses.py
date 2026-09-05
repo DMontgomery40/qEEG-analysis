@@ -578,4 +578,6 @@ Parallel improvements in P300 latency and theta/beta ratio suggest coordinated c
 - Replication required before drawing conclusions
 
 The P300 and theta/beta improvements are consistent patterns. Their functional significance requires behavioral correlates, self-report data, and replication to establish.
+
+<!-- END STAGE6 FINAL DRAFT -->
 """

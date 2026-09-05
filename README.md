@@ -18,11 +18,13 @@ Frontend (React/Vite)  →  Backend (FastAPI)  →  CLIProxyAPI(Plus)  →  LLM 
 ### Storage
 
 - `data/app.db` - SQLite metadata (patients, reports, runs, artifacts)
-- `data/reports/{patient_id}/{report_id}/` - uploaded files, extracted text, page images
+- `data/reports/{patient_uuid}/{report_id}/` - uploaded files, extracted text, page images
 - `data/artifacts/{run_id}/stage-{n}/` - stage outputs per model
 - `data/exports/{run_id}/` - final exported reports
-- `data/patient_files/{patient_id}/{file_id}/` - DB-tracked uploaded patient files (MP4/PDF/etc)
-- `data/portal_patients/{patient_id}/` - clinician portal **sync folder** (drop final MP4s here)
+- `data/patient_files/{patient_uuid}/{file_id}/` - DB-tracked uploaded patient files (MP4/PDF/etc)
+- `data/portal_patients/{PATIENT_ID}/` - clinician portal **sync folder** (drop final MP4s here).
+  `{patient_uuid}` above is the internal SQLite key; `{PATIENT_ID}` here is the canonical clinic ID
+  `XX_MM-DD-YYYY[_N]` that the clinic, the hub, and the renderers all use.
 
 ## 6-Stage Workflow
 
@@ -101,10 +103,16 @@ Optional `.env` variables:
 ```
 CLIPROXY_BASE_URL=http://127.0.0.1:8317
 CLIPROXY_API_KEY=
-DEFAULT_STAGE1_VISION_MODEL=gemini-3.1-flash-lite-preview
-DEFAULT_STAGE2_REVIEW_MODEL=gpt-5.5
-DEFAULT_STAGE4_CONSOLIDATOR=gpt-5.5
-DEFAULT_STAGE5_REVIEW_MODEL=gpt-5.5
+OPENROUTER_API_KEY=
+DEFAULT_STAGE1_VISION_MODEL=openai/gpt-5.6-sol
+DEFAULT_STAGE2_REVIEW_MODEL=openai/gpt-5.6-sol
+DEFAULT_STAGE4_CONSOLIDATOR=z-ai/glm-5.2
+DEFAULT_STAGE5_REVIEW_MODEL=openai/gpt-5.6-sol
+DEFAULT_STAGE6_FINAL_DRAFT_MODEL=z-ai/glm-5.2
+DEFAULT_PATIENT_FACING_REWRITE_MODEL=z-ai/glm-5.2
+QEEG_OPENROUTER_EXTRA_MODELS=z-ai/glm-5.2
+QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT=0
+QEEG_OPENROUTER_REASONING_EFFORT_Z_AI_GLM_5_2=high
 ```
 
 ## License

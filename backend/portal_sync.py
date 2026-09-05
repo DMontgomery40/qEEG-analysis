@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -66,6 +67,10 @@ def _pipeline_watch_state_path(root_dir: Path) -> Path:
 
 def _sync_watch_state_path(root_dir: Path) -> Path:
     return root_dir / ".qeeg_portal_sync_watch_state.json"
+
+
+def _sync_spawn_lock_path(root_dir: Path) -> Path:
+    return root_dir / ".qeeg_portal_netlify_sync.spawn.lock"
 
 
 def _load_sync_state(path: Path) -> dict[str, Any]:
@@ -174,6 +179,32 @@ def _merge_sync_state_for_patient(
     return merged
 
 
+def _persist_scoped_sync_progress(
+    *,
+    state_path: Path,
+    base_state: dict[str, Any],
+    temp_state_path: Path,
+    patient_id: str,
+) -> dict[str, Any]:
+    synced_state = _load_sync_state(temp_state_path)
+    merged_state = _merge_sync_state_for_patient(
+        base_state, synced_state, patient_id
+    )
+    _write_sync_state(state_path, merged_state)
+    return merged_state
+
+
+def _mark_patient_sync_retryable(root_dir: Path, patient_id: str) -> None:
+    watch_state_path = _sync_watch_state_path(root_dir)
+    if not watch_state_path.exists():
+        return
+    watch_state = _load_pipeline_watch_state(watch_state_path)
+    if patient_id not in watch_state:
+        return
+    watch_state.pop(patient_id, None)
+    _write_pipeline_watch_state(watch_state_path, watch_state)
+
+
 def _mirror_tree_with_hardlinks(src_dir: Path, dest_dir: Path) -> None:
     for path in src_dir.rglob("*"):
         rel_path = path.relative_to(src_dir)
@@ -202,19 +233,41 @@ def _sync_command(*, temp_root_dir: Path) -> tuple[list[str], Path] | None:
 
 
 @contextmanager
-def _sync_lock(root_dir: Path) -> Iterator[None]:
+def _sync_lock(root_dir: Path) -> Iterator[bool]:
     lock_path = root_dir / ".qeeg_portal_netlify_sync.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        timeout_s = float(
+            os.getenv("QEEG_PORTAL_SYNC_LOCK_TIMEOUT_S", "30") or "30"
+        )
+    except Exception:
+        timeout_s = 30.0
+    if timeout_s < 0:
+        timeout_s = 30.0
+
     with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(
+                    lock_file.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+            except BlockingIOError:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    yield False
+                    return
+                time.sleep(min(0.1, remaining_s))
         try:
-            yield
+            yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def sync_patient_to_thrylen(patient_label: str) -> bool:
-    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", True):
+    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False):
         return False
 
     patient_id = _normalize_portal_patient_id(patient_label)
@@ -244,7 +297,15 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
         )
         return False
 
-    with _sync_lock(root_dir):
+    with _sync_lock(root_dir) as lock_acquired:
+        if not lock_acquired:
+            _mark_patient_sync_retryable(root_dir, patient_id)
+            LOGGER.warning(
+                "portal_sync_lock_timed_out",
+                patient_label=patient_id,
+                operatorHint="Another portal sync exceeded the bounded lock wait; this patient remains retryable after the active sync releases the reservation.",
+            )
+            return False
         state_path = _sync_state_path(root_dir)
         base_state = _load_sync_state(state_path)
         scoped_state = _filter_sync_state_for_patient(base_state, patient_id)
@@ -270,14 +331,60 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
                 return False
             command, cwd = command_info
 
-            proc = subprocess.run(
-                command,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                timeout_s = float(
+                    os.getenv("QEEG_PORTAL_NETLIFY_SYNC_TIMEOUT_S", "900") or "900"
+                )
+            except Exception:
+                timeout_s = 900.0
+            if timeout_s <= 0:
+                timeout_s = 900.0
+            try:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_s,
+                )
+            except subprocess.TimeoutExpired:
+                _persist_scoped_sync_progress(
+                    state_path=state_path,
+                    base_state=base_state,
+                    temp_state_path=temp_state_path,
+                    patient_id=patient_id,
+                )
+                _mark_patient_sync_retryable(root_dir, patient_id)
+                LOGGER.error(
+                    "portal_sync_timed_out",
+                    patient_label=patient_id,
+                    timeout_s=timeout_s,
+                    operatorHint="Single-patient Netlify sync exceeded its bounded runtime; the watcher will retry the latest patient-folder state after the active reservation is released.",
+                )
+                return False
+            except Exception:
+                _persist_scoped_sync_progress(
+                    state_path=state_path,
+                    base_state=base_state,
+                    temp_state_path=temp_state_path,
+                    patient_id=patient_id,
+                )
+                _mark_patient_sync_retryable(root_dir, patient_id)
+                LOGGER.exception(
+                    "portal_sync_process_failed",
+                    patient_label=patient_id,
+                    operatorHint="The single-patient sync process failed after partial progress was saved; the watcher will retry the remaining files.",
+                )
+                return False
             if proc.returncode != 0:
+                _persist_scoped_sync_progress(
+                    state_path=state_path,
+                    base_state=base_state,
+                    temp_state_path=temp_state_path,
+                    patient_id=patient_id,
+                )
+                _mark_patient_sync_retryable(root_dir, patient_id)
                 LOGGER.error(
                     "portal_sync_failed",
                     patient_label=patient_id,
@@ -304,7 +411,7 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
 
 
 def spawn_portal_sync(patient_label: str) -> bool:
-    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", True):
+    if not _truthy_env("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False):
         return False
 
     patient_id = _normalize_portal_patient_id(patient_label)
@@ -317,6 +424,23 @@ def spawn_portal_sync(patient_label: str) -> bool:
             "portal_sync_spawn_unavailable",
             patient_label=patient_id,
             sync_repo=str(portal_sync_repo()),
+        )
+        return False
+
+    root_dir = portal_patients_dir()
+    spawn_lock_path = _sync_spawn_lock_path(root_dir)
+    spawn_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    spawn_lock_file = spawn_lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(
+            spawn_lock_file.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        spawn_lock_file.close()
+        LOGGER.info(
+            "portal_sync_already_running",
+            patient_label=patient_id,
         )
         return False
 
@@ -334,14 +458,17 @@ def spawn_portal_sync(patient_label: str) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            pass_fds=(spawn_lock_file.fileno(),),
         )
     except Exception:
+        spawn_lock_file.close()
         LOGGER.exception(
             "portal_sync_spawn_failed",
             patient_label=patient_id,
             operatorHint="Background portal sync spawn shells back into python -m backend.portal_sync; verify sys.executable, repo cwd, and local process launch permissions.",
         )
         return False
+    spawn_lock_file.close()
 
     LOGGER.info("portal_sync_spawned", patient_label=patient_id)
     return True
@@ -400,6 +527,10 @@ def _source_pdfs_missing_complete_runs(
 
 
 def spawn_portal_pipeline(patient_label: str) -> bool:
+    from .clinic_execution_cutover import shared_execution_enabled
+
+    if shared_execution_enabled():
+        return False
     patient_id = _normalize_portal_patient_id(patient_label)
     if patient_id is None:
         return False
@@ -492,6 +623,9 @@ async def watch_portal_patients_forever() -> None:
     local_pipeline_watcher = _truthy_env(
         "QEEG_PORTAL_LOCAL_PIPELINE_WATCHER", True
     )
+    netlify_sync_watcher = _truthy_env(
+        "QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False
+    )
 
     try:
         poll_interval_s = float(os.getenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "5") or "5")
@@ -516,6 +650,7 @@ async def watch_portal_patients_forever() -> None:
         poll_interval_s=poll_interval_s,
         stable_polls=stable_polls,
         local_pipeline_watcher=local_pipeline_watcher,
+        netlify_sync_watcher=netlify_sync_watcher,
     )
 
     previous_snapshots: dict[str, tuple[int, int, int]] | None = None
@@ -536,6 +671,10 @@ async def watch_portal_patients_forever() -> None:
             current_snapshots = await asyncio.to_thread(
                 _snapshot_portal_patient_fingerprints, root_dir
             )
+            if sync_state_path.exists():
+                last_synced_snapshots = _load_pipeline_watch_state(
+                    sync_state_path
+                )
 
             if previous_snapshots is None:
                 previous_snapshots = current_snapshots
@@ -574,7 +713,8 @@ async def watch_portal_patients_forever() -> None:
                     stable_counts[patient_id] = 1
 
                 if (
-                    fingerprint != last_synced_snapshots.get(patient_id)
+                    netlify_sync_watcher
+                    and fingerprint != last_synced_snapshots.get(patient_id)
                     and stable_counts[patient_id] >= stable_polls
                 ):
                     LOGGER.info(

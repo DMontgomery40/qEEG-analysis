@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .execution import current_execution
 from .constants import DATA_PACK_SCHEMA_VERSION
 
 
@@ -11,11 +12,14 @@ def _prompt_path(name: str) -> Path:
 
 
 def _load_prompt(name: str) -> str:
+    context = current_execution()
+    if context is not None:
+        return context.manifest["prompts"][name]
     path = _prompt_path(name)
     return path.read_text(encoding="utf-8")
 
 
-def _workflow_context_block(*, stage_num: int, stage_name: str) -> str:
+def _workflow_context_block(*, stage_num: int, stage_name: str, special_instructions: str = "") -> str:
     extra = ""
     if stage_num == 1:
         extra = (
@@ -59,6 +63,14 @@ def _workflow_context_block(*, stage_num: int, stage_name: str) -> str:
         "when it is present in the DATA PACK or the report text.\n"
         "- Do not invent numbers. If a value is shown as N/A, report it as present but N/A.\n"
         f"{extra}"
+        + (
+            "\nOPERATOR CONTEXT (source: saved instructions for this run):\n"
+            "Address this requested focus and supplied context while keeping measured report/data-pack values, "
+            "required sections, clinical uncertainty, and stage validation criteria authoritative. "
+            "Attribute supplied context to the operator and measured findings to the reports.\n"
+            "<operator_instructions>\n" + special_instructions + "\n</operator_instructions>\n"
+            if special_instructions else ""
+        )
     )
 
 

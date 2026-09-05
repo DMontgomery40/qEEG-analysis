@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
+
+import pytest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
@@ -18,6 +22,9 @@ def _test_app(temp_data_dir, monkeypatch):
         lambda: Path(temp_data_dir) / "cliproxyapi.conf",
     )
     monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    from backend.run_runtime import RunRuntime
+
+    monkeypatch.setattr(RunRuntime, "start", AsyncMock())
     monkeypatch.setattr(main, "EXPORTS_DIR", Path(temp_data_dir) / "exports")
     return main.app, main
 
@@ -77,15 +84,6 @@ def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="P", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
-    with storage.session_scope() as session:
-        run = storage.create_run(
-            session,
-            patient_id=patient.id,
-            report_id=report.id,
-            council_model_ids=["mock-council-a"],
-            consolidator_model_id="mock-consolidator",
-        )
-
     scheduled: list[str | None] = []
 
     def fake_create_task(coro, *, name=None):
@@ -100,14 +98,137 @@ def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
     monkeypatch.setattr(main, "_spawn_task", fake_create_task)
 
     with TestClient(app, raise_server_exceptions=False) as client:
+        from types import SimpleNamespace
+
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
+        run = SimpleNamespace(id=created["id"])
         first = client.post(f"/api/runs/{run.id}/start")
         second = client.post(f"/api/runs/{run.id}/start")
 
     assert first.status_code == 200
-    assert first.json() == {"ok": True}
+    assert first.json()["ok"] is True
+    assert first.json()["start_requested_at"] == second.json()["start_requested_at"]
     assert second.status_code == 200
-    assert second.json()["status"] == "running"
-    assert scheduled == [f"qeeg-run-{run.id}"]
+    assert second.json()["execution_state"] == "pending"
+    assert second.json()["status"] == "created"
+    assert scheduled == []
+
+
+def test_run_creation_echoes_exact_models_and_runtime_before_start(
+    temp_data_dir, monkeypatch
+):
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a", "mock-council-b"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        )
+        health = client.get("/api/health").json()
+
+    assert response.status_code == 200
+    created = response.json()
+    assert created["status"] == "created"
+    assert created["requested_model_ids"] == [
+        "mock-council-a",
+        "mock-council-b",
+        "mock-consolidator",
+    ]
+    assert created["resolved_model_ids"] == created["requested_model_ids"]
+    assert created["creating_instance_id"] == health["runtime"]["instance_id"]
+    assert (
+        created["model_catalogue_fingerprint"]
+        == health["runtime"]["model_catalogue_fingerprint"]
+    )
+
+
+def test_start_refuses_runtime_or_catalogue_drift_without_scheduling_work(
+    temp_data_dir, monkeypatch
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import config, storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        main, "_spawn_task", lambda *_args, **_kwargs: scheduled.append("called")
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
+        config.DISCOVERED_MODEL_IDS.remove("mock-council-a")
+        response = client.post(f"/api/runs/{created['id']}/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+    assert scheduled == []
+    with storage.session_scope() as session:
+        assert storage.get_run(session, created["id"]).status == "created"
+
+
+def test_run_creation_allows_only_an_explicit_available_fallback(
+    temp_data_dir, monkeypatch
+):
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        implicit = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["retired-model"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        )
+        explicit = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["retired-model"],
+                "consolidator_model_id": "mock-consolidator",
+                "allowed_model_fallbacks": {"retired-model": "mock-council-a"},
+            },
+        )
+
+    assert implicit.status_code == 409
+    assert implicit.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+    assert explicit.status_code == 200
+    assert explicit.json()["requested_model_ids"][0] == "retired-model"
+    assert explicit.json()["resolved_model_ids"][0] == "mock-council-a"
 
 
 def test_select_rejects_artifact_from_different_run(temp_data_dir, monkeypatch):
@@ -163,7 +284,7 @@ def test_export_rejects_selected_artifact_that_is_not_final_markdown(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "stage5.json"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +326,7 @@ def test_export_rejects_selected_artifact_from_different_run(
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,12 +372,21 @@ def test_create_and_update_patient_reject_duplicate_labels(temp_data_dir, monkey
     app, _main = _test_app(temp_data_dir, monkeypatch)
 
     with TestClient(app, raise_server_exceptions=False) as client:
-        first = client.post("/api/patients", json={"label": "Same Label", "notes": ""})
-        second = client.post("/api/patients", json={"label": "same label", "notes": ""})
-        other = client.post("/api/patients", json={"label": "Other Label", "notes": ""})
+        first = client.post(
+            "/api/patients", json={"label": "BT_12-11-1963", "notes": ""}
+        )
+        second = client.post(
+            "/api/patients", json={"label": "BT_12-11-1963", "notes": ""}
+        )
+        wrong_case = client.post(
+            "/api/patients", json={"label": "bt_12-11-1963", "notes": ""}
+        )
+        other = client.post(
+            "/api/patients", json={"label": "HT_09-05-1954", "notes": ""}
+        )
         update = client.put(
             f"/api/patients/{other.json()['id']}",
-            json={"label": "Same Label", "notes": ""},
+            json={"label": "BT_12-11-1963", "notes": ""},
         )
 
     assert first.status_code == 200
@@ -264,6 +394,10 @@ def test_create_and_update_patient_reject_duplicate_labels(temp_data_dir, monkey
     assert second.json()["detail"] == "Patient label already exists"
     assert update.status_code == 409
     assert update.json()["detail"] == "Patient label already exists"
+    # A clinic id is case-strict, so a lowercase variant never reaches the
+    # duplicate check — it is not an id at all. Keeps a case-divergent folder
+    # from existing beside the real one on a case-preserving filesystem.
+    assert wrong_case.status_code == 400
 
 
 def test_delete_patient_file_removes_portal_copy(temp_data_dir, monkeypatch):
@@ -271,7 +405,7 @@ def test_delete_patient_file_removes_portal_copy(temp_data_dir, monkeypatch):
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
 
     with TestClient(app, raise_server_exceptions=False) as client:
         upload = client.post(
@@ -281,7 +415,7 @@ def test_delete_patient_file_removes_portal_copy(temp_data_dir, monkeypatch):
         file_id = upload.json()["file"]["id"]
 
         portal_path = (
-            Path(temp_data_dir) / "portal_patients" / "09-05-1954-0" / "guide.pdf"
+            Path(temp_data_dir) / "portal_patients" / "HT_09-05-1954" / "guide.pdf"
         )
         assert portal_path.exists()
 
@@ -304,7 +438,7 @@ def test_upload_patient_file_schedules_portal_sync(temp_data_dir, monkeypatch):
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
@@ -313,7 +447,7 @@ def test_upload_patient_file_schedules_portal_sync(temp_data_dir, monkeypatch):
         )
 
     assert response.status_code == 200
-    assert scheduled == [("09-05-1954-0", "upload_patient_file")]
+    assert scheduled == [("HT_09-05-1954", "upload_patient_file")]
 
 
 def test_export_rejects_unreviewed_selected_final_draft(temp_data_dir, monkeypatch):
@@ -321,7 +455,7 @@ def test_export_rejects_unreviewed_selected_final_draft(temp_data_dir, monkeypat
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,7 +494,7 @@ def test_cached_export_download_rejects_unreviewed_run(temp_data_dir, monkeypatc
     from backend import storage
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_path = Path(temp_data_dir) / "artifacts" / "final.md"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,7 +532,9 @@ def test_cached_export_download_rejects_unreviewed_run(temp_data_dir, monkeypatc
     assert "peer review did not complete" in response.json()["detail"]
 
 
-def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monkeypatch):
+def test_export_schedules_portal_sync_for_delivery_ready_run(
+    temp_data_dir, monkeypatch
+):
     app, main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
 
@@ -410,7 +546,7 @@ def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monk
     )
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+        patient = storage.create_patient(session, label="HT_09-05-1954", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     artifact_dir = Path(temp_data_dir) / "artifacts"
     stage2_path = artifact_dir / "stage-2" / "peer-review.json"
@@ -482,4 +618,991 @@ def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monk
     assert download.text == "# Final Draft"
     assert stale_download.status_code == 409
     assert "no longer matches" in stale_download.json()["detail"]
-    assert scheduled == [("09-05-1954-0", "export_run")]
+    assert scheduled == [("HT_09-05-1954", "export_run")]
+
+
+def test_bulk_upload_registers_a_report_under_an_allocated_canonical_id(
+    temp_data_dir, monkeypatch
+):
+    """Intake order: identity first, canonical patient second, report third.
+
+    Nothing downstream may carry the date of birth on its own. This asserts the
+    database label, the portal folder, and the API payload all land on
+    ``BT_12-11-1963`` even though the uploaded file is named after the DOB.
+    """
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("12-11-1963-0.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "12-11-1963-0.txt",
+                            "first_name": "Barto",
+                            "last_name": "Tinker",
+                            "birthdate": "12-11-1963",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"] == {"created": 1, "skipped": 0, "errors": 0}
+    created = body["created"][0]
+    assert created["patient"]["patient_id"] == "BT_12-11-1963"
+    assert created["patient"]["label"] == "BT_12-11-1963"
+    assert created["patient"]["first_name"] == "Barto"
+
+    with storage.session_scope() as session:
+        labels = [patient.label for patient in storage.list_patients(session)]
+        reports = storage.list_reports(session, created["patient"]["id"])
+    assert labels == ["BT_12-11-1963"]
+    assert [report.filename for report in reports] == ["12-11-1963-0.txt"]
+
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    assert sorted(path.name for path in portal_root.iterdir()) == ["BT_12-11-1963"]
+
+
+def test_bulk_upload_without_identity_creates_no_patient_and_no_folder(
+    temp_data_dir, monkeypatch
+):
+    """A file the operator has not identified is an error, never a fallback label."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("12-11-1963-0.txt", b"qEEG report text", "text/plain"))],
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"] == {"created": 0, "skipped": 0, "errors": 1}
+    assert body["errors"][0]["filename"] == "12-11-1963-0.txt"
+
+    with storage.session_scope() as session:
+        assert storage.list_patients(session) == []
+
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    assert not portal_root.exists() or list(portal_root.iterdir()) == []
+
+
+def test_bulk_upload_reuses_the_patient_already_wearing_that_canonical_id(
+    temp_data_dir, monkeypatch
+):
+    """The same person twice is one patient, never a ``_2`` duplicate family."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    identity = {
+        "first_name": "Barto",
+        "last_name": "Tinker",
+        "birthdate": "12-11-1963",
+    }
+    with TestClient(app, raise_server_exceptions=False) as client:
+        first = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-one.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps([{"filename": "session-one.txt", **identity}])
+            },
+        )
+        second = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-two.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps([{"filename": "session-two.txt", **identity}])
+            },
+        )
+
+    assert first.json()["counts"]["created"] == 1
+    assert second.json()["counts"]["created"] == 1
+    patient_ids = {
+        first.json()["created"][0]["patient"]["id"],
+        second.json()["created"][0]["patient"]["id"],
+    }
+    assert len(patient_ids) == 1
+
+    with storage.session_scope() as session:
+        labels = [patient.label for patient in storage.list_patients(session)]
+        reports = storage.list_reports(session, patient_ids.pop())
+    assert labels == ["BT_12-11-1963"]
+    assert sorted(report.filename for report in reports) == [
+        "session-one.txt",
+        "session-two.txt",
+    ]
+
+
+def test_portal_publishing_refuses_a_legacy_dob_label(temp_data_dir, monkeypatch):
+    """``MM-DD-YYYY-N`` is not a patient id any more, so nothing routes on it."""
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="09-05-1954-0", notes="")
+
+    scheduled: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        main,
+        "_schedule_portal_sync",
+        lambda patient_label, *, source: scheduled.append((patient_label, source)),
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/patients/{patient.id}/files",
+            files={"file": ("guide.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["portal_published_path"] is None
+    assert scheduled == []
+    assert not (Path(temp_data_dir) / "portal_patients" / "09-05-1954-0").exists()
+
+
+def test_bulk_upload_names_the_ambiguity_instead_of_adding_a_third_chart(
+    temp_data_dir, monkeypatch
+):
+    """Two charts already matching one identity is the operator's call, not a guess."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    for label in ("BT_12-11-1963", "BT_12-11-1963_2"):
+        with storage.session_scope() as session:
+            storage.create_patient(
+                session,
+                label=label,
+                notes="",
+                first_name="Barto",
+                last_name="Tinker",
+                birthdate="12-11-1963",
+                first_initial="B",
+                last_initial="T",
+            )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-three.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "session-three.txt",
+                            "first_name": "Barto",
+                            "last_name": "Tinker",
+                            "birthdate": "12-11-1963",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["counts"]["created"] == 0
+    assert "BT_12-11-1963, BT_12-11-1963_2" in body["errors"][0]["error"]
+
+    with storage.session_scope() as session:
+        labels = sorted(patient.label for patient in storage.list_patients(session))
+    assert labels == ["BT_12-11-1963", "BT_12-11-1963_2"]
+
+
+def test_bulk_upload_lands_on_the_chart_created_from_a_bare_canonical_label(
+    temp_data_dir, monkeypatch
+):
+    """A chart with no names on it is still that patient's chart.
+
+    Creating a patient from a bare canonical label stores the initials and date
+    of birth but no names. The first report to arrive with a full name must land
+    on that chart and fill the names in — not allocate `_2` and split one person
+    into two families.
+    """
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/patients", json={"label": "BT_12-11-1963", "notes": ""}
+        )
+        assert created.status_code == 200, created.text
+
+        uploaded = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("session-one.txt", b"qEEG report text", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "session-one.txt",
+                            "first_name": "Barto",
+                            "last_name": "Tinker",
+                            "birthdate": "12-11-1963",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["counts"]["created"] == 1
+    assert body["created"][0]["patient"]["id"] == created.json()["id"]
+
+    with storage.session_scope() as session:
+        patients = storage.list_patients(session)
+    assert [patient.label for patient in patients] == ["BT_12-11-1963"]
+    assert (patients[0].first_name, patients[0].last_name) == ("Barto", "Tinker")
+
+
+def test_bulk_upload_failure_leaves_no_half_created_patient(temp_data_dir, monkeypatch):
+    """A report that cannot be read files nothing at all.
+
+    Identity resolution commits the patient before the upload is extracted, so a
+    failure after that point has to be compensated: no patient row, no empty
+    portal folder that batch discovery would go on to enumerate.
+    """
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("broken.pdf", b"%PDF-1.4\n", "application/pdf"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "broken.pdf",
+                            "first_name": "Barto",
+                            "last_name": "Tinker",
+                            "birthdate": "12-11-1963",
+                        }
+                    ]
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["counts"] == {"created": 0, "skipped": 0, "errors": 1}
+
+    with storage.session_scope() as session:
+        assert storage.list_patients(session) == []
+
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    assert not portal_root.exists() or list(portal_root.iterdir()) == []
+
+
+def test_generated_portal_filenames_never_carry_a_legacy_patient_key(
+    temp_data_dir, monkeypatch
+):
+    """The filename leg of the invariant: nothing the engine writes is DOB-keyed.
+
+    Exercises the generator rather than the classifier — every file export puts
+    into the portal tree has to be named off the canonical id.
+    """
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    monkeypatch.setattr(
+        main, "_schedule_portal_sync", lambda patient_label, *, source: None
+    )
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="BT_12-11-1963", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    artifact_dir = Path(temp_data_dir) / "artifacts"
+    stage2_path = artifact_dir / "stage-2" / "peer-review.json"
+    stage3_path = artifact_dir / "stage-3" / "revision.md"
+    stage6_path = artifact_dir / "stage-6" / "final.md"
+    for path, text in (
+        (stage2_path, "{}"),
+        (stage3_path, "# Revision"),
+        (stage6_path, "# Final Draft"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    with storage.session_scope() as session:
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status="complete")
+        for stage_num, stage_name, kind, path, content_type in (
+            (2, "peer_review", "peer_review", stage2_path, "application/json"),
+            (3, "revision", "revision", stage3_path, "text/markdown"),
+        ):
+            storage.create_artifact(
+                session,
+                run_id=run.id,
+                stage_num=stage_num,
+                stage_name=stage_name,
+                model_id="mock-council-a",
+                kind=kind,
+                content_path=path,
+                content_type=content_type,
+            )
+        artifact = storage.create_artifact(
+            session,
+            run_id=run.id,
+            stage_num=6,
+            stage_name="final_draft",
+            model_id="mock-council-a",
+            kind="final_draft",
+            content_path=stage6_path,
+            content_type="text/markdown",
+        )
+        storage.select_artifact(session, run.id, artifact.id)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(f"/api/runs/{run.id}/export")
+
+    assert response.status_code == 200
+
+    portal_root = Path(temp_data_dir) / "portal_patients"
+    written = [path for path in portal_root.rglob("*") if path.is_file()]
+    assert written, "export published nothing to the portal tree"
+    legacy_key = re.compile(r"\d{2}-\d{2}-\d{4}-\d")
+    for path in written:
+        assert legacy_key.search(path.name) is None, path.name
+        assert path.name.startswith("BT_12-11-1963"), path.name
+
+
+def test_saving_a_patient_without_notes_keeps_the_notes_on_file(
+    temp_data_dir, monkeypatch
+):
+    """Notes are agent-managed memory, so silence is not an instruction to erase."""
+    app, _main = _test_app(temp_data_dir, monkeypatch)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/patients",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+                "notes": "sleeps badly before sessions",
+            },
+        ).json()
+
+        untouched = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+            },
+        ).json()
+
+        replaced = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+                "notes": "sleep improved after week three",
+            },
+        ).json()
+
+        cleared = client.put(
+            f"/api/patients/{created['id']}",
+            json={
+                "first_name": "Barto",
+                "last_name": "Tinker",
+                "birthdate": "12-11-1963",
+                "notes": "",
+            },
+        ).json()
+
+    assert untouched["notes"] == "sleeps badly before sessions"
+    assert replaced["notes"] == "sleep improved after week three"
+    assert cleared["notes"] == ""
+
+
+@pytest.mark.parametrize("catalogue_change", ["restart", "addition", "removal"])
+@pytest.mark.parametrize("initial_status", ["created", "failed", "running", "complete"])
+def test_saved_model_envelope_survives_restart_and_unrelated_catalogue_changes(
+    temp_data_dir, monkeypatch, catalogue_change, initial_status
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import runtime_identity, storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled = []
+
+    def capture_task(coro, *, name=None):
+        scheduled.append(name)
+        coro.close()
+
+    monkeypatch.setattr(main, "_spawn_task", capture_task)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
+        with storage.session_scope() as session:
+            storage.update_run_status(session, created["id"], status=initial_status)
+        if catalogue_change == "restart":
+            monkeypatch.setattr(runtime_identity, "INSTANCE_ID", "restarted-engine")
+        elif catalogue_change == "addition":
+            main.DISCOVERED_MODEL_IDS.add("unrelated-model")
+        else:
+            main.DISCOVERED_MODEL_IDS.remove("mock-council-b")
+        response = client.post(f"/api/runs/{created['id']}/start")
+        repeated = client.post(f"/api/runs/{created['id']}/start")
+        saved = client.get(f"/api/runs/{created['id']}").json()
+        monkeypatch.setattr(app.state, "mock_mode", False)
+        monkeypatch.setattr(
+            app.state.llm,
+            "list_models",
+            AsyncMock(return_value=sorted(main.DISCOVERED_MODEL_IDS)),
+        )
+        health = client.get("/api/health").json()
+
+    expected_status = 409 if initial_status in {"running", "failed"} else 200
+    assert response.status_code == repeated.status_code == expected_status
+    assert scheduled == []
+    assert bool(saved["start_requested_at"]) == (initial_status == "created")
+    for field in (
+        "id",
+        "requested_model_ids",
+        "resolved_model_ids",
+        "creating_instance_id",
+        "model_catalogue_fingerprint",
+    ):
+        assert saved[field] == created[field]
+    assert health["runtime"]["available_model_ids"] == sorted(main.DISCOVERED_MODEL_IDS)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("requested_model_ids_json", "[]"),
+        ("requested_model_ids_json", '"mock-council-a"'),
+        ("requested_model_ids_json", '["mock-council-a"]'),
+        ("requested_model_ids_json", '["", "mock-consolidator"]'),
+        ("requested_model_ids_json", '[null, "mock-consolidator"]'),
+        ("requested_model_ids_json", '[{}, "mock-consolidator"]'),
+        ("requested_model_ids_json", '[" mock-council-a", "mock-consolidator"]'),
+        ("resolved_model_ids_json", '["mock-consolidator", "mock-council-a"]'),
+        ("resolved_model_ids_json", "[]"),
+        ("resolved_model_ids_json", "null"),
+        ("resolved_model_ids_json", "{"),
+        ("resolved_model_ids_json", '[{}, "mock-consolidator"]'),
+        ("council_model_ids_json", '{"mock-council-a": 1}'),
+        ("council_model_ids_json", '["mock-council-b"]'),
+        ("consolidator_model_id", "mock-council-b"),
+    ],
+)
+def test_start_rejects_malformed_or_modified_saved_execution_models(
+    temp_data_dir, monkeypatch, field, value
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled = []
+
+    def capture_task(coro, *, name=None):
+        scheduled.append(name)
+        coro.close()
+
+    monkeypatch.setattr(main, "_spawn_task", capture_task)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
+        with storage.session_scope() as session:
+            setattr(storage.get_run(session, created["id"]), field, value)
+            session.commit()
+        response = client.post(f"/api/runs/{created['id']}/start")
+        with storage.session_scope() as session:
+            assert storage.get_run(session, created["id"]).status == "created"
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+    assert scheduled == []
+
+
+@pytest.mark.parametrize("fallback_available", [True, False])
+def test_saved_explicit_fallback_stays_pinned_after_restart(
+    temp_data_dir, monkeypatch, fallback_available
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import runtime_identity, storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="P", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    scheduled = []
+
+    def capture_task(coro, *, name=None):
+        scheduled.append(name)
+        coro.close()
+
+    monkeypatch.setattr(main, "_spawn_task", capture_task)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["retired-model"],
+                "consolidator_model_id": "mock-consolidator",
+                "allowed_model_fallbacks": {"retired-model": "mock-council-a"},
+            },
+        ).json()
+        monkeypatch.setattr(runtime_identity, "INSTANCE_ID", "restarted-engine")
+        main.DISCOVERED_MODEL_IDS.add("retired-model")
+        if not fallback_available:
+            main.DISCOVERED_MODEL_IDS.remove("mock-council-a")
+        response = client.post(f"/api/runs/{created['id']}/start")
+        saved = client.get(f"/api/runs/{created['id']}").json()
+
+    assert response.status_code == (200 if fallback_available else 409)
+    assert scheduled == []
+    assert bool(saved["start_requested_at"]) == fallback_available
+    assert saved["requested_model_ids"] == ["retired-model", "mock-consolidator"]
+    assert saved["resolved_model_ids"] == ["mock-council-a", "mock-consolidator"]
+    assert saved["creating_instance_id"] == created["creating_instance_id"]
+
+
+def test_runtime_identity_reports_unique_sorted_available_model_ids():
+    from backend.runtime_identity import current_runtime_identity
+
+    identity = current_runtime_identity(["writer", "a", "writer", "b"])
+    assert identity["available_model_ids"] == ["a", "b", "writer"]
+    assert identity["model_contract_version"] == 1
+
+
+@pytest.mark.parametrize(
+    "status", ["created", "running", "failed", "needs_auth", "complete"]
+)
+def test_legacy_without_immutable_admission_never_acquires_start_intent(
+    temp_data_dir, monkeypatch, status
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="ZZ_01-01-1900", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    with storage.session_scope() as session:
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status=status)
+    with TestClient(app) as client:
+        result = client.post(f"/api/runs/{run.id}/start")
+        assert result.status_code == (200 if status == "complete" else 409)
+        saved = client.get(f"/api/runs/{run.id}").json()
+        assert saved["analysis_input_fingerprint"] == ""
+        assert saved["start_requested_at"] is None
+        assert saved["execution_state"] is None
+        assert saved["patient_facing"]["state"] == "absent"
+        assert saved["status"] == status
+
+
+def test_concurrent_http_start_and_lost_ack_rejoin_original_source_order_offline(
+    temp_data_dir, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from backend import storage
+
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="ZZ_01-01-1900", notes="")
+    from backend.tests.test_analysis_inputs import source
+
+    reports = [
+        source(temp_data_dir, patient.id, date=f"2026-0{n+1}-02") for n in range(2)
+    ]
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_ids": [r.id for r in reversed(reports)],
+                "special_instructions": "Preserve the original ordering.",
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+                "operation_id": "same-start",
+            },
+        ).json()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            replies = list(
+                pool.map(
+                    lambda _: client.post(f'/api/runs/{created["id"]}/start'), range(8)
+                )
+            )
+        assert all(response.status_code == 200 for response in replies)
+        assert len({response.json()["start_requested_at"] for response in replies}) == 1
+        main.DISCOVERED_MODEL_IDS.clear()
+        repeated = client.post(f'/api/runs/{created["id"]}/start').json()
+        for field in (
+            "id",
+            "analysis_input_fingerprint",
+            "source_report_ids",
+            "special_instructions",
+            "requested_model_ids",
+            "resolved_model_ids",
+        ):
+            assert repeated[field] == created[field]
+        assert repeated["execution_state"] == "pending"
+
+
+@pytest.mark.parametrize("failure", ["missing-identity", "extraction", "http"])
+def test_bulk_partial_results_retain_exact_input_indexes(
+    temp_data_dir, monkeypatch, failure
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    original = main.save_report_upload
+
+    def extract(**kwargs):
+        if kwargs["file_bytes"] == b"bad":
+            if failure == "http":
+                raise main.HTTPException(422, "Unreadable report")
+            raise ValueError("Unreadable report")
+        return original(**kwargs)
+
+    monkeypatch.setattr(main, "save_report_upload", extract)
+    names = [
+        "same.txt",
+        "unknown.txt" if failure == "missing-identity" else "same.txt",
+        "same.txt",
+    ]
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[
+                ("files", (name, data, "text/plain"))
+                for name, data in zip(names, [b"first", b"bad", b"third"])
+            ],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": names[i],
+                            "file_index": i,
+                            "first_name": "Synthetic",
+                            "last_name": "Example",
+                            "birthdate": "01-01-1900",
+                        }
+                        for i in range(3) if not (failure == "missing-identity" and i == 1)
+                    ]
+                )
+            },
+        )
+    assert response.status_code == 200
+    result = response.json()
+    assert [row["file_index"] for row in result["created"]] == [0, 2]
+    assert [row["file_index"] for row in result["errors"]] == [1]
+    assert result["counts"] == {"created": 2, "skipped": 0, "errors": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("extraction_fails", [False, True])
+async def test_preview_extraction_does_not_block_and_drains_scratch(
+    temp_data_dir, monkeypatch, cancel, extraction_fails
+):
+    import asyncio
+    import threading
+    import httpx
+
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    started, release = threading.Event(), threading.Event()
+    scratch_paths = []
+
+    def extract(**kwargs):
+        folder = kwargs["target_dir"]
+        scratch_paths.append(folder)
+        started.set()
+        assert release.wait(3), "Preview worker did not receive release"
+        assert folder.exists(), "Scratch was deleted while extraction was active"
+        if extraction_fails:
+            raise ValueError("Synthetic extraction error")
+        extracted = folder / "extracted.txt"
+        extracted.write_text("Synthetic preview", encoding="utf-8")
+        return folder / "source.txt", extracted, "text/plain", "Synthetic preview"
+
+    monkeypatch.setattr(main, "save_report_upload", extract)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        task = asyncio.create_task(
+            client.post(
+                "/api/reports/preview",
+                files={"file": ("report.txt", b"synthetic", "text/plain")},
+            )
+        )
+        try:
+            # The timer prevents a synchronous-regression test from hanging.
+            timer = threading.Timer(1, release.set)
+            timer.start()
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            assert started.is_set()
+            assert not release.is_set(), "Extraction blocked the event loop"
+            timer.cancel()
+            if cancel:
+                task.cancel()
+                await asyncio.sleep(0.01)
+                task.cancel()
+                await asyncio.sleep(0.01)
+                assert not task.done()
+                assert scratch_paths[0].exists()
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                response = await task
+                assert response.status_code == (500 if extraction_fails else 200)
+                if not extraction_fails:
+                    assert response.json()["text"] == "Synthetic preview"
+        finally:
+            release.set()
+            timer.cancel()
+            if not task.done():
+                await asyncio.gather(task, return_exceptions=True)
+    assert scratch_paths and all(not p.exists() for p in scratch_paths)
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+def test_bulk_duplicate_names_bind_identity_to_position(
+    temp_data_dir, monkeypatch, indexed
+):
+    app, _ = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    identities = [
+        dict(
+            filename="report.txt",
+            first_name=name,
+            last_name="Example",
+            birthdate="01-01-1900",
+            **({"file_index": i} if indexed else {}),
+        )
+        for i, name in enumerate(["Alice", "Bob"])
+    ]
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[
+                ("files", ("report.txt", body, "text/plain"))
+                for body in [b"alice report", b"bob report"]
+            ],
+            data={"identities": json.dumps(identities)},
+        )
+    if not indexed:
+        assert response.status_code == 400
+        with storage.session_scope() as s:
+            assert storage.list_patients(s) == []
+        return
+    assert response.status_code == 200
+    assert [r["patient"]["first_name"] for r in response.json()["created"]] == [
+        "Alice",
+        "Bob",
+    ]
+    with storage.session_scope() as s:
+        for patient in storage.list_patients(s):
+            assert (
+                Path(storage.list_reports(s, patient.id)[0].stored_path).read_bytes()
+                == f"{patient.first_name.lower()} report".encode()
+            )
+
+
+@pytest.mark.parametrize("positions", [[0, 0], [-1, 1], [False, 1], ["0", 1], [0, 2]])
+def test_bulk_rejects_ambiguous_positions_before_filing(
+    temp_data_dir, monkeypatch, positions
+):
+    app, _ = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("report.txt", b"report", "text/plain"))] * 2,
+            data={
+                "identities": json.dumps(
+                    [
+                        dict(
+                            file_index=i,
+                            filename="report.txt",
+                            first_name="Alice",
+                            last_name="Example",
+                            birthdate="01-01-1900",
+                        )
+                        for i in positions
+                    ]
+                )
+            },
+        )
+    assert response.status_code == 400
+    with storage.session_scope() as s:
+        assert storage.list_patients(s) == []
+
+
+@pytest.mark.parametrize(
+    "dependent",
+    [
+        "upload",
+        "operation",
+        "artifact",
+        "report",
+        "file",
+        "alias",
+        "projection",
+        "catalogue",
+    ],
+)
+def test_bulk_failed_extraction_preserves_concurrent_patient_dependants(
+    temp_data_dir, monkeypatch, dependent
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+    from backend.clinic_models import (
+        ClinicArtifact,
+        ClinicPatientAlias,
+        ClinicProjection,
+        ClinicPatientCatalogState,
+    )
+    from backend.clinic_records import ClinicUpload, ClinicOperation
+
+    saved = []
+
+    def fail_after_other_request(**kwargs):
+        patient_id = kwargs["patient_id"]
+        saved.append(patient_id)
+        with storage.session_scope() as s:
+            if dependent == "upload":
+                s.add(
+                    ClinicUpload(
+                        id="concurrent",
+                        admission_key="key",
+                        patient_uuid=patient_id,
+                        manifest_json="{}",
+                        uploaded_at=1,
+                    )
+                )
+            elif dependent == "operation":
+                s.add(
+                    ClinicOperation(
+                        id="op",
+                        patient_uuid=patient_id,
+                        producer="video",
+                        kind="render",
+                        original_json="{}",
+                        generation=1,
+                        sequence=1,
+                        payload_json="{}",
+                    )
+                )
+            elif dependent == "artifact":
+                s.add(
+                    ClinicArtifact(
+                        id="artifact",
+                        patient_uuid=patient_id,
+                        source_kind="test",
+                        source_id="source",
+                        logical_family="test",
+                        version=1,
+                        file_key="test.txt",
+                        original_name="test",
+                        sha256="0" * 64,
+                        size=1,
+                        content_type="text/plain",
+                        registered_at=1,
+                        provenance_json="{}",
+                    )
+                )
+            elif dependent == "alias":
+                s.add(ClinicPatientAlias(alias="other", patient_uuid=patient_id))
+            elif dependent == "projection":
+                s.add(
+                    ClinicProjection(
+                        id="proj",
+                        patient_uuid=patient_id,
+                        source_kind="test",
+                        source_id="source",
+                        payload_json="{}",
+                    )
+                )
+            elif dependent == "catalogue":
+                s.get(ClinicPatientCatalogState, patient_id).revision += 1
+            elif dependent == "report":
+                storage.create_report(
+                    s,
+                    patient_id=patient_id,
+                    filename="other.txt",
+                    mime_type="text/plain",
+                    stored_path=Path(temp_data_dir) / "other.txt",
+                    extracted_text_path=Path(temp_data_dir) / "other.txt",
+                )
+            else:
+                storage.create_patient_file(
+                    s,
+                    patient_id=patient_id,
+                    filename="other.txt",
+                    mime_type="text/plain",
+                    size_bytes=1,
+                    stored_path=Path(temp_data_dir) / "other.txt",
+                )
+            s.commit()
+        raise ValueError("original extraction failed")
+
+    monkeypatch.setattr(main, "save_report_upload", fail_after_other_request)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("report.txt", b"report", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        dict(
+                            filename="report.txt",
+                            first_name="Alice",
+                            last_name="Example",
+                            birthdate="01-01-1900",
+                        )
+                    ]
+                )
+            },
+        )
+    assert response.json()["counts"]["errors"] == 1
+    with storage.session_scope() as s:
+        assert storage.get_patient(s, saved[0]) is not None

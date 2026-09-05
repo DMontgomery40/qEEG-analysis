@@ -9,17 +9,18 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
-from sqlalchemy import select as sa_select
+from pydantic import BaseModel, Field, StrictInt
+from sqlalchemy import select as sa_select, text as sa_text
 
 from . import storage
 from . import config as cfg
@@ -40,6 +41,7 @@ from .exports import render_markdown_to_pdf
 from .llm_client import AsyncOpenAICompatClient
 from .logging_utils import configure_logging, get_logger, log_context, new_request_id
 from .model_selection import resolve_model_preference
+from . import runtime_identity
 from .orchestration import (
     build_patient_orchestration_detail,
     build_patient_orchestration_summary,
@@ -58,10 +60,27 @@ from .orchestration import (
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from . import pipeline_uploads
+from .patient_intake import (
+    IdentityInput,
+    IdentityNameConflict,
+    find_patient_by_identity,
+)
+from .patient_identity import (
+    PatientIdentityError,
+    allocate_canonical_patient_id,
+    derive_initial,
+    normalize_birthdate,
+    parse_canonical_patient_id,
+    require_initial,
+    reserve_canonical_patient_id,
+)
 from .portal_export_manifest import (
     council_export_manifest_payload,
     write_council_export_manifest,
 )
+from .clinic_api import router as clinic_router
+from .clinic_internal_api import router as clinic_internal_router
 from .portal_files import normalize_portal_patient_id
 from .portal_sync import (
     spawn_portal_sync,
@@ -79,6 +98,8 @@ configure_logging()
 LOGGER = get_logger(__name__)
 
 app = FastAPI(title="qEEG Council API")
+app.include_router(clinic_router)
+app.include_router(clinic_internal_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,20 +190,50 @@ async def _request_context_middleware(request: Request, call_next):
 
 
 class PatientCreate(BaseModel):
-    label: str = Field(min_length=1)
+    """Structured identity allocates the canonical clinic ID.
+
+    `first_initial`/`last_initial` are for names whose first letter has no A-Z
+    equivalent, where the operator supplies the intended initial. A bare `label`
+    is the pre-cutover path for patients that already have one.
+    """
+
+    label: str | None = None
     notes: str = ""
+    first_name: str | None = None
+    last_name: str | None = None
+    birthdate: str | None = None
+    first_initial: str | None = None
+    last_initial: str | None = None
+    # How the operator answers an identity_name_mismatch conflict. `attach_to`
+    # names the existing clinic id this is the same person as; `force_new` says
+    # they are genuinely two people and takes the next collision ordinal.
+    attach_to: str | None = None
+    force_new: bool = False
 
 
-class PatientUpdate(BaseModel):
-    label: str = Field(min_length=1)
-    notes: str = ""
+class PatientUpdate(PatientCreate):
+    """Same identity fields as create; the canonical ID is re-resolved on save.
+
+    Notes are the exception. They carry what the agent has learned about this
+    patient, so leaving them out of a save keeps what is on file; sending a
+    string, empty one included, replaces it.
+    """
+
+    notes: str | None = None
 
 
 class RunCreate(BaseModel):
     patient_id: str
-    report_id: str
+    report_id: str | None = None
+    report_ids: list[str] = Field(default_factory=list)
+    special_instructions: str = ""
+    source_session_aliases: dict[str, dict[str, StrictInt]] = Field(
+        default_factory=dict
+    )
+    operation_id: str | None = None
     council_model_ids: list[str]
     consolidator_model_id: str
+    allowed_model_fallbacks: dict[str, str] = Field(default_factory=dict)
 
 
 class SelectRequest(BaseModel):
@@ -479,6 +530,9 @@ async def _auto_generate_patient_facing_for_run(
         run = storage.get_run(session, run_id)
         if run is None or (run.status or "") != "complete":
             return False
+        from .run_execution import require_unowned_run
+
+        require_unowned_run(session, run)
         completion_gaps = run_downstream_delivery_gaps(
             run,
             progress=summarize_run_progress(run),
@@ -507,41 +561,9 @@ async def _auto_generate_patient_facing_for_run(
     if normalized_patient_id is None:
         return False
 
-    preferred_model = (
-        os.getenv(
-            "QEEG_PATIENT_FACING_MODEL", MODEL_ROLE_DEFAULTS.patient_facing_rewrite
-        )
-        or MODEL_ROLE_DEFAULTS.patient_facing_rewrite
-    ).strip()
-    version_prefix = (
-        os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto"
-    ).strip() or "auto"
-    version = f"{version_prefix}-{run_id.split('-')[0]}"
-
-    cmd = [
-        sys.executable,
-        str(_repo_root() / "scripts" / "generate_patient_facing_writeups.py"),
-        "--patient-label",
-        normalized_patient_id,
-        "--model",
-        preferred_model,
-        "--version",
-        version,
-        "--overwrite",
-    ]
-    if not sync_outputs:
-        cmd.append("--no-sync")
-    configured_portal_dir = (os.getenv("QEEG_PORTAL_PATIENTS_DIR", "") or "").strip()
-    if configured_portal_dir:
-        cmd.extend(["--portal-dir", configured_portal_dir])
-
-    LOGGER.info(
-        "patient_facing_generation_started",
-        run_id=run_id,
-        patient_label=normalized_patient_id,
-        model_id=preferred_model,
-        version=version,
-    )
+    # The old helper may already have entered before explicit owned admission.
+    # Publish first, then rejoin the original E5 transaction. There is no
+    # unowned subprocess boundary left to race with another process.
     await broker.publish(
         run_id,
         {
@@ -549,86 +571,55 @@ async def _auto_generate_patient_facing_for_run(
             "stage_name": "patient_facing",
             "status": "start",
             "patient_label": normalized_patient_id,
-            "model_id": preferred_model,
         },
     )
+    from .council.execution import _settings_snapshot, drain_task
+    from .patient_postprocessing import snapshot_post_config, admit_patient_facing
+    from .run_execution import ExecutionStore
 
+    snapshot = snapshot_post_config(
+        _settings_snapshot(),
+        sorted(DISCOVERED_MODEL_IDS),
+        base_url=cfg.CLIPROXY_BASE_URL,
+        timeout_s=600.0,
+    )
+    if not sync_outputs:
+        snapshot["sync_enabled"] = False
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            admit_patient_facing,
+            ExecutionStore(storage.engine),
+            run_id,
+            config_snapshot=snapshot,
+        )
+    )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(_repo_root()),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        out_text = (stdout or b"").decode("utf-8", errors="replace")
-        err_text = (stderr or b"").decode("utf-8", errors="replace")
-        if proc.returncode == 0:
-            LOGGER.info(
-                "patient_facing_generation_completed",
-                run_id=run_id,
-                patient_label=normalized_patient_id,
-                model_id=preferred_model,
-                version=version,
-                returncode=proc.returncode,
-            )
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "patient_facing",
-                    "status": "complete",
-                    "patient_label": normalized_patient_id,
-                    "version": version,
-                    "log": out_text[-2000:],
-                },
-            )
-            return True
-        else:
-            LOGGER.error(
-                "patient_facing_generation_failed",
-                run_id=run_id,
-                patient_label=normalized_patient_id,
-                model_id=preferred_model,
-                version=version,
-                returncode=proc.returncode,
-                operatorHint="generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
-            )
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "patient_facing",
-                    "status": "failed",
-                    "patient_label": normalized_patient_id,
-                    "version": version,
-                    "error": (err_text or out_text)[-2000:],
-                    "operatorHint": "generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
-                },
-            )
-            return False
-    except Exception as e:
-        LOGGER.exception(
-            "patient_facing_generation_crashed",
-            run_id=run_id,
-            patient_label=normalized_patient_id,
-            model_id=preferred_model,
-            version=version,
-            operatorHint="auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
-        )
+        result = await drain_task(task)
+    except Exception as error:
+        LOGGER.exception("patient_facing_owned_admission_failed", run_id=run_id)
         await broker.publish(
             run_id,
             {
                 "run_id": run_id,
                 "stage_name": "patient_facing",
                 "status": "failed",
-                "patient_label": normalized_patient_id,
-                "version": version,
-                "error": str(e),
-                "operatorHint": "auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
+                "reason": str(error),
             },
         )
         return False
+    runtime = getattr(app.state, "run_runtime", None)
+    if runtime is not None:
+        runtime.wake()
+    await broker.publish(
+        run_id,
+        {
+            "run_id": run_id,
+            "stage_name": "patient_facing",
+            "status": result["state"],
+            "patient_facing": result,
+        },
+    )
+    return result["state"] == "done" and bool(result.get("verified"))
 
 
 async def _auto_generate_cathode_video_for_run(
@@ -1033,6 +1024,9 @@ async def _refresh_discovered_models(*, llm: AsyncOpenAICompatClient) -> None:
 async def _model_refresh_loop(
     *, llm: AsyncOpenAICompatClient, interval_s: float
 ) -> None:
+    # Initial discovery shares this retained task so receipt recovery and API
+    # startup remain available while the catalogue is slow or offline.
+    await _refresh_discovered_models(llm=llm)
     # Default: weekly refresh to pick up CLIProxyAPI model catalog updates.
     if interval_s <= 0:
         return
@@ -1046,7 +1040,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     Reduce clutter in the frontend model picker by hiding older provider versions.
 
     Policy (as requested):
-    - OpenAI: show only GPT-5.5 families, hide 5.4 and older
+    - OpenAI: show GPT-5.5 and GPT-5.6 families, hide 5.4 and older
     - Anthropic: hide claude-* models older than 4.6
     - Gemini: hide gemini-* models older than 3
 
@@ -1067,7 +1061,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     if m:
         major = int(m.group("major"))
         minor = int(m.group("minor"))
-        if major != 5 or minor != 5:
+        if major != 5 or minor not in {5, 6}:
             return False
         suffix = m.group("suffix") or ""
         tokens = [t for t in suffix.split("-") if t]
@@ -1139,6 +1133,71 @@ def _model_visible_in_ui(model_id: str) -> bool:
     return True
 
 
+def _new_start_intent(store, run_id):
+    """Validate only genuinely new starts; existing intent rejoins without discovery."""
+    from .analysis_inputs import validate_admitted_run
+    from .council.execution import ADMISSION_FIELDS
+    from .run_runtime import compatibility_reason
+    from sqlalchemy.orm import Session
+
+    with Session(store.engine, expire_on_commit=False) as session:
+        run = session.get(storage.Run, run_id)
+        if run is None:
+            raise HTTPException(404, "Run not found")
+        if run.start_requested_at is not None:
+            return run
+        if run.status == "complete":
+            return run
+        try:
+            banked_source = (
+                json.loads(run.source_manifest_json).get("legacy", True) is False
+            )
+        except (ValueError, TypeError, AttributeError):
+            banked_source = False
+        if (
+            run.status != "created"
+            or not run.analysis_input_fingerprint
+            or not banked_source
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "code": "LEGACY_RECONCILIATION_REQUIRED",
+                    "reason": compatibility_reason(run),
+                },
+            )
+        try:
+            requested = json.loads(run.requested_model_ids_json)
+            resolved = json.loads(run.resolved_model_ids_json)
+            council = json.loads(run.council_model_ids_json)
+            valid = all(
+                isinstance(ids, list)
+                and ids
+                and all(isinstance(m, str) and m and m == m.strip() for m in ids)
+                for ids in (requested, resolved, council)
+            )
+            valid = (
+                valid
+                and len(requested) == len(resolved)
+                and resolved == [*council, run.consolidator_model_id]
+            )
+            valid = valid and all(m in DISCOVERED_MODEL_IDS for m in resolved)
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise HTTPException(
+                409,
+                {
+                    "code": "ANALYSIS_MODEL_MISMATCH",
+                    "message": "The saved model envelope is invalid or a selected model is unavailable.",
+                },
+            )
+        validate_admitted_run(run)
+        expected = {name: getattr(run, name) for name in ADMISSION_FIELDS}
+        expected["status"] = "created"
+    return store.request_run_start(run_id, expected=expected)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     LOGGER.info("backend_startup_begin")
@@ -1172,7 +1231,6 @@ async def _startup() -> None:
 
     loop = asyncio.get_running_loop()
     if not app.state.mock_mode:
-        await _refresh_discovered_models(llm=app.state.llm)
         try:
             interval_s = float(
                 os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0"
@@ -1184,6 +1242,16 @@ async def _startup() -> None:
         app.state.model_refresh_task = loop.create_task(
             _model_refresh_loop(llm=app.state.llm, interval_s=interval_s)
         )
+    from .run_execution import ExecutionStore
+    from .run_runtime import RunRuntime
+
+    app.state.run_runtime = RunRuntime(
+        ExecutionStore(storage.engine),
+        llm=app.state.llm,
+        workflow=app.state.workflow,
+        publish=app.state.broker.publish,
+    )
+    await app.state.run_runtime.start()
     app.state.portal_raw_sync_task = loop.create_task(watch_portal_patients_forever())
     LOGGER.info(
         "backend_startup_complete",
@@ -1194,6 +1262,9 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     LOGGER.info("backend_shutdown_begin")
+    runtime = getattr(app.state, "run_runtime", None)
+    if runtime is not None:
+        await runtime.stop()
     task = getattr(app.state, "model_refresh_task", None)
     await _cancel_task_if_possible(task)
     raw_sync_task = getattr(app.state, "portal_raw_sync_task", None)
@@ -1221,24 +1292,31 @@ async def health() -> dict[str, Any]:
                 error=None,
             ),
             "mock_mode": True,
+            "runtime": runtime_identity.current_runtime_identity(MOCK_MODEL_IDS),
         }
 
     try:
         discovered = await llm.list_models()
         set_discovered_model_ids(discovered)
-        return status_payload(
-            base_url=CLIPROXY_BASE_URL,
-            reachable=True,
-            discovered_model_count=len(discovered),
-            error=None,
-        )
+        return {
+            **status_payload(
+                base_url=CLIPROXY_BASE_URL,
+                reachable=True,
+                discovered_model_count=len(discovered),
+                error=None,
+            ),
+            "runtime": runtime_identity.current_runtime_identity(discovered),
+        }
     except Exception as e:
-        return status_payload(
-            base_url=CLIPROXY_BASE_URL,
-            reachable=False,
-            discovered_model_count=0,
-            error=e,
-        )
+        return {
+            **status_payload(
+                base_url=CLIPROXY_BASE_URL,
+                reachable=False,
+                discovered_model_count=0,
+                error=e,
+            ),
+            "runtime": runtime_identity.current_runtime_identity(DISCOVERED_MODEL_IDS),
+        }
 
 
 @app.post("/api/cliproxy/start")
@@ -1375,6 +1453,70 @@ async def models() -> dict[str, Any]:
     }
 
 
+class UploadResolution(BaseModel):
+    """How the operator answers a parked upload's name conflict."""
+
+    attach_to: str | None = None
+    force_new: bool = False
+
+
+@app.get("/api/pipeline/uploads")
+async def list_pipeline_uploads() -> list[dict[str, Any]]:
+    """Hub uploads the worker has seen, including any waiting on an answer."""
+    return pipeline_uploads.list_uploads()
+
+
+@app.post("/api/pipeline/uploads/{upload_id}/resolution")
+async def resolve_pipeline_upload(
+    upload_id: str, req: UploadResolution
+) -> dict[str, Any]:
+    """Answer a parked upload. The worker acts on it next cycle."""
+    record = pipeline_uploads.read_upload(upload_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    if record.get("status") == pipeline_uploads.STATUS_REGISTERED:
+        # Answering twice, or answering after the worker got there first, is not
+        # an error — say where the report went.
+        return {
+            "ok": True,
+            "upload_id": upload_id,
+            "status": pipeline_uploads.STATUS_REGISTERED,
+            "patient_id": record.get("patientId"),
+            "detail": "This upload is already filed.",
+        }
+
+    attach_to = (req.attach_to or "").strip()
+    if bool(attach_to) == bool(req.force_new):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Say which patient this is with attach_to, or force_new if they "
+                "are two different people — one or the other."
+            ),
+        )
+    if attach_to and parse_canonical_patient_id(attach_to) is None:
+        raise HTTPException(
+            status_code=400, detail=f"{attach_to} is not a clinic patient id."
+        )
+
+    resolution = {"attachTo": attach_to} if attach_to else {"forceNew": True}
+    pipeline_uploads.write_upload(
+        {
+            **record,
+            "uploadId": upload_id,
+            "status": pipeline_uploads.STATUS_PENDING,
+            "resolution": resolution,
+        }
+    )
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "status": pipeline_uploads.STATUS_PENDING,
+        "resolution": resolution,
+    }
+
+
 @app.get("/api/patients")
 async def list_patients() -> list[dict[str, Any]]:
     with storage.session_scope() as session:
@@ -1402,117 +1544,428 @@ async def list_patients() -> list[dict[str, Any]]:
         ]
 
 
+_IDENTITY_FIELDS = (
+    "first_name",
+    "last_name",
+    "birthdate",
+    "first_initial",
+    "last_initial",
+)
+
+
+def _has_structured_identity(req: PatientCreate) -> bool:
+    return any((getattr(req, name) or "").strip() for name in _IDENTITY_FIELDS)
+
+
+def _resolve_patient_identity(
+    session: Any, req: PatientCreate, *, exclude_patient_uuid: str | None = None
+) -> dict[str, Any]:
+    """Turn a request body into the patient fields to store.
+
+    Structured identity wins: it allocates the canonical clinic ID and that ID
+    becomes the label. A bare label has to already be a canonical ID; it is
+    reserved on the way through so the same ID can never be issued to anyone
+    else. Anything else is refused, because a label the portal cannot route on
+    would leave the patient with no folder, no publishing, and no sync.
+    """
+    if _has_structured_identity(req):
+        try:
+            first = (
+                require_initial(req.first_initial, field="first")
+                if (req.first_initial or "").strip()
+                else derive_initial(req.first_name, field="first")
+            )
+            last = (
+                require_initial(req.last_initial, field="last")
+                if (req.last_initial or "").strip()
+                else derive_initial(req.last_name, field="last")
+            )
+            birthdate = normalize_birthdate(req.birthdate)
+            canonical = allocate_canonical_patient_id(
+                session,
+                first_initial=first,
+                last_initial=last,
+                birthdate=birthdate,
+                exclude_patient_uuid=exclude_patient_uuid,
+            )
+        except PatientIdentityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # A name that was not supplied is not a name of "". `update_patient`
+        # applies any non-None value, so emitting empty strings here erased the
+        # stored name on an initials-only correction — a legitimate operator
+        # flow, and exactly the class of thing this system must never do to a
+        # patient's record. Omitted means keep.
+        return {
+            "label": canonical,
+            "first_name": (req.first_name or "").strip() or None,
+            "last_name": (req.last_name or "").strip() or None,
+            "birthdate": birthdate,
+            "first_initial": first,
+            "last_initial": last,
+        }
+
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(
+            status_code=400,
+            detail="Give the patient's name and date of birth, or an existing label.",
+        )
+
+    parsed = reserve_canonical_patient_id(session, label)
+    if parsed is None:
+        # A label that is not a clinic id routes nowhere: every portal path
+        # rejects it, so the patient would be created, show up in the roster,
+        # and silently have no folder, no publishing, no sync, and no batch
+        # work. Refuse it here instead. Patients already carrying a pre-cutover
+        # label keep it; Task 5 migrates them.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{label} is not a clinic patient id. Give the patient's name "
+                "and date of birth, or an id written as XX_MM-DD-YYYY."
+            ),
+        )
+    return {
+        "label": parsed.value,
+        "birthdate": parsed.birthdate,
+        "first_initial": parsed.first_initial,
+        "last_initial": parsed.last_initial,
+    }
+
+
 @app.post("/api/patients")
 async def create_patient(req: PatientCreate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        if storage.find_patients_by_label(session, req.label):
+        if _has_structured_identity(req) or (req.attach_to or "").strip():
+            try:
+                existing, _keep_stored_name = _find_patient_by_identity(session, req)
+            except IdentityNameConflict as exc:
+                raise HTTPException(status_code=409, detail=exc.payload) from exc
+            except PatientIdentityError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if existing is not None:
+                # The operator named this person's existing chart, so there is
+                # nothing to create.
+                return _patient_out(existing)
+
+        fields = _resolve_patient_identity(session, req)
+        if storage.find_patients_by_label(session, fields["label"]):
             raise HTTPException(status_code=409, detail="Patient label already exists")
-        p = storage.create_patient(session, label=req.label, notes=req.notes)
+        p = storage.create_patient(session, notes=req.notes, **fields)
         _ensure_portal_patient_folder(p.label)
         return _patient_out(p)
 
 
-@app.post("/api/patients/bulk_upload")
-async def bulk_upload_patients(files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    """
-    Bulk upload qEEG report files. Each file creates a new patient whose label is the filename stem.
+def _parse_bulk_upload_identities(
+    raw: str, filenames: list[str]
+) -> dict[int, PatientCreate]:
+    """Bind per-file identities to multipart positions, never ambiguous basenames.
 
-    If a patient with the same label already exists (case-insensitive), the file is skipped and reported.
+    Comes from the preview step: the operator reads the name and date of birth
+    off the report before anything is filed, so the canonical id exists before
+    the patient does.
     """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Identities are not readable JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Identities must be a list with one entry per file.",
+        )
+
+    identities: dict[int, PatientCreate] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            raise HTTPException(
+                status_code=400, detail="Each identity must be an object."
+            )
+        filename = str(entry.get("filename") or "").strip()
+        if not filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Each identity must name the file it belongs to.",
+            )
+        if "file_index" in entry:
+            position = entry["file_index"]
+            if type(position) is not int or not 0 <= position < len(filenames):
+                raise HTTPException(
+                    status_code=400, detail="Identity file_index is invalid."
+                )
+            if filenames[position] != filename:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Identity filename does not match its file_index.",
+                )
+        else:
+            matches = [i for i, name in enumerate(filenames) if name == filename]
+            if len(matches) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Identity requires an unambiguous file_index.",
+                )
+            position = matches[0]
+        if position in identities:
+            raise HTTPException(
+                status_code=400, detail="Each file must have at most one identity."
+            )
+        identities[position] = PatientCreate(
+            first_name=entry.get("first_name"),
+            last_name=entry.get("last_name"),
+            birthdate=entry.get("birthdate"),
+            first_initial=entry.get("first_initial"),
+            last_initial=entry.get("last_initial"),
+            attach_to=entry.get("attach_to"),
+            force_new=bool(entry.get("force_new")),
+        )
+    return identities
+
+
+def _identity_input(req: PatientCreate) -> IdentityInput:
+    return IdentityInput(
+        first_name=req.first_name,
+        last_name=req.last_name,
+        birthdate=req.birthdate,
+        first_initial=req.first_initial,
+        last_initial=req.last_initial,
+        attach_to=req.attach_to,
+        force_new=req.force_new,
+    )
+
+
+def _find_patient_by_identity(
+    session: Any, req: PatientCreate
+) -> tuple[storage.Patient | None, bool]:
+    return find_patient_by_identity(session, _identity_input(req))
+
+
+def _discard_half_created_patient(
+    patient_uuid: str | None, patient_label: str, created_revision: int | None
+) -> None:
+    """Undo a patient created for a report that then failed to file.
+
+    Identity has to be committed before the upload can be read, so a failure
+    after that point leaves a patient with a real person's name, no reports, and
+    an empty portal folder that batch discovery would go on to enumerate.
+
+    The reservation row is deliberately left behind. IDs are issued once and
+    never reused, so this ordinal is spent even though nobody ended up wearing
+    it — the same rule that stops a relabel from freeing an ID for the next
+    patient.
+    """
+    if patient_uuid is None:
+        return
+
+    portal_dir = _portal_patients_dir() / patient_label if patient_label else None
+    try:
+        with storage.session_scope() as session:
+            # Serialize the dependency check and deletion with concurrent filing.
+            # Derive the guard from every registered FK, including shared uploads,
+            # producer operations and catalogue records (not just ORM relations).
+            session.execute(sa_text("BEGIN IMMEDIATE"))
+            patient = storage.get_patient(session, patient_uuid)
+            if patient is None:
+                return
+            from .clinic_models import ClinicPatientAlias, ClinicPatientCatalogState
+            from .clinic_catalogue import _bump
+
+            state = session.get(ClinicPatientCatalogState, patient_uuid)
+            if (state.revision if state else None) != created_revision:
+                return
+            aliases = session.scalars(
+                sa_select(ClinicPatientAlias).where(
+                    ClinicPatientAlias.patient_uuid == patient_uuid
+                )
+            ).all()
+            if any(
+                alias.alias != patient_label or alias.ambiguous for alias in aliases
+            ):
+                return
+            for table in storage.Base.metadata.tables.values():
+                if table.name in {
+                    "clinic_patient_aliases",
+                    "clinic_patient_catalog_state",
+                }:
+                    continue
+                for fk in table.foreign_keys:
+                    if (
+                        fk.target_fullname == "patients.id"
+                        and session.execute(
+                            sa_select(fk.parent)
+                            .where(fk.parent == patient_uuid)
+                            .limit(1)
+                        ).first()
+                        is not None
+                    ):
+                        return
+            if portal_dir is not None and portal_dir.is_dir():
+                try:
+                    portal_dir.rmdir()
+                except OSError:
+                    # Another writer left bytes; retain their chart as well.
+                    return
+            for alias in aliases:
+                session.delete(alias)
+            if state:
+                session.delete(state)
+                _bump(session)
+            session.delete(patient)
+            session.commit()
+    except Exception:
+        LOGGER.exception(
+            "bulk_upload_patient_cleanup_failed",
+            patient_label=patient_label,
+            operatorHint="The report could not be filed. The existing chart was retained for a safe retry.",
+        )
+
+
+@app.post("/api/patients/bulk_upload")
+async def bulk_upload_patients(
+    files: list[UploadFile] = File(...),
+    identities: str = Form(""),
+) -> dict[str, Any]:
+    """Register uploaded qEEG reports under canonical clinic patient ids.
+
+    Intake runs in one order and only that order: the operator previews each
+    report and reads off the name and date of birth, that identity allocates or
+    finds the canonical patient, and the report is registered under it. A file
+    nobody has identified is an error — the filename never becomes a label.
+    """
+    filenames = [(file.filename or "upload").strip() or "upload" for file in files]
+    identities_by_position = _parse_bulk_upload_identities(identities, filenames)
+
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    seen_labels: set[str] = set()
-    for file in files:
+    for file_index, file in enumerate(files):
         filename = (file.filename or "upload").strip() or "upload"
-        patient_label = Path(filename).stem.strip()
-        if not patient_label:
+        identity = identities_by_position.get(file_index)
+        if identity is None:
             errors.append(
                 {
+                    "file_index": file_index,
                     "filename": filename,
-                    "error": "Empty filename stem (cannot derive patient label)",
+                    "error": (
+                        "Give this report's patient name and date of birth. "
+                        "Preview it first if they are not to hand."
+                    ),
                 }
             )
             continue
-
-        label_key = patient_label.lower()
-        if label_key in seen_labels:
-            skipped.append(
-                {
-                    "filename": filename,
-                    "patient_label": patient_label,
-                    "reason": "duplicate_label_in_batch",
-                }
-            )
-            continue
-        seen_labels.add(label_key)
-
-        with storage.session_scope() as session:
-            existing = storage.find_patients_by_label(session, patient_label)
-            if existing:
-                skipped.append(
-                    {
-                        "filename": filename,
-                        "patient_label": patient_label,
-                        "reason": "patient_label_exists",
-                        "existing_patient_ids": [p.id for p in existing],
-                    }
-                )
-                continue
 
         report_id = str(uuid.uuid4())
         report_folder: Path | None = None
+        patient_label = ""
+        created_patient_uuid: str | None = None
+        created_revision: int | None = None
         try:
-            file_bytes = await file.read()
-            preview = ""
-
             with storage.session_scope() as session:
-                patient = storage.Patient(label=patient_label, notes="")
-                session.add(patient)
-                session.flush()
-                patient_id = patient.id
+                existing, keep_stored_name = _find_patient_by_identity(
+                    session, identity
+                )
+                if keep_stored_name and existing is not None:
+                    # Attached by the operator to a chart they named. Its label
+                    # and the name on it both stay exactly as they are.
+                    patient = existing
+                else:
+                    fields = _resolve_patient_identity(
+                        session,
+                        identity,
+                        exclude_patient_uuid=existing.id if existing else None,
+                    )
+                    if existing is not None:
+                        # Never blank a name already on file: an identity given
+                        # as bare initials carries empty name strings.
+                        patient = storage.update_patient(
+                            session,
+                            existing.id,
+                            notes=existing.notes,
+                            **{key: value or None for key, value in fields.items()},
+                        )
+                    else:
+                        patient = storage.create_patient(
+                            session, notes=identity.notes, commit=False, **fields
+                        )
+                        created_patient_uuid = patient.id
+                        from .clinic_models import ClinicPatientCatalogState
 
+                        state = session.get(ClinicPatientCatalogState, patient.id)
+                        created_revision = state.revision if state else None
+                        session.commit()
+                patient_label = patient.label
+                patient_uuid = patient.id
                 _ensure_portal_patient_folder(patient_label)
 
-                report_folder = report_storage_dir(patient_id, report_id)
-                original_path, extracted_path, mime_type, preview = save_report_upload(
-                    patient_id=patient_id,
-                    report_id=report_id,
-                    filename=filename,
-                    provided_mime_type=file.content_type,
-                    file_bytes=file_bytes,
-                )
+            file_bytes = await file.read()
+            report_folder = report_storage_dir(patient_uuid, report_id)
+            original_path, extracted_path, mime_type, preview = save_report_upload(
+                patient_id=patient_uuid,
+                report_id=report_id,
+                filename=filename,
+                provided_mime_type=file.content_type,
+                file_bytes=file_bytes,
+            )
 
-                report = storage.Report(
-                    id=report_id,
-                    patient_id=patient_id,
+            with storage.session_scope() as session:
+                report = storage.create_report(
+                    session,
+                    report_id=report_id,
+                    patient_id=patient_uuid,
                     filename=filename,
                     mime_type=mime_type,
-                    stored_path=str(original_path),
-                    extracted_text_path=str(extracted_path),
+                    stored_path=original_path,
+                    extracted_text_path=extracted_path,
                 )
-                session.add(report)
-                session.commit()
-                session.refresh(patient)
-                session.refresh(report)
-
-            created.append(
+                patient = storage.get_patient(session, patient_uuid)
+                created.append(
+                    {
+                        "file_index": file_index,
+                        "filename": filename,
+                        "patient": _patient_out(patient),
+                        "report": _report_out(report),
+                        "preview": preview,
+                    }
+                )
+        except IdentityNameConflict as exc:
+            # Structured so the operator can answer it per file, with attach_to
+            # or force_new, without holding up the rest of the batch.
+            errors.append(
                 {
+                    "file_index": file_index,
                     "filename": filename,
-                    "patient": _patient_out(patient),
-                    "report": _report_out(report),
-                    "preview": preview,
+                    **exc.payload,
+                    "error": exc.payload["detail"],
                 }
             )
-        except Exception as e:
-            if report_folder is not None:
-                try:
-                    shutil.rmtree(report_folder, ignore_errors=True)
-                except Exception:
-                    pass
+        except HTTPException as exc:
             errors.append(
-                {"filename": filename, "patient_label": patient_label, "error": str(e)}
+                {
+                    "file_index": file_index,
+                    "filename": filename,
+                    "error": str(exc.detail),
+                }
+            )
+        except Exception as exc:
+            if report_folder is not None:
+                shutil.rmtree(report_folder, ignore_errors=True)
+            _discard_half_created_patient(
+                created_patient_uuid, patient_label, created_revision
+            )
+            errors.append(
+                {
+                    "file_index": file_index,
+                    "filename": filename,
+                    "patient_label": patient_label,
+                    "error": str(exc),
+                }
             )
 
     return {
@@ -1654,17 +2107,45 @@ async def run_patient_action(
                 status_code=409,
                 detail="No complete run is available for patient-facing generation",
             )
-        broker: _EventBroker = app.state.broker
-        _spawn_task(
-            _auto_generate_patient_facing_for_run(patient_facing_run_id, broker),
-            name=f"patient-facing-{patient_facing_run_id}",
-        )
+        from .council.execution import _settings_snapshot
+        from .patient_postprocessing import snapshot_post_config
+        from .run_runtime import AdmissionUnavailable
+        from .run_execution import ExecutionConflict
+
+        runtime = app.state.run_runtime
+        from .patient_postprocessing import project_patient_facing
+
+        try:
+            post = await runtime.admission(
+                project_patient_facing, runtime.store, patient_facing_run_id
+            )
+            if post["state"] == "absent":
+                # Freeze once; every bounded contention retry uses this configuration.
+                snapshot = await asyncio.to_thread(
+                    snapshot_post_config,
+                    _settings_snapshot(),
+                    sorted(DISCOVERED_MODEL_IDS),
+                    base_url=app.state.llm._base_url,
+                    timeout_s=app.state.llm._timeout_s,
+                )
+                post = await runtime.admit_post(
+                    patient_facing_run_id, config_snapshot=snapshot
+                )
+        except AdmissionUnavailable as error:
+            raise HTTPException(
+                503, {"code": "ADMISSION_RETRY", "message": str(error)}
+            ) from error
+        except ExecutionConflict as error:
+            raise HTTPException(
+                409, {"code": "POST_ADMISSION_CONFLICT", "message": str(error)}
+            ) from error
         return {
             "ok": True,
             "action": action,
             "run_id": patient_facing_run_id,
             "patient_label": patient_label,
-            "scheduled": True,
+            "scheduled": post["state"] in ("pending", "owned"),
+            "postprocessing": post,
         }
 
     if action == "prepare_cathode_handoff":
@@ -1745,12 +2226,15 @@ async def run_patient_action(
 @app.put("/api/patients/{patient_id}")
 async def update_patient(patient_id: str, req: PatientUpdate) -> dict[str, Any]:
     with storage.session_scope() as session:
-        existing = storage.find_patients_by_label(session, req.label)
+        if storage.get_patient(session, patient_id) is None:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        fields = _resolve_patient_identity(
+            session, req, exclude_patient_uuid=patient_id
+        )
+        existing = storage.find_patients_by_label(session, fields["label"])
         if any(p.id != patient_id for p in existing):
             raise HTTPException(status_code=409, detail="Patient label already exists")
-        p = storage.update_patient(
-            session, patient_id, label=req.label, notes=req.notes
-        )
+        p = storage.update_patient(session, patient_id, notes=req.notes, **fields)
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
         _ensure_portal_patient_folder(p.label)
@@ -1911,6 +2395,62 @@ async def delete_patient_file(file_id: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/reports/preview")
+async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Read a dropped report so the patient's name and date of birth can be seen.
+
+    Runs the same extraction/OCR as a real upload, in a scratch directory that is
+    deleted on the way out. Creates no patient, no report row, no portal folder,
+    and starts no analysis run, so it costs nothing and files nothing.
+    """
+    filename = (file.filename or "upload").strip() or "upload"
+    file_bytes = await file.read()
+
+    with tempfile.TemporaryDirectory(prefix="qeeg-preview-") as scratch:
+        scratch_dir = Path(scratch)
+        from .council.execution import drain_task
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                save_report_upload,
+                patient_id="preview",
+                report_id="preview",
+                filename=filename,
+                provided_mime_type=file.content_type,
+                file_bytes=file_bytes,
+                target_dir=scratch_dir,
+            )
+        )
+        try:
+            _original, extracted_path, mime_type, preview = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # OCR owns the scratch directory until its worker actually exits.
+            # Preserve request cancellation even if extraction also fails.
+            try:
+                await drain_task(worker)
+            except Exception:
+                pass
+            raise
+        text = extracted_path.read_text(encoding="utf-8")
+
+        page_count = 0
+        metadata_path = scratch_dir / "metadata.json"
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                page_count = int(metadata.get("page_count", 0))
+            except (ValueError, TypeError, AttributeError, OSError):
+                page_count = 0
+
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "preview": preview,
+        "text": text,
+        "page_count": page_count,
+    }
+
+
 @app.get("/api/reports/{report_id}/extracted")
 async def get_report_extracted(report_id: str):
     with storage.session_scope() as session:
@@ -1962,6 +2502,21 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=400, detail="Re-extract only supported for PDFs"
         )
+
+    from .analysis_inputs import repair_combined_report
+
+    if await asyncio.to_thread(repair_combined_report, report):
+        directory = original_path.parent
+        enhanced_text = (directory / "extracted_enhanced.txt").read_text(
+            encoding="utf-8"
+        )
+        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        return {
+            "ok": True,
+            "chars": len(enhanced_text),
+            "enhanced_chars": len(enhanced_text),
+            "page_images_written": metadata["page_count"],
+        }
 
     # Best-effort: also regenerate enhanced OCR text + page images for multimodal Stage 1.
     # IMPORTANT: write into the same folder as extracted_path (some older reports used a
@@ -2183,7 +2738,7 @@ async def list_runs(patient_id: str) -> list[dict[str, Any]]:
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
         runs = storage.list_runs(session, patient_id)
-        return [_run_out(r) for r in runs]
+        return await asyncio.to_thread(lambda: [_run_out(r) for r in runs])
 
 
 @app.post("/api/runs")
@@ -2195,73 +2750,88 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
     if not req.consolidator_model_id:
         raise HTTPException(status_code=400, detail="consolidator_model_id is required")
 
-    with storage.session_scope() as session:
-        if storage.get_patient(session, req.patient_id) is None:
-            raise HTTPException(status_code=404, detail="Patient not found")
-        report = storage.get_report(session, req.report_id)
-        if report is None:
-            raise HTTPException(status_code=404, detail="Report not found")
-        if report.patient_id != req.patient_id:
+    requested_model_ids = [
+        *[str(model_id).strip() for model_id in req.council_model_ids],
+        str(req.consolidator_model_id).strip(),
+    ]
+    from .analysis_inputs import admit_run, normalize_source_ids
+
+    source_ids = normalize_source_ids(
+        req.report_id,
+        req.report_ids,
+        list_supplied="report_ids" in req.model_fields_set,
+    )
+    immutable_request = {
+        "patient_id": req.patient_id,
+        "source_ids": source_ids,
+        "special_instructions": req.special_instructions,
+        "source_session_aliases": req.source_session_aliases,
+        "requested_model_ids": requested_model_ids,
+        "allowed_model_fallbacks": {
+            key: value.strip() for key, value in req.allowed_model_fallbacks.items()
+        },
+    }
+
+    def resolve_model_fields() -> dict[str, Any]:
+        # Called under the admission operation lock only when no saved resolution
+        # can establish the request. Rejoining acknowledged work is entirely free.
+        discovered = sorted(DISCOVERED_MODEL_IDS)
+        resolved_model_ids: list[str] = []
+        for requested in requested_model_ids:
+            if requested in discovered:
+                resolved_model_ids.append(requested)
+                continue
+            fallback = immutable_request["allowed_model_fallbacks"].get(requested, "")
+            if fallback and fallback in discovered:
+                resolved_model_ids.append(fallback)
+                continue
             raise HTTPException(
-                status_code=400, detail="Report does not belong to patient"
+                status_code=409,
+                detail={
+                    "code": "ANALYSIS_MODEL_MISMATCH",
+                    "message": f"Requested model is not currently available: {requested}",
+                },
             )
-        run = storage.create_run(
-            session,
-            patient_id=req.patient_id,
-            report_id=req.report_id,
-            council_model_ids=req.council_model_ids,
-            consolidator_model_id=req.consolidator_model_id,
-        )
-        return _run_out(run)
+        runtime = runtime_identity.current_runtime_identity(discovered)
+        return {
+            "council_model_ids": resolved_model_ids[:-1],
+            "consolidator_model_id": resolved_model_ids[-1],
+            "requested_model_ids": requested_model_ids,
+            "resolved_model_ids": resolved_model_ids,
+            "creating_instance_id": str(runtime["instance_id"]),
+            "model_catalogue_fingerprint": str(runtime["model_catalogue_fingerprint"]),
+        }
+
+    run = await asyncio.to_thread(
+        admit_run,
+        patient_id=req.patient_id,
+        source_ids=source_ids,
+        special_instructions=req.special_instructions,
+        source_session_aliases=req.source_session_aliases,
+        operation_id=req.operation_id,
+        immutable_request=immutable_request,
+        model_fields=resolve_model_fields,
+    )
+    return await asyncio.to_thread(_run_out, run)
 
 
 @app.post("/api/runs/{run_id}/start")
 async def start_run(run_id: str) -> dict[str, Any]:
-    with storage.session_scope() as session:
-        run = storage.get_run(session, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        started = storage.claim_run_start(session, run_id)
+    from .run_runtime import AdmissionUnavailable
+    from .run_execution import ExecutionConflict
 
-    with storage.session_scope() as session:
-        run = storage.get_run(session, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        if not started:
-            return _run_out(run)
-        patient_id = run.patient_id
-        report_id = run.report_id
-
-    broker: _EventBroker = app.state.broker
-    workflow: QEEGCouncilWorkflow = app.state.workflow
-
-    async def _runner() -> None:
-        with log_context(run_id=run_id, patient_id=patient_id, report_id=report_id):
-            LOGGER.info("run_task_started")
-
-            async def on_event(payload: dict[str, Any]) -> None:
-                await broker.publish(run_id, payload)
-
-            try:
-                await workflow.run_pipeline(run_id, on_event=on_event)
-                await _auto_generate_patient_facing_for_run(run_id, broker)
-                await _auto_generate_cathode_video_for_run(run_id, broker)
-            except Exception:
-                LOGGER.exception(
-                    "run_task_crashed",
-                    operatorHint="run_task wraps workflow.run_pipeline, patient-facing generation, and Cathode video queue launch; inspect the first failed workflow stage or post-run subprocess for this run.",
-                )
-                raise
-            LOGGER.info("run_task_completed")
-
-    LOGGER.info(
-        "run_task_scheduled",
-        run_id=run_id,
-        patient_id=patient_id,
-        report_id=report_id,
-    )
-    _spawn_task(_runner(), name=f"qeeg-run-{run_id}")
-    return {"ok": True}
+    runtime = app.state.run_runtime
+    try:
+        run = await runtime.admission(_new_start_intent, runtime.store, run_id)
+    except AdmissionUnavailable as error:
+        raise HTTPException(
+            503, {"code": "ADMISSION_RETRY", "message": str(error)}
+        ) from error
+    except ExecutionConflict as error:
+        raise HTTPException(
+            409, {"code": "START_ADMISSION_CONFLICT", "message": str(error)}
+        ) from error
+    return {"ok": True, **await asyncio.to_thread(_run_out, run)}
 
 
 @app.get("/api/runs/{run_id}")
@@ -2270,7 +2840,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
         run = storage.get_run(session, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        return _run_out(run)
+        return await asyncio.to_thread(_run_out, run)
 
 
 @app.get("/api/runs/{run_id}/artifacts")
@@ -2312,7 +2882,11 @@ async def stream(run_id: str):
                 run = storage.get_run(session, run_id)
                 if run is not None:
                     yield _sse(
-                        {"run_id": run_id, "type": "snapshot", "run": _run_out(run)}
+                        {
+                            "run_id": run_id,
+                            "type": "snapshot",
+                            "run": await asyncio.to_thread(_run_out, run),
+                        }
                     )
 
             while True:
@@ -2365,7 +2939,7 @@ async def select(run_id: str, req: SelectRequest) -> dict[str, Any]:
         run2 = storage.select_artifact(session, run_id, artifact_id)
         if run2 is None:
             raise HTTPException(status_code=404, detail="Artifact not found for run")
-        return _run_out(run2)
+        return await asyncio.to_thread(_run_out, run2)
 
 
 @app.post("/api/runs/{run_id}/export")
@@ -2553,9 +3127,18 @@ def _patient_out(
     has_explainer_video: bool = False,
     orchestration_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    canonical = parse_canonical_patient_id(p.label)
     return {
+        # `id` is the internal relational UUID; `patient_id` is the clinic ID.
+        # Patients created before the cutover have no canonical ID yet.
         "id": p.id,
+        "patient_id": canonical.value if canonical else None,
         "label": p.label,
+        "first_name": p.first_name or "",
+        "last_name": p.last_name or "",
+        "birthdate": p.birthdate or "",
+        "first_initial": p.first_initial or "",
+        "last_initial": p.last_initial or "",
         "notes": p.notes,
         "has_explainer_video": bool(has_explainer_video),
         "orchestration_summary": orchestration_summary,
@@ -2592,6 +3175,39 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
             artifacts = storage.list_artifacts(session, r.id)
     except Exception:
         artifacts = None
+    try:
+        with storage.session_scope() as session:
+            postprocessing = [
+                {
+                    "kind": row.kind,
+                    "state": row.state,
+                    "blocked_reason": row.blocked_reason,
+                    "next_check_at": row.next_check_at.isoformat()
+                    if row.next_check_at
+                    else None,
+                }
+                for row in session.scalars(
+                    sa_select(storage.PostObligation)
+                    .where(storage.PostObligation.run_id == r.id)
+                    .order_by(storage.PostObligation.kind)
+                )
+            ]
+    except Exception:
+        postprocessing = None
+    from .patient_postprocessing import project_patient_facing
+    from .run_execution import ExecutionStore
+    from .run_runtime import compatibility_reason
+
+    try:
+        patient_facing = project_patient_facing(ExecutionStore(storage.engine), r.id)
+    except Exception as error:
+        patient_facing = {
+            "run_id": r.id,
+            "state": "unavailable",
+            "verified": False,
+            "integrity_error": str(error),
+            "delivery_verified": False,
+        }
     liveness = derive_run_liveness(r, progress=progress, artifacts=artifacts)
     try:
         council_model_ids = json.loads(r.council_model_ids_json)
@@ -2601,12 +3217,41 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         label_map = json.loads(r.label_map_json or "{}")
     except Exception:
         label_map = {}
+    try:
+        requested_model_ids = json.loads(r.requested_model_ids_json or "[]")
+    except Exception:
+        requested_model_ids = []
+    try:
+        resolved_model_ids = json.loads(r.resolved_model_ids_json or "[]")
+    except Exception:
+        resolved_model_ids = []
 
     return {
         "id": r.id,
         "patient_id": r.patient_id,
         "report_id": r.report_id,
+        "source_report_ids": json.loads(r.source_report_ids_json or "[]")
+        or [r.report_id],
+        "source_manifest": json.loads(r.source_manifest_json or '{"legacy":true}'),
+        "special_instructions": r.special_instructions or "",
+        "analysis_input_fingerprint": r.analysis_input_fingerprint or "",
+        "operation_id": r.operation_id,
         "status": r.status,
+        "start_requested_at": r.start_requested_at.isoformat()
+        if r.start_requested_at
+        else None,
+        "execution_state": r.execution_state,
+        "owner_generation": r.owner_generation,
+        "owner_pid": r.owner_pid,
+        "owner_started_at": r.owner_started_at.isoformat()
+        if r.owner_started_at
+        else None,
+        "next_check_at": r.next_check_at.isoformat() if r.next_check_at else None,
+        "blocked_reason": r.blocked_reason,
+        "execution_manifest_hash": r.execution_manifest_hash,
+        "postprocessing": postprocessing,
+        "patient_facing": patient_facing,
+        "execution_diagnostic": compatibility_reason(r, has_post=bool(postprocessing)),
         "raw_status": liveness["raw_status"],
         "display_status": liveness["display_status"],
         "display_label": liveness["display_label"],
@@ -2614,6 +3259,10 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "error_message": r.error_message,
         "council_model_ids": council_model_ids,
         "consolidator_model_id": r.consolidator_model_id,
+        "requested_model_ids": requested_model_ids,
+        "resolved_model_ids": resolved_model_ids,
+        "creating_instance_id": r.creating_instance_id,
+        "model_catalogue_fingerprint": r.model_catalogue_fingerprint,
         "label_map": label_map,
         "started_at": r.started_at.isoformat() if r.started_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,

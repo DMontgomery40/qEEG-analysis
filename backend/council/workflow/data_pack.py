@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
-import os
+from ...execution_settings import execution_getenv
 import re
 from pathlib import Path
 from typing import Any
 
 from ...storage import Report, create_artifact
 from ...storage import session_scope
+from ..completion import load_product, save_product
+from ..execution import (
+    current_execution,
+    execute_unit,
+    raise_if_execution_blocked,
+    bind_source,
+    canonical_execution_report,
+)
 from ..constants import DATA_PACK_SCHEMA_VERSION, STAGES
 from ..json_utils import _json_loads_loose
 from ..paths import _data_pack_path, _stage_dir, _vision_transcript_path
@@ -102,15 +110,17 @@ class _DataPackMixin:
         cls, facts: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         deduped: list[dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for fact in facts:
             key = cls._fact_semantic_key(fact)
-            if not key:
+            signature = cls._fact_numeric_signature(fact)
+            if not key or signature is None:
                 deduped.append(fact)
                 continue
-            if key in seen:
+            identity = (key, json.dumps(signature, sort_keys=True))
+            if identity in seen:
                 continue
-            seen.add(key)
+            seen.add(identity)
             deduped.append(fact)
         return deduped
 
@@ -120,25 +130,52 @@ class _DataPackMixin:
         facts: list[dict[str, Any]],
         *,
         page_session_aliases: dict[int, dict[int, int]],
+        input_namespace: str = "local",
     ) -> list[dict[str, Any]]:
-        if not page_session_aliases:
-            return facts
+        """Canonicalize explicit local facts; global facts are never remapped.
 
+        input_namespace is the producer contract for unmarked facts. Model output
+        and existing data-pack caches use global indices; deterministic page
+        parsers use local indices and mark their canonical output themselves.
+        """
         normalized: list[dict[str, Any]] = []
         for fact in facts:
             if not isinstance(fact, dict):
                 continue
             new_fact = dict(fact)
+            namespace = new_fact.get("session_index_namespace", input_namespace)
+            if namespace not in {"local", "global"}:
+                raise ValueError(f"Unknown session index namespace: {namespace!r}")
             page = new_fact.get("source_page")
             session_index = new_fact.get("session_index")
-            if isinstance(page, int) and isinstance(session_index, int):
-                mapped = page_session_aliases.get(page, {}).get(session_index)
-                if isinstance(mapped, int):
-                    if mapped != session_index:
-                        new_fact.setdefault("local_session_index", session_index)
-                    new_fact["session_index"] = mapped
+            if isinstance(session_index, int):
+                if namespace == "local":
+                    new_fact.setdefault("local_session_index", session_index)
+                    new_fact["session_index"] = page_session_aliases.get(page, {}).get(
+                        session_index, session_index
+                    )
+                elif "local_session_index" not in new_fact:
+                    # The namespace is already known from the producer contract.
+                    # Only an unambiguous inverse alias supplies local provenance.
+                    aliases = page_session_aliases.get(page, {})
+                    local_indices = [
+                        local
+                        for local, glob in aliases.items()
+                        if glob == session_index
+                    ]
+                    if len(local_indices) == 1:
+                        new_fact["local_session_index"] = local_indices[0]
+                    elif not aliases:
+                        new_fact["local_session_index"] = session_index
+                new_fact["session_index_namespace"] = "global"
             normalized.append(new_fact)
-        return cls._dedupe_facts_semantic(normalized)
+        # Repeated visits can agree or conflict. Preserve different values so the
+        # strict numeric conflict gate can reject them after canonicalization.
+        return (
+            cls._dedupe_facts_semantic(normalized)
+            if page_session_aliases
+            else normalized
+        )
 
     @staticmethod
     def _fact_key(fact: dict[str, Any]) -> str | None:
@@ -159,7 +196,8 @@ class _DataPackMixin:
         """
         Return a tuple representing the numeric payload of a fact for conflict detection.
 
-        We intentionally ignore incidental fields (e.g., labels, units, target ranges) and focus on required numbers.
+        Include measured values and their SD/yield details. Labels, units, and target
+        ranges are metadata, not observed clinical numbers.
         """
 
         def coerce(val: Any) -> Any:
@@ -179,9 +217,20 @@ class _DataPackMixin:
                     return int(num) if num.is_integer() else num
             return val
 
+        details = tuple(
+            (field, coerce(fact[field]))
+            for field in ("sd_plus_minus", "yield")
+            if fact.get(field) is not None
+        )
         shown_as = fact.get("shown_as")
         if isinstance(shown_as, str) and shown_as.strip().upper() == "N/A":
-            return ("NA",)
+            # A missing measurement can still carry a recorded yield or latency.
+            measured = tuple(
+                (field, coerce(fact[field]))
+                for field in ("value", "uv", "ms")
+                if fact.get(field) is not None
+            )
+            return ("NA",) + measured + details
         ftype = fact.get("fact_type")
         if ftype in {
             "performance_metric",
@@ -192,22 +241,22 @@ class _DataPackMixin:
             val = coerce(fact.get("value"))
             if val is None:
                 return None
-            return ("value", val)
+            return ("value", val) + details
         if ftype == "p300_cp_site":
             uv = coerce(fact.get("uv"))
             ms = coerce(fact.get("ms"))
             if uv is None or ms is None:
                 return None
-            return ("uv_ms", uv, ms)
+            return ("uv_ms", uv, ms) + details
         if ftype == "n100_central_frontal_average":
             uv = coerce(fact.get("uv"))
             ms = coerce(fact.get("ms"))
             if uv is None or ms is None:
                 return None
-            return ("uv_ms", uv, ms)
+            return ("uv_ms", uv, ms) + details
         # Default: best-effort, include common numeric fields if present.
         payload: list[Any] = ["generic"]
-        for k in ("value", "uv", "ms", "yield"):
+        for k in ("value", "uv", "ms", "sd_plus_minus", "yield"):
             if k in fact:
                 payload.append(coerce(fact.get(k)))
         return tuple(payload)
@@ -218,7 +267,7 @@ class _DataPackMixin:
         for f in facts:
             if not isinstance(f, dict):
                 continue
-            key = cls._fact_key(f)
+            key = cls._fact_semantic_key(f)
             if not key:
                 continue
             by_key.setdefault(key, []).append(f)
@@ -233,7 +282,20 @@ class _DataPackMixin:
                 if sig is None:
                     continue
                 sigs.setdefault(sig, []).append(f)
-            if len(sigs) > 1:
+            # Optional recorded details participate in equality, so deduplication
+            # preserves a richer source. Absence is not a contradictory number:
+            # only different recorded values for the same detail are conflicts.
+            cores: set[tuple[Any, ...]] = set()
+            details: dict[str, set[Any]] = {}
+            for signature in sigs:
+                cores.add(
+                    tuple(item for item in signature if not isinstance(item, tuple))
+                )
+                for item in signature:
+                    if isinstance(item, tuple):
+                        field, value = item
+                        details.setdefault(field, set()).add(value)
+            if len(cores) > 1 or any(len(values) > 1 for values in details.values()):
                 conflicts.append(
                     {
                         "key": key,
@@ -266,7 +328,29 @@ class _DataPackMixin:
         - This runs multi-pass multimodal extraction across ALL available page images.
         - If strict is True, missing required numeric fields raises an error (no silent degradation).
         """
+        report = canonical_execution_report(
+            run_id, report, report_text=report_text, page_images=page_images
+        )
+        bind_source(
+            "s1/data-pack-input",
+            {
+                "run_id": run_id,
+                "report_id": report.id,
+                "filename": report.filename,
+                "report_text": report_text,
+                "strict": strict,
+                "candidates": candidate_extractor_model_ids,
+                "images": [
+                    {"page": im.page, "label": im.label, "base64_png": im.base64_png}
+                    for im in page_images
+                ],
+            },
+            consumers="s1/data-pack/",
+        )
         out_path = _data_pack_path(run_id)
+        accepted = load_product("data_pack")
+        if accepted is not None:
+            return json.loads(accepted)
         expected_sessions = _expected_session_indices(report_text)
         expected_pages = sorted(
             {img.page for img in page_images if isinstance(img.page, int)}
@@ -277,14 +361,13 @@ class _DataPackMixin:
         )
 
         def apply_page_session_aliases(merged: dict[str, Any]) -> None:
-            if not page_session_aliases:
-                return
             facts = merged.get("facts")
             if not isinstance(facts, list):
                 return
             merged["facts"] = self._normalize_facts_for_page_session_aliases(
                 [f for f in facts if isinstance(f, dict)],
                 page_session_aliases=page_session_aliases,
+                input_namespace="global",
             )
             merged["page_session_aliases"] = {
                 str(page): {
@@ -294,7 +377,7 @@ class _DataPackMixin:
             }
 
         # If an existing data pack is present, upgrade it in-place with deterministic facts and derived views.
-        if out_path.exists():
+        if out_path.exists() and current_execution() is None:
             try:
                 existing = json.loads(out_path.read_text(encoding="utf-8"))
             except Exception:
@@ -334,6 +417,7 @@ class _DataPackMixin:
                     base_facts = self._normalize_facts_for_page_session_aliases(
                         base_facts,
                         page_session_aliases=page_session_aliases,
+                        input_namespace="global",
                     )
                     add_facts: list[dict[str, Any]] = []
                     add_facts.extend(
@@ -409,12 +493,19 @@ class _DataPackMixin:
                 )
             return None
 
-        chunk_size = int(os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
+        chunk_size = int(execution_getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
         if chunk_size <= 0:
             chunk_size = 8
         # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
         if len(page_images) > 10 and chunk_size > 10:
             chunk_size = 10
+        chunk_timeout_s = self._int_env(
+            "QEEG_STAGE1_DATA_PACK_TIMEOUT_S",
+            self._int_env(
+                "QEEG_STAGE1_MULTIMODAL_TIMEOUT_S",
+                self._int_env("QEEG_LLM_TIMEOUT_S", 600),
+            ),
+        )
 
         debug_dir: Path | None = None
         attempt_log: list[dict[str, Any]] = []
@@ -456,12 +547,15 @@ class _DataPackMixin:
             if combined:
                 # Deterministic facts come first so they override duplicates from model output.
                 merged["facts"] = self._dedupe_facts(combined)
+                apply_page_session_aliases(merged)
             return self._find_fact_conflicts(combined)
 
         # Multi-pass extraction across all pages.
         errors: list[str] = []
         chunks = list(_chunked(page_images, chunk_size))
-        for extractor_model_id in candidate_extractor_model_ids:
+        for extractor_index, extractor_model_id in enumerate(
+            candidate_extractor_model_ids
+        ):
             try:
                 if emit is not None:
                     await emit(
@@ -501,13 +595,16 @@ class _DataPackMixin:
                             }
                         )
                     raw = await self._await_with_heartbeat(
-                        self._call_model_multimodal(
-                            model_id=extractor_model_id,
-                            prompt_text=prompt_text,
-                            images=chunk,
-                            temperature=0.0,
-                            max_tokens=3500,
-                            allow_text_fallback=False,
+                        execute_unit(
+                            f"s1/data-pack/{extractor_index}/{extractor_model_id}/chunk/{chunk_index}",
+                            self._call_model_multimodal(
+                                model_id=extractor_model_id,
+                                prompt_text=prompt_text,
+                                images=chunk,
+                                temperature=0.0,
+                                max_tokens=3500,
+                                allow_text_fallback=False,
+                            ),
                         ),
                         emit=emit,
                         payload={
@@ -520,6 +617,7 @@ class _DataPackMixin:
                             "chunk_count": len(chunks),
                             "pages": pages,
                         },
+                        timeout_s=chunk_timeout_s,
                     )
                     if emit is not None:
                         await emit(
@@ -625,15 +723,18 @@ class _DataPackMixin:
                     candidate_pages = _find_p300_rare_comparison_pages(
                         report_text, page_count=len(page_images)
                     )
-                    merged = await self._targeted_retry_missing(
-                        extractor_model_id=extractor_model_id,
-                        page_images=page_images,
-                        merged=merged,
-                        expected_sessions=expected_sessions,
-                        missing=missing,
-                        candidate_pages=candidate_pages,
-                        debug_dir=debug_dir,
-                        attempt_log=attempt_log,
+                    merged = await execute_unit(
+                        f"s1/data-pack/{extractor_index}/{extractor_model_id}/targeted-p300-n100",
+                        self._targeted_retry_missing(
+                            extractor_model_id=extractor_model_id,
+                            page_images=page_images,
+                            merged=merged,
+                            expected_sessions=expected_sessions,
+                            missing=missing,
+                            candidate_pages=candidate_pages,
+                            debug_dir=debug_dir,
+                            attempt_log=attempt_log,
+                        ),
                     )
                     apply_page_session_aliases(merged)
                     fact_conflicts = apply_deterministic_facts(merged)
@@ -645,15 +746,18 @@ class _DataPackMixin:
                     )
 
                 if missing:
-                    merged = await self._targeted_retry_summary_missing(
-                        extractor_model_id=extractor_model_id,
-                        page_images=page_images,
-                        merged=merged,
-                        expected_sessions=expected_sessions,
-                        missing=missing,
-                        candidate_pages=candidate_summary_pages,
-                        debug_dir=debug_dir,
-                        attempt_log=attempt_log,
+                    merged = await execute_unit(
+                        f"s1/data-pack/{extractor_index}/{extractor_model_id}/targeted-summary",
+                        self._targeted_retry_summary_missing(
+                            extractor_model_id=extractor_model_id,
+                            page_images=page_images,
+                            merged=merged,
+                            expected_sessions=expected_sessions,
+                            missing=missing,
+                            candidate_pages=candidate_summary_pages,
+                            debug_dir=debug_dir,
+                            attempt_log=attempt_log,
+                        ),
                     )
                     apply_page_session_aliases(merged)
                     fact_conflicts = apply_deterministic_facts(merged)
@@ -725,23 +829,28 @@ class _DataPackMixin:
                     )
                     raise RuntimeError("\n".join(msg_lines))
 
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(
-                    json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8"
-                )
-
-                # Store as an artifact for traceability/debugging.
-                with session_scope() as session:
-                    create_artifact(
-                        session,
-                        run_id=run_id,
-                        stage_num=1,
-                        stage_name=STAGES[0].name,
-                        model_id="_data_pack",
-                        kind="data_pack",
-                        content_path=out_path,
-                        content_type="application/json",
+                if current_execution() is not None:
+                    save_product(
+                        "data_pack", json.dumps(merged, indent=2, sort_keys=True)
                     )
+                else:
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text(
+                        json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8"
+                    )
+
+                    # Store as an artifact for traceability/debugging.
+                    with session_scope() as session:
+                        create_artifact(
+                            session,
+                            run_id=run_id,
+                            stage_num=1,
+                            stage_name=STAGES[0].name,
+                            model_id="_data_pack",
+                            kind="data_pack",
+                            content_path=out_path,
+                            content_type="application/json",
+                        )
 
                 if emit is not None:
                     await emit(
@@ -758,6 +867,7 @@ class _DataPackMixin:
                     )
                 return merged
             except Exception as e:
+                raise_if_execution_blocked(e)
                 if emit is not None:
                     await emit(
                         {
@@ -800,8 +910,26 @@ class _DataPackMixin:
         - Data pack is strict + normalized for required metrics.
         - Vision transcript is broad + best-effort for everything visible on the pages.
         """
+        report = canonical_execution_report(run_id, report, page_images=page_images)
+        bind_source(
+            "s1/transcript-input",
+            {
+                "run_id": run_id,
+                "report_id": report.id,
+                "model": transcript_model_id,
+                "strict": strict,
+                "images": [
+                    {"page": im.page, "label": im.label, "base64_png": im.base64_png}
+                    for im in page_images
+                ],
+            },
+            consumers="s1/transcript/",
+        )
         out_path = _vision_transcript_path(run_id)
-        if out_path.exists():
+        accepted = load_product("vision_transcript")
+        if accepted is not None:
+            return accepted
+        if out_path.exists() and current_execution() is None:
             try:
                 existing = out_path.read_text(encoding="utf-8", errors="replace")
                 if existing.strip():
@@ -834,7 +962,9 @@ class _DataPackMixin:
                 )
             return None
 
-        chunk_size = int(os.getenv("QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL", "2") or "2")
+        chunk_size = int(
+            execution_getenv("QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL", "2") or "2"
+        )
         if chunk_size <= 0:
             chunk_size = 2
         # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
@@ -842,10 +972,17 @@ class _DataPackMixin:
             chunk_size = 10
 
         max_tokens = int(
-            os.getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000"
+            execution_getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000"
         )
         if max_tokens <= 0:
             max_tokens = 4000
+        chunk_timeout_s = self._int_env(
+            "QEEG_STAGE1_VISION_TRANSCRIPT_TIMEOUT_S",
+            self._int_env(
+                "QEEG_STAGE1_MULTIMODAL_TIMEOUT_S",
+                self._int_env("QEEG_LLM_TIMEOUT_S", 600),
+            ),
+        )
 
         parts: list[str] = []
         errors: list[str] = []
@@ -884,13 +1021,16 @@ class _DataPackMixin:
                         }
                     )
                 text = await self._await_with_heartbeat(
-                    self._call_model_multimodal(
-                        model_id=transcript_model_id,
-                        prompt_text=prompt_text,
-                        images=chunk,
-                        temperature=0.0,
-                        max_tokens=max_tokens,
-                        allow_text_fallback=not strict,
+                    execute_unit(
+                        f"s1/transcript/{transcript_model_id}/chunk/{chunk_index}",
+                        self._call_model_multimodal(
+                            model_id=transcript_model_id,
+                            prompt_text=prompt_text,
+                            images=chunk,
+                            temperature=0.0,
+                            max_tokens=max_tokens,
+                            allow_text_fallback=not strict,
+                        ),
                     ),
                     emit=emit,
                     payload={
@@ -903,6 +1043,7 @@ class _DataPackMixin:
                         "chunk_count": len(chunks),
                         "pages": pages,
                     },
+                    timeout_s=chunk_timeout_s,
                 )
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
@@ -921,6 +1062,7 @@ class _DataPackMixin:
                         }
                     )
             except Exception as e:
+                raise_if_execution_blocked(e)
                 if emit is not None:
                     await emit(
                         {
@@ -967,26 +1109,29 @@ class _DataPackMixin:
         )
         transcript = f"{header}{transcript_body}\n"
 
-        try:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(transcript, encoding="utf-8")
-        except Exception:
-            pass
+        if current_execution() is not None:
+            save_product("vision_transcript", transcript)
+        else:
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(transcript, encoding="utf-8")
+            except Exception:
+                pass
 
-        try:
-            with session_scope() as session:
-                create_artifact(
-                    session,
-                    run_id=run_id,
-                    stage_num=1,
-                    stage_name=STAGES[0].name,
-                    model_id="_vision_transcript",
-                    kind="vision_transcript",
-                    content_path=out_path,
-                    content_type="text/markdown",
-                )
-        except Exception:
-            pass
+            try:
+                with session_scope() as session:
+                    create_artifact(
+                        session,
+                        run_id=run_id,
+                        stage_num=1,
+                        stage_name=STAGES[0].name,
+                        model_id="_vision_transcript",
+                        kind="vision_transcript",
+                        content_path=out_path,
+                        content_type="text/markdown",
+                    )
+            except Exception:
+                pass
 
         return transcript
 

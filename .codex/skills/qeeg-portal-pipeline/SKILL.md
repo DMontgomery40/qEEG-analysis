@@ -1,6 +1,6 @@
 ---
 name: qeeg-portal-pipeline
-description: Run and repair the qEEG portal upload pipeline when clinic uploads, portal patients, Netlify blobs, pipeline jobs, or missing analyses need auditing; use for real qEEG Council runs, worker failures, and patient label backfills. Do not use for mock-only tests or unrelated frontend styling.
+description: Run and repair the qEEG portal upload pipeline when clinic uploads, portal patients, Netlify blobs, pipeline jobs, or missing analyses need auditing; use for real qEEG Council runs, worker failures, and patient ID backfills. Do not use for mock-only tests or unrelated frontend styling.
 ---
 
 # qEEG Portal Pipeline
@@ -10,12 +10,19 @@ Use this skill when a clinic-uploaded portal patient needs to be found, download
 ## Required Posture
 
 - Real runs only. Do not use `QEEG_MOCK_LLM=1` for incident recovery or quality validation.
-- Read `/Users/davidmontgomery/qEEG-analysis/plan.md` before changing pipeline code.
+- Read `references/pipeline-contract.md` for how the portal pipeline is wired, and
+  `AGENTS.md` + `CLAUDE.md` for patient identity, before changing pipeline code.
+  `plan.md` is a 2026-04 historical record: useful for the reliability lessons,
+  superseded on identity.
 - Read project-local memory under `~/.codex/projects/-Users-davidmontgomery-qEEG-analysis/`.
 - If explainer-video output is involved, also read `~/.codex/projects/-Users-davidmontgomery-local-explainer-video/MEMORY.md` and the linked mandatory validation notes.
 - Treat Netlify job markers, local status files, DB rows, and generated artifacts as evidence. Do not report success from intent alone.
 
 ## Fast Commands
+
+`<PATIENT_ID>` is the canonical clinic ID `XX_MM-DD-YYYY[_N]`
+(e.g. `ZZ_01-01-1900`) — the same string the engine allocates, the folder is
+named for, and the hub keys its blobs by.
 
 Audit all portal patients once:
 
@@ -26,19 +33,19 @@ uv run python scripts/portal_pipeline_worker.py --once --dry-run
 Process one patient label:
 
 ```bash
-uv run python scripts/portal_pipeline_worker.py --once --include-label MM-DD-YYYY-N
+uv run python scripts/portal_pipeline_worker.py --once --include-label <PATIENT_ID>
 ```
 
 Run the existing council batch runner directly:
 
 ```bash
-uv run python scripts/run_portal_council_batch.py --include-label MM-DD-YYYY-N
+uv run python scripts/run_portal_council_batch.py --include-label <PATIENT_ID>
 ```
 
 Check local worker status:
 
 ```bash
-python3 .codex/skills/qeeg-portal-pipeline/scripts/check_status.py MM-DD-YYYY-N
+python3 .codex/skills/qeeg-portal-pipeline/scripts/check_status.py <PATIENT_ID>
 ```
 
 ## Workflow

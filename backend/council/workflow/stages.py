@@ -3,16 +3,38 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
+from ...execution_settings import execution_getenv
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ...config import DISCOVERED_MODEL_IDS, MODEL_ROLE_DEFAULTS, is_vision_capable
 from ...model_selection import resolve_model_preference
 from ...reports import extract_pdf_full
-from ...storage import Report, get_report, get_run, set_run_label_map
+from ...storage import Report, get_report, get_run
 from ...storage import session_scope
 from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
+from ..execution import (
+    execute_unit,
+    gather_units,
+    drain_task,
+    raise_if_execution_blocked,
+    current_execution,
+    bind_source,
+    validate_stage_admission,
+    canonical_execution_report,
+    validate_prepared_report,
+    bind_artifact_sources,
+    execution_llm,
+)
+from ..completion import (
+    durable_stage,
+    durable_member,
+    finish_member,
+    project_label_map,
+    finish_member_failure,
+    clinical_exhaustion,
+    is_clinical_failure,
+)
 from ..constants import STAGES
 from ..db_utils import _aggregate_required_changes, _stage_artifacts, _validate_stage5
 from ..json_utils import _json_loads_loose
@@ -28,6 +50,13 @@ from ..types import PageImage
 from ..utils import _chunked, _truthy_env
 
 
+def _execution_vision_capable(model_id):
+    context = current_execution()
+    if context is not None:
+        return context.roles["vision"].get(model_id, False)
+    return is_vision_capable(model_id)
+
+
 class _StagesMixin:
     async def _await_with_heartbeat(
         self,
@@ -39,61 +68,49 @@ class _StagesMixin:
     ) -> Any:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
-
         interval_s = self._int_env("QEEG_PROGRESS_HEARTBEAT_S", 30)
-        if emit is None or interval_s <= 0:
-            if timeout_s is None:
-                return await awaitable
-            return await asyncio.wait_for(awaitable, timeout=timeout_s)
-
-        task = asyncio.create_task(awaitable)
+        task = asyncio.ensure_future(awaitable)
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         deadline = started_at + timeout_s if timeout_s is not None else None
         heartbeat_count = 0
-        while True:
-            wait_s = interval_s
-            if deadline is not None:
-                remaining_s = deadline - loop.time()
-                if remaining_s <= 0:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    raise TimeoutError(
-                        f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+        try:
+            while True:
+                wait_s = interval_s if emit is not None and interval_s > 0 else None
+                if deadline is not None:
+                    remaining_s = deadline - loop.time()
+                    if remaining_s <= 0:
+                        raise TimeoutError(
+                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+                        )
+                    wait_s = (
+                        min(wait_s, remaining_s) if wait_s is not None else remaining_s
                     )
-                wait_s = min(wait_s, remaining_s)
-
+                try:
+                    return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        return await task
+                    if deadline is not None and loop.time() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+                        )
+                    heartbeat_count += 1
+                    await emit(
+                        {
+                            **payload,
+                            "status": "heartbeat",
+                            "elapsed_s": int(loop.time() - started_at),
+                            "heartbeat_count": heartbeat_count,
+                        }
+                    )
+        except BaseException as error:
             try:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
-            except asyncio.TimeoutError:
-                if task.done():
-                    return await task
-
-                now = loop.time()
-                elapsed_s = int(now - started_at)
-                if deadline is not None and now >= deadline:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    raise TimeoutError(
-                        f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
-                    )
-
-                heartbeat_count += 1
-                heartbeat_payload = dict(payload)
-                heartbeat_payload.update(
-                    {
-                        "status": "heartbeat",
-                        "elapsed_s": elapsed_s,
-                        "heartbeat_count": heartbeat_count,
-                    }
-                )
-                await emit(heartbeat_payload)
+                await drain_task(task, cancel=True)
+            except BaseException as child_error:
+                raise_if_execution_blocked(child_error)
+            raise_if_execution_blocked(error)
+            raise
 
     @staticmethod
     def _select_discovered_model_id(preferred: str) -> str | None:
@@ -144,10 +161,176 @@ class _StagesMixin:
     @staticmethod
     def _int_env(name: str, default: int) -> int:
         try:
-            v = int(os.getenv(name, str(default)) or str(default))
+            v = int(execution_getenv(name, str(default)) or str(default))
         except Exception:
             v = default
         return v
+
+    @staticmethod
+    def _compact_middle_text(text: str, *, limit_chars: int, label: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        if limit_chars <= 0 or len(text) <= limit_chars:
+            return text.strip()
+        marker_budget = 240
+        body_budget = max(0, limit_chars - marker_budget)
+        if body_budget < 1000:
+            body_budget = max(0, limit_chars)
+        head_chars = max(1, body_budget // 2)
+        tail_chars = max(1, body_budget - head_chars)
+        omitted = max(0, len(text) - head_chars - tail_chars)
+        return (
+            text[:head_chars].rstrip()
+            + "\n\n"
+            + f"[STAGE 4 {label} COMPACTED: omitted {omitted} characters to stay within the consolidator context budget.]\n\n"
+            + text[-tail_chars:].lstrip()
+        ).strip()
+
+    @classmethod
+    def _stage4_page_score(cls, block: str, *, page: int, total_pages: int) -> int:
+        lower = (block or "").lower()
+        score = 0
+        if page <= 2 or (total_pages and page > total_pages - 2):
+            score += 5
+        weighted_terms = {
+            "assessment scores": 18,
+            "performance assessments": 14,
+            "evoked potentials": 14,
+            "physical reaction time": 12,
+            "trail making": 12,
+            "audio p300 delay": 12,
+            "audio p300 voltage": 12,
+            "moca": 14,
+            "montreal cognitive": 14,
+            "balance": 10,
+            "theta/beta": 9,
+            "alpha ratio": 9,
+            "peak frequency": 9,
+            "percentage change": 9,
+            "maximum p300": 8,
+            "central-parietal": 8,
+            "central-frontal": 8,
+            "session number": 8,
+        }
+        for term, weight in weighted_terms.items():
+            if term in lower:
+                score += weight
+        return score
+
+    @classmethod
+    def _stage4_compact_page_marked_text(
+        cls,
+        text: str,
+        *,
+        limit_chars: int,
+        marker_pattern: str,
+        label: str,
+    ) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        if limit_chars <= 0 or len(text) <= limit_chars:
+            return text.strip()
+
+        import re
+
+        markers = list(re.finditer(marker_pattern, text, flags=re.MULTILINE))
+        if not markers:
+            return cls._compact_middle_text(
+                text, limit_chars=limit_chars, label=label
+            )
+
+        blocks: list[tuple[int, str]] = []
+        for idx, marker in enumerate(markers):
+            start = marker.start()
+            end = markers[idx + 1].start() if idx + 1 < len(markers) else len(text)
+            try:
+                page = int(marker.group(1))
+            except Exception:
+                page = idx + 1
+            blocks.append((page, text[start:end].strip()))
+
+        total_pages = max((page for page, _ in blocks), default=len(blocks))
+        scored = [
+            (
+                cls._stage4_page_score(block, page=page, total_pages=total_pages),
+                idx,
+                page,
+                block,
+            )
+            for idx, (page, block) in enumerate(blocks)
+        ]
+        scored.sort(key=lambda item: (-item[0], item[2], item[1]))
+
+        selected: dict[int, str] = {}
+        used_chars = 0
+        intro_budget = 500
+        available_chars = max(1000, limit_chars - intro_budget)
+        for score, idx, _page, block in scored:
+            if score <= 0 and selected:
+                continue
+            remaining = available_chars - used_chars
+            if remaining <= 0:
+                break
+            if len(block) <= remaining:
+                selected[idx] = block
+                used_chars += len(block) + 2
+                continue
+            if score >= 12 and remaining >= 1200:
+                selected[idx] = cls._compact_middle_text(
+                    block,
+                    limit_chars=remaining,
+                    label=f"{label} PAGE",
+                )
+                used_chars = available_chars
+                break
+
+        if not selected:
+            return cls._compact_middle_text(
+                text, limit_chars=limit_chars, label=label
+            )
+
+        selected_pages = [blocks[idx][0] for idx in sorted(selected)]
+        omitted_pages = [
+            page for idx, (page, _block) in enumerate(blocks) if idx not in selected
+        ]
+        omitted_preview = ", ".join(str(p) for p in omitted_pages[:30])
+        if len(omitted_pages) > 30:
+            omitted_preview += f", ... ({len(omitted_pages)} total)"
+        elif not omitted_preview:
+            omitted_preview = "none"
+
+        header = (
+            f"[STAGE 4 {label} COMPACTED: retained pages "
+            f"{', '.join(str(p) for p in selected_pages)}; omitted pages "
+            f"{omitted_preview}. The structured data pack remains authoritative "
+            "for extracted numeric facts across all sessions.]\n\n"
+        )
+        compacted = header + "\n\n".join(
+            selected[idx] for idx in sorted(selected)
+        )
+        if len(compacted) > limit_chars:
+            return cls._compact_middle_text(
+                compacted, limit_chars=limit_chars, label=label
+            )
+        return compacted.strip()
+
+    @classmethod
+    def _stage4_source_excerpt(cls, text: str, *, limit_chars: int) -> str:
+        return cls._stage4_compact_page_marked_text(
+            text,
+            limit_chars=limit_chars,
+            marker_pattern=r"^===\s*PAGE\s+(\d+)\s*/\s*\d+\s*===\s*$",
+            label="SOURCE REPORT",
+        )
+
+    @classmethod
+    def _stage4_vision_excerpt(cls, text: str, *, limit_chars: int) -> str:
+        return cls._stage4_compact_page_marked_text(
+            text,
+            limit_chars=limit_chars,
+            marker_pattern=r"^##\s+Page\s+(\d+)\s*$",
+            label="VISION TRANSCRIPT",
+        )
 
     async def _call_longform_chat_with_repairs(
         self,
@@ -189,7 +372,7 @@ class _StagesMixin:
 
         repaired = text
         headings = required_headings or []
-        for _ in range(repair_calls):
+        for repair_index in range(repair_calls):
             start_heading = None
             start_idx = None
             if headings:
@@ -258,6 +441,7 @@ class _StagesMixin:
         # Return best-effort text; caller can decide whether to hard-fail.
         return repaired
 
+    @durable_stage(1)
     async def _stage1(
         self,
         run_id: str,
@@ -265,27 +449,36 @@ class _StagesMixin:
         report: Report,
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
+        report = canonical_execution_report(run_id, report)
         stage = STAGES[0]
         prompt = _load_prompt("stage1_analysis.md")
         end_sentinel = "<!-- END STAGE1 ANALYSIS -->"
         report_dir = _derive_report_dir(report)
+        from ...analysis_inputs import repair_combined_report
+
+        repair_combined_report(report, run_id=run_id)
         report_text = _load_best_report_text(report, report_dir)
 
         # Prefer a single "checker" vision model for multimodal extraction + verification.
         # This is intentionally independent from the selected council model set, so the council can use
         # text-only models while still getting page-grounded structured data + transcript.
-        vision_checker_pref = os.getenv(
+        vision_checker_pref = execution_getenv(
             "QEEG_VISION_CHECKER_MODEL", MODEL_ROLE_DEFAULTS.stage1_vision
         )
         vision_checker_id = self._select_discovered_model_id(vision_checker_pref)
-        if vision_checker_id and not is_vision_capable(vision_checker_id):
+        context = current_execution()
+        if context is not None:
+            vision_checker_id = context.roles["checker"]
+            vision_checker_pref = context.roles["checker_preference"]
+        if vision_checker_id and not _execution_vision_capable(vision_checker_id):
             vision_checker_id = None
 
         # Load images from the report folder (preferred), then fallback lookup.
         page_images = _load_page_images(report, report_dir)
 
         needs_images = bool(vision_checker_id) or any(
-            is_vision_capable(m) for m in council_model_ids
+            _execution_vision_capable(m) for m in council_model_ids
         )
         expected_page_count = _page_count_from_markers(report_text)
         pages_present = {img.page for img in page_images}
@@ -489,11 +682,31 @@ class _StagesMixin:
                     "Fix: ensure Apple Vision OCR + Tesseract are available, then re-run: POST /api/reports/{report_id}/reextract"
                 )
 
-        extractor_models = [m for m in council_model_ids if is_vision_capable(m)]
+        extractor_models = [
+            m for m in council_model_ids if _execution_vision_capable(m)
+        ]
         if vision_checker_id:
             extractor_models = [vision_checker_id] + [
                 m for m in extractor_models if m != vision_checker_id
             ]
+        if context is not None:
+            extractor_models = context.roles["extractors"]
+        validate_prepared_report(
+            run_id, report, report_text=report_text, page_images=page_images
+        )
+        bind_source(
+            "s1/prepared-report",
+            {
+                "report_id": report.id,
+                "filename": report.filename,
+                "text": report_text,
+                "images": [
+                    {"page": im.page, "label": im.label, "base64_png": im.base64_png}
+                    for im in page_images
+                ],
+            },
+            consumers="s1/",
+        )
         if strict_data and not extractor_models:
             raise RuntimeError(
                 "Strict data availability requested, but no vision-capable models were selected.\n"
@@ -521,6 +734,11 @@ class _StagesMixin:
         elif extractor_models:
             transcript_model_id = extractor_models[0]
 
+        bind_source(
+            "s1/transcript-selection",
+            {"model": transcript_model_id, "data_pack": data_pack},
+            consumers="s1/transcript/",
+        )
         vision_transcript_text = await self._ensure_vision_transcript(
             run_id=run_id,
             report=report,
@@ -562,8 +780,12 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
 
         base_prompt_text = (
@@ -594,7 +816,8 @@ class _StagesMixin:
             stage1_retry_max_tokens = 6000
         stage1_require_complete = _truthy_env("QEEG_STAGE1_REQUIRE_COMPLETE", True)
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        @durable_member(stage)
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             try:
                 await emit(
                     {
@@ -613,12 +836,12 @@ class _StagesMixin:
                     "QEEG_STAGE1_PER_MODEL_VISION_NOTES", False
                 )
                 if (
-                    is_vision_capable(model_id)
+                    _execution_vision_capable(model_id)
                     and page_images
                     and (per_model_notes or not vision_transcript_block)
                 ):
                     chunk_size = int(
-                        os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8"
+                        execution_getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8"
                     )
                     if chunk_size <= 0:
                         chunk_size = 8
@@ -653,13 +876,16 @@ class _StagesMixin:
                             }
                         )
                         notes = await self._await_with_heartbeat(
-                            self._call_model_multimodal(
-                                model_id=model_id,
-                                prompt_text=ingest_prompt,
-                                images=chunk,
-                                temperature=0.0,
-                                max_tokens=2500,
-                                allow_text_fallback=not strict_data,
+                            execute_unit(
+                                f"s1/member/{member_index}/{model_id}/vision-notes/chunk/{chunk_index}",
+                                self._call_model_multimodal(
+                                    model_id=model_id,
+                                    prompt_text=ingest_prompt,
+                                    images=chunk,
+                                    temperature=0.0,
+                                    max_tokens=2500,
+                                    allow_text_fallback=not strict_data,
+                                ),
                             ),
                             emit=emit,
                             payload={
@@ -705,18 +931,26 @@ class _StagesMixin:
                 }
                 try:
                     text = await self._await_with_heartbeat(
-                        self._call_longform_chat_with_repairs(
-                            model_id=model_id,
-                            prompt_text=final_prompt.strip(),
-                            temperature=0.2,
-                            max_tokens=stage1_max_tokens,
-                            end_sentinel=end_sentinel,
-                            required_headings=None,
+                        execute_unit(
+                            f"s1/member/{member_index}/{model_id}/primary",
+                            self._call_longform_chat_with_repairs(
+                                model_id=model_id,
+                                prompt_text=final_prompt.strip(),
+                                temperature=0.2,
+                                max_tokens=stage1_max_tokens,
+                                end_sentinel=end_sentinel,
+                                required_headings=None,
+                            ),
                         ),
                         emit=emit,
                         payload=stage1_payload,
                     )
                 except Exception as primary_exc:
+                    raise_if_execution_blocked(primary_exc)
+                    if current_execution() is not None and not is_clinical_failure(
+                        primary_exc, key=f"s1/member/{member_index}/{model_id}/primary"
+                    ):
+                        raise
                     if isinstance(model_id, str) and model_id.startswith("mock-"):
                         raise
                     await emit(
@@ -737,13 +971,16 @@ class _StagesMixin:
                         "do not invent missing values, and still end with the required sentinel line.\n"
                     )
                     text = await self._await_with_heartbeat(
-                        self._call_longform_chat_with_repairs(
-                            model_id=model_id,
-                            prompt_text=retry_prompt,
-                            temperature=0.2,
-                            max_tokens=stage1_retry_max_tokens,
-                            end_sentinel=end_sentinel,
-                            required_headings=None,
+                        execute_unit(
+                            f"s1/member/{member_index}/{model_id}/reduced-budget",
+                            self._call_longform_chat_with_repairs(
+                                model_id=model_id,
+                                prompt_text=retry_prompt,
+                                temperature=0.2,
+                                max_tokens=stage1_retry_max_tokens,
+                                end_sentinel=end_sentinel,
+                                required_headings=None,
+                            ),
                         ),
                         emit=emit,
                         payload={**stage1_payload, "attempt": "retry"},
@@ -756,10 +993,11 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=None,
                 ):
-                    raise RuntimeError(
+                    raise clinical_exhaustion(
                         "Stage 1 analysis remained incomplete after repair attempts. "
                         f"End sentinel present: {end_sentinel in (text or '')}"
                     )
+                finish_member(stage, member_index, model_id, text)
                 await emit(
                     {
                         "run_id": run_id,
@@ -772,6 +1010,8 @@ class _StagesMixin:
                 )
                 return model_id, text
             except Exception as exc:
+                raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 await emit(
                     {
                         "run_id": run_id,
@@ -785,15 +1025,18 @@ class _StagesMixin:
                 )
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in council_model_ids))
+        results = await gather_units(
+            *(one(i, m) for i, m in enumerate(council_model_ids))
+        )
         successes = [r for r in results if r is not None]
         if not successes:
             raise RuntimeError("All models failed during Stage 1 analysis")
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         await emit(
             {
@@ -806,12 +1049,14 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(2)
     async def _stage2(
         self,
         run_id: str,
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[1]
         prompt = _load_prompt("stage2_peer_review.md")
 
@@ -843,8 +1088,21 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -860,6 +1118,7 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
+        bind_artifact_sources("s2/artifacts", artifacts)
         analyses_by_model: dict[str, str] = {}
         for a in artifacts:
             analyses_by_model[a.model_id] = Path(a.content_path).read_text(
@@ -882,7 +1141,7 @@ class _StagesMixin:
 
         label_map = _stable_label_map(run_id, available_models)
         with session_scope() as session:
-            set_run_label_map(session, run_id, label_map)
+            project_label_map(session, run_id, label_map)
 
         await emit(
             {
@@ -893,7 +1152,10 @@ class _StagesMixin:
             }
         )
 
-        async def one(reviewer_model_id: str) -> tuple[str, str] | None:
+        @durable_member(stage)
+        async def one(
+            member_index: int, reviewer_model_id: str
+        ) -> tuple[str, str] | None:
             # Reviewer sees all analyses except its own, still labeled A/B/C...
             reviewer_label = next(
                 (lbl for lbl, mid in label_map.items() if mid == reviewer_model_id),
@@ -905,6 +1167,12 @@ class _StagesMixin:
                     continue
                 filtered.append(f"Analysis {label}:\n{analyses_by_model[mid]}".strip())
             if not filtered:
+                finish_member_failure(
+                    stage,
+                    member_index,
+                    reviewer_model_id,
+                    skip_reason="no_peer_targets",
+                )
                 return None
             filtered_text = "\n\n".join(filtered)
             prompt_text = (
@@ -925,23 +1193,35 @@ class _StagesMixin:
                     for label, mid in label_map.items()
                     if mid != reviewer_model_id
                 ]
-                text = await run_stage2_peer_review_json(
-                    llm_client=self._llm,
-                    model_id=reviewer_model_id,
-                    prompt_text=prompt_text,
-                    expected_labels=expected_labels,
+                text = await execute_unit(
+                    f"s2/reviewer/{member_index}/{reviewer_model_id}",
+                    run_stage2_peer_review_json(
+                        llm_client=execution_llm(self._llm),
+                        model_id=reviewer_model_id,
+                        prompt_text=prompt_text,
+                        expected_labels=expected_labels,
+                    ),
                 )
                 return reviewer_model_id, text
-            except Exception:
+            except Exception as exc:
+                raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, reviewer_model_id, error=exc)
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in available_models))
+        results = await gather_units(
+            *(
+                one(i, m)
+                for i, m in enumerate(council_model_ids)
+                if m in available_models
+            )
+        )
         successes = [r for r in results if r is not None]
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         await emit(
             {
@@ -955,12 +1235,14 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(3)
     async def _stage3(
         self,
         run_id: str,
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[2]
         prompt = _load_prompt("stage3_revision.md")
         required_headings = None
@@ -998,8 +1280,21 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1015,6 +1310,7 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
+        bind_artifact_sources("s3/artifacts", s1 + s2)
         analyses_by_model = {
             a.model_id: Path(a.content_path).read_text(
                 encoding="utf-8", errors="replace"
@@ -1047,9 +1343,13 @@ class _StagesMixin:
         stage3_require_complete = _truthy_env("QEEG_STAGE3_REQUIRE_COMPLETE", True)
         stage3_timeout_s = self._int_env("QEEG_STAGE3_MODEL_TIMEOUT_S", 0)
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        @durable_member(stage)
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             analysis = analyses_by_model.get(model_id)
             if not analysis:
+                finish_member_failure(
+                    stage, member_index, model_id, skip_reason="empty_analysis"
+                )
                 return None
             my_label = next(
                 (lbl for lbl, mid in label_map.items() if mid == model_id), None
@@ -1083,13 +1383,16 @@ class _StagesMixin:
             await emit({**event_payload, "status": "start"})
             try:
                 text = await self._await_with_heartbeat(
-                    self._call_longform_chat_with_repairs(
-                        model_id=model_id,
-                        prompt_text=prompt_text.strip(),
-                        temperature=0.2,
-                        max_tokens=stage3_max_tokens,
-                        end_sentinel=end_sentinel,
-                        required_headings=required_headings,
+                    execute_unit(
+                        f"s3/member/{member_index}/{model_id}",
+                        self._call_longform_chat_with_repairs(
+                            model_id=model_id,
+                            prompt_text=prompt_text.strip(),
+                            temperature=0.2,
+                            max_tokens=stage3_max_tokens,
+                            end_sentinel=end_sentinel,
+                            required_headings=required_headings,
+                        ),
                     ),
                     emit=emit,
                     payload=event_payload,
@@ -1103,13 +1406,16 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    raise RuntimeError(
+                    raise clinical_exhaustion(
                         "Stage 3 revision remained incomplete after repair attempts. "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
+                finish_member(stage, member_index, model_id, text)
                 await emit({**event_payload, "status": "complete"})
                 return model_id, text
             except Exception as exc:
+                raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 await emit(
                     {
                         **event_payload,
@@ -1120,15 +1426,22 @@ class _StagesMixin:
                 )
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in available_models))
+        results = await gather_units(
+            *(
+                one(i, m)
+                for i, m in enumerate(council_model_ids)
+                if m in available_models
+            )
+        )
         successes = [r for r in results if r is not None]
         if not successes:
             raise RuntimeError("All models failed during Stage 3 revision")
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
         await emit(
             {
                 "run_id": run_id,
@@ -1141,11 +1454,13 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(4)
     async def _stage4(
         self,
         run_id: str,
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id)
         stage = STAGES[3]
         prompt = _load_prompt("stage4_consolidation.md")
         required_headings = [
@@ -1228,8 +1543,21 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1238,19 +1566,34 @@ class _StagesMixin:
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
             )
 
+        report_text_for_prompt = self._stage4_source_excerpt(
+            report_text,
+            limit_chars=self._int_env("QEEG_STAGE4_REPORT_TEXT_CHAR_LIMIT", 70000),
+        )
+        vision_transcript_for_prompt = self._stage4_vision_excerpt(
+            vision_transcript_text,
+            limit_chars=self._int_env(
+                "QEEG_STAGE4_VISION_TRANSCRIPT_CHAR_LIMIT", 30000
+            ),
+        )
+        revision_limit = self._int_env("QEEG_STAGE4_REVISION_CHAR_LIMIT_PER_MODEL", 0)
+
         vision_transcript_block = ""
-        if vision_transcript_text.strip():
+        if vision_transcript_for_prompt.strip():
             vision_transcript_block = (
                 "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
-                f"{vision_transcript_text.strip()}\n\n---\n\n"
+                f"{vision_transcript_for_prompt.strip()}\n\n---\n\n"
             )
 
         if not revisions:
             raise RuntimeError("Consolidation requires at least one revision artifact")
 
+        bind_artifact_sources("s4/artifacts", revisions)
         revision_text = "\n\n".join(
             [
-                f"Revision by {a.model_id}:\n{Path(a.content_path).read_text(encoding='utf-8', errors='replace')}"
+                "Revision by "
+                f"{a.model_id}:\n"
+                f"{self._compact_middle_text(Path(a.content_path).read_text(encoding='utf-8', errors='replace'), limit_chars=revision_limit, label='REVISION')}"
                 for a in revisions
             ]
         )
@@ -1262,24 +1605,29 @@ class _StagesMixin:
             f"{workflow_context}\n\n---\n\n"
             f"{data_pack_block}"
             f"{vision_transcript_block}"
-            f"ORIGINAL qEEG REPORT (the source of truth - verify all claims against this):\n\n{report_text}\n\n---\n\n"
+            "ORIGINAL qEEG REPORT EXCERPT (source text selected for Stage 4 context; "
+            "verify numeric claims against the structured data pack above):\n\n"
+            f"{report_text_for_prompt}\n\n---\n\n"
             f"REVISED ANALYSES TO CONSOLIDATE:\n\n{revision_text}\n"
         )
         try:
-            max_tokens = int(os.getenv("QEEG_STAGE4_MAX_TOKENS", "12000") or "12000")
+            max_tokens = int(
+                execution_getenv("QEEG_STAGE4_MAX_TOKENS", "12000") or "12000"
+            )
         except Exception:
             max_tokens = 12000
         if max_tokens <= 0:
             max_tokens = 12000
         try:
-            repair_calls = int(os.getenv("QEEG_STAGE4_REPAIR_CALLS", "6") or "6")
+            repair_calls = int(execution_getenv("QEEG_STAGE4_REPAIR_CALLS", "6") or "6")
         except Exception:
             repair_calls = 6
         if repair_calls < 0:
             repair_calls = 0
         try:
             continuation_context_chars = int(
-                os.getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000") or "12000"
+                execution_getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000")
+                or "12000"
             )
         except Exception:
             continuation_context_chars = 12000
@@ -1307,11 +1655,14 @@ class _StagesMixin:
         }
         await emit({**task_payload, "status": "start"})
         text = await self._await_with_heartbeat(
-            self._call_model_chat(
-                model_id=consolidator,
-                prompt_text=base_prompt_text,
-                temperature=0.2,
-                max_tokens=max_tokens,
+            execute_unit(
+                "s4/consolidation/initial",
+                self._call_model_chat(
+                    model_id=consolidator,
+                    prompt_text=base_prompt_text,
+                    temperature=0.2,
+                    max_tokens=max_tokens,
+                ),
             ),
             emit=emit,
             payload=task_payload,
@@ -1322,7 +1673,7 @@ class _StagesMixin:
         # long consolidations. Repair by regenerating from the next missing (or last present) required section onward.
         if not is_complete(text):
             repaired = text
-            for _ in range(repair_calls):
+            for repair_index in range(repair_calls):
                 # Prefer resuming from the first missing section. If all required sections are present but the
                 # sentinel is missing, resume from the last heading and ask for a clean ending.
                 start_heading = (
@@ -1363,11 +1714,14 @@ class _StagesMixin:
                     f"{continuation_instruction}"
                 )
                 cont = await self._await_with_heartbeat(
-                    self._call_model_chat(
-                        model_id=consolidator,
-                        prompt_text=cont_prompt,
-                        temperature=0.2,
-                        max_tokens=max_tokens,
+                    execute_unit(
+                        f"s4/consolidation/repair/{repair_index}",
+                        self._call_model_chat(
+                            model_id=consolidator,
+                            prompt_text=cont_prompt,
+                            temperature=0.2,
+                            max_tokens=max_tokens,
+                        ),
                     ),
                     emit=emit,
                     payload={**task_payload, "task": "stage4_repair"},
@@ -1402,11 +1756,14 @@ class _StagesMixin:
                 "Increase QEEG_STAGE4_MAX_TOKENS and/or QEEG_STAGE4_REPAIR_CALLS, then retry."
             )
             if require_complete:
-                raise RuntimeError(detail)
+                raise clinical_exhaustion(detail)
 
-        await self._write_artifact(
-            run_id=run_id, stage=stage, model_id=consolidator, text=text
-        )
+        if current_execution() is None:
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=consolidator, text=text
+            )
+        else:
+            finish_member(stage, 0, consolidator, text)
         await emit({**task_payload, "status": "complete"})
         await emit(
             {
@@ -1417,12 +1774,14 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(5)
     async def _stage5(
         self,
         run_id: str,
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[4]
         prompt = _load_prompt("stage5_final_review.md")
 
@@ -1454,8 +1813,21 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1464,16 +1836,32 @@ class _StagesMixin:
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
             )
 
+        report_text_for_prompt = self._stage4_source_excerpt(
+            report_text,
+            limit_chars=self._int_env(
+                "QEEG_STAGE5_REPORT_TEXT_CHAR_LIMIT",
+                self._int_env("QEEG_STAGE4_REPORT_TEXT_CHAR_LIMIT", 70000),
+            ),
+        )
+        vision_transcript_for_prompt = self._stage4_vision_excerpt(
+            vision_transcript_text,
+            limit_chars=self._int_env(
+                "QEEG_STAGE5_VISION_TRANSCRIPT_CHAR_LIMIT",
+                self._int_env("QEEG_STAGE4_VISION_TRANSCRIPT_CHAR_LIMIT", 30000),
+            ),
+        )
+
         vision_transcript_block = ""
-        if vision_transcript_text.strip():
+        if vision_transcript_for_prompt.strip():
             vision_transcript_block = (
                 "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
-                f"{vision_transcript_text.strip()}\n\n---\n\n"
+                f"{vision_transcript_for_prompt.strip()}\n\n---\n\n"
             )
 
         if not s4:
             raise RuntimeError("Stage 5 requires Stage 4 consolidation artifact")
 
+        bind_artifact_sources(f"s{stage.num}/artifacts", s4)
         consolidated = Path(s4[0].content_path).read_text(
             encoding="utf-8", errors="replace"
         )
@@ -1487,36 +1875,49 @@ class _StagesMixin:
             }
         )
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        @durable_member(stage)
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             prompt_text = (
                 f"{prompt}\n\n---\n\n"
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
                 f"{vision_transcript_block}"
-                f"ORIGINAL qEEG REPORT (for verification):\n\n{report_text}\n\n---\n\n"
+                "ORIGINAL qEEG REPORT EXCERPT (for verification; verify numeric claims against the structured data pack above):\n\n"
+                f"{report_text_for_prompt}\n\n---\n\n"
                 f"CONSOLIDATED REPORT TO REVIEW:\n\n{consolidated}\n"
             )
             try:
-                text = await run_stage5_final_review_json(
-                    llm_client=self._llm,
-                    model_id=model_id,
-                    prompt_text=prompt_text,
+                text = await execute_unit(
+                    f"s5/reviewer/{member_index}/{model_id}",
+                    run_stage5_final_review_json(
+                        llm_client=execution_llm(self._llm),
+                        model_id=model_id,
+                        prompt_text=prompt_text,
+                    ),
                 )
-                payload = _json_loads_loose(text)
-                _validate_stage5(payload)
+                try:
+                    payload = _json_loads_loose(text)
+                    _validate_stage5(payload)
+                except (ValueError, TypeError) as error:
+                    raise clinical_exhaustion(str(error)) from error
                 return model_id, json.dumps(payload, indent=2, sort_keys=True)
-            except Exception:
+            except Exception as exc:
+                raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in council_model_ids))
+        results = await gather_units(
+            *(one(i, m) for i, m in enumerate(council_model_ids))
+        )
         successes = [r for r in results if r is not None]
         if not successes:
             raise RuntimeError("All models failed during Stage 5 final review")
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         await emit(
             {
@@ -1529,22 +1930,71 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(6)
     async def _stage6(
         self,
         run_id: str,
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[5]
         prompt = _load_prompt("stage6_final_draft.md")
-        required_headings = None
+        required_headings = [
+            "# Dataset and Sessions",
+            "# Key Empirical Findings",
+            "# Performance Assessments",
+            "# Auditory ERP: P300 and N100",
+            "# Background EEG Metrics",
+            "# Speculative Commentary and Interpretive Hypotheses",
+        ]
         end_sentinel = "<!-- END STAGE6 FINAL DRAFT -->"
+        context = current_execution()
+        writer_model = (
+            context.roles["writer_preference"]
+            if context is not None
+            else (
+                execution_getenv(
+                    "QEEG_STAGE6_FINAL_DRAFT_MODEL",
+                    MODEL_ROLE_DEFAULTS.stage6_final_draft,
+                )
+                or MODEL_ROLE_DEFAULTS.stage6_final_draft
+            )
+        ).strip()
+        if context is None and not writer_model:
+            raise RuntimeError("Stage 6 final-draft writer model is not configured")
 
         with session_scope() as session:
             s4 = _stage_artifacts(session, run_id, 4, kind="consolidation")
             s5 = _stage_artifacts(session, run_id, 5, kind="final_review")
             run = get_run(session, run_id)
             report = get_report(session, run.report_id) if run else None
+
+        writer_candidates: list[str] = []
+        if context is not None:
+            writer_candidates = context.roles["writers"]
+        elif DISCOVERED_MODEL_IDS:
+            fallback_writer = (
+                execution_getenv(
+                    "QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2"
+                )
+                or "z-ai/glm-5.2"
+            ).strip()
+            candidate_preferences = [writer_model, fallback_writer]
+            for preference in candidate_preferences:
+                resolved = self._select_discovered_model_id(preference)
+                if resolved and resolved not in writer_candidates:
+                    writer_candidates.append(resolved)
+        else:
+            # Model discovery is populated by the live application. Retain the
+            # configured writer for isolated workflows and test harnesses.
+            writer_candidates.append(writer_model)
+
+        if not writer_candidates:
+            raise RuntimeError(
+                "Stage 6 has no available final-draft model. "
+                f"Configured writer: {writer_model}"
+            )
 
         report_text = ""
         if report and report.extracted_text_path:
@@ -1569,8 +2019,21 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
+        from ...analysis_inputs import saved_operator_instructions
+
         workflow_context = _workflow_context_block(
-            stage_num=stage.num, stage_name=stage.name
+            stage_num=stage.num,
+            stage_name=stage.name,
+            special_instructions=saved_operator_instructions(run_id),
         )
         data_pack_block = ""
         if data_pack_text.strip():
@@ -1579,15 +2042,31 @@ class _StagesMixin:
                 f"```json\n{data_pack_text.strip()}\n```\n\n---\n\n"
             )
 
+        report_text_for_prompt = self._stage4_source_excerpt(
+            report_text,
+            limit_chars=self._int_env(
+                "QEEG_STAGE6_REPORT_TEXT_CHAR_LIMIT",
+                self._int_env("QEEG_STAGE4_REPORT_TEXT_CHAR_LIMIT", 70000),
+            ),
+        )
+        vision_transcript_for_prompt = self._stage4_vision_excerpt(
+            vision_transcript_text,
+            limit_chars=self._int_env(
+                "QEEG_STAGE6_VISION_TRANSCRIPT_CHAR_LIMIT",
+                self._int_env("QEEG_STAGE4_VISION_TRANSCRIPT_CHAR_LIMIT", 30000),
+            ),
+        )
+
         vision_transcript_block = ""
-        if vision_transcript_text.strip():
+        if vision_transcript_for_prompt.strip():
             vision_transcript_block = (
                 "MULTIMODAL VISION TRANSCRIPT (page-grounded transcription from ALL PDF page images):\n\n"
-                f"{vision_transcript_text.strip()}\n\n---\n\n"
+                f"{vision_transcript_for_prompt.strip()}\n\n---\n\n"
             )
 
         if not s4:
             raise RuntimeError("Stage 6 requires Stage 4 consolidation artifact")
+        bind_artifact_sources("s6/artifacts", s4 + s5)
         consolidated = Path(s4[0].content_path).read_text(
             encoding="utf-8", errors="replace"
         )
@@ -1600,6 +2079,8 @@ class _StagesMixin:
                 "stage_num": stage.num,
                 "stage_name": stage.name,
                 "status": "start",
+                "model_id": writer_candidates[0],
+                "candidate_count": len(writer_candidates),
             }
         )
         stage6_max_tokens = self._int_env("QEEG_STAGE6_MAX_TOKENS", 12000)
@@ -1607,7 +2088,10 @@ class _StagesMixin:
             stage6_max_tokens = 12000
         stage6_require_complete = _truthy_env("QEEG_STAGE6_REQUIRE_COMPLETE", True)
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        failures: list[str] = []
+
+        @durable_member(stage)
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             changes = (
                 "\n".join([f"- {c}" for c in required_changes])
                 if required_changes
@@ -1621,18 +2105,22 @@ class _StagesMixin:
                 f"{workflow_context}\n\n---\n\n"
                 f"{data_pack_block}"
                 f"{vision_transcript_block}"
-                f"ORIGINAL qEEG REPORT (for any needed verification):\n\n{report_text}\n\n---\n\n"
+                "ORIGINAL qEEG REPORT EXCERPT (for any needed verification; verify numeric claims against the structured data pack above):\n\n"
+                f"{report_text_for_prompt}\n\n---\n\n"
                 f"Required changes to apply:\n{changes}\n\n"
                 f"CONSOLIDATED REPORT:\n\n{consolidated}\n"
             )
             try:
-                text = await self._call_longform_chat_with_repairs(
-                    model_id=model_id,
-                    prompt_text=prompt_text.strip(),
-                    temperature=0.2,
-                    max_tokens=stage6_max_tokens,
-                    end_sentinel=end_sentinel,
-                    required_headings=required_headings,
+                text = await execute_unit(
+                    f"s6/writer/{member_index}/{model_id}",
+                    self._call_longform_chat_with_repairs(
+                        model_id=model_id,
+                        prompt_text=prompt_text.strip(),
+                        temperature=0.2,
+                        max_tokens=stage6_max_tokens,
+                        end_sentinel=end_sentinel,
+                        required_headings=required_headings,
+                    ),
                 )
                 enforce_complete = stage6_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
@@ -1642,24 +2130,38 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    raise RuntimeError(
+                    raise clinical_exhaustion(
                         "Stage 6 final draft remained incomplete after repair attempts. "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
                 return model_id, text
-            except Exception:
+            except Exception as exc:
+                raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
+                failures.append(f"{model_id}: {type(exc).__name__}: {exc}")
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in council_model_ids))
-        successes = [r for r in results if r is not None]
+        successes: list[tuple[str, str]] = []
+        for member_index, candidate in enumerate(writer_candidates):
+            result = await one(member_index, candidate)
+            if result is not None:
+                successes.append(result)
+                if context is None:
+                    break  # Preserve the isolated legacy writer fallback contract.
         if not successes:
-            raise RuntimeError("All models failed during Stage 6 final draft")
-
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
+            detail = "; ".join(failures) or "no model call was attempted"
+            raise RuntimeError(
+                f"All models failed during Stage 6 final draft. {detail}"
             )
 
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
+
+        # Durable execution accounts for every admitted council member, with
+        # individual failure receipts retained alongside successful drafts.
         await emit(
             {
                 "run_id": run_id,
@@ -1667,6 +2169,6 @@ class _StagesMixin:
                 "stage_name": stage.name,
                 "status": "complete",
                 "success_count": len(successes),
-                "requested_count": len(council_model_ids),
+                "requested_count": len(writer_candidates) if context is not None else 1,
             }
         )

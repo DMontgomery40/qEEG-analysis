@@ -44,7 +44,9 @@ def test_model_visible_in_ui_filters_legacy_provider_versions(temp_data_dir):
     assert _model_visible_in_ui("some-custom-model") is True
 
 
-def test_models_endpoint_reports_configured_availability_from_real_discovery(monkeypatch):
+def test_models_endpoint_reports_configured_availability_from_real_discovery(
+    monkeypatch,
+):
     from backend.config import CouncilModelConfig, set_discovered_model_ids
     import backend.main as main
 
@@ -58,9 +60,7 @@ def test_models_endpoint_reports_configured_availability_from_real_discovery(mon
             ),
         ],
     )
-    set_discovered_model_ids(
-        ["openai/gpt-5.5", "google/gemini-3.1-flash-lite-preview"]
-    )
+    set_discovered_model_ids(["openai/gpt-5.5", "google/gemini-3.1-flash-lite-preview"])
 
     payload = asyncio.run(main.models())
     configured = {item["id"]: item for item in payload["configured_models"]}
@@ -76,3 +76,17 @@ def test_models_endpoint_reports_configured_availability_from_real_discovery(mon
         configured["gemini-3.1-flash-lite-preview"]["resolved_discovered_id"]
         == "google/gemini-3.1-flash-lite-preview"
     )
+
+
+def test_current_gpt56_family_visible_without_legacy_toggle(temp_data_dir):
+    from backend.main import _model_visible_in_ui
+
+    for model in [
+        "openai/gpt-5.6-terra",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "openai/gpt-5.6-terra-low",
+    ]:
+        assert _model_visible_in_ui(model)
+    for model in ["gpt-5.4", "gpt-5.6-mini", "gpt-5.6-high"]:
+        assert not _model_visible_in_ui(model)

@@ -62,19 +62,76 @@ qEEG Council is a **6-stage deliberation workflow** where multiple LLMs collabor
 - This swaps in a deterministic mocked transport for LLM calls.
 - **Do not use mock mode to judge report quality** (it will produce canned content quickly).
 
+### Running against scratch data (local E2E, smoke tests)
+
+- `DATA_DIR` moves this repo's data root. The portal folder follows it
+  (`DATA_DIR/portal_patients`) unless `QEEG_PORTAL_PATIENTS_DIR` overrides it.
+- **Pair it with the workbench's `QEEG_ANALYSIS_ROOT`.** The workbench builds its
+  portal path as `QEEG_ANALYSIS_ROOT/data/portal_patients` and has no override of
+  its own, so setting `DATA_DIR=$S/data` requires `QEEG_ANALYSIS_ROOT=$S`.
+  Changing one alone points the two processes at different folders — and the
+  workbench's default is the *production* checkout.
+- **Export every provider key explicitly, even to run without one.** `config.py`
+  calls a bare `load_dotenv()`, and `find_dotenv()` walks up past this repo to
+  `/Users/davidmontgomery/.env`, so simply leaving `OPENROUTER_API_KEY` unset
+  loads the real one. `load_dotenv()` uses `override=False`, so an explicitly
+  exported value (empty, or an obviously-invalid sentinel) is what actually
+  keeps a test run from being able to spend.
+
+## Patient identity
+
+Every patient has one canonical clinic ID: `XX_MM-DD-YYYY` — two initials, an
+underscore, the date of birth — with a collision ordinal only when two real
+people share both (`ZZ_01-01-1900`, `ZZ_01-01-1900_2`; ordinal 1 is the
+unsuffixed form, so `_1` never exists). `backend/patient_identity.py` holds the
+authoritative regex and the real-calendar-date check.
+
+- **This engine is the only allocator.** `allocate_canonical_patient_id` runs
+  under a SQLite write transaction against the durable `patient_id_reservations`
+  table, so an ordinal is issued once and never recomputed or reused. Ordinals
+  are scoped to one initials-and-birthdate pair, not global: whatever happens to
+  `ZZ_01-01-1900` leaves `QX_02-29-1904` untouched. The workbench, the hub, and
+  the renderers read the ID; none of them mint one.
+- **The ID is the clinic-visible key.** It is the patient's `label` column, the
+  `data/portal_patients/` folder name, the prefix on every published filename,
+  the hub's blob key, and the `patient_id` field in API responses.
+- **The SQLite UUID is the invisible relational key.** It is the `patients.id`
+  primary key and the join key for reports, runs, and files — and it is also the
+  `{patient_uuid}` path parameter on `/api/patients/...` routes and the directory
+  name under `data/reports/` and `data/patient_files/`. It never reaches a clinic
+  screen, a portal folder, a published filename, or a chat message. Responses
+  carry both: `id` is the UUID, `patient_id` is the canonical clinic ID.
+- **Full names are stored.** `first_name`, `last_name`, `birthdate`,
+  `first_initial`, and `last_initial` are normalized columns on `patients`. Names
+  are ordinary working data for the clinic; the ID just carries the initials and
+  the date of birth in a form a person can read at a glance.
+- **Identity comes before creation.** The patient-neutral report preview endpoint
+  runs extraction/OCR without creating a patient, report row, portal folder, or
+  paid run. Create or find the patient from what it read, then register the
+  report.
+- **Name conflicts are answered, never guessed.** When incoming identity matches
+  an existing patient's initials and birthdate but not their stored name, create
+  returns `409 identity_name_mismatch` with the candidate patients and the
+  incoming name. The caller resolves it explicitly with `attach_to` (same person;
+  the stored name is not overwritten) or `force_new` (next ordinal). Never
+  silently split a chart and never silently merge one.
+- **`notes` is agent-managed free text.** Video/analogy preferences and informal
+  context the clinic mentions once. No taxonomy, no parsing. A `PUT` that omits
+  `notes` keeps what is stored — updates never blank it.
+
 ## Persistence and filesystem layout
 
 - SQLite: `data/app.db`
 - Reports:
-  - `data/reports/<patient_id>/<upload_id>/original.pdf`
-  - `data/reports/<patient_id>/<upload_id>/extracted.txt`
-  - `data/reports/<patient_id>/<upload_id>/extracted_enhanced.txt` (OCR/table-friendly)
-  - `data/reports/<patient_id>/<upload_id>/pages/page-<n>.png` (for multimodal Stage 1)
-  - `data/reports/<patient_id>/<upload_id>/metadata.json`
+  - `data/reports/<patient_uuid>/<upload_id>/original.pdf`
+  - `data/reports/<patient_uuid>/<upload_id>/extracted.txt`
+  - `data/reports/<patient_uuid>/<upload_id>/extracted_enhanced.txt` (OCR/table-friendly)
+  - `data/reports/<patient_uuid>/<upload_id>/pages/page-<n>.png` (for multimodal Stage 1)
+  - `data/reports/<patient_uuid>/<upload_id>/metadata.json`
 - Patient files:
-  - `data/patient_files/<patient_id>/<file_id>/original.<ext>`
+  - `data/patient_files/<patient_uuid>/<file_id>/original.<ext>`
 - Portal sync folder:
-  - `data/portal_patients/<patient_label>/...` (best-effort local publish copies, watched by `thrylen`)
+  - `data/portal_patients/<PATIENT_ID>/...` (best-effort local publish copies, watched by `thrylen`)
 - Artifacts: `data/artifacts/<run_id>/stage-<n>/<model_id>.(md|json)`
 - Exports: `data/exports/<run_id>/final.(md|pdf)`
 
@@ -106,6 +163,13 @@ Important gotcha:
 
 ## API surface (see `backend/main.py`)
 
+In these routes a `{patient_uuid}` path segment is the internal SQLite key.
+The clinic-facing canonical ID is the patient's `label` column, returned as the
+`patient_id` field in responses — never a path segment. `backend/main.py` still
+spells the parameter `patient_id` in its decorators and handler signatures, so
+grepping for `patient_uuid` there finds nothing; the name is the old one, the
+value is the UUID.
+
 - Health/models
   - `GET /api/health`
   - `GET /api/models`
@@ -116,15 +180,15 @@ Important gotcha:
 - Patients
   - `GET/POST /api/patients`
   - `POST /api/patients/bulk_upload`
-  - `GET/PUT /api/patients/{patient_id}`
-  - `GET /api/patients/{patient_id}/reports`
-  - `GET /api/patients/{patient_id}/runs`
-  - `GET /api/patients/{patient_id}/files`
-  - `POST /api/patients/{patient_id}/files`
+  - `GET/PUT /api/patients/{patient_uuid}`
+  - `GET /api/patients/{patient_uuid}/reports`
+  - `GET /api/patients/{patient_uuid}/runs`
+  - `GET /api/patients/{patient_uuid}/files`
+  - `POST /api/patients/{patient_uuid}/files`
   - `GET /api/patient_files/{file_id}`
   - `DELETE /api/patient_files/{file_id}`
 - Reports
-  - `POST /api/patients/{patient_id}/reports` (upload)
+  - `POST /api/patients/{patient_uuid}/reports` (upload)
   - `GET /api/reports/{report_id}/extracted`
   - `POST /api/reports/{report_id}/reextract` (regenerate extracted/enhanced/pages)
   - `GET /api/reports/{report_id}/original`
@@ -176,7 +240,7 @@ This repo is the source of truth for the explainer-video QC gate:
 - Numeric truth: Stage 1 data pack JSON (`kind='data_pack'`, `stage_num=1`, `model_id='_data_pack'`)
 
 Publishing targets:
-- Portal sync folder: `data/portal_patients/<MM-DD-YYYY-N>/` (configurable via `QEEG_PORTAL_PATIENTS_DIR`)
+- Portal sync folder: `data/portal_patients/<PATIENT_ID>/` (configurable via `QEEG_PORTAL_PATIENTS_DIR`)
 - DB-tracked upload: `POST /api/patients/{patient_uuid}/files` (also publishes a best-effort copy into the portal folder)
 
 The “generate narrative + slides” pipeline lives in `../local-explainer-video`. Its **QC + Publish** step reads
@@ -185,12 +249,12 @@ The “generate narrative + slides” pipeline lives in `../local-explainer-vide
 Visual QC note:
 - By default, the explainer repo runs visual QC in **check-only** mode (no automated image edits). When issues are found it writes:
   - `../local-explainer-video/projects/<PROJECT>/qc_visual_issues.json`
-- Image models (in the explainer repo): generate via `qwen/qwen-image-2512`, edit via `qwen/qwen-image-edit-2511` (or DashScope `qwen-image-edit-max` when configured).
+- Image models for qEEG explainer assets: use Cathode with Codex/OpenAI native image generation (`gpt-image-2`) for generation and edits. Do not use Qwen for assets that include or may include text.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **qEEG-analysis** (5903 symbols, 14667 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **qEEG-analysis** (4894 symbols, 13485 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

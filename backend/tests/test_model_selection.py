@@ -55,3 +55,12 @@ def test_resolve_model_preference_does_not_map_plain_gpt55_to_xhigh_only():
     discovered = ["gpt-5.5-xhigh"]
 
     assert resolve_model_preference("gpt-5.5", discovered) is None
+
+
+def test_resolve_model_preference_maps_provider_prefixed_openai_id_to_cliproxy_id():
+    discovered = ["gpt-5.6-sol", "gpt-5.6-terra"]
+
+    assert (
+        resolve_model_preference("openai/gpt-5.6-sol", discovered)
+        == "gpt-5.6-sol"
+    )

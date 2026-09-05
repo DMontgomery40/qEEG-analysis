@@ -8,13 +8,20 @@ from typing import Any
 from ...config import ARTIFACTS_DIR
 from ...llm_client import AsyncOpenAICompatClient
 from ...logging_utils import get_logger, log_context
-from ...storage import get_report, get_run, update_run_status
+from ...storage import get_report, get_run, list_artifacts
 from ...storage import session_scope
+from ..execution import raise_if_execution_blocked, current_execution
+from ..completion import (
+    verified_stage_prefix,
+    _verified_stage,
+    stage_progress,
+    project_run_status,
+)
 from ..json_utils import _loads_json_list
 from ..types import OnEvent
 from .data_pack import _DataPackMixin
 from .exceptions import _NeedsAuth
-from .llm_calls import _LLMCallsMixin
+from .llm_calls import _LLMCallsMixin, _USAGE_RUN_ID
 from .stages import _StagesMixin
 
 
@@ -95,7 +102,13 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
     def __init__(self, *, llm: AsyncOpenAICompatClient):
         self._llm = llm
 
-    async def run_pipeline(self, run_id: str, on_event: OnEvent = None) -> None:
+    async def run_pipeline(
+        self,
+        run_id: str,
+        on_event: OnEvent = None,
+        *,
+        propagate_owned_errors: bool = False,
+    ) -> None:
         latest_counts: dict[str, Any] = {}
 
         async def emit(payload: dict[str, Any]) -> None:
@@ -104,7 +117,12 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
             for key in ("stage_num", "stage_name", "success_count", "requested_count"):
                 if key in payload and payload.get(key) is not None:
                     latest_counts[key] = payload.get(key)
-            _append_progress_event(run_id, payload)
+            context = current_execution()
+            if context is None:
+                _append_progress_event(run_id, payload)
+            else:
+                with context.owner.file_guard():
+                    _append_progress_event(run_id, payload)
             if on_event is not None:
                 await on_event(payload)
 
@@ -113,9 +131,13 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
             if run is None:
                 LOGGER.warning("pipeline_run_missing", run_id=run_id)
                 return
+            if current_execution() is None:
+                from ...run_execution import require_unowned_run
+
+                require_unowned_run(session, run)
             report = get_report(session, run.report_id)
             if report is None:
-                update_run_status(
+                project_run_status(
                     session, run_id, status="failed", error_message="Report not found"
                 )
                 LOGGER.error("pipeline_report_missing", run_id=run_id)
@@ -123,7 +145,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
 
             council_model_ids = _loads_json_list(run.council_model_ids_json)
             if not council_model_ids:
-                update_run_status(
+                project_run_status(
                     session,
                     run_id,
                     status="failed",
@@ -134,27 +156,51 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
 
             patient_id = run.patient_id
             report_id = run.report_id
-            update_run_status(session, run_id, status="running")
+            completed_stage_num = (
+                0
+                if current_execution() is not None
+                else max(
+                    (
+                        artifact.stage_num
+                        for artifact in list_artifacts(session, run_id)
+                    ),
+                    default=0,
+                )
+            )
+            project_run_status(session, run_id, status="running")
+
+        if current_execution() is not None:
+            completed_stage_num = verified_stage_prefix()
+            for stage_num in range(1, completed_stage_num + 1):
+                await emit(stage_progress(stage_num, _verified_stage(stage_num)))
 
         with log_context(run_id=run_id, patient_id=patient_id, report_id=report_id):
             LOGGER.info("pipeline_started", council_model_count=len(council_model_ids))
-            await emit({"run_id": run_id, "status": "running"})
+            running_event: dict[str, Any] = {"run_id": run_id, "status": "running"}
+            if 0 < completed_stage_num < 6:
+                running_event["resuming_at_stage"] = completed_stage_num + 1
+            await emit(running_event)
+            usage_token = _USAGE_RUN_ID.set(run_id)
 
             try:
-                await self._stage1(run_id, council_model_ids, report, emit)
-                await self._stage2(run_id, council_model_ids, emit)
-                await self._stage3(run_id, council_model_ids, emit)
-                await self._stage4(run_id, emit)
-                await self._stage5(run_id, council_model_ids, emit)
-                await self._stage6(run_id, council_model_ids, emit)
+                if completed_stage_num < 1:
+                    await self._stage1(run_id, council_model_ids, report, emit)
+                if completed_stage_num < 2:
+                    await self._stage2(run_id, council_model_ids, emit)
+                if completed_stage_num < 3:
+                    await self._stage3(run_id, council_model_ids, emit)
+                if completed_stage_num < 4:
+                    await self._stage4(run_id, emit)
+                if completed_stage_num < 5:
+                    await self._stage5(run_id, council_model_ids, emit)
+                if completed_stage_num < 6:
+                    await self._stage6(run_id, council_model_ids, emit)
             except _NeedsAuth as e:
                 with session_scope() as session:
-                    update_run_status(
+                    project_run_status(
                         session, run_id, status="needs_auth", error_message=str(e)
                     )
-                operator_hint = (
-                    "run_pipeline surfaced _NeedsAuth from a model call; refresh CLIProxy login for the provider used by this run before retrying."
-                )
+                operator_hint = "run_pipeline surfaced _NeedsAuth from a model call; refresh CLIProxy login for the provider used by this run before retrying."
                 LOGGER.warning(
                     "pipeline_needs_auth",
                     error=str(e),
@@ -168,10 +214,13 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                         "operatorHint": operator_hint,
                     }
                 )
+                if current_execution() is not None and propagate_owned_errors:
+                    raise
                 return
             except Exception as e:
+                raise_if_execution_blocked(e)
                 with session_scope() as session:
-                    update_run_status(
+                    project_run_status(
                         session, run_id, status="failed", error_message=str(e)
                     )
                 operator_hint = _pipeline_failure_operator_hint()
@@ -184,10 +233,14 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                         "operatorHint": operator_hint,
                     }
                 )
+                if current_execution() is not None and propagate_owned_errors:
+                    raise
                 return
+            finally:
+                _USAGE_RUN_ID.reset(usage_token)
 
             with session_scope() as session:
-                update_run_status(session, run_id, status="complete")
+                project_run_status(session, run_id, status="complete")
             LOGGER.info("pipeline_completed")
             complete_payload = {
                 "run_id": run_id,

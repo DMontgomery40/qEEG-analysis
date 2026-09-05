@@ -10,12 +10,22 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
+from .model_selection import resolve_model_preference
+
 load_dotenv()
 
 CLIPROXY_BASE_URL = os.getenv("CLIPROXY_BASE_URL", "http://127.0.0.1:8317").rstrip("/")
 CLIPROXY_API_KEY = os.getenv("CLIPROXY_API_KEY", "")
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+# The clinic's data lives beside the code, not beside whatever directory someone
+# happened to launch from. A relative default meant a test suite run from the
+# production checkout wrote the live database, and a run from a worktree wrote a
+# different one — six patient rows reached the clinic's database that way.
+# An explicit DATA_DIR still wins, and a relative one is still honoured as given.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_DATA_DIR_ENV = os.getenv("DATA_DIR")
+DATA_DIR = Path(_DATA_DIR_ENV) if _DATA_DIR_ENV else REPO_ROOT / "data"
 REPORTS_DIR = DATA_DIR / "reports"
 PATIENT_FILES_DIR = DATA_DIR / "patient_files"
 ARTIFACTS_DIR = DATA_DIR / "artifacts"
@@ -81,41 +91,43 @@ def _load_models_from_env() -> list[CouncilModelConfig] | None:
 
 MODEL_ROLE_DEFAULTS = ModelRoleDefaults(
     stage1_vision=os.getenv(
-        "DEFAULT_STAGE1_VISION_MODEL", "gemini-3.1-flash-lite-preview"
+        "DEFAULT_STAGE1_VISION_MODEL", "z-ai/glm-5.3-flash"
     ),
-    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "gpt-5.5"),
+    stage2_review=os.getenv("DEFAULT_STAGE2_REVIEW_MODEL", "z-ai/glm-5.3-flash"),
     stage4_consolidator=os.getenv(
         "DEFAULT_STAGE4_CONSOLIDATOR",
-        os.getenv("DEFAULT_CONSOLIDATOR", "gpt-5.5"),
+        os.getenv("DEFAULT_CONSOLIDATOR", "z-ai/glm-5.3-flash"),
     ),
-    stage5_final_review=os.getenv("DEFAULT_STAGE5_REVIEW_MODEL", "gpt-5.5"),
+    stage5_final_review=os.getenv(
+        "DEFAULT_STAGE5_REVIEW_MODEL", "z-ai/glm-5.3-flash"
+    ),
     stage6_final_draft=os.getenv(
-        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "claude-sonnet-4-6"
+        "DEFAULT_STAGE6_FINAL_DRAFT_MODEL", "z-ai/glm-5.3-flash"
     ),
     patient_facing_rewrite=os.getenv(
-        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "gpt-5.5"
+        "DEFAULT_PATIENT_FACING_REWRITE_MODEL", "z-ai/glm-5.3-flash"
     ),
 )
 
 
 COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
     CouncilModelConfig(
-        id=MODEL_ROLE_DEFAULTS.stage2_review,
-        name="GPT-5.5 low",
+        id="deepseek-v4-flash",
+        name="DeepSeek V4 Flash",
+        source="CLIProxyAPI",
+        endpoint_preference="chat",
+    ),
+    CouncilModelConfig(
+        id="z-ai/glm-5.3-flash",
+        name="GLM 5.3 Flash",
+        source="OpenRouter via CLIProxyAPI",
+        endpoint_preference="chat",
+    ),
+    CouncilModelConfig(
+        id="openai/gpt-5.6-terra",
+        name="GPT-5.6 Terra",
         source="Subscription via CLIProxyAPI",
         endpoint_preference="responses",
-    ),
-    CouncilModelConfig(
-        id=MODEL_ROLE_DEFAULTS.stage6_final_draft,
-        name="Claude Sonnet 4.6",
-        source="Subscription via CLIProxyAPI",
-        endpoint_preference="chat",
-    ),
-    CouncilModelConfig(
-        id=MODEL_ROLE_DEFAULTS.stage1_vision,
-        name="Gemini 3.1 Flash Lite Preview",
-        source="Subscription via CLIProxyAPI",
-        endpoint_preference="chat",
     ),
 ]
 
@@ -124,6 +136,7 @@ DEFAULT_CONSOLIDATOR = MODEL_ROLE_DEFAULTS.stage4_consolidator
 # Models that support vision/multimodal input (can process images)
 # These will receive page images in addition to text for Stage 1 analysis
 VISION_CAPABLE_MODELS: set[str] = {
+    "z-ai/glm-5.3-flash",
     # OpenAI vision models (GPT-4o, GPT-4-turbo, GPT-5+ all support vision)
     "gpt-4o",
     "gpt-4o-mini",
@@ -133,6 +146,8 @@ VISION_CAPABLE_MODELS: set[str] = {
     "gpt-5.3",
     "gpt-5.4",
     "gpt-5.5",
+    "gpt-5.6",
+    "gpt-5.6-terra",
     "gpt-5.2-codex",
     "gpt-5.3-codex",
     "gpt-5.4-codex",
@@ -145,6 +160,8 @@ VISION_CAPABLE_MODELS: set[str] = {
     "openai/gpt-5.3",
     "openai/gpt-5.4",
     "openai/gpt-5.5",
+    "openai/gpt-5.6",
+    "openai/gpt-5.6-terra",
     "openai/gpt-5.2-codex",
     "openai/gpt-5.3-codex",
     "openai/gpt-5.4-codex",
@@ -198,6 +215,20 @@ VISION_CAPABLE_MODELS: set[str] = {
     "gemini-pro-vision",
     "google/gemini-pro-vision",
 }
+
+
+def resolve_role_model(
+    primary: str, fallback: str, discovered_model_ids: list[str] | set[str]
+) -> str:
+    """Choose a role model from live discovery, preserving isolated test runs."""
+    discovered = list(discovered_model_ids)
+    if not discovered:
+        return primary
+    resolved_primary = resolve_model_preference(primary, discovered)
+    if resolved_primary:
+        return resolved_primary
+    resolved_fallback = resolve_model_preference(fallback, discovered)
+    return resolved_fallback or primary
 
 
 def is_vision_capable(model_id: str) -> bool:
