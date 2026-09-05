@@ -2,10 +2,11 @@
 
 import hashlib
 import json
+from sqlalchemy import select
 from .clinic_catalogue import _write, _bump
 from .clinic_catalogue_reads import _json
 from .clinic_models import CatalogueConflict, CatalogueUnavailable
-from .clinic_records import ClinicLegacyUpload
+from .clinic_records import ClinicLegacyUpload, ClinicUpload, ClinicUploadItem
 from .clinic_intake import require_key, submit_upload
 
 
@@ -79,6 +80,17 @@ def import_submission_evidence(receipt, *, marker=None, files=None, registered=N
         or len(expected["uploaded"]) != len(m["files"])
     ):
         raise ValueError("Missing original upload response")
+    if registered is not None and (
+        not isinstance(registered, dict)
+        or set(registered) != {"patientId", "sourceIds"}
+        or not isinstance(registered["patientId"], str)
+        or not registered["patientId"]
+        or not isinstance(registered["sourceIds"], list)
+        or len(registered["sourceIds"]) != len(m["files"])
+        or any(not isinstance(sid, str) or not sid for sid in registered["sourceIds"])
+        or len(set(registered["sourceIds"])) != len(registered["sourceIds"])
+    ):
+        raise ValueError("Exact original ordered source bindings required")
 
     def matching_marker(value):
         return (
@@ -123,24 +135,39 @@ def import_submission_evidence(receipt, *, marker=None, files=None, registered=N
                 if not same_patient:
                     raise CatalogueConflict("Original registered chart binding changed")
 
-        # Preserve the first receipt and every distinct observation, including absent
-        # or mismatched markers. Replaying old phases cannot erase surviving proof.
+        # Preserve history as evidence. Each call supplies the current marker;
+        # an earlier marker may since have been consumed by the legacy worker.
         evidence.setdefault("originalSubmission", receipt)
         observations = evidence.setdefault("submissionObservations", [])
         observation = dict(receipt=receipt, marker=marker)
         if observation not in observations:
             observations.append(observation)
-        marker_seen = any(matching_marker(o["marker"]) for o in observations)
-        publishing_seen = any(
-            o["receipt"]["phase"] in ("publishing", "published") for o in observations
+        common = s.get(ClinicUpload, key)
+        bound_items = (
+            list(
+                s.scalars(
+                    select(ClinicUploadItem)
+                    .where(ClinicUploadItem.upload_id == key)
+                    .order_by(ClinicUploadItem.position)
+                )
+            )
+            if common
+            else []
+        )
+        common_bound = (
+            common is not None
+            and common.admission_key == key
+            and common.patient_uuid is not None
+            and [i.position for i in bound_items] == list(range(len(m["files"])))
+            and all(i.source_id for i in bound_items)
         )
         previous_status = (
             legacy.get("preReconciliationStatus", "uncertain")
             if legacy["status"] == "uncertain"
             else legacy["status"]
         )
-        uncertain = bool(legacy.get("patientId")) or (
-            (publishing_seen or previous_status == "uncertain") and not marker_seen
+        uncertain = not common_bound and (
+            bool(legacy.get("patientId")) or not matching_marker(marker)
         )
         record = {
             **legacy,

@@ -257,11 +257,7 @@ def test_existing_legacy_receipt_and_reconciliation_survive_process_replacement(
         legacy["patientId"] = "AB_02-02-1900"
     import_legacy_record(legacy)
     receipt = original(phase)
-    expected_status = (
-        "uncertain"
-        if phase != "admitted" or legacy_status == "registered"
-        else legacy_status
-    )
+    expected_status = "uncertain"
     returned = import_submission_evidence(receipt)
     snapshot = durable_legacy_snapshot()
     assert returned["status"] == expected_status
@@ -333,9 +329,13 @@ def test_import_preserves_phase_marker_history_and_rejects_changed_material(
         dict(receipt=published, marker=None),
         dict(receipt=published, marker=marker),
     ]
-    # Old observations can replay, but cannot erase newer reconciliation proof.
+    # Each call describes the current marker. History does not prove it survives.
     import_submission_evidence(first)
-    assert durable_legacy_snapshot() == state
+    current = durable_legacy_snapshot()
+    assert current["evidence"] == state["evidence"]
+    assert current["record"]["status"] == "uncertain"
+    assert current["record"]["resolution"] == legacy["resolution"]
+    state = current
     for field in ("manifest", "uploadedAt", "response"):
         changed = copy.deepcopy(published)
         if field == "manifest":
@@ -399,7 +399,11 @@ def test_reconciliation_keeps_later_operator_answer_and_original_conflict(
     )
     answer = {"forceNew": True}
     resolve_upload("original-id", key="operator-answer", resolution=answer)
-    assert import_submission_evidence(receipt)["status"] == "pending"
+    assert import_submission_evidence(receipt)["status"] == "uncertain"
+    assert (
+        import_submission_evidence(receipt, marker=original_marker())["status"]
+        == "pending"
+    )
     state = durable_legacy_snapshot()
     assert state["record"]["resolution"] == answer
     assert state["evidence"]["conflict"] == conflict
@@ -408,3 +412,207 @@ def test_reconciliation_keeps_later_operator_answer_and_original_conflict(
         dict(receipt=receipt, marker=mismatched),
         dict(receipt=receipt, marker=original_marker()),
     ]
+
+
+@pytest.mark.parametrize("force_new", [False, True])
+@pytest.mark.parametrize("prior_allocation", [False, True])
+@pytest.mark.parametrize("current_marker_kind", ["absent", "mismatched"])
+def test_current_marker_loss_blocks_fresh_admission_until_exact_reconciliation(
+    temp_data_dir, force_new, prior_allocation, current_marker_kind
+):
+    import os
+    import subprocess
+    import sys
+    from backend import clinic_intake
+    from backend.clinic_models import CatalogueConflict
+
+    receipt = original("publishing")
+    receipt["manifest"]["resolution"] = {"forceNew": True} if force_new else {}
+    receipt["manifestHash"] = hashlib.sha256(
+        json.dumps(receipt["manifest"], separators=(",", ":")).encode()
+    ).hexdigest()
+    marker = original_marker()
+    assert import_submission_evidence(receipt, marker=marker)["status"] == "pending"
+
+    def original_source():
+        return clinic_intake.submit_upload(
+            key="separate-original-consumer",
+            identity=receipt["manifest"]["identity"],
+            resolution=receipt["manifest"]["resolution"],
+            actor="Doctor",
+            files=[("same.txt", b"one", "text/plain")],
+            file_meta=[{}],
+        )["upload"]
+
+    source = original_source() if prior_allocation else None
+    before = counts()
+    current = (
+        None if current_marker_kind == "absent" else {**marker, "uploadedBy": "Another"}
+    )
+    # An earlier observed marker could have been consumed by a separate legacy
+    # registration. Replacement sees the current evidence and must not allocate.
+    paired = temp_data_dir.parent / (temp_data_dir.name + "-marker-paired")
+    paired.mkdir()
+    (paired / "data").symlink_to(temp_data_dir, target_is_directory=True)
+    code = """
+import json, sys
+from backend import storage
+from backend.llm_client import AsyncOpenAICompatClient
+from backend.paid_transport import PaidAsyncTransport, PaidSyncTransport
+calls=[]
+def forbidden(*a,**k):
+    calls.append('paid')
+    raise AssertionError('Import must not call providers')
+for name in ('chat_completions','responses','list_models'):
+    setattr(AsyncOpenAICompatClient,name,forbidden)
+PaidAsyncTransport.handle_async_request=forbidden
+PaidSyncTransport.handle_request=forbidden
+from backend.clinic_upload_import import import_submission_evidence
+from backend.tests.test_clinic_intake import counts
+storage.init_db()
+value=json.load(sys.stdin)
+result=import_submission_evidence(value['receipt'],marker=value['marker'],files=[('same.txt',b'one','text/plain')])
+print(json.dumps({'result':result,'counts':counts(),'calls':calls}))
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        input=json.dumps(dict(receipt=receipt, marker=current)),
+        env={
+            **os.environ,
+            "DATA_DIR": str(paired / "data"),
+            "QEEG_ANALYSIS_ROOT": str(paired),
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert child.returncode == 0, child.stderr
+    result = json.loads(child.stdout)
+    assert result["result"].get("status") == "uncertain"
+    assert tuple(result["counts"]) == before
+    assert result["calls"] == []
+    state = durable_legacy_snapshot()
+    assert state["shared"]["upload"]["status"] == "uncertain"
+    assert state["evidence"]["submissionObservations"] == [
+        dict(receipt=receipt, marker=marker),
+        dict(receipt=receipt, marker=current),
+    ]
+    assert (
+        import_submission_evidence(
+            receipt, marker=current, files=[("same.txt", b"one", "text/plain")]
+        )["status"]
+        == "uncertain"
+    )
+    assert counts() == before
+    if source is None:
+        source = original_source()
+    original_counts = counts()
+    registered = dict(
+        patientId=source["patientId"], sourceIds=[source["items"][0]["sourceId"]]
+    )
+    with pytest.raises(CatalogueConflict):
+        import_submission_evidence(
+            receipt,
+            marker=current,
+            files=[("same.txt", b"one", "text/plain")],
+            registered={**registered, "sourceIds": ["missing-source"]},
+        )
+    assert counts() == original_counts
+    accepted = import_submission_evidence(
+        receipt,
+        marker=current,
+        files=[("same.txt", b"one", "text/plain")],
+        registered=registered,
+    )["upload"]
+    assert accepted["patientId"] == source["patientId"]
+    assert [i["sourceId"] for i in accepted["items"]] == registered["sourceIds"]
+    assert accepted["status"] == "registered"
+    assert counts() == original_counts
+    # The original common binding now permits safe resume despite marker absence.
+    replay = import_submission_evidence(
+        receipt, marker=current, files=[("same.txt", b"one", "text/plain")]
+    )["upload"]
+    assert replay == accepted
+    assert counts() == original_counts
+
+
+def test_marker_loss_reuses_common_patient_binding_after_interrupted_item_filing(
+    temp_data_dir, monkeypatch
+):
+    from backend import patient_files
+
+    original_save = patient_files.save_patient_file_upload
+
+    def interrupted(**kwargs):
+        raise OSError("filing interrupted after durable patient binding")
+
+    monkeypatch.setattr(patient_files, "save_patient_file_upload", interrupted)
+    receipt = original("published")
+    receipt["manifest"]["resolution"] = {"forceNew": True}
+    receipt["manifestHash"] = hashlib.sha256(
+        json.dumps(receipt["manifest"], separators=(",", ":")).encode()
+    ).hexdigest()
+    first = import_submission_evidence(
+        receipt, marker=original_marker(), files=[("same.txt", b"one", "text/plain")]
+    )["upload"]
+    assert first["patientId"] == "AB_02-02-1900"
+    assert first["status"] == "failed"
+    assert counts() == (1, 1, 0, 0, 0)
+    monkeypatch.setattr(patient_files, "save_patient_file_upload", original_save)
+    resumed = import_submission_evidence(
+        receipt, marker=None, files=[("same.txt", b"one", "text/plain")]
+    )["upload"]
+    assert resumed["patientId"] == first["patientId"]
+    assert resumed["items"][0]["sourceId"] == first["items"][0]["sourceId"]
+    assert resumed["status"] == "registered"
+    assert counts() == (1, 1, 0, 1, 0)
+
+
+def test_marker_loss_does_not_treat_unbound_common_intent_as_allocation_proof(
+    temp_data_dir, monkeypatch
+):
+    from backend import clinic_intake
+    from backend.clinic_records import ClinicUpload
+    from backend import storage
+
+    bind = clinic_intake._bind_patient
+
+    def interrupted(upload_id):
+        raise OSError("interrupted before patient binding")
+
+    monkeypatch.setattr(clinic_intake, "_bind_patient", interrupted)
+    receipt = original("published")
+    files = [("same.txt", b"one", "text/plain")]
+    with pytest.raises(OSError, match="before patient binding"):
+        import_submission_evidence(receipt, marker=original_marker(), files=files)
+    with storage.session_scope() as session:
+        assert session.get(ClinicUpload, "original-id").patient_uuid is None
+    assert counts() == (0, 0, 0, 0, 0)
+    monkeypatch.setattr(clinic_intake, "_bind_patient", bind)
+    assert import_submission_evidence(receipt, files=files)["status"] == "uncertain"
+    assert counts() == (0, 0, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "registered",
+    [
+        {},
+        False,
+        {"patientId": "AB_02-02-1900"},
+        {"patientId": "AB_02-02-1900", "sourceIds": []},
+        {"patientId": "AB_02-02-1900", "sourceIds": [""]},
+    ],
+)
+def test_empty_or_incomplete_source_proof_cannot_bypass_current_marker_uncertainty(
+    temp_data_dir, registered
+):
+    receipt = original("published")
+    import_submission_evidence(receipt, marker=original_marker())
+    with pytest.raises(ValueError):
+        import_submission_evidence(
+            receipt,
+            marker=None,
+            files=[("same.txt", b"one", "text/plain")],
+            registered=registered,
+        )
+    assert counts() == (0, 0, 0, 0, 0)
