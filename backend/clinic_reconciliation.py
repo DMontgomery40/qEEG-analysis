@@ -345,6 +345,11 @@ def _original_args(row):
         document_kind="source-report" if kind == "report" else None,
         uploaded_at=row["uploadedAt"],
         provenance={kind + "Id": row["sourceId"]},
+        **(
+            {"sha256": row["sha256"], "size": row["size"]}
+            if row["status"] == "available"
+            else {}
+        ),
     )
 
 

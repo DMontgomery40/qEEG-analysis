@@ -413,3 +413,91 @@ reconcile.import_inventory('interrupted',remote_readback=lambda *a: iter([b'orig
     )
     with storage.session_scope() as session:
         assert session.scalar(select(func.count()).select_from(ClinicArtifact)) == 1
+
+
+@pytest.mark.parametrize("source_kind", ["report", "patient-file"])
+@pytest.mark.parametrize("replacement", [None, b"replaced", b"different-sized bytes"])
+def test_first_import_binds_original_inventory_bytes(
+    temp_data_dir, source_kind, replacement
+):
+    from backend.clinic_models import ClinicCatalogState
+
+    original = b"original"
+    path = temp_data_dir / "historical.txt"
+    path.write_bytes(original)
+    model = storage.Report if source_kind == "report" else storage.PatientFile
+    with storage.session_scope() as s:
+        patient = storage.create_patient(s, label="ZZ_01-01-1900")
+    # Historical original rows precede catalogue hooks. Core insertion models
+    # that first-import boundary without creating an artifact beforehand.
+    with storage.engine.begin() as connection:
+        connection.execute(
+            model.__table__.insert().values(
+                id="historical-source",
+                patient_id=patient.id,
+                filename=path.name,
+                mime_type="text/plain",
+                stored_path=str(path),
+                **(
+                    {"extracted_text_path": str(path)}
+                    if source_kind == "report"
+                    else {}
+                ),
+            )
+        )
+        connection.execute(
+            ClinicCatalogState.__table__.update().values(import_complete=False)
+        )
+    inventory = reconcile.build_inventory(
+        "original-bytes",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    row = next(
+        r
+        for r in reconcile.inventory_rows(inventory)
+        if r.get("sourceId") == "historical-source"
+    )
+    if replacement is not None:
+        path.write_bytes(replacement)
+        for _ in range(2):
+            with pytest.raises(CatalogueUnavailable):
+                reconcile.import_inventory(
+                    "original-bytes", remote_readback=lambda *a: (), activate=True
+                )
+            with storage.session_scope() as s:
+                assert s.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
+                assert not s.get(ClinicCatalogState, 1).import_complete
+                assert (
+                    s.scalar(
+                        select(func.count())
+                        .select_from(ClinicProjection)
+                        .where(ClinicProjection.artifact_id.is_not(None))
+                    )
+                    == 0
+                )
+                assert s.get(model, "historical-source").stored_path == str(path)
+        path.write_bytes(original)
+    # Restoration and untouched sources both admit the original bytes; exact
+    # replay retains the same identity/version and successful activation.
+    result = reconcile.import_inventory(
+        "original-bytes", remote_readback=lambda *a: (), activate=True
+    )
+    assert result["activated"]
+    assert (
+        reconcile.import_inventory(
+            "original-bytes", remote_readback=lambda *a: (), activate=True
+        )
+        == result
+    )
+    with storage.session_scope() as s:
+        artifacts = list(s.scalars(select(ClinicArtifact)))
+        assert len(artifacts) == 1
+        assert (artifacts[0].sha256, artifacts[0].size) == (row["sha256"], row["size"])
+        assert (
+            artifacts[0].source_kind,
+            artifacts[0].source_id,
+            artifacts[0].version,
+        ) == (source_kind, "historical-source", 1)
+        assert s.get(ClinicCatalogState, 1).import_complete
