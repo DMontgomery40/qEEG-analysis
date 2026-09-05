@@ -71,6 +71,9 @@ def _envelope(session, **payload):
 def _patient(session, patient_id):
     if not isinstance(patient_id, str) or not patient_id or len(patient_id) > 256:
         raise ValueError("Invalid patientId")
+    alias = session.get(ClinicPatientAlias, patient_id)
+    if alias is not None and alias.ambiguous:
+        raise CatalogueConflict("Historical patient alias is ambiguous")
     patients = list(
         session.scalars(
             select(storage.Patient).where(storage.Patient.label == patient_id)
@@ -80,12 +83,18 @@ def _patient(session, patient_id):
         raise CatalogueConflict("Patient identity is ambiguous")
     patient = patients[0] if patients else None
     if patient is None:
-        alias = session.get(ClinicPatientAlias, patient_id)
-        if alias is not None and alias.ambiguous:
-            raise CatalogueConflict("Historical patient alias is ambiguous")
         patient = session.get(storage.Patient, alias.patient_uuid) if alias else None
     if patient is None or not parse_canonical_patient_id(patient.label):
         raise CatalogueNotFound("Patient not found")
+    if (
+        session.scalar(
+            select(func.count())
+            .select_from(storage.Patient)
+            .where(storage.Patient.label == patient.label)
+        )
+        != 1
+    ):
+        raise CatalogueConflict("Current patient identity remains ambiguous")
     return patient
 
 

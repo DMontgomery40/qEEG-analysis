@@ -86,8 +86,13 @@ def _bump(session, patient_uuid=None):
     revision = session.scalar(
         select(ClinicCatalogState.revision).where(ClinicCatalogState.id == 1)
     )
-    if patient_uuid and revision is not None:
-        _touch_patient_revision(session, patient_uuid, revision)
+    if revision is None:
+        raise CatalogueUnavailable("Catalogue state is missing")
+    patients = (
+        {patient_uuid} if isinstance(patient_uuid, str) else (patient_uuid or set())
+    )
+    for patient in patients:
+        _touch_patient_revision(session, patient, revision)
     return revision
 
 
@@ -239,11 +244,13 @@ def _location(session, artifact, kind, key, patient_alias, verified, fingerprint
             )
         )
     )
+    affected = set()
     for other in others:
         previous = session.get(ClinicArtifact, other.artifact_id)
         if (previous.sha256, previous.size) != (artifact.sha256, artifact.size):
             other.active = False
             other.verified = False
+            affected.add(previous.patient_uuid)
     if location is None:
         location = ClinicLocation(
             id=str(uuid.uuid4()),
@@ -257,7 +264,7 @@ def _location(session, artifact, kind, key, patient_alias, verified, fingerprint
             fingerprint=fingerprint,
         )
         session.add(location)
-        return True
+        return affected | {artifact.patient_uuid}
     changed = (
         any(not other.active for other in others)
         or not location.active
@@ -268,7 +275,7 @@ def _location(session, artifact, kind, key, patient_alias, verified, fingerprint
         location.verified = verified
         location.verified_at = _now() if verified else None
         location.fingerprint = fingerprint
-    return changed
+    return affected | ({artifact.patient_uuid} if changed else set())
 
 
 def _register(
@@ -376,7 +383,7 @@ def _register(
             raise CatalogueConflict(
                 "Producer identity is already bound to different material"
             )
-        changed = False
+        affected = set()
     else:
         version = (
             session.scalar(
@@ -410,9 +417,9 @@ def _register(
             **material,
         )
         session.add(artifact)
-        changed = True
+        affected = {patient_uuid}
     if local_path:
-        changed = (
+        affected.update(
             _location(
                 session,
                 artifact,
@@ -422,7 +429,6 @@ def _register(
                 True,
                 fingerprint,
             )
-            or changed
         )
     projection = session.scalar(
         select(ClinicProjection).where(
@@ -432,8 +438,8 @@ def _register(
     )
     if projection is not None and projection.artifact_id != artifact.id:
         projection.artifact_id, projection.error = artifact.id, None
-        changed = True
-    return artifact, changed
+        affected.add(patient_uuid)
+    return artifact, affected
 
 
 def register_artifact(**kwargs):
@@ -448,9 +454,9 @@ def register_artifact(**kwargs):
     if kwargs.get("local_path") is not None:
         kwargs["_verified_local"] = _read_local(kwargs["local_path"])
     with _write() as session:
-        artifact, changed = _register(session, **kwargs)
-        if changed:
-            _bump(session, artifact.patient_uuid)
+        artifact, affected = _register(session, **kwargs)
+        if affected:
+            _bump(session, affected)
         session.flush()
         return _artifact_json(
             session, artifact, session.get(storage.Patient, artifact.patient_uuid)
@@ -491,8 +497,9 @@ def add_remote_location(file_id, key):
             known is None or known.patient_uuid != patient.id
         ):
             raise CatalogueConflict("Remote key belongs to an unbound patient alias")
-        if _location(session, artifact, "netlify", key, alias, False):
-            _bump(session, artifact.patient_uuid)
+        affected = _location(session, artifact, "netlify", key, alias, False)
+        if affected:
+            _bump(session, affected)
 
 
 def verify_remote_location(file_id, key, readback):
@@ -544,11 +551,11 @@ def resolve_projection(source_kind, source_id):
             if artifact is None:
                 raise CatalogueNotFound("Projection not found")
         else:
-            artifact, changed = _register(
+            artifact, affected = _register(
                 session, **json.loads(projection.payload_json)
             )
-            if changed:
-                _bump(session, artifact.patient_uuid)
+            if affected:
+                _bump(session, affected)
         session.flush()
         return _artifact_json(
             session, artifact, session.get(storage.Patient, artifact.patient_uuid)
@@ -616,7 +623,9 @@ def _producer_hook(session, flush_context, instances):
             uploaded_at=_millis(source.created_at),
         )
         try:
-            _register(session, **args)
+            _, affected = _register(session, **args)
+            for patient_uuid in affected:
+                _touch_patient_revision(session, patient_uuid, revision)
         except (CatalogueUnavailable, CatalogueNotFound, ValueError) as error:
             if isinstance(error, CatalogueConflict):
                 raise

@@ -650,3 +650,320 @@ def test_exact_historical_files_keep_original_chart_through_duplicate_relabels(
     other = register(healthy, temp_data_dir, "unrelated")
     with pytest.raises(catalogue.CatalogueNotFound):
         reads.file_binding(old, file_id=other["fileId"])
+
+
+@pytest.mark.parametrize("relabelled", [(), (0,), (1,), (0, 1)])
+@pytest.mark.parametrize("lookup", ["file_id", "file_key", "remote_key"])
+def test_persistent_duplicate_alias_matrix(temp_data_dir, relabelled, lookup):
+    old = "AA_01-01-1900"
+    patients, files = [], []
+    for i in range(2):
+        with storage.session_scope() as session:
+            patient = storage.create_patient(session, label=old)
+        patients.append(patient)
+        file = register(patient, temp_data_dir, f"duplicate-{i}")
+        catalogue.add_remote_location(file["fileId"], f"patients/{old}/files/{i}.pdf")
+        files.append(file)
+    with storage.session_scope() as session:
+        for i in relabelled:
+            storage.update_patient(session, patients[i].id, label=f"{old}_{i + 2}")
+        healthy = storage.create_patient(session, label="HH_02-02-1900")
+    with pytest.raises(catalogue.CatalogueConflict):
+        reads.roster(old)
+    assert reads.patient_files(healthy.label)["files"] == []
+    for i, file in enumerate(files):
+        key = {
+            "file_id": {"file_id": file["fileId"]},
+            "file_key": {"file_key": file["fileKey"]},
+            "remote_key": {"file_key": f"patients/{old}/files/{i}.pdf"},
+        }[lookup]
+        if not relabelled:
+            with pytest.raises(catalogue.CatalogueConflict):
+                reads.file_binding(old, **key)
+        else:
+            bound = reads.file_binding(old, **key)
+            assert bound["patientId"] == (f"{old}_{i + 2}" if i in relabelled else old)
+            assert bound["fileId"] == file["fileId"]
+
+
+def test_historical_alias_requires_unique_resolved_current_label(chart):
+    catalogue.register_patient_alias(chart.id, "historical-chart")
+    with storage.session_scope() as session:
+        storage.create_patient(session, label=chart.label)
+    with pytest.raises(catalogue.CatalogueConflict):
+        reads.roster("historical-chart")
+
+
+@pytest.mark.parametrize("kind", ["local", "remote"])
+@pytest.mark.parametrize("same_chart", [False, True])
+def test_location_replacement_revisions_and_unrelated_paging(
+    chart, temp_data_dir, kind, same_chart
+):
+    from backend.clinic_models import ClinicPatientCatalogState
+
+    with storage.session_scope() as session:
+        other = storage.create_patient(session, label="BB_02-02-1900")
+        unrelated = storage.create_patient(session, label="CC_03-03-1900")
+    target = chart if same_chart else other
+    for p in (chart, other, unrelated):
+        for i in range(2):
+            register(p, temp_data_dir, f"{p.id}-{i}")
+    old = register(chart, temp_data_dir, "shared", data=b"old")
+    key = f"patients/{chart.label}/files/shared.pdf"
+    if kind == "remote":
+        catalogue.add_remote_location(old["fileId"], key)
+        catalogue.verify_remote_location(old["fileId"], key, lambda: iter([b"old"]))
+        # Existing low-level duplicate history permits a recorded alias shared by
+        # both owners. Relabel the original so its explicit chart read is unique.
+        if not same_chart:
+            with storage.session_scope() as session:
+                storage.update_patient(session, other.id, label=chart.label)
+                storage.update_patient(session, chart.id, label="ZZ_01-01-1900_13")
+            chart.label = "ZZ_01-01-1900_13"
+            other.label = "ZZ_01-01-1900_12"
+        new = register(target, temp_data_dir, "replacement", data=b"new")
+    first = reads.patient_files(chart.label, mode="archive", page="1", limit=1)
+    stable = reads.patient_files(unrelated.label, mode="archive", page="1", limit=1)
+    before = reads.current_revision()
+    if kind == "local":
+        args = dict(
+            patient_uuid=target.id,
+            source_kind="replacement",
+            source_id="new",
+            original_name="shared.pdf",
+            logical_family="replacement",
+            local_path=temp_data_dir / "shared.pdf",
+        )
+        args["local_path"].write_bytes(b"new")
+        new = catalogue.register_artifact(**args)
+
+        def replay():
+            return catalogue.register_artifact(**args)
+    else:
+        catalogue.add_remote_location(new["fileId"], key)
+
+        def replay():
+            return catalogue.add_remote_location(new["fileId"], key)
+
+    assert reads.current_revision() == before + 1
+    with storage.session_scope() as session:
+        for p in (chart, target):
+            assert session.get(ClinicPatientCatalogState, p.id).revision == before + 1
+    with pytest.raises(catalogue.CatalogueConflict):
+        reads.patient_files(
+            chart.label, mode="archive", cursor=first["nextCursor"], limit=1
+        )
+    continued = reads.patient_files(
+        unrelated.label, mode="archive", cursor=stable["nextCursor"], limit=1
+    )
+    assert continued["indexVersion"] == stable["indexVersion"]
+    binding = reads.file_binding(chart.label, file_id=old["fileId"])
+    location = next(
+        location
+        for location in binding["locations"]
+        if location["kind"] == ("netlify" if kind == "remote" else kind)
+    )
+    assert not location["active"] and not location["verified"]
+    replay()
+    assert reads.current_revision() == before + 1
+
+
+@pytest.mark.parametrize(
+    "operation", ["create", "update", "report", "file", "pending", "register"]
+)
+def test_initialized_missing_state_rolls_back_producer_and_projection(
+    chart, temp_data_dir, operation
+):
+    from sqlalchemy import select, func
+    from backend.clinic_models import (
+        ClinicCatalogState,
+        ClinicArtifact,
+        ClinicProjection,
+        ClinicPatientCatalogState,
+    )
+
+    models = (
+        storage.Patient,
+        storage.Report,
+        storage.PatientFile,
+        ClinicArtifact,
+        ClinicProjection,
+        ClinicPatientCatalogState,
+    )
+    with storage.session_scope() as session:
+        counts = [session.scalar(select(func.count()).select_from(m)) for m in models]
+        notes = session.get(storage.Patient, chart.id).notes
+        session.execute(ClinicCatalogState.__table__.delete())
+        session.commit()
+    path = temp_data_dir / "source.pdf"
+    if operation != "pending":
+        path.write_bytes(b"source")
+    with pytest.raises(catalogue.CatalogueUnavailable):
+        with storage.session_scope() as session:
+            if operation == "create":
+                storage.create_patient(session, label="MM_04-04-1900")
+            elif operation == "update":
+                storage.update_patient(
+                    session, chart.id, label=chart.label, notes="must roll back"
+                )
+            elif operation == "report":
+                storage.create_report(
+                    session,
+                    patient_id=chart.id,
+                    filename="source.pdf",
+                    mime_type="application/pdf",
+                    stored_path=path,
+                    extracted_text_path=path,
+                )
+            elif operation in ("file", "pending"):
+                storage.create_patient_file(
+                    session,
+                    patient_id=chart.id,
+                    filename="source.pdf",
+                    mime_type="application/pdf",
+                    size_bytes=6,
+                    stored_path=path,
+                )
+            else:
+                register(chart, temp_data_dir, "explicit")
+    with storage.session_scope() as session:
+        assert [
+            session.scalar(select(func.count()).select_from(m)) for m in models
+        ] == counts
+        assert session.get(storage.Patient, chart.id).notes == notes
+        assert session.get(ClinicCatalogState, 1) is None
+
+
+@pytest.mark.parametrize("producer", ["hook", "projection"])
+def test_source_location_replacement_touches_original_chart(
+    chart, temp_data_dir, producer
+):
+    from backend.clinic_models import ClinicPatientCatalogState
+
+    with storage.session_scope() as session:
+        target = storage.create_patient(session, label="TT_02-02-1900")
+    original = register(chart, temp_data_dir, "shared")
+    path = temp_data_dir / "shared.pdf"
+    if producer == "projection":
+        path.unlink()
+    else:
+        path.write_bytes(b"replacement")
+    before = reads.current_revision()
+    with storage.session_scope() as session:
+        source = storage.create_patient_file(
+            session,
+            patient_id=target.id,
+            filename="replacement.pdf",
+            mime_type="application/pdf",
+            size_bytes=11,
+            stored_path=path,
+        )
+    if producer == "projection":
+        path.write_bytes(b"replacement")
+        before = reads.current_revision()
+        catalogue.resolve_projection("patient-file", source.id)
+    with storage.session_scope() as session:
+        for p in (chart, target):
+            assert session.get(ClinicPatientCatalogState, p.id).revision == before + 1
+    assert not reads.file_binding(chart.label, file_id=original["fileId"])["locations"][
+        0
+    ]["active"]
+    if producer == "projection":
+        catalogue.resolve_projection("patient-file", source.id)
+        assert reads.current_revision() == before + 1
+
+
+@pytest.mark.parametrize("kind", ["local", "remote"])
+@pytest.mark.parametrize("same_chart", [False, True])
+def test_location_retirement_and_all_revisions_rollback(
+    chart, temp_data_dir, kind, same_chart, monkeypatch
+):
+    from backend.clinic_models import ClinicLocation, ClinicPatientCatalogState
+    from sqlalchemy import select
+
+    original = register(chart, temp_data_dir, "old")
+    key = f"patients/{chart.label}/files/shared.pdf"
+    with storage.session_scope() as session:
+        target = (
+            chart
+            if same_chart
+            else storage.create_patient(
+                session, label=chart.label if kind == "remote" else "BB_02-02-1900"
+            )
+        )
+    if kind == "remote":
+        catalogue.add_remote_location(original["fileId"], key)
+        new = register(target, temp_data_dir, "new", data=b"new")
+    with storage.session_scope() as session:
+        old_revisions = {
+            p.id: session.get(ClinicPatientCatalogState, p.id).revision
+            for p in (chart, target)
+        }
+    global_revision = reads.current_revision()
+    real_touch = catalogue._touch_patient_revision
+
+    def fail_after_touch(session, patient_uuid, revision):
+        real_touch(session, patient_uuid, revision)
+        raise RuntimeError("injected failure after revision update")
+
+    monkeypatch.setattr(catalogue, "_touch_patient_revision", fail_after_touch)
+    with pytest.raises(RuntimeError):
+        if kind == "remote":
+            catalogue.add_remote_location(new["fileId"], key)
+        else:
+            path = temp_data_dir / "old.pdf"
+            path.write_bytes(b"new")
+            catalogue.register_artifact(
+                patient_uuid=target.id,
+                source_kind="test",
+                source_id="replacement",
+                original_name="new.pdf",
+                logical_family="report",
+                local_path=path,
+            )
+    assert reads.current_revision() == global_revision
+    with storage.session_scope() as session:
+        for patient_id, revision in old_revisions.items():
+            assert (
+                session.get(ClinicPatientCatalogState, patient_id).revision == revision
+            )
+        locations = list(
+            session.scalars(
+                select(ClinicLocation).where(
+                    ClinicLocation.artifact_id == original["fileId"]
+                )
+            )
+        )
+        assert all(location.active for location in locations)
+
+
+def test_missing_state_rolls_back_materialized_projection(chart, temp_data_dir):
+    from sqlalchemy import select, func
+    from backend.clinic_models import (
+        ClinicCatalogState,
+        ClinicArtifact,
+        ClinicProjection,
+    )
+
+    path = temp_data_dir / "later.pdf"
+    with storage.session_scope() as session:
+        source = storage.create_patient_file(
+            session,
+            patient_id=chart.id,
+            filename="later.pdf",
+            mime_type="application/pdf",
+            size_bytes=5,
+            stored_path=path,
+        )
+        session.execute(ClinicCatalogState.__table__.delete())
+        session.commit()
+    path.write_bytes(b"later")
+    with pytest.raises(catalogue.CatalogueUnavailable):
+        catalogue.resolve_projection("patient-file", source.id)
+    with storage.session_scope() as session:
+        projection = session.scalar(
+            select(ClinicProjection).where(ClinicProjection.source_id == source.id)
+        )
+        assert projection.artifact_id is None and projection.error is not None
+        assert session.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
+        assert session.get(storage.PatientFile, source.id) is not None
