@@ -636,3 +636,46 @@ async def owned_to_thread(function, *args):
             task.exception()
         raise cancelled
     return task.result()
+
+
+def current_paid_scope():
+    """Expose sticky execution authority to the shared patient report retry loop."""
+    return _scope.get()
+
+
+@contextmanager
+def post_paid_scope(owner, kind, manifest_path, manifest_hash, source_fingerprint):
+    """Narrow post-only scope; leaves council admission/attestation untouched."""
+    from pathlib import Path
+
+    with owner.file_guard():
+        try:
+            raw = Path(manifest_path).read_bytes()
+            saved = json.loads(raw)
+            valid = (
+                _hash(raw) == manifest_hash
+                and saved["run_id"] == owner.run_id
+                and saved["kind"] == kind == "patient_facing"
+                and saved["source_fingerprint"] == source_fingerprint
+            )
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise ExecutionConflict("invalid post-only manifest") from error
+        if not valid:
+            raise ExecutionConflict("post-only scope differs from source manifest")
+    with owner.transaction() as session:
+        row = session.get(storage.PostObligation, (owner.run_id, kind))
+        if (
+            row is None
+            or row.state not in ("pending", "owned")
+            or (row.manifest_path, row.manifest_hash)
+            != (str(manifest_path), manifest_hash)
+        ):
+            raise ExecutionConflict("post-only obligation differs from scope")
+    cursor = PaidScope(
+        owner, "post/patient_facing/generation", manifest_hash, source_fingerprint
+    )
+    token = _scope.set(cursor)
+    try:
+        yield cursor
+    finally:
+        _scope.reset(token)

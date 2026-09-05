@@ -236,7 +236,12 @@ def prepare_execution(owner, *, llm_client=None):
         },
     }
     root = Path(__file__).resolve().parents[1]
+    from ..patient_postprocessing import snapshot_post_config
+
     manifest = {
+        "postprocessing": snapshot_post_config(
+            env, discovered, base_url=transport["base_url"], timeout_s=600.0
+        ),
         "schema_version": 1,
         "admission": admission,
         "settings": env,
@@ -750,7 +755,10 @@ def _verify_admitted_sources(admission):
 
 def _settings_snapshot():
     root = Path(__file__).resolve().parents[1]
-    consumers = list((root / "council").rglob("*.py")) + [root / "llm_client.py"]
+    consumers = list((root / "council").rglob("*.py")) + [
+        root / "llm_client.py",
+        root / "patient_postprocessing.py",
+    ]
     names = set()
     for path in consumers:
         names.update(re.findall(r"\bQEEG_[A-Z0-9_]+\b", path.read_text()))

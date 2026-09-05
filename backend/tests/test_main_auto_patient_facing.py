@@ -471,3 +471,42 @@ async def test_auto_cathode_video_prepares_handoff_and_spawns_queue(
         e.get("stage_name") == "cathode_video" and e.get("status") == "queued"
         for e in broker.events
     )
+
+
+def test_owned_completion_retires_automatic_cathode_without_dispatch(
+    temp_data_dir, monkeypatch
+):
+    from types import SimpleNamespace
+    from backend import main, patient_postprocessing as post, storage
+    from backend.council import completion
+    from backend.tests.test_patient_postprocessing import ready as ready_fixture
+    from sqlalchemy import select
+
+    store, run_id, cfg = ready_fixture.__wrapped__(temp_data_dir, monkeypatch)
+    cfg["retired_cathode_flag"] = "1"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "new owned completion launched a legacy automatic dispatcher"
+        )
+
+    monkeypatch.setattr(main, "_auto_generate_cathode_video_for_run", forbidden)
+    store.request_run_start(run_id)
+    owner = store.claim_run_owner(run_id)
+    monkeypatch.setattr(
+        completion,
+        "current_execution",
+        lambda: SimpleNamespace(owner=owner, manifest={"postprocessing": cfg}),
+    )
+    try:
+        completion.project_run_status(None, run_id, status="complete")
+        with owner.transaction() as session:
+            cathode = session.get(storage.PostObligation, (run_id, "cathode"))
+            assert cathode.state == "skipped"
+            assert not list(session.scalars(select(storage.PaidRequest)))
+        assert (
+            post._load(cathode.manifest_path)["diagnostic"]
+            == "automatic_cathode_routing_retired"
+        )
+    finally:
+        owner.release()

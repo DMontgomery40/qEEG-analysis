@@ -103,3 +103,60 @@ def test_patient_facing_writer_validates_all_required_sections():
         script._validate_patient_facing_markdown(
             complete.replace("## Spectral Power Summary", "")
         )
+
+
+@pytest.mark.asyncio
+async def test_shared_writeup_recipe_is_used_by_cli(
+    temp_data_dir, tmp_path, monkeypatch
+):
+    """The standalone explicit-source action reaches the same shared recipe."""
+    from scripts import generate_patient_facing_writeups as script
+
+    source = tmp_path / "source.md"
+    source.write_text("Authoritative council findings")
+    received = []
+
+    class Client:
+        async def list_models(self):
+            return ["writer"]
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(script, "AsyncOpenAICompatClient", lambda **kw: Client())
+
+    async def shared(llm, **kwargs):
+        received.append(kwargs)
+
+    monkeypatch.setattr(script, "generate_writeup", shared)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "script",
+            "--patient-label",
+            "ZZ_01-01-1900",
+            "--portal-dir",
+            str(tmp_path),
+            "--source-markdown",
+            str(source),
+            "--model",
+            "writer",
+            "--version",
+            "explicit-v7",
+            "--date",
+            "2026-01-02",
+            "--overwrite",
+            "--no-sync",
+        ],
+    )
+    assert await script.main() == 0
+    assert len(received) == 1
+    call = received[0]
+    assert "Authoritative council findings" in call["prompt"]
+    assert call["max_tokens"] == 12000
+    assert call["overwrite"] and call["no_sync"]
+    assert (
+        call["md_path"].name
+        == "ZZ_01-01-1900__patient-facing__explicit-v7__2026-01-02.md"
+    )

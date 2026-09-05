@@ -63,7 +63,19 @@ def project_run_status(session, run_id, *, status, error_message=""):
         )
     if run_id != ctx.owner.run_id:
         raise ExecutionConflict("run status projection belongs to another owner")
+    prepared_posts = None
+    if status == "complete":
+        from ..patient_postprocessing import (
+            prepare_completion_posts,
+            register_completion_posts,
+        )
+
+        prepared_posts = prepare_completion_posts(
+            ctx.owner, ctx.manifest["postprocessing"]
+        )
     with ctx.owner.transaction() as owned_session:
+        if prepared_posts is not None:
+            register_completion_posts(owned_session, ctx.owner, prepared_posts)
         run = owned_session.get(storage.Run, run_id)
         run.status, run.error_message = status, error_message
         if status == "running" and run.started_at is None:

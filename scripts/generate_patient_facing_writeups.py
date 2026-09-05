@@ -71,8 +71,7 @@ def _validate_patient_facing_markdown(markdown: str) -> None:
     ]
     if missing:
         raise ValueError(
-            "Patient-facing report is missing required sections: "
-            + ", ".join(missing)
+            "Patient-facing report is missing required sections: " + ", ".join(missing)
         )
 
 
@@ -100,6 +99,12 @@ async def _chat_with_retries(
                 stream=False,
             )
         except UpstreamError as exc:
+            from backend.paid_transport import current_paid_scope
+
+            scope = current_paid_scope()
+            if scope is not None:
+                scope.raise_if_blocked()
+                raise
             last_error = exc
             retryable = exc.status_code in {429, 500, 502, 503, 504, None}
             if not retryable or attempt == attempts - 1:
@@ -161,42 +166,42 @@ def _best_source_bundle_for_label(label: str) -> SourceBundle | None:
         )
         arts = list_artifacts(session, run.id)
 
-        # Prefer 2–3 Stage 6 final drafts.
-        stage6 = [a for a in arts if a.stage_num == 6 and a.kind == "final_draft"]
-        stage6_sorted = sorted(stage6, key=lambda a: a.created_at, reverse=True)
+        chosen = select_source_artifacts(run, arts)
+        return (
+            SourceBundle(patient=patient, run=run, artifacts=chosen) if chosen else None
+        )
 
-        chosen: list[Artifact] = []
-        if run.selected_artifact_id:
-            sel = next(
-                (a for a in stage6_sorted if a.id == run.selected_artifact_id), None
-            )
-            if sel is not None:
-                chosen.append(sel)
-                stage6_sorted = [a for a in stage6_sorted if a.id != sel.id]
 
-        for a in stage6_sorted:
-            if len(chosen) >= 3:
+def select_source_artifacts(run, arts):
+    # Prefer 2–3 Stage 6 final drafts.
+    stage6 = [a for a in arts if a.stage_num == 6 and a.kind == "final_draft"]
+    stage6_sorted = sorted(stage6, key=lambda a: a.created_at, reverse=True)
+
+    chosen: list[Artifact] = []
+    if run.selected_artifact_id:
+        sel = next((a for a in stage6_sorted if a.id == run.selected_artifact_id), None)
+        if sel is not None:
+            chosen.append(sel)
+            stage6_sorted = [a for a in stage6_sorted if a.id != sel.id]
+
+    for a in stage6_sorted:
+        if len(chosen) >= 3:
+            break
+        chosen.append(a)
+
+    # If we still don't have at least 2 distinct "perspectives", fall back to consolidation then revision.
+    if len(chosen) < 2:
+        stage4 = [a for a in arts if a.stage_num == 4 and a.kind == "consolidation"]
+        if stage4:
+            chosen.append(sorted(stage4, key=lambda a: a.created_at, reverse=True)[0])
+    if len(chosen) < 2:
+        stage3 = [a for a in arts if a.stage_num == 3 and a.kind == "revision"]
+        for a in sorted(stage3, key=lambda a: a.created_at, reverse=True):
+            if len(chosen) >= 2:
                 break
             chosen.append(a)
 
-        # If we still don't have at least 2 distinct "perspectives", fall back to consolidation then revision.
-        if len(chosen) < 2:
-            stage4 = [a for a in arts if a.stage_num == 4 and a.kind == "consolidation"]
-            if stage4:
-                chosen.append(
-                    sorted(stage4, key=lambda a: a.created_at, reverse=True)[0]
-                )
-        if len(chosen) < 2:
-            stage3 = [a for a in arts if a.stage_num == 3 and a.kind == "revision"]
-            for a in sorted(stage3, key=lambda a: a.created_at, reverse=True):
-                if len(chosen) >= 2:
-                    break
-                chosen.append(a)
-
-        if not chosen:
-            return None
-
-        return SourceBundle(patient=patient, run=run, artifacts=chosen)
+    return chosen
 
 
 def _read_text(path: str) -> str:
@@ -337,6 +342,78 @@ def _explicit_markdown_sources(paths: list[str]) -> list[tuple[str, str]]:
     return out
 
 
+async def generate_writeup(
+    llm,
+    *,
+    model_id,
+    prompt,
+    temperature,
+    max_tokens,
+    label,
+    meta,
+    md_path,
+    pdf_path,
+    meta_path,
+    overwrite=False,
+    no_sync=False,
+    publisher=None,
+):
+    """Existing generation/validation/render recipe, with an owned publication seam."""
+    md = await _chat_with_retries(
+        llm,
+        model_id=model_id,
+        prompt=prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    md = (md or "").strip()
+    _validate_patient_facing_markdown(md)
+    if publisher is not None:
+        return publisher(md, meta)
+    out_dir, stem = md_path.parent, md_path.stem
+    with tempfile.TemporaryDirectory(dir=out_dir, prefix=f".{stem}.") as temp_dir_raw:
+        temp_dir = Path(temp_dir_raw)
+        temp_md_path = temp_dir / md_path.name
+        temp_pdf_path = temp_dir / pdf_path.name
+        temp_meta_path = temp_dir / meta_path.name
+
+        temp_md_path.write_text(md + "\n", encoding="utf-8")
+        temp_meta_path.write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        render_patient_facing_markdown_to_pdf(md, temp_pdf_path, patient_label=label)
+
+        if not overwrite and (
+            md_path.exists() or pdf_path.exists() or meta_path.exists()
+        ):
+            print(f"SKIP {label}: outputs exist (use --overwrite): {md_path.name}")
+            return None
+
+        moved_paths: list[Path] = []
+        try:
+            for src, dst in (
+                (temp_md_path, md_path),
+                (temp_pdf_path, pdf_path),
+                (temp_meta_path, meta_path),
+            ):
+                src.replace(dst)
+                moved_paths.append(dst)
+        except Exception:
+            for path in moved_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
+
+    if not no_sync:
+        synced = sync_patient_to_thrylen(label)
+        print(
+            f"PORTAL SYNC {label}: {'completed' if synced else 'skipped'}",
+            flush=True,
+        )
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(
         description="Generate patient-facing qEEG writeups into portal folders."
@@ -358,7 +435,10 @@ async def main() -> int:
         help=f"Preferred model id (default: {DEFAULT_PATIENT_FACING_MODEL})",
     )
     ap.add_argument(
-        "--max-tokens", type=int, default=12000, help="Max output tokens (default: 12000)"
+        "--max-tokens",
+        type=int,
+        default=12000,
+        help="Max output tokens (default: 12000)",
     )
     ap.add_argument(
         "--temperature", type=float, default=0.2, help="LLM temperature (default: 0.2)"
@@ -522,61 +602,20 @@ async def main() -> int:
             continue
 
         assert llm is not None
-        md = await _chat_with_retries(
+        await generate_writeup(
             llm,
             model_id=model_id,
             prompt=prompt,
             temperature=float(args.temperature),
             max_tokens=int(args.max_tokens),
+            label=label,
+            meta=meta,
+            md_path=md_path,
+            pdf_path=pdf_path,
+            meta_path=meta_path,
+            overwrite=args.overwrite,
+            no_sync=args.no_sync,
         )
-        md = (md or "").strip()
-        _validate_patient_facing_markdown(md)
-
-        with tempfile.TemporaryDirectory(
-            dir=out_dir, prefix=f".{stem}."
-        ) as temp_dir_raw:
-            temp_dir = Path(temp_dir_raw)
-            temp_md_path = temp_dir / md_path.name
-            temp_pdf_path = temp_dir / pdf_path.name
-            temp_meta_path = temp_dir / meta_path.name
-
-            temp_md_path.write_text(md + "\n", encoding="utf-8")
-            temp_meta_path.write_text(
-                json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            render_patient_facing_markdown_to_pdf(
-                md, temp_pdf_path, patient_label=label
-            )
-
-            if not args.overwrite and (
-                md_path.exists() or pdf_path.exists() or meta_path.exists()
-            ):
-                print(f"SKIP {label}: outputs exist (use --overwrite): {md_path.name}")
-                continue
-
-            moved_paths: list[Path] = []
-            try:
-                for src, dst in (
-                    (temp_md_path, md_path),
-                    (temp_pdf_path, pdf_path),
-                    (temp_meta_path, meta_path),
-                ):
-                    src.replace(dst)
-                    moved_paths.append(dst)
-            except Exception:
-                for path in moved_paths:
-                    try:
-                        path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                raise
-
-        if not args.no_sync:
-            synced = sync_patient_to_thrylen(label)
-            print(
-                f"PORTAL SYNC {label}: {'completed' if synced else 'skipped'}",
-                flush=True,
-            )
 
     if llm is not None:
         await llm.aclose()

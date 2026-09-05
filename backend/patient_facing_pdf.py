@@ -3,9 +3,12 @@ Beautiful patient-facing PDF renderer using HTML/CSS and WeasyPrint.
 
 This creates actual beautiful documents, not corporate garbage.
 """
+
 from __future__ import annotations
 
 import base64
+from contextvars import ContextVar
+from contextlib import contextmanager
 import os
 import re
 from pathlib import Path
@@ -39,8 +42,10 @@ def _import_weasyprint():
 
     return HTML, CSS
 
+
 # Markdown extensions for tables
 MD_EXTENSIONS = ["tables", "smarty"]
+
 
 def _resolve_logo_path() -> Path | None:
     """Resolve patient-facing logo path with explicit override and safe fallbacks."""
@@ -99,8 +104,24 @@ def render_patient_facing_markdown_to_pdf(
     HTML(string=html).write_pdf(str(output_path), stylesheets=[CSS(string=_get_css())])
 
 
+_owned_logo = ContextVar("patient_pdf_logo", default=None)
+
+
+@contextmanager
+def patient_pdf_assets(logo_uri):
+    """Use the admitted logo bytes for one owned render; legacy callers resolve normally."""
+    token = _owned_logo.set(logo_uri)
+    try:
+        yield
+    finally:
+        _owned_logo.reset(token)
+
+
 def _get_logo_base64() -> str:
     """Get the logo as a base64 data URI."""
+    pinned = _owned_logo.get()
+    if pinned is not None:
+        return pinned
     logo_path = _resolve_logo_path()
     if logo_path is not None:
         with open(logo_path, "rb") as f:
@@ -138,16 +159,16 @@ def _build_html_document(
 
     # Replace the Technical Appendix h1 with cover + h1
     content_html = re.sub(
-        r'<h1>Technical Appendix</h1>',
+        r"<h1>Technical Appendix</h1>",
         appendix_cover + '<h1 class="appendix-h1">Technical Appendix</h1>',
         content_html,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
     content_html = re.sub(
-        r'<h1>\s*Technical\s+Appendix\s*</h1>',
+        r"<h1>\s*Technical\s+Appendix\s*</h1>",
         appendix_cover + '<h1 class="appendix-h1">Technical Appendix</h1>',
         content_html,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
     return f"""<!DOCTYPE html>
@@ -178,7 +199,7 @@ def _build_html_document(
 def _get_css() -> str:
     """Return the CSS for beautiful PDF rendering."""
     logo_uri = _get_logo_base64()
-    
+
     # Build watermark CSS if logo exists
     watermark_css = ""
     if logo_uri:
@@ -200,8 +221,9 @@ def _get_css() -> str:
         pointer-events: none;
     }}
 """
-    
-    return """
+
+    return (
+        """
 @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&display=swap');
 
 @page {
@@ -225,7 +247,9 @@ def _get_css() -> str:
 * {
     box-sizing: border-box;
 }
-""" + watermark_css + """
+"""
+        + watermark_css
+        + """
 body {
     font-family: 'Source Serif 4', Georgia, 'Times New Roman', serif;
     font-size: 11pt;
@@ -590,3 +614,4 @@ h1.appendix-h1 + p em {
     display: none; /* Hide the "For patients who wish to share..." since it's on the cover now */
 }
 """
+    )
