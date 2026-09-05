@@ -28,6 +28,18 @@ from .clinic_models import (
 from .clinic_intake import _immutable, upload_lock
 from .patient_identity import parse_canonical_patient_id
 
+ROOT_OPERATIONAL_FILES = frozenset(
+    {
+        ".DS_Store",
+        ".qeeg_portal_netlify_sync.lock",
+        ".qeeg_portal_sync_state.json",
+        "_README.txt",
+        ".qeeg_portal_local_pipeline_state.json",
+        ".qeeg_portal_sync_watch_state.json",
+        ".qeeg_portal_netlify_sync.spawn.lock",
+    }
+)
+
 
 def _digest(chunks, limit):
     digest = hashlib.sha256()
@@ -252,6 +264,26 @@ def build_inventory(
                         )
                         try:
                             with path.open("rb") as stream:
+                                if (
+                                    path.parent == portal
+                                    and name in ROOT_OPERATIONAL_FILES
+                                    and not path.is_symlink()
+                                ):
+                                    raw = stream.read(max_file_bytes + 1)
+                                    row["sha256"], row["size"] = _digest(
+                                        [raw], max_file_bytes
+                                    )
+                                    object_name = (
+                                        "operational-"
+                                        + hashlib.sha256(str(path).encode()).hexdigest()
+                                        + ".bin"
+                                    )
+                                    _immutable(root / "objects" / object_name, raw)
+                                    row.update(
+                                        kind="root-operational",
+                                        rawOperational=object_name,
+                                    )
+                                    stream.seek(0)
                                 row["sha256"], row["size"] = _digest(
                                     iter(lambda: stream.read(65536), b""),
                                     max_file_bytes,
@@ -686,6 +718,26 @@ def import_inventory(inventory_id, *, remote_readback, activate=False):
                     result = "retained_missing"
                 elif row["status"] != "available":
                     raise CatalogueUnavailable("Original inventory source unavailable")
+                elif row["kind"] == "root-operational":
+                    from .portal_sync import portal_patients_dir
+
+                    path = Path(row["path"])
+                    if (
+                        path.parent != portal_patients_dir()
+                        or path.name not in ROOT_OPERATIONAL_FILES
+                        or path.is_symlink()
+                    ):
+                        raise CatalogueConflict("Original operational path changed")
+                    original = (root / "objects" / row["rawOperational"]).read_bytes()
+                    if _digest([original], row["size"]) != (row["sha256"], row["size"]):
+                        raise CatalogueConflict("Original operational evidence changed")
+                    with path.open("rb") as stream:
+                        observed = _digest(
+                            iter(lambda: stream.read(65536), b""), row["size"]
+                        )
+                    if observed != (row["sha256"], row["size"]):
+                        raise CatalogueConflict("Original operational bytes changed")
+                    result = "retained_operational"
                 elif row["kind"] == "engine-source":
                     with storage.session_scope() as s:
                         existing = s.scalar(

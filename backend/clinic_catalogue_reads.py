@@ -165,7 +165,7 @@ def _location_verified(location):
     return True
 
 
-def _artifact_json(session, artifact, patient):
+def _artifact_json(session, artifact, patient, *, locations=None, feedback_events=None):
     from .clinic_feedback import current_feedback
 
     if (
@@ -181,11 +181,15 @@ def _artifact_json(session, artifact, patient):
             raise ValueError()
     except ValueError as error:
         raise CatalogueUnavailable("Catalogue provenance is malformed") from error
-    locations = list(
-        session.scalars(
-            select(ClinicLocation)
-            .where(ClinicLocation.artifact_id == artifact.id)
-            .order_by(ClinicLocation.kind, ClinicLocation.key)
+    locations = (
+        locations
+        if locations is not None
+        else list(
+            session.scalars(
+                select(ClinicLocation)
+                .where(ClinicLocation.artifact_id == artifact.id)
+                .order_by(ClinicLocation.kind, ClinicLocation.key)
+            )
         )
     )
     canonical = parse_canonical_patient_id(patient.label)
@@ -212,7 +216,7 @@ def _artifact_json(session, artifact, patient):
         generatedAt=artifact.generated_at,
         documentKind=artifact.document_kind,
         sessionDate=artifact.session_date,
-        feedback=current_feedback(session, artifact.id),
+        feedback=current_feedback(session, artifact.id, events=feedback_events),
         archived=artifact.archived,
         provenance=provenance,
         locations=[

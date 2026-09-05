@@ -448,3 +448,153 @@ def test_expected_producer_pair_rejects_invalid_material_without_snapshot(
     )
     assert response.status_code == 400, response.text
     assert not (root / "clinic_producer_bytes").exists()
+
+
+@pytest.mark.parametrize("admitted_before_patch", [False, True])
+@pytest.mark.parametrize("current_folder", ["absent", "empty", "different"])
+def test_original_producer_alias_survives_patch_and_exact_replay(
+    live_api, monkeypatch, admitted_before_patch, current_folder
+):
+    client, chart, root = live_api
+    portal = root / "portal_patients"
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal))
+    original_path = portal / chart.label / "original.mp4"
+    original_path.parent.mkdir(parents=True)
+    original_path.write_bytes(b"original")
+    operation = {
+        "operationId": "relabel-original",
+        "patientId": chart.label,
+        "producer": "renderer",
+        "kind": "video",
+        "original": {"receiptId": "retained-original"},
+    }
+    assert client.post("/internal/operations", json=operation).status_code == 200
+    material = {
+        "patientId": chart.label,
+        "operationId": operation["operationId"],
+        "outputId": "final-video",
+        "relativePath": original_path.name,
+        "originalName": original_path.name,
+        "logicalFamily": "video",
+        "expectedSha256": hashlib.sha256(b"original").hexdigest(),
+        "expectedSize": 8,
+    }
+    accepted = None
+    publication_key = None
+    if admitted_before_patch:
+        response = client.post("/internal/artifacts", json=material)
+        assert response.status_code == 200, response.text
+        accepted = response.json()["artifact"]
+        publication_key = client.post(
+            f"/internal/publication/{accepted['fileId']}/prepare", json={}
+        ).json()["item"]["remoteKey"]
+    patched = client.patch(
+        f"/patients/{chart.label}",
+        headers={"Idempotency-Key": "original-relabel"},
+        json={"firstInitial": "A"},
+    )
+    assert patched.status_code == 200, patched.text
+    current = patched.json()["patient"]["patientId"]
+    if current_folder != "absent":
+        (portal / current).mkdir()
+    if current_folder == "different":
+        (portal / current / original_path.name).write_bytes(b"different")
+    response = client.post("/internal/artifacts", json=material)
+    assert response.status_code == 200, response.text
+    artifact = response.json()["artifact"]
+    if accepted:
+        assert (artifact["fileId"], artifact["fileKey"], artifact["version"]) == (
+            accepted["fileId"],
+            accepted["fileKey"],
+            accepted["version"],
+        )
+        assert (
+            client.post(
+                f"/internal/publication/{artifact['fileId']}/prepare", json={}
+            ).json()["item"]["remoteKey"]
+            == publication_key
+        )
+    assert artifact["patientId"] == current
+    assert artifact["sha256"] == material["expectedSha256"]
+    assert (
+        client.post("/internal/artifacts", json=material).json()["artifact"] == artifact
+    )
+    for label in (chart.label, current):
+        download = client.get(
+            "/file", params={"patientId": label, "fileId": artifact["fileId"]}
+        )
+        assert download.status_code == 200 and download.content == b"original"
+    original_path.write_bytes(b"replaced")
+    assert client.post("/internal/artifacts", json=material).status_code == 409
+    original_path.write_bytes(b"original")
+    assert client.post("/internal/artifacts", json=material).status_code == 200
+    # A new operation targets the current chart directory independently.
+    new_path = portal / current / "new.mp4"
+    new_path.parent.mkdir(exist_ok=True)
+    new_path.write_bytes(b"new")
+    assert (
+        client.post(
+            "/internal/operations",
+            json={**operation, "operationId": "new-output", "patientId": current},
+        ).status_code
+        == 200
+    )
+    new_material = {
+        **material,
+        "patientId": current,
+        "operationId": "new-output",
+        "relativePath": new_path.name,
+        "originalName": new_path.name,
+        "expectedSha256": hashlib.sha256(b"new").hexdigest(),
+        "expectedSize": 3,
+    }
+    assert client.post("/internal/artifacts", json=new_material).status_code == 200
+
+
+@pytest.mark.parametrize("alias_kind", ["dot", "parent", "outside", "other-chart"])
+def test_original_producer_directory_keeps_owned_containment(
+    live_api, monkeypatch, alias_kind
+):
+    client, chart, root = live_api
+    portal = root / "portal_patients"
+    portal.mkdir()
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal))
+    operation = {
+        "operationId": "directory-owner",
+        "patientId": chart.label,
+        "producer": "renderer",
+        "kind": "video",
+        "original": {"receiptId": "original"},
+    }
+    assert client.post("/internal/operations", json=operation).status_code == 200
+    if alias_kind == "other-chart":
+        alias = "BB_01-01-1900"
+        with storage.session_scope() as session:
+            storage.create_patient(session, label=alias)
+        directory = portal / alias
+        directory.mkdir()
+    else:
+        alias = {"dot": ".", "parent": "..", "outside": "old-chart"}[alias_kind]
+        catalogue.register_patient_alias(chart.id, alias)
+        if alias_kind == "outside":
+            directory = root / "outside"
+            directory.mkdir()
+            (portal / alias).symlink_to(directory, target_is_directory=True)
+        else:
+            directory = (portal / alias).resolve()
+    (directory / "unowned.mp4").write_bytes(b"original")
+    response = client.post(
+        "/internal/artifacts",
+        json={
+            "patientId": alias,
+            "operationId": operation["operationId"],
+            "outputId": "mp4",
+            "relativePath": "unowned.mp4",
+            "originalName": "unowned.mp4",
+            "logicalFamily": "video",
+            "expectedSha256": hashlib.sha256(b"original").hexdigest(),
+            "expectedSize": 8,
+        },
+    )
+    assert response.status_code == (409 if alias_kind == "other-chart" else 400)
+    assert not list((root / "clinic_producer_bytes").rglob("original"))

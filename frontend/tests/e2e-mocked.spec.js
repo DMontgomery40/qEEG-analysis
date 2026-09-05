@@ -1045,3 +1045,42 @@ test.describe('Gemini login', () => {
     await expect(page.getByPlaceholder('project_id (optional)')).toBeVisible();
   });
 });
+
+for (const duplicateNames of [false, true]) {
+  test(`bulk retry retains only unsuccessful File objects (duplicate names: ${duplicateNames})`, async ({ page }) => {
+    await setupMockApi(page);
+    const requests = [];
+    await page.route(/\/api\/patients\/bulk_upload(?:\?.*)?$/, async (route) => {
+      requests.push(route.request().postDataBuffer().toString());
+      const created = requests.length === 1
+        ? [{ file_index: 0, filename: 'same.txt', report: { id: 'first' } }, { file_index: 2, filename: 'third.txt', report: { id: 'third' } }]
+        : [{ file_index: 0, filename: 'same.txt', report: { id: 'second' } }];
+      await route.fulfill({ json: {
+        created, skipped: [], errors: requests.length === 1 ? [{ file_index: 1, filename: duplicateNames ? 'same.txt' : 'second.txt', error: 'Choose chart', conflict: 'identity_name_mismatch', candidates: [{ patient_id: 'SE_01-01-1900', name: 'Synthetic Example' }] }] : [],
+        counts: { created: created.length, skipped: 0, errors: requests.length === 1 ? 1 : 0 },
+      } });
+    });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Bulk Upload', exact: true }).click();
+    await page.locator('.bulk-hidden-input').setInputFiles([
+      { name: 'same.txt', mimeType: 'text/plain', buffer: Buffer.from('FIRST-BYTES') },
+      { name: duplicateNames ? 'same.txt' : 'second.txt', mimeType: 'text/plain', buffer: Buffer.from('SECOND-BYTES') },
+      { name: 'third.txt', mimeType: 'text/plain', buffer: Buffer.from('THIRD-BYTES') },
+    ]);
+    for (const row of await page.locator('.bulk-file-row').all()) {
+      await row.getByPlaceholder('First name').fill('Synthetic');
+      await row.getByPlaceholder('Last name').fill('Example');
+      await row.getByPlaceholder('MM-DD-YYYY').fill('01-01-1900');
+    }
+    await page.getByRole('button', { name: 'Upload', exact: true }).click();
+    await expect(page.locator('.bulk-file-row')).toHaveCount(1);
+    await page.getByRole('button', { name: /Same as Synthetic Example/ }).click();
+    await page.getByRole('button', { name: 'Upload', exact: true }).click();
+    await expect(page.locator('.bulk-file-row')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Upload', exact: true })).toBeDisabled();
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toContain('SECOND-BYTES');
+    expect(requests[1]).not.toContain('FIRST-BYTES');
+    expect(requests[1]).not.toContain('THIRD-BYTES');
+  });
+}

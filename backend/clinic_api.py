@@ -487,3 +487,18 @@ async def clinic_notification_receipt(event_id: str, request: Request):
         status=body["status"],
         detail=detail,
     )
+
+
+@router.get("/recent-files")
+def clinic_recent_files(request: Request):
+    from .clinic_recent_files import recent_files
+
+    query = request.query_params
+    if set(query) - {"kind", "contentType", "limit"}:
+        return _error(ValueError("Unsupported recent file query"))
+    return _call(
+        recent_files,
+        kind=query.get("kind"),
+        content_type=query.get("contentType"),
+        limit=query.get("limit", "30"),
+    )

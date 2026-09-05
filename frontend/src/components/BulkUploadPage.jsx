@@ -116,11 +116,19 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
               setUploading(true);
               setResult(null);
               try {
-                const payload = selectedFiles.map((f) => ({
+                const submittedFiles = selectedFiles;
+                const payload = submittedFiles.map((f) => ({
                   filename: f.name,
                   ...(identities[f.name] || {}),
                 }));
-                const res = await api.bulkUploadPatients(selectedFiles, payload);
+                const res = await api.bulkUploadPatients(submittedFiles, payload);
+                const acceptedFiles = new Set(
+                  (res?.created || [])
+                    .filter((row) => Number.isInteger(row.file_index)
+                      && row.file_index >= 0 && row.file_index < submittedFiles.length)
+                    .map((row) => submittedFiles[row.file_index]),
+                );
+                setSelectedFiles((current) => current.filter((file) => !acceptedFiles.has(file)));
                 setResult(res);
                 setConflicts(
                   Object.fromEntries(

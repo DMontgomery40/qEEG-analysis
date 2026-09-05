@@ -27,12 +27,16 @@ def _event(row):
     )
 
 
-def current_feedback(session, file_id):
-    events = list(
-        session.scalars(
-            select(ClinicFeedback)
-            .where(ClinicFeedback.artifact_id == file_id)
-            .order_by(ClinicFeedback.sequence)
+def current_feedback(session, file_id, *, events=None):
+    events = (
+        events
+        if events is not None
+        else list(
+            session.scalars(
+                select(ClinicFeedback)
+                .where(ClinicFeedback.artifact_id == file_id)
+                .order_by(ClinicFeedback.sequence)
+            )
         )
     )
     if not events:

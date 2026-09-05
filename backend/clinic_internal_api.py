@@ -181,7 +181,15 @@ def producer_artifact(body):
         if operation.patient_uuid != patient.id:
             raise CatalogueConflict("Operation belongs to another chart")
         patient_uuid = patient.id
-        root = (portal_patients_dir() / patient.label).resolve(strict=True)
+        # The request's recorded chart alias owns the original output path.
+        # Relabels change display identity while preserving those source bytes.
+        alias = body["patientId"]
+        if alias in (".", "..") or any(c in alias for c in "/\\\0"):
+            raise ValueError("Invalid original patient directory")
+        portal = portal_patients_dir().resolve(strict=True)
+        root = (portal / alias).resolve(strict=True)
+        if not root.is_relative_to(portal) or root == portal:
+            raise ValueError("Patient directory escapes configured portal")
     relative = Path(body["relativePath"])
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("Invalid original relative path")

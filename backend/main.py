@@ -1776,12 +1776,13 @@ async def bulk_upload_patients(
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    for file in files:
+    for file_index, file in enumerate(files):
         filename = (file.filename or "upload").strip() or "upload"
         identity = identities_by_filename.get(filename)
         if identity is None:
             errors.append(
                 {
+                    "file_index": file_index,
                     "filename": filename,
                     "error": (
                         "Give this report's patient name and date of birth. "
@@ -1851,6 +1852,7 @@ async def bulk_upload_patients(
                 patient = storage.get_patient(session, patient_uuid)
                 created.append(
                     {
+                        "file_index": file_index,
                         "filename": filename,
                         "patient": _patient_out(patient),
                         "report": _report_out(report),
@@ -1861,16 +1863,28 @@ async def bulk_upload_patients(
             # Structured so the operator can answer it per file, with attach_to
             # or force_new, without holding up the rest of the batch.
             errors.append(
-                {"filename": filename, **exc.payload, "error": exc.payload["detail"]}
+                {
+                    "file_index": file_index,
+                    "filename": filename,
+                    **exc.payload,
+                    "error": exc.payload["detail"],
+                }
             )
         except HTTPException as exc:
-            errors.append({"filename": filename, "error": str(exc.detail)})
+            errors.append(
+                {
+                    "file_index": file_index,
+                    "filename": filename,
+                    "error": str(exc.detail),
+                }
+            )
         except Exception as exc:
             if report_folder is not None:
                 shutil.rmtree(report_folder, ignore_errors=True)
             _discard_half_created_patient(created_patient_uuid, patient_label)
             errors.append(
                 {
+                    "file_index": file_index,
                     "filename": filename,
                     "patient_label": patient_label,
                     "error": str(exc),
@@ -2317,14 +2331,29 @@ async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="qeeg-preview-") as scratch:
         scratch_dir = Path(scratch)
-        _original, extracted_path, mime_type, preview = save_report_upload(
-            patient_id="preview",
-            report_id="preview",
-            filename=filename,
-            provided_mime_type=file.content_type,
-            file_bytes=file_bytes,
-            target_dir=scratch_dir,
+        from .council.execution import drain_task
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                save_report_upload,
+                patient_id="preview",
+                report_id="preview",
+                filename=filename,
+                provided_mime_type=file.content_type,
+                file_bytes=file_bytes,
+                target_dir=scratch_dir,
+            )
         )
+        try:
+            _original, extracted_path, mime_type, preview = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # OCR owns the scratch directory until its worker actually exits.
+            # Preserve request cancellation even if extraction also fails.
+            try:
+                await drain_task(worker)
+            except Exception:
+                pass
+            raise
         text = extracted_path.read_text(encoding="utf-8")
 
         page_count = 0

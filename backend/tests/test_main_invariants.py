@@ -1279,3 +1279,122 @@ def test_concurrent_http_start_and_lost_ack_rejoin_original_source_order_offline
         ):
             assert repeated[field] == created[field]
         assert repeated["execution_state"] == "pending"
+
+
+@pytest.mark.parametrize("failure", ["missing-identity", "extraction", "http"])
+def test_bulk_partial_results_retain_exact_input_indexes(
+    temp_data_dir, monkeypatch, failure
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    original = main.save_report_upload
+
+    def extract(**kwargs):
+        if kwargs["file_bytes"] == b"bad":
+            if failure == "http":
+                raise main.HTTPException(422, "Unreadable report")
+            raise ValueError("Unreadable report")
+        return original(**kwargs)
+
+    monkeypatch.setattr(main, "save_report_upload", extract)
+    names = [
+        "same.txt",
+        "unknown.txt" if failure == "missing-identity" else "same.txt",
+        "same.txt",
+    ]
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[
+                ("files", (name, data, "text/plain"))
+                for name, data in zip(names, [b"first", b"bad", b"third"])
+            ],
+            data={
+                "identities": json.dumps(
+                    [
+                        {
+                            "filename": "same.txt",
+                            "first_name": "Synthetic",
+                            "last_name": "Example",
+                            "birthdate": "01-01-1900",
+                        }
+                    ]
+                )
+            },
+        )
+    assert response.status_code == 200
+    result = response.json()
+    assert [row["file_index"] for row in result["created"]] == [0, 2]
+    assert [row["file_index"] for row in result["errors"]] == [1]
+    assert result["counts"] == {"created": 2, "skipped": 0, "errors": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("extraction_fails", [False, True])
+async def test_preview_extraction_does_not_block_and_drains_scratch(
+    temp_data_dir, monkeypatch, cancel, extraction_fails
+):
+    import asyncio
+    import threading
+    import httpx
+
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    started, release = threading.Event(), threading.Event()
+    scratch_paths = []
+
+    def extract(**kwargs):
+        folder = kwargs["target_dir"]
+        scratch_paths.append(folder)
+        started.set()
+        assert release.wait(3), "Preview worker did not receive release"
+        assert folder.exists(), "Scratch was deleted while extraction was active"
+        if extraction_fails:
+            raise ValueError("Synthetic extraction error")
+        extracted = folder / "extracted.txt"
+        extracted.write_text("Synthetic preview", encoding="utf-8")
+        return folder / "source.txt", extracted, "text/plain", "Synthetic preview"
+
+    monkeypatch.setattr(main, "save_report_upload", extract)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        task = asyncio.create_task(
+            client.post(
+                "/api/reports/preview",
+                files={"file": ("report.txt", b"synthetic", "text/plain")},
+            )
+        )
+        try:
+            # The timer prevents a synchronous-regression test from hanging.
+            timer = threading.Timer(1, release.set)
+            timer.start()
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            assert started.is_set()
+            assert not release.is_set(), "Extraction blocked the event loop"
+            timer.cancel()
+            if cancel:
+                task.cancel()
+                await asyncio.sleep(0.01)
+                task.cancel()
+                await asyncio.sleep(0.01)
+                assert not task.done()
+                assert scratch_paths[0].exists()
+            release.set()
+            if cancel:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                response = await task
+                assert response.status_code == (500 if extraction_fails else 200)
+                if not extraction_fails:
+                    assert response.json()["text"] == "Synthetic preview"
+        finally:
+            release.set()
+            timer.cancel()
+            if not task.done():
+                await asyncio.gather(task, return_exceptions=True)
+    assert scratch_paths and all(not p.exists() for p in scratch_paths)

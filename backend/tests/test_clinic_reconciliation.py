@@ -501,3 +501,83 @@ def test_first_import_binds_original_inventory_bytes(
             artifacts[0].version,
         ) == (source_kind, "historical-source", 1)
         assert s.get(ClinicCatalogState, 1).import_complete
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".DS_Store",
+        ".qeeg_portal_netlify_sync.lock",
+        ".qeeg_portal_sync_state.json",
+        "_README.txt",
+        ".qeeg_portal_local_pipeline_state.json",
+        ".qeeg_portal_sync_watch_state.json",
+        ".qeeg_portal_netlify_sync.spawn.lock",
+    ],
+)
+def test_root_operational_inventory_retains_bytes_and_replays(
+    temp_data_dir, monkeypatch, name
+):
+    portal = temp_data_dir / "portal_patients"
+    portal.mkdir()
+    monkeypatch.setattr("backend.portal_sync.portal_patients_dir", lambda: portal)
+    path = portal / name
+    path.write_bytes(b"original root operational bytes")
+    inventory = reconcile.build_inventory(
+        "operational",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    row = next(reconcile.inventory_rows(inventory))
+    assert row["kind"] == "root-operational"
+    retained = (
+        reconcile._inventory_root("operational") / "objects" / row["rawOperational"]
+    )
+    assert retained.read_bytes() == path.read_bytes()
+    first = reconcile.import_inventory(
+        "operational", remote_readback=lambda *a: (), activate=True
+    )
+    assert (
+        reconcile.import_inventory(
+            "operational", remote_readback=lambda *a: (), activate=True
+        )
+        == first
+    )
+    with storage.session_scope() as session:
+        assert session.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
+    path.write_bytes(b"changed root operational bytes")
+    with pytest.raises(CatalogueUnavailable):
+        reconcile.import_inventory(
+            "operational", remote_readback=lambda *a: (), activate=True
+        )
+    assert retained.read_bytes() == b"original root operational bytes"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "unknown.json",
+        "ZZ_01-01-1900/.DS_Store",
+        "ZZ_01-01-1900/.qeeg_portal_sync_state.json",
+    ],
+)
+def test_operational_retention_never_hides_unknown_or_nested_files(
+    temp_data_dir, monkeypatch, relative
+):
+    portal = temp_data_dir / "portal_patients"
+    path = portal / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"must retain unresolved ownership")
+    monkeypatch.setattr("backend.portal_sync.portal_patients_dir", lambda: portal)
+    inventory = reconcile.build_inventory(
+        "not-operational",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    assert next(reconcile.inventory_rows(inventory))["kind"] == "local-file"
+    with pytest.raises(CatalogueUnavailable):
+        reconcile.import_inventory(
+            "not-operational", remote_readback=lambda *a: (), activate=True
+        )
