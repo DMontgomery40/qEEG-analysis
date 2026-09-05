@@ -10,6 +10,7 @@ from typing import Any, Iterable, Literal
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    UniqueConstraint,
     String,
     Text,
     create_engine,
@@ -256,6 +257,11 @@ class AnalysisInputReservation(Base):
 
 class Artifact(Base):
     __tablename__ = "artifacts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "operation_key", name="uq_artifacts_run_operation"),
+    )
+
+    operation_key: Mapped[str | None] = mapped_column(String, nullable=True)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_new_id)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False)
@@ -420,6 +426,20 @@ def _ensure_run_execution_columns() -> None:
                 conn.exec_driver_sql(f"ALTER TABLE runs ADD COLUMN {column} {sql_type}")
 
 
+def _ensure_artifact_operation_key() -> None:
+    with engine.begin() as conn:
+        present = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(artifacts)")
+        }
+        if "operation_key" not in present:
+            conn.exec_driver_sql(
+                "ALTER TABLE artifacts ADD COLUMN operation_key VARCHAR"
+            )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_artifacts_run_operation ON artifacts(run_id, operation_key)"
+        )
+
+
 def init_db() -> None:
     ensure_data_dirs()
     Base.metadata.create_all(engine)
@@ -427,6 +447,7 @@ def init_db() -> None:
     _ensure_run_attestation_columns()
     _ensure_analysis_input_columns()
     _ensure_run_execution_columns()
+    _ensure_artifact_operation_key()
 
 
 @contextmanager

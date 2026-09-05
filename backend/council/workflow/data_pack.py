@@ -8,7 +8,9 @@ from typing import Any
 
 from ...storage import Report, create_artifact
 from ...storage import session_scope
+from ..completion import load_product, save_product
 from ..execution import (
+    current_execution,
     execute_unit,
     raise_if_execution_blocked,
     bind_source,
@@ -346,6 +348,9 @@ class _DataPackMixin:
             consumers="s1/data-pack/",
         )
         out_path = _data_pack_path(run_id)
+        accepted = load_product("data_pack")
+        if accepted is not None:
+            return json.loads(accepted)
         expected_sessions = _expected_session_indices(report_text)
         expected_pages = sorted(
             {img.page for img in page_images if isinstance(img.page, int)}
@@ -372,7 +377,7 @@ class _DataPackMixin:
             }
 
         # If an existing data pack is present, upgrade it in-place with deterministic facts and derived views.
-        if out_path.exists():
+        if out_path.exists() and current_execution() is None:
             try:
                 existing = json.loads(out_path.read_text(encoding="utf-8"))
             except Exception:
@@ -824,23 +829,28 @@ class _DataPackMixin:
                     )
                     raise RuntimeError("\n".join(msg_lines))
 
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(
-                    json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8"
-                )
-
-                # Store as an artifact for traceability/debugging.
-                with session_scope() as session:
-                    create_artifact(
-                        session,
-                        run_id=run_id,
-                        stage_num=1,
-                        stage_name=STAGES[0].name,
-                        model_id="_data_pack",
-                        kind="data_pack",
-                        content_path=out_path,
-                        content_type="application/json",
+                if current_execution() is not None:
+                    save_product(
+                        "data_pack", json.dumps(merged, indent=2, sort_keys=True)
                     )
+                else:
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text(
+                        json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8"
+                    )
+
+                    # Store as an artifact for traceability/debugging.
+                    with session_scope() as session:
+                        create_artifact(
+                            session,
+                            run_id=run_id,
+                            stage_num=1,
+                            stage_name=STAGES[0].name,
+                            model_id="_data_pack",
+                            kind="data_pack",
+                            content_path=out_path,
+                            content_type="application/json",
+                        )
 
                 if emit is not None:
                     await emit(
@@ -916,7 +926,10 @@ class _DataPackMixin:
             consumers="s1/transcript/",
         )
         out_path = _vision_transcript_path(run_id)
-        if out_path.exists():
+        accepted = load_product("vision_transcript")
+        if accepted is not None:
+            return accepted
+        if out_path.exists() and current_execution() is None:
             try:
                 existing = out_path.read_text(encoding="utf-8", errors="replace")
                 if existing.strip():
@@ -1096,26 +1109,29 @@ class _DataPackMixin:
         )
         transcript = f"{header}{transcript_body}\n"
 
-        try:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(transcript, encoding="utf-8")
-        except Exception:
-            pass
+        if current_execution() is not None:
+            save_product("vision_transcript", transcript)
+        else:
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(transcript, encoding="utf-8")
+            except Exception:
+                pass
 
-        try:
-            with session_scope() as session:
-                create_artifact(
-                    session,
-                    run_id=run_id,
-                    stage_num=1,
-                    stage_name=STAGES[0].name,
-                    model_id="_vision_transcript",
-                    kind="vision_transcript",
-                    content_path=out_path,
-                    content_type="text/markdown",
-                )
-        except Exception:
-            pass
+            try:
+                with session_scope() as session:
+                    create_artifact(
+                        session,
+                        run_id=run_id,
+                        stage_num=1,
+                        stage_name=STAGES[0].name,
+                        model_id="_vision_transcript",
+                        kind="vision_transcript",
+                        content_path=out_path,
+                        content_type="text/markdown",
+                    )
+            except Exception:
+                pass
 
         return transcript
 

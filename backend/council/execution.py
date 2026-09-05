@@ -346,6 +346,9 @@ async def execute_unit(key, awaitable):
             try:
                 result = await awaitable
                 cursor.raise_if_blocked()
+                from .completion import record_semantic_result
+
+                record_semantic_result(key, result)
                 return result
             except BaseException as error:
                 raise_if_execution_blocked(error)

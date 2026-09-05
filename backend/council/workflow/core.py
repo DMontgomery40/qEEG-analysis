@@ -8,9 +8,15 @@ from typing import Any
 from ...config import ARTIFACTS_DIR
 from ...llm_client import AsyncOpenAICompatClient
 from ...logging_utils import get_logger, log_context
-from ...storage import get_report, get_run, list_artifacts, update_run_status
+from ...storage import get_report, get_run, list_artifacts
 from ...storage import session_scope
-from ..execution import raise_if_execution_blocked
+from ..execution import raise_if_execution_blocked, current_execution
+from ..completion import (
+    verified_stage_prefix,
+    _verified_stage,
+    stage_progress,
+    project_run_status,
+)
 from ..json_utils import _loads_json_list
 from ..types import OnEvent
 from .data_pack import _DataPackMixin
@@ -105,7 +111,12 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
             for key in ("stage_num", "stage_name", "success_count", "requested_count"):
                 if key in payload and payload.get(key) is not None:
                     latest_counts[key] = payload.get(key)
-            _append_progress_event(run_id, payload)
+            context = current_execution()
+            if context is None:
+                _append_progress_event(run_id, payload)
+            else:
+                with context.owner.file_guard():
+                    _append_progress_event(run_id, payload)
             if on_event is not None:
                 await on_event(payload)
 
@@ -116,7 +127,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                 return
             report = get_report(session, run.report_id)
             if report is None:
-                update_run_status(
+                project_run_status(
                     session, run_id, status="failed", error_message="Report not found"
                 )
                 LOGGER.error("pipeline_report_missing", run_id=run_id)
@@ -124,7 +135,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
 
             council_model_ids = _loads_json_list(run.council_model_ids_json)
             if not council_model_ids:
-                update_run_status(
+                project_run_status(
                     session,
                     run_id,
                     status="failed",
@@ -135,11 +146,23 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
 
             patient_id = run.patient_id
             report_id = run.report_id
-            completed_stage_num = max(
-                (artifact.stage_num for artifact in list_artifacts(session, run_id)),
-                default=0,
+            completed_stage_num = (
+                0
+                if current_execution() is not None
+                else max(
+                    (
+                        artifact.stage_num
+                        for artifact in list_artifacts(session, run_id)
+                    ),
+                    default=0,
+                )
             )
-            update_run_status(session, run_id, status="running")
+            project_run_status(session, run_id, status="running")
+
+        if current_execution() is not None:
+            completed_stage_num = verified_stage_prefix()
+            for stage_num in range(1, completed_stage_num + 1):
+                await emit(stage_progress(stage_num, _verified_stage(stage_num)))
 
         with log_context(run_id=run_id, patient_id=patient_id, report_id=report_id):
             LOGGER.info("pipeline_started", council_model_count=len(council_model_ids))
@@ -164,7 +187,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                     await self._stage6(run_id, council_model_ids, emit)
             except _NeedsAuth as e:
                 with session_scope() as session:
-                    update_run_status(
+                    project_run_status(
                         session, run_id, status="needs_auth", error_message=str(e)
                     )
                 operator_hint = (
@@ -187,7 +210,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
             except Exception as e:
                 raise_if_execution_blocked(e)
                 with session_scope() as session:
-                    update_run_status(
+                    project_run_status(
                         session, run_id, status="failed", error_message=str(e)
                     )
                 operator_hint = _pipeline_failure_operator_hint()
@@ -205,7 +228,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                 _USAGE_RUN_ID.reset(usage_token)
 
             with session_scope() as session:
-                update_run_status(session, run_id, status="complete")
+                project_run_status(session, run_id, status="complete")
             LOGGER.info("pipeline_completed")
             complete_payload = {
                 "run_id": run_id,

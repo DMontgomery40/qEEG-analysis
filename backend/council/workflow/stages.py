@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable
 from ...config import DISCOVERED_MODEL_IDS, MODEL_ROLE_DEFAULTS, is_vision_capable
 from ...model_selection import resolve_model_preference
 from ...reports import extract_pdf_full
-from ...storage import Report, get_report, get_run, set_run_label_map
+from ...storage import Report, get_report, get_run
 from ...storage import session_scope
 from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
 from ..execution import (
@@ -26,6 +26,7 @@ from ..execution import (
     bind_artifact_sources,
     execution_llm,
 )
+from ..completion import durable_stage, durable_member, finish_member, project_label_map
 from ..constants import STAGES
 from ..db_utils import _aggregate_required_changes, _stage_artifacts, _validate_stage5
 from ..json_utils import _json_loads_loose
@@ -432,6 +433,7 @@ class _StagesMixin:
         # Return best-effort text; caller can decide whether to hard-fail.
         return repaired
 
+    @durable_stage(1)
     async def _stage1(
         self,
         run_id: str,
@@ -806,6 +808,7 @@ class _StagesMixin:
             stage1_retry_max_tokens = 6000
         stage1_require_complete = _truthy_env("QEEG_STAGE1_REQUIRE_COMPLETE", True)
 
+        @durable_member(stage)
         async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             try:
                 await emit(
@@ -982,6 +985,7 @@ class _StagesMixin:
                         "Stage 1 analysis remained incomplete after repair attempts. "
                         f"End sentinel present: {end_sentinel in (text or '')}"
                     )
+                finish_member(stage, member_index, model_id, text)
                 await emit(
                     {
                         "run_id": run_id,
@@ -1015,10 +1019,11 @@ class _StagesMixin:
         if not successes:
             raise RuntimeError("All models failed during Stage 1 analysis")
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         await emit(
             {
@@ -1031,6 +1036,7 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(2)
     async def _stage2(
         self,
         run_id: str,
@@ -1122,7 +1128,7 @@ class _StagesMixin:
 
         label_map = _stable_label_map(run_id, available_models)
         with session_scope() as session:
-            set_run_label_map(session, run_id, label_map)
+            project_label_map(session, run_id, label_map)
 
         await emit(
             {
@@ -1133,6 +1139,7 @@ class _StagesMixin:
             }
         )
 
+        @durable_member(stage)
         async def one(
             member_index: int, reviewer_model_id: str
         ) -> tuple[str, str] | None:
@@ -1190,10 +1197,11 @@ class _StagesMixin:
         )
         successes = [r for r in results if r is not None]
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         await emit(
             {
@@ -1207,6 +1215,7 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(3)
     async def _stage3(
         self,
         run_id: str,
@@ -1314,6 +1323,7 @@ class _StagesMixin:
         stage3_require_complete = _truthy_env("QEEG_STAGE3_REQUIRE_COMPLETE", True)
         stage3_timeout_s = self._int_env("QEEG_STAGE3_MODEL_TIMEOUT_S", 0)
 
+        @durable_member(stage)
         async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             analysis = analyses_by_model.get(model_id)
             if not analysis:
@@ -1377,6 +1387,7 @@ class _StagesMixin:
                         "Stage 3 revision remained incomplete after repair attempts. "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
+                finish_member(stage, member_index, model_id, text)
                 await emit({**event_payload, "status": "complete"})
                 return model_id, text
             except Exception as exc:
@@ -1402,10 +1413,11 @@ class _StagesMixin:
         if not successes:
             raise RuntimeError("All models failed during Stage 3 revision")
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
         await emit(
             {
                 "run_id": run_id,
@@ -1418,6 +1430,7 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(4)
     async def _stage4(
         self,
         run_id: str,
@@ -1721,9 +1734,12 @@ class _StagesMixin:
             if require_complete:
                 raise RuntimeError(detail)
 
-        await self._write_artifact(
-            run_id=run_id, stage=stage, model_id=consolidator, text=text
-        )
+        if current_execution() is None:
+            await self._write_artifact(
+                run_id=run_id, stage=stage, model_id=consolidator, text=text
+            )
+        else:
+            finish_member(stage, 0, consolidator, text)
         await emit({**task_payload, "status": "complete"})
         await emit(
             {
@@ -1734,6 +1750,7 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(5)
     async def _stage5(
         self,
         run_id: str,
@@ -1834,6 +1851,7 @@ class _StagesMixin:
             }
         )
 
+        @durable_member(stage)
         async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             prompt_text = (
                 f"{prompt}\n\n---\n\n"
@@ -1867,10 +1885,11 @@ class _StagesMixin:
         if not successes:
             raise RuntimeError("All models failed during Stage 5 final review")
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         await emit(
             {
@@ -1883,6 +1902,7 @@ class _StagesMixin:
             }
         )
 
+    @durable_stage(6)
     async def _stage6(
         self,
         run_id: str,
@@ -2042,6 +2062,7 @@ class _StagesMixin:
 
         failures: list[str] = []
 
+        @durable_member(stage)
         async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             changes = (
                 "\n".join([f"- {c}" for c in required_changes])
@@ -2103,10 +2124,11 @@ class _StagesMixin:
                 f"All models failed during Stage 6 final draft. {detail}"
             )
 
-        for model_id, text in successes:
-            await self._write_artifact(
-                run_id=run_id, stage=stage, model_id=model_id, text=text
-            )
+        if current_execution() is None:
+            for model_id, text in successes:
+                await self._write_artifact(
+                    run_id=run_id, stage=stage, model_id=model_id, text=text
+                )
 
         # Stage 6 wants exactly one final draft; `writer_candidates` is a
         # fallback chain tried in order until one works, not a fan-out. Counting
