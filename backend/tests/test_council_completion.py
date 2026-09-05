@@ -905,7 +905,7 @@ async def test_pipeline_resumes_the_remaining_member_after_predispatch_cancellat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage_num", range(1, 7))
 @pytest.mark.parametrize("phase", ["before", "after"])
-@pytest.mark.parametrize("error_type", [OSError, ValueError])
+@pytest.mark.parametrize("error_type", [OSError, ValueError, TypeError])
 async def test_ordinary_local_interruptions_remain_unfinished_before_and_after_ack(
     owner, tmp_path, monkeypatch, stage_num, phase, error_type
 ):
@@ -1005,8 +1005,9 @@ async def test_ordinary_local_interruptions_remain_unfinished_before_and_after_a
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage_num", [1, 3, 4])
 @pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("error_type", [OSError, TypeError])
 async def test_progress_failures_never_become_terminal_clinical_failures(
-    owner, tmp_path, monkeypatch, stage_num, phase
+    owner, tmp_path, monkeypatch, stage_num, phase, error_type
 ):
     models = ["model-a", "model-b"]
     report = seed_stages(owner, tmp_path, monkeypatch)
@@ -1026,7 +1027,7 @@ async def test_progress_failures_never_become_terminal_clinical_failures(
             and event.get("model_id") == models[0]
             and event.get("status") == ("start" if phase == "before" else "complete")
         ):
-            raise OSError("transient progress sink unavailable")
+            raise error_type("transient progress sink unavailable")
 
     async def run(emit):
         workflow = QEEGCouncilWorkflow(llm=llm)
@@ -1182,3 +1183,226 @@ async def test_failed_progress_after_clinical_exhaustion_preserves_terminal_evid
         assert record["reason"] == "validation_exhausted"
         await QEEGCouncilWorkflow(llm=llm)._stage1("r", models, report, silent)
     assert sorted(sent) == models
+
+
+def sdk_review_payload(stage_num, model):
+    from backend.council.workflow.stages import _stable_label_map
+    from backend.tests.test_council_execution import fixture
+
+    payload = fixture(
+        "stage2_valid.json" if stage_num == 2 else "stage5_approve_valid.json"
+    )
+    if stage_num == 2:
+        labels = _stable_label_map("r", ["model-a", "model-b"])
+        expected = [label for label, member in labels.items() if member != model]
+        payload["reviews"] = [
+            item for item in payload["reviews"] if item["analysis_label"] in expected
+        ]
+        payload["ranking_best_to_worst"] = expected
+    return payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["exhausted", "repaired", "zero_success"])
+@pytest.mark.parametrize(
+    "stage_num,field_path,invalid",
+    [
+        (2, ("overall_notes",), 7),
+        (2, ("reviews", 0, "analysis_label"), 7),
+        (2, ("reviews", 0, "risk_of_overreach"), {}),
+        (2, ("reviews", 0, "strengths"), "wrong collection"),
+        (2, ("reviews", 0, "weaknesses"), [7]),
+        (2, ("reviews", 0, "missing_or_unclear"), [None]),
+        (2, ("reviews", 0, "accuracy_issues"), [{}]),
+        (2, ("ranking_best_to_worst",), {}),
+        (2, ("ranking_best_to_worst",), [7]),
+        (5, ("vote",), 7),
+        (5, ("quality_score_1to10",), []),
+        (5, ("required_changes",), 7),
+        (5, ("optional_changes",), "wrong collection"),
+        (5, ("required_changes",), [7]),
+        (5, ("optional_changes",), [{}]),
+    ],
+)
+async def test_sdk_malformed_field_types_obey_bounded_validation_and_stage_policy(
+    owner, tmp_path, monkeypatch, stage_num, field_path, invalid, outcome
+):
+    from backend.tests.test_council_execution import completion as sdk_completion
+
+    seed_stages(owner, tmp_path, monkeypatch)
+    models = ["model-a", "model-b"]
+    sent = []
+
+    def send(req):
+        model = json.loads(req.content)["model"]
+        sent.append(model)
+        payload = sdk_review_payload(stage_num, model)
+        if (model == models[0] or outcome == "zero_success") and (
+            outcome != "repaired" or sent.count(model) == 1
+        ):
+            target = payload
+            for part in field_path[:-1]:
+                target = target[part]
+            target[field_path[-1]] = invalid
+        return sdk_completion(req, payload)
+
+    llm = client(send)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    with e.execution_context(ctx):
+        for attempt in range(2):
+            run = getattr(QEEGCouncilWorkflow(llm=llm), f"_stage{stage_num}")
+            if outcome == "zero_success" and stage_num == 5:
+                with pytest.raises(RuntimeError, match="All models failed"):
+                    await run("r", models, emit)
+            else:
+                await run("r", models, emit)
+            assert sent.count(models[0]) == (2 if outcome == "repaired" else 3)
+            assert sent.count(models[1]) == (3 if outcome == "zero_success" else 1)
+            for i, model in enumerate(models):
+                record = completion()._read(
+                    "member/" + completion().member_key(stage_num, i, model)
+                )
+                failed = outcome == "zero_success" or (
+                    outcome == "exhausted" and i == 0
+                )
+                assert record["disposition"] == ("failed" if failed else "success")
+                assert len(record["paid"]) == sent.count(model)
+                if failed:
+                    assert record["reason"] == "model_attempts_exhausted"
+            with owner.transaction() as session:
+                receipt = session.get(storage.StageReceipt, ("r", stage_num))
+                assert (receipt is None) == (
+                    outcome == "zero_success" and stage_num == 5
+                )
+        if not (outcome == "zero_success" and stage_num == 5):
+            completed = [event for event in events if event.get("status") == "complete"]
+            assert (
+                completed[-1]["success_count"]
+                == {"exhausted": 1, "repaired": 2, "zero_success": 0}[outcome]
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", [2, 5])
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("error_type", [OSError, ValueError, TypeError])
+async def test_sdk_local_errors_stay_recoverable_with_successful_sibling(
+    owner, tmp_path, monkeypatch, stage_num, phase, error_type
+):
+    from backend.council.workflow import stages
+    from backend.tests.test_council_execution import completion as sdk_completion
+
+    seed_stages(owner, tmp_path, monkeypatch)
+    sent = []
+
+    def send(req):
+        model = json.loads(req.content)["model"]
+        sent.append(model)
+        return sdk_completion(req, sdk_review_payload(stage_num, model))
+
+    llm = client(send)
+    name = (
+        "run_stage2_peer_review_json"
+        if stage_num == 2
+        else "run_stage5_final_review_json"
+    )
+    generate = getattr(stages, name)
+    armed = True
+
+    async def interrupted(*, model_id, **kwargs):
+        nonlocal armed
+        if armed and model_id == "model-a" and phase == "before":
+            armed = False
+            raise error_type("ordinary local failure")
+        result = await generate(model_id=model_id, **kwargs)
+        if armed and model_id == "model-a" and phase == "after":
+            armed = False
+            raise error_type("ordinary local failure")
+        return result
+
+    monkeypatch.setattr(stages, name, interrupted)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        run = getattr(QEEGCouncilWorkflow(llm=llm), f"_stage{stage_num}")
+        with pytest.raises(Exception):
+            await run("r", ["model-a", "model-b"], silent)
+        assert (
+            completion()._read(
+                "member/" + completion().member_key(stage_num, 0, "model-a")
+            )
+            is None
+        )
+        assert (
+            completion()._read(
+                "member/" + completion().member_key(stage_num, 1, "model-b")
+            )["disposition"]
+            == "success"
+        )
+        assert sent.count("model-a") == (phase == "after")
+        await run("r", ["model-a", "model-b"], silent)
+        assert (
+            completion()._read(
+                "member/" + completion().member_key(stage_num, 0, "model-a")
+            )["disposition"]
+            == "success"
+        )
+    assert sorted(sent) == ["model-a", "model-b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", [2, 5])
+async def test_sdk_malformed_output_then_unknown_repair_remains_blocked(
+    owner, tmp_path, monkeypatch, stage_num
+):
+    from backend.tests.test_council_execution import completion as sdk_completion
+
+    seed_stages(owner, tmp_path, monkeypatch)
+    sent = []
+
+    def send(req):
+        model = json.loads(req.content)["model"]
+        sent.append(model)
+        if model == "model-a" and sent.count(model) == 2:
+            raise httpx.ReadError("repair response lost")
+        payload = sdk_review_payload(stage_num, model)
+        if model == "model-a":
+            payload["overall_notes" if stage_num == 2 else "required_changes"] = 7
+        return sdk_completion(req, payload)
+
+    llm = client(send)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        for attempt in range(2):
+            with pytest.raises(PaidOutcomeUnknown):
+                await getattr(QEEGCouncilWorkflow(llm=llm), f"_stage{stage_num}")(
+                    "r", ["model-a", "model-b"], silent
+                )
+            if attempt == 0:
+                original_count = len(sent)
+            assert len(sent) == original_count
+            assert sent.count("model-a") == 2 and sent.count("model-b") <= 1
+            assert (
+                completion()._read(
+                    "member/" + completion().member_key(stage_num, 0, "model-a")
+                )
+                is None
+            )
+            with owner.transaction() as session:
+                assert session.get(storage.StageReceipt, ("r", stage_num)) is None
+                requests = list(session.scalars(select(storage.PaidRequest)))
+                assert sorted(
+                    row.state for row in requests if "model-a" in row.scope_key
+                ) == [
+                    "response_saved",
+                    "unknown",
+                ]
+                assert all(
+                    row.state in {"response_saved", "prepared"}
+                    for row in requests
+                    if "model-b" in row.scope_key
+                )

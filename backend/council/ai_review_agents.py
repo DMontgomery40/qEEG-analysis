@@ -33,7 +33,9 @@ from .utils import _sleep_backoff
 
 def _strip_text(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string")
+        # Pydantic turns ValueError into model-output validation feedback;
+        # TypeError escapes the SDK without entering its bounded output repair.
+        raise ValueError(f"{field_name} must be a string")
     text = value.strip()
     if not text:
         raise ValueError(f"{field_name} must not be empty")
@@ -42,7 +44,7 @@ def _strip_text(value: Any, *, field_name: str) -> str:
 
 def _strip_string_list(value: Any, *, field_name: str) -> list[str]:
     if not isinstance(value, list):
-        raise TypeError(f"{field_name} must be a list")
+        raise ValueError(f"{field_name} must be a list")
     cleaned: list[str] = []
     for item in value:
         text = _strip_text(item, field_name=field_name)
@@ -97,7 +99,7 @@ class Stage2PeerReviewPayload(BaseModel):
     @classmethod
     def _validate_ranking(cls, value: Any) -> list[str]:
         if not isinstance(value, list):
-            raise TypeError("ranking_best_to_worst must be a list")
+            raise ValueError("ranking_best_to_worst must be a list")
         return [_normalize_label(item) for item in value]
 
     @field_validator("overall_notes", mode="before")
