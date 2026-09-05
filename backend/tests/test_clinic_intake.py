@@ -506,3 +506,78 @@ def test_missing_accepted_private_policy_fails_loudly_without_losing_filing(
             },
         )
     assert counts() == (1, 1, 1, 1, 0)
+
+
+@pytest.mark.parametrize("drift", ["settings", "prompts", "models", "presentation"])
+def test_confirmed_policy_fingerprint_rejects_new_drift_but_replays_original(
+    temp_data_dir, monkeypatch, drift
+):
+    from backend import clinic_analysis_intents as policy, config, clinic_naming
+    from types import SimpleNamespace
+
+    shown = policy.public_current_policy()
+    intent = {
+        "operationId": "confirmed-policy",
+        "confirmed": True,
+        "reportItemIndexes": [0],
+        "specialInstructions": "",
+        "expectedPolicyFingerprint": shown["analysisPolicyFingerprint"],
+    }
+    original = submit(
+        file_meta=[{"documentKind": "report"}, {}], analysis_intent=intent
+    )["upload"]
+    binding = policy.confirmed_analysis_binding(original["uploadId"])
+    assert binding["policyHash"] == shown["analysisPolicyFingerprint"]
+    if drift == "settings":
+        monkeypatch.setenv("QEEG_STAGE1_MAX_TOKENS", "98765")
+    elif drift == "prompts":
+        monkeypatch.setattr(policy, "_snapshot_prompts", lambda: {"new": "changed"})
+    elif drift == "models":
+        monkeypatch.setattr(config, "COUNCIL_MODELS", [SimpleNamespace(id="new-model")])
+    else:
+        monkeypatch.setitem(clinic_naming.POLICY, "tts", {"voice": "changed"})
+    assert (
+        policy.public_current_policy()["analysisPolicyFingerprint"]
+        != shown["analysisPolicyFingerprint"]
+    )
+    replay = submit(file_meta=[{"documentKind": "report"}, {}], analysis_intent=intent)[
+        "upload"
+    ]
+    assert replay["uploadId"] == original["uploadId"]
+    assert (
+        policy.confirmed_analysis_binding(original["uploadId"])["policySnapshot"]
+        == binding["policySnapshot"]
+    )
+    before = counts()
+    with pytest.raises(CatalogueConflict, match="policy changed"):
+        submit(
+            "new-policy",
+            file_meta=[{"documentKind": "report"}, {}],
+            analysis_intent={**intent, "operationId": "new-operation"},
+        )
+    assert counts() == before
+    rejected_root = (
+        temp_data_dir
+        / "clinic_intake"
+        / "submissions"
+        / hashlib.sha256(b"new-policy").hexdigest()
+    )
+    assert not rejected_root.exists()
+
+
+@pytest.mark.parametrize("fingerprint", [None, "", "z" * 64, "A" * 64, 123])
+def test_invalid_expected_policy_fingerprint_is_not_admitted(
+    temp_data_dir, fingerprint
+):
+    with pytest.raises(ValueError):
+        submit(
+            file_meta=[{"documentKind": "report"}, {}],
+            analysis_intent={
+                "operationId": "invalid-policy",
+                "confirmed": True,
+                "reportItemIndexes": [0],
+                "specialInstructions": "",
+                "expectedPolicyFingerprint": fingerprint,
+            },
+        )
+    assert counts() == (0, 0, 0, 0, 0)

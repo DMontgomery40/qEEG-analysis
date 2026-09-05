@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import clinic_catalogue_reads as catalogue
-from .clinic_naming import POLICY, POLICY_REVISION
+from .clinic_naming import POLICY_REVISION
 
 
 def trusted_actor(request: Request):
@@ -76,13 +76,15 @@ def _call(function, *args, **kwargs):
 
 @router.get("/policy")
 def policy():
+    from .clinic_analysis_intents import public_current_policy
+
     return _call(
         lambda: dict(
             ok=True,
             schemaVersion="clinic-v1",
             policyRevision=POLICY_REVISION,
             catalogRevision=catalogue.current_revision(),
-            policy=POLICY,
+            **public_current_policy(),
         )
     )
 

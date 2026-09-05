@@ -238,3 +238,40 @@ def test_existing_patient_and_attachment_http_apis_feed_shared_reads(live_api):
         ).content
         == b"Original attachment"
     )
+
+
+def test_policy_exposes_only_public_rules_and_stable_snapshot_fingerprint(
+    live_api, monkeypatch
+):
+    from backend import config
+    from backend import clinic_analysis_intents as intents
+
+    client, _, root = live_api
+    monkeypatch.setenv("QEEG_PROVIDER_SECRET", "private-test-credential")
+    monkeypatch.setattr(
+        intents, "_snapshot_prompts", lambda: {"private": "private-test-prompt"}
+    )
+    first = client.get("/policy")
+    assert first.status_code == 200
+    payload = first.json()
+    fingerprint = payload["analysisPolicyFingerprint"]
+    assert len(fingerprint) == 64 and int(fingerprint, 16) >= 0
+    assert client.get("/policy").json() == payload
+    assert payload["policy"]["analysis"]["councilModelIds"] == [
+        m.id for m in config.COUNCIL_MODELS
+    ]
+    assert payload["policy"]["analysis"]["finalDraftModelIds"] == [
+        m.id for m in config.COUNCIL_MODELS
+    ]
+    assert payload["policy"]["render"]["formats"] == ["markdown", "pdf"]
+    assert payload["policy"]["video"] == {
+        "automatic": False,
+        "requiresSeparateConfirmation": True,
+    }
+    assert payload["policy"]["tts"]["voice"] == "Charon"
+    assert "private-test" not in first.text and "settings" not in payload["policy"]
+    assert not (root / "clinic_intake" / "submissions").exists()
+    monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "0")
+    changed = client.get("/policy").json()
+    assert changed["policy"]["render"]["automaticPatientDocument"] is False
+    assert changed["analysisPolicyFingerprint"] != fingerprint

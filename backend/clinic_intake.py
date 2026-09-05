@@ -190,13 +190,22 @@ def _manifest(
         )
     if analysis_intent is not None:
         a = analysis_intent
-        if not isinstance(a, dict) or set(a) != {
+        required = {
             "operationId",
             "confirmed",
             "reportItemIndexes",
             "specialInstructions",
-        }:
+        }
+        if not isinstance(a, dict) or set(a) not in (
+            required,
+            required | {"expectedPolicyFingerprint"},
+        ):
             raise ValueError("Invalid confirmed analysis intent")
+        if "expectedPolicyFingerprint" in a and (
+            not isinstance(a["expectedPolicyFingerprint"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", a["expectedPolicyFingerprint"])
+        ):
+            raise ValueError("Invalid expected analysis policy fingerprint")
         require_key(a["operationId"])
         indexes = a["reportItemIndexes"]
         if (
@@ -279,11 +288,22 @@ def submit_upload(
             / "submissions"
             / hashlib.sha256(key.encode()).hexdigest()
         )
+        policy = None
+        policy_binding = None
+        if (
+            analysis_intent
+            and not existing
+            and "expectedPolicyFingerprint" in analysis_intent
+        ):
+            from .clinic_analysis_intents import prepare_policy_binding
+
+            # Verify exactly what was shown before persisting upload material or intent.
+            policy, policy_binding = prepare_policy_binding(
+                root, expected_fingerprint=analysis_intent["expectedPolicyFingerprint"]
+            )
         for item, (_, data, _) in zip(manifest["items"], files):
             _immutable(root / (str(item["itemIndex"]) + ".bytes"), data)
         _immutable(root / "manifest.json", _json(manifest).encode())
-        policy = None
-        policy_binding = None
         if analysis_intent:
             from .clinic_analysis_intents import (
                 prepare_policy_binding,
@@ -294,7 +314,7 @@ def submit_upload(
                 policy_binding = json.loads(existing.analysis_json)["policyBinding"]
                 snapshot, _ = read_policy_binding(policy_binding)
                 policy = snapshot["publicPolicy"]
-            else:
+            elif policy_binding is None:
                 policy, policy_binding = prepare_policy_binding(root)
         with _write() as s:
             existing = s.get(ClinicUpload, chosen)

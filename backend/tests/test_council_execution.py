@@ -161,7 +161,7 @@ async def test_real_sdk_validation_sequence_replays(owner, stage, invalid, valid
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", [2, 5])
-@pytest.mark.parametrize("failure", ["reset", "429", "503"])
+@pytest.mark.parametrize("failure", ["reset", "503"])
 async def test_wrapped_sdk_unknown_never_retries_or_falls_back(
     owner, monkeypatch, stage, failure
 ):
@@ -1904,3 +1904,61 @@ async def test_owned_stage6_attempts_every_admitted_member_and_replays_without_s
     assert sent == list(
         models
     ), "owned stage completion must rejoin all original paid receipts"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model", ["gpt-5.6", "gpt-5.6-terra", "openai/gpt-5.6", "openai/gpt-5.6-terra"]
+)
+async def test_owned_stage1_current_gpt56_members_receive_page_images(
+    owner, tmp_path, monkeypatch, model
+):
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import stages
+    from backend.council.types import PageImage
+
+    report = seed_stages(owner, tmp_path, monkeypatch, models=(model,))
+    monkeypatch.setattr(
+        stages, "_load_page_images", lambda *_: [PageImage(page=1, base64_png="eA==")]
+    )
+
+    class MemberImages(QEEGCouncilWorkflow):
+        async def _ensure_data_pack(self, **kwargs):
+            return None
+
+        async def _ensure_vision_transcript(self, **kwargs):
+            return None
+
+    sent = []
+
+    def send(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "output_text": "Clinical analysis.\n<!-- END STAGE1 ANALYSIS -->",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Clinical analysis.\n<!-- END STAGE1 ANALYSIS -->"
+                        }
+                    }
+                ],
+            },
+        )
+
+    llm = client(send)
+    context = execution().prepare_execution(owner, llm_client=llm)
+
+    async def emit(event):
+        pass
+
+    try:
+        with execution().execution_context(context):
+            await MemberImages(llm=llm)._stage1("r", [model], report, emit)
+        assert any(
+            "data:image/png;base64,eA==" in json.dumps(request) for request in sent
+        )
+        assert all(request["model"] == model for request in sent)
+    finally:
+        await context.aclose()

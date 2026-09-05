@@ -103,3 +103,61 @@ def test_admission_preserves_first_trusted_principal_without_breaking_cross_adap
         u = s.scalar(select(ClinicUpload).where(ClinicUpload.id == "attribution"))
         assert u.uploaded_principal == "workbench"
         assert u.uploaded_by == "Staff"
+
+
+def test_http_analysis_confirmation_binds_shown_policy_before_filing(
+    live_api, monkeypatch
+):
+    import hashlib
+    import json
+    from backend import clinic_analysis_intents
+
+    client, _, root = live_api
+    shown = client.get("/policy").json()["analysisPolicyFingerprint"]
+    intent = dict(
+        operationId="http-policy",
+        confirmed=True,
+        reportItemIndexes=[0],
+        specialInstructions="",
+        expectedPolicyFingerprint=shown,
+    )
+    fields = dict(
+        firstName="Ada",
+        lastName="Baker",
+        birthdate="02-02-1900",
+        analysisIntent=json.dumps(intent),
+    )
+    files = [
+        ("files", ("source.txt", b"original report", "text/plain")),
+        ("fileMeta", (None, '{"documentKind":"report"}')),
+    ]
+
+    def post(key):
+        return client.post(
+            "/uploads",
+            headers={
+                "Idempotency-Key": key,
+                "X-Clinic-Actor": "Staff",
+                "X-Clinic-Principal": "thrylen-service",
+            },
+            data=fields,
+            files=files,
+        )
+
+    first = post("confirmed-http")
+    assert first.status_code == 200, first.text
+    upload_id = first.json()["upload"]["uploadId"]
+    assert (
+        clinic_analysis_intents.confirmed_analysis_binding(upload_id)["policyHash"]
+        == shown
+    )
+    monkeypatch.setenv("QEEG_STAGE1_MAX_TOKENS", "87654")
+    assert post("confirmed-http").json()["upload"]["uploadId"] == upload_id
+    response = post("stale-http")
+    assert response.status_code == 409 and "policy changed" in response.text
+    assert not (
+        root
+        / "clinic_intake"
+        / "submissions"
+        / hashlib.sha256(b"stale-http").hexdigest()
+    ).exists()

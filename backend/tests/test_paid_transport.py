@@ -131,7 +131,7 @@ async def test_saved_request_identity_fails_closed(owner, change):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["timeout", "reset", "502", "429", "400"])
+@pytest.mark.parametrize("outcome", ["timeout", "reset", "502", "400"])
 async def test_ambiguous_outcome_is_sticky_even_after_wrapping(owner, outcome):
     p = paid()
     calls = []
@@ -903,3 +903,105 @@ async def test_partial_body_is_unknown_not_a_complete_response(owner):
     assert rows(owner)[0].state == "unknown"
     assert rows(owner)[0].response_path is None
     assert calls == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 429])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"",
+        b"plain rejection",
+        b'{"error":{"message":"expired or throttled"}}',
+        b'{"error":{"code":"unrecognized"}}',
+    ],
+)
+@pytest.mark.parametrize("sync", [False, True])
+async def test_acknowledged_rejection_status_replays_independently_of_body(
+    owner, status, body, sync
+):
+    p = paid()
+    calls = []
+
+    def send(request):
+        calls.append(1)
+        return httpx.Response(status, content=body)
+
+    if sync:
+        with httpx.Client(
+            transport=p.PaidSyncTransport(httpx.MockTransport(send))
+        ) as client:
+            for _ in range(2):
+                with scope(owner):
+                    response = client.post("http://test/v1/responses", content=b"body")
+                    assert response.status_code == status and response.content == body
+    else:
+        async with httpx.AsyncClient(
+            transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+        ) as client:
+            for _ in range(2):
+                with scope(owner):
+                    response = await client.post(
+                        "http://test/v1/responses", content=b"body"
+                    )
+                    assert response.status_code == status and response.content == body
+    assert rows(owner)[0].state == "rejected" and calls == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,failures", [(429, 2), (429, 5), (401, 1)])
+@pytest.mark.parametrize("branch", ["chat", "responses"])
+async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
+    owner, monkeypatch, status, failures, branch
+):
+    from backend.llm_client import AsyncOpenAICompatClient
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import llm_calls
+
+    calls, sleeps = [], []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(llm_calls, "_sleep_backoff", sleep)
+
+    def send(request):
+        calls.append(1)
+        if len(calls) <= failures:
+            return httpx.Response(status, content=b"plain acknowledged rejection")
+        return httpx.Response(
+            200,
+            json={"output_text": "ok"}
+            if branch == "responses"
+            else {"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://test", api_key="", transport=httpx.MockTransport(send)
+    )
+    workflow = QEEGCouncilWorkflow(llm=client)
+    try:
+        with scope(owner):
+            call = workflow._call_model_chat
+            kwargs = dict(
+                model_id="gpt-5" if branch == "responses" else "model",
+                prompt_text="original",
+                max_tokens=100,
+                temperature=0.2,
+            )
+            if branch == "chat":
+                kwargs["temperature"] = 0.2
+            if status == 401 or failures > 4:
+                with pytest.raises(Exception) as failure:
+                    await call(**kwargs)
+                assert not isinstance(failure.value, paid().PaidOutcomeUnknown)
+                if status == 401:
+                    assert type(failure.value).__name__ == "_NeedsAuth"
+                else:
+                    assert getattr(failure.value, "status_code", None) == status
+            else:
+                assert await call(**kwargs) == "ok"
+    finally:
+        await client.aclose()
+    assert len(calls) == (1 if status == 401 else min(failures + 1, 5))
+    assert len(sleeps) == (0 if status == 401 else min(failures, 4))

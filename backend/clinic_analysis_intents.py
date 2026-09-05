@@ -19,34 +19,67 @@ def _snapshot_prompts():
     }
 
 
-def prepare_policy_binding(root):
+def current_policy_snapshot():
+    """One current snapshot for preview and original-upload confirmation."""
+    from .clinic_naming import POLICY
+    from .patient_postprocessing import snapshot_post_config
+
+    settings = {
+        k: v
+        for k, v in execution._settings_snapshot().items()
+        if not k.endswith(("_KEY", "_TOKEN", "_PASSWORD", "_SECRET", "_CREDENTIALS"))
+    }
+    post = snapshot_post_config(
+        settings, config.DISCOVERED_MODEL_IDS, base_url="", timeout_s=600.0
+    )
+    council = [m.id for m in config.COUNCIL_MODELS]
+    return dict(
+        publicPolicy=dict(
+            councilModelIds=council,
+            finalDraftModelIds=council,
+            consolidatorModelId=config.DEFAULT_CONSOLIDATOR,
+            modelRoles=asdict(config.MODEL_ROLE_DEFAULTS),
+        ),
+        presentationPolicy={
+            **POLICY,
+            "render": dict(
+                automaticPatientDocument=post["enabled"],
+                patientDocumentModel=post["model_id"],
+                formats=["markdown", "pdf"],
+            ),
+            "video": dict(automatic=False, requiresSeparateConfirmation=True),
+        },
+        settings=settings,
+        prompts=_snapshot_prompts(),
+        recipe=execution._recipe(),
+    )
+
+
+def public_current_policy():
+    snapshot = current_policy_snapshot()
+    return dict(
+        policy={**snapshot["presentationPolicy"], "analysis": snapshot["publicPolicy"]},
+        analysisPolicyFingerprint=hashlib.sha256(_json(snapshot).encode()).hexdigest(),
+    )
+
+
+def prepare_policy_binding(root, *, expected_fingerprint=None):
     from .clinic_intake import _immutable
 
     path = root / "analysis-policy.json"
-    if not path.exists():
-        settings = {
-            k: v
-            for k, v in execution._settings_snapshot().items()
-            if not k.endswith(
-                ("_KEY", "_TOKEN", "_PASSWORD", "_SECRET", "_CREDENTIALS")
-            )
-        }
-        snapshot = dict(
-            publicPolicy=dict(
-                councilModelIds=[m.id for m in config.COUNCIL_MODELS],
-                consolidatorModelId=config.DEFAULT_CONSOLIDATOR,
-                modelRoles=asdict(config.MODEL_ROLE_DEFAULTS),
-            ),
-            settings=settings,
-            prompts=_snapshot_prompts(),
-            recipe=execution._recipe(),
-        )
-        _immutable(path, _json(snapshot).encode())
-    data = path.read_bytes()
-    snapshot = json.loads(data)
-    return snapshot["publicPolicy"], dict(
-        path=str(path), sha256=hashlib.sha256(data).hexdigest()
+    data = (
+        path.read_bytes()
+        if path.exists()
+        else _json(current_policy_snapshot()).encode()
     )
+    fingerprint = hashlib.sha256(data).hexdigest()
+    if expected_fingerprint is not None and expected_fingerprint != fingerprint:
+        raise CatalogueConflict(
+            "Analysis policy changed; review and confirm the current policy"
+        )
+    _immutable(path, data)
+    snapshot = json.loads(data)
+    return snapshot["publicPolicy"], dict(path=str(path), sha256=fingerprint)
 
 
 def read_policy_binding(binding):

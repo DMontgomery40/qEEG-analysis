@@ -205,24 +205,20 @@ def _fsync_dir(path):
 
 
 def _rejection(status, body):
-    """Conservative explicit protocol rejections; generic status alone is unknown.
+    """Acknowledged auth/rate-limit responses and explicit endpoint rejections.
 
-    The compat contract supports structured authentication errors and explicit
-    chat-unsupported errors directing clients to Responses. 429/5xx and generic
-    invalid requests do not prove the provider's generation acceptance boundary.
+    A complete 401 or 429 response rejects this attempt independently of its
+    optional error body. Ambiguous server errors remain outcome-unknown.
     """
+    if status == 401:
+        return "authentication_rejected"
+    if status == 429:
+        return "rate_limit_rejected"
     try:
         error = json.loads(body).get("error", {})
-        code = error.get("code") or error.get("type")
         message = error.get("message", "").lower()
     except (ValueError, AttributeError, TypeError):
         return None
-    if status == 401 and code in (
-        "invalid_api_key",
-        "authentication_error",
-        "invalid_authentication",
-    ):
-        return "authentication_rejected"
     if status in (400, 404, 405) and (
         ("not supported" in message or "not support chat" in message)
         and ("chat" in message)
