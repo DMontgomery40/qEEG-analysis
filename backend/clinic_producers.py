@@ -4,6 +4,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import tempfile
@@ -13,8 +14,18 @@ from .clinic_catalogue_reads import _patient
 from .clinic_models import CatalogueConflict, CatalogueUnavailable
 
 
-def retained_producer_path(path, source_kind, source_id):
+def retained_producer_path(
+    path, source_kind, source_id, *, expected_sha256=None, expected_size=None
+):
     """Preserve exact bytes before a mutable latest path can be reused."""
+    if expected_sha256 is not None or expected_size is not None:
+        if (
+            not isinstance(expected_sha256, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", expected_sha256)
+            or type(expected_size) is not int
+            or expected_size < 0
+        ):
+            raise ValueError("Expected SHA-256 and size must be supplied together")
     path = Path(path)
     identity = json.dumps([source_kind, source_id], separators=(",", ":")).encode()
     directory = (
@@ -28,7 +39,11 @@ def retained_producer_path(path, source_kind, source_id):
     try:
         with os.fdopen(fd, "wb") as out, path.open("rb") as source:
             before = os.fstat(source.fileno())
-            shutil.copyfileobj(source, out, length=65536)
+            digest, size = hashlib.sha256(), 0
+            while chunk := source.read(65536):
+                out.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
             out.flush()
             os.fsync(out.fileno())
             after = os.fstat(source.fileno())
@@ -47,6 +62,15 @@ def retained_producer_path(path, source_kind, source_id):
                 after
             ) != fingerprint(current):
                 raise CatalogueUnavailable("Producer bytes changed during snapshot")
+        # Validate the bytes in this exact private snapshot before the immutable
+        # source identity can be reserved. A caller-side/path precheck races.
+        if expected_sha256 is not None and (digest.hexdigest(), size) != (
+            expected_sha256,
+            expected_size,
+        ):
+            raise CatalogueConflict(
+                "Original producer bytes differ from expected binding"
+            )
         try:
             os.link(pending, target)
         except FileExistsError:
@@ -70,9 +94,17 @@ def register_original_output(
     path,
     original_name,
     logical_family,
+    expected_sha256=None,
+    expected_size=None,
     **metadata,
 ):
-    snapshot = retained_producer_path(path, source_kind, source_id)
+    snapshot = retained_producer_path(
+        path,
+        source_kind,
+        source_id,
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
+    )
     args = dict(
         patient_uuid=patient_uuid,
         source_kind=source_kind,

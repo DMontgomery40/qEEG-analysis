@@ -360,3 +360,91 @@ def test_helper_cancellation_after_pipe_eof_drains_process(temp_data_dir):
         assert time.monotonic() - start < 0.75
     finally:
         timer.cancel()
+
+
+@pytest.mark.parametrize(
+    "replacement", [b"replaced", b"longer replacement", b"original"]
+)
+def test_expected_producer_bytes_guard_first_snapshot_and_restore(
+    live_api, monkeypatch, replacement
+):
+    client, chart, root = live_api
+    path = root / "portal_patients" / chart.label / "bound.mp4"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(replacement)
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(root / "portal_patients"))
+    assert (
+        client.post(
+            "/internal/operations",
+            json={
+                "operationId": "expected-op",
+                "patientId": chart.label,
+                "producer": "renderer",
+                "kind": "video",
+                "original": {"receiptId": "original"},
+            },
+        ).status_code
+        == 200
+    )
+    output = {
+        "patientId": chart.label,
+        "operationId": "expected-op",
+        "outputId": "mp4",
+        "relativePath": path.name,
+        "originalName": path.name,
+        "logicalFamily": "video",
+        "expectedSha256": hashlib.sha256(b"original").hexdigest(),
+        "expectedSize": 8,
+    }
+    first = client.post("/internal/artifacts", json=output)
+    if replacement != b"original":
+        assert first.status_code == 409, first.text
+        assert not list((root / "clinic_producer_bytes").rglob("original"))
+        with storage.session_scope() as session:
+            from backend.clinic_models import ClinicArtifact
+
+            assert (
+                not session.query(ClinicArtifact)
+                .filter_by(source_kind="renderer")
+                .all()
+            )
+    else:
+        assert first.status_code == 200, first.text
+    path.write_bytes(b"original")
+    accepted = client.post("/internal/artifacts", json=output)
+    assert accepted.status_code == 200, accepted.text
+    repeated = client.post("/internal/artifacts", json=output)
+    assert repeated.json()["artifact"] == accepted.json()["artifact"]
+    assert accepted.json()["artifact"]["version"] == 1
+    assert accepted.json()["artifact"]["sha256"] == output["expectedSha256"]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"expectedSha256": "a" * 64},
+        {"expectedSize": 8},
+        {"expectedSha256": None, "expectedSize": None},
+        {"expectedSha256": "bad", "expectedSize": 8},
+        {"expectedSha256": "a" * 64, "expectedSize": True},
+        {"expectedSha256": "a" * 64, "expectedSize": -1},
+    ],
+)
+def test_expected_producer_pair_rejects_invalid_material_without_snapshot(
+    live_api, fields
+):
+    client, chart, root = live_api
+    response = client.post(
+        "/internal/artifacts",
+        json={
+            "patientId": chart.label,
+            "operationId": "invalid-op",
+            "outputId": "mp4",
+            "relativePath": "unused.mp4",
+            "originalName": "unused.mp4",
+            "logicalFamily": "video",
+            **fields,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert not (root / "clinic_producer_bytes").exists()

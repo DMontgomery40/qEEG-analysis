@@ -151,11 +151,28 @@ def producer_artifact(body):
         "originalName",
         "logicalFamily",
     }
-    optional = {"documentKind", "sessionDate", "generatedAt", "provenance"}
+    optional = {
+        "documentKind",
+        "sessionDate",
+        "generatedAt",
+        "provenance",
+        "expectedSha256",
+        "expectedSize",
+    }
     if set(body) - required - optional or not required <= set(body):
         raise ValueError("Expected original output binding")
     if any(not isinstance(body[k], str) or not body[k] for k in required):
         raise ValueError("Invalid output identity")
+    if "expectedSha256" in body or "expectedSize" in body:
+        import re
+
+        if (
+            not isinstance(body.get("expectedSha256"), str)
+            or not re.fullmatch(r"[a-f0-9]{64}", body["expectedSha256"])
+            or type(body.get("expectedSize")) is not int
+            or body["expectedSize"] < 0
+        ):
+            raise ValueError("Expected SHA-256 and size must be supplied together")
     with storage.session_scope() as s:
         patient = _patient(s, body["patientId"])
         operation = s.get(ClinicOperation, body["operationId"])
@@ -183,6 +200,8 @@ def producer_artifact(body):
         original_name=body["originalName"],
         logical_family=body["logicalFamily"],
         path=path,
+        expected_sha256=body.get("expectedSha256"),
+        expected_size=body.get("expectedSize"),
         document_kind=body.get("documentKind"),
         session_date=body.get("sessionDate"),
         generated_at=body.get("generatedAt"),
