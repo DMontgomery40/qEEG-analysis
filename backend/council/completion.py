@@ -415,6 +415,76 @@ def _load_member(stage, index, model_id, *, reconstruct=True):
     return True, (model_id, Path(row.content_path).read_text(encoding="utf-8"))
 
 
+class ClinicalExhaustion(RuntimeError):
+    """An explicit output-policy gate exhausted the existing clinical recipe."""
+
+
+def clinical_exhaustion(message):
+    # Keep legacy exception behavior while making owned policy decisions explicit.
+    return (
+        ClinicalExhaustion(message)
+        if current_execution() is not None
+        else RuntimeError(message)
+    )
+
+
+def is_clinical_failure(error, *, key=None):
+    from .workflow.exceptions import _NeedsAuth
+    from ..llm_client import UpstreamError
+    from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
+
+    recognized = isinstance(
+        error,
+        (
+            ClinicalExhaustion,
+            _NeedsAuth,
+            UpstreamError,
+            ModelAPIError,
+            UnexpectedModelBehavior,
+        ),
+    )
+    if key is not None and recognized and not isinstance(error, ClinicalExhaustion):
+        return bool(_paid(key))
+    return recognized
+
+
+def finish_member_failure(stage, index, model_id, *, error=None, skip_reason=None):
+    """Record only an explicit exhausted clinical call/output gate or peer skip.
+
+    Ordinary local/projection exceptions propagate without a disposition, even
+    after an acknowledged response. Provider/SDK exception types also require
+    their original completed paid receipts; a paid list alone proves no policy.
+    """
+    if current_execution() is None:
+        return
+    from .execution import raise_if_execution_blocked
+    from .workflow.exceptions import _NeedsAuth
+
+    if error is not None:
+        raise_if_execution_blocked(error)
+        if not is_clinical_failure(error):
+            raise error
+    elif skip_reason not in {"no_peer_targets", "empty_analysis"}:
+        raise ValueError("explicit clinical failure or supported member skip required")
+    key = member_key(stage.num, index, model_id)
+    paid = _paid(key)
+    if error is not None and not isinstance(error, ClinicalExhaustion) and not paid:
+        raise error
+    _save(
+        "member/" + key,
+        disposition="failed",
+        paid=paid,
+        reason=skip_reason
+        or (
+            "validation_exhausted"
+            if isinstance(error, ClinicalExhaustion)
+            else "model_attempts_exhausted"
+        ),
+        error=str(error) if error is not None else skip_reason,
+        error_type="needs_auth" if isinstance(error, _NeedsAuth) else "failed",
+    )
+
+
 def durable_member(stage):
     def decorate(function):
         @wraps(function)
@@ -428,7 +498,11 @@ def durable_member(stage):
             result = await function(index, model_id)
             key = member_key(stage.num, index, model_id)
             if result is None:
-                _save("member/" + key, disposition="failed", paid=_paid(key))
+                record = _read("member/" + key)
+                if record is None or record["disposition"] != "failed":
+                    raise RuntimeError(
+                        "member returned without an authoritative clinical disposition"
+                    )
             else:
                 finish_member(stage, index, model_id, result[1])
             return result
@@ -748,19 +822,16 @@ def durable_stage(stage_num):
                 result = await function(*bound.args, **bound.kwargs)
             except Exception as error:
                 from .execution import raise_if_execution_blocked
-                from .workflow.exceptions import _NeedsAuth
 
                 raise_if_execution_blocked(error)
                 if stage_num == 4 and _read("member/s4/consolidation") is None:
-                    _save(
-                        "member/s4/consolidation",
-                        disposition="failed",
-                        error=str(error),
-                        error_type="needs_auth"
-                        if isinstance(error, _NeedsAuth)
-                        else "failed",
-                        paid=_paid("s4/consolidation"),
+                    finish_member_failure(
+                        STAGES[3],
+                        0,
+                        ctx.manifest["admission"]["consolidator_model_id"],
+                        error=error,
                     )
+
                 raise
             if not committed:
                 raise ExecutionConflict("stage returned without explicit completion")

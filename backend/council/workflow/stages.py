@@ -26,7 +26,15 @@ from ..execution import (
     bind_artifact_sources,
     execution_llm,
 )
-from ..completion import durable_stage, durable_member, finish_member, project_label_map
+from ..completion import (
+    durable_stage,
+    durable_member,
+    finish_member,
+    project_label_map,
+    finish_member_failure,
+    clinical_exhaustion,
+    is_clinical_failure,
+)
 from ..constants import STAGES
 from ..db_utils import _aggregate_required_changes, _stage_artifacts, _validate_stage5
 from ..json_utils import _json_loads_loose
@@ -939,6 +947,10 @@ class _StagesMixin:
                     )
                 except Exception as primary_exc:
                     raise_if_execution_blocked(primary_exc)
+                    if current_execution() is not None and not is_clinical_failure(
+                        primary_exc, key=f"s1/member/{member_index}/{model_id}/primary"
+                    ):
+                        raise
                     if isinstance(model_id, str) and model_id.startswith("mock-"):
                         raise
                     await emit(
@@ -981,7 +993,7 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=None,
                 ):
-                    raise RuntimeError(
+                    raise clinical_exhaustion(
                         "Stage 1 analysis remained incomplete after repair attempts. "
                         f"End sentinel present: {end_sentinel in (text or '')}"
                     )
@@ -999,6 +1011,7 @@ class _StagesMixin:
                 return model_id, text
             except Exception as exc:
                 raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 await emit(
                     {
                         "run_id": run_id,
@@ -1154,6 +1167,12 @@ class _StagesMixin:
                     continue
                 filtered.append(f"Analysis {label}:\n{analyses_by_model[mid]}".strip())
             if not filtered:
+                finish_member_failure(
+                    stage,
+                    member_index,
+                    reviewer_model_id,
+                    skip_reason="no_peer_targets",
+                )
                 return None
             filtered_text = "\n\n".join(filtered)
             prompt_text = (
@@ -1186,6 +1205,7 @@ class _StagesMixin:
                 return reviewer_model_id, text
             except Exception as exc:
                 raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, reviewer_model_id, error=exc)
                 return None
 
         results = await gather_units(
@@ -1327,6 +1347,9 @@ class _StagesMixin:
         async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             analysis = analyses_by_model.get(model_id)
             if not analysis:
+                finish_member_failure(
+                    stage, member_index, model_id, skip_reason="empty_analysis"
+                )
                 return None
             my_label = next(
                 (lbl for lbl, mid in label_map.items() if mid == model_id), None
@@ -1383,7 +1406,7 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    raise RuntimeError(
+                    raise clinical_exhaustion(
                         "Stage 3 revision remained incomplete after repair attempts. "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
@@ -1392,6 +1415,7 @@ class _StagesMixin:
                 return model_id, text
             except Exception as exc:
                 raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 await emit(
                     {
                         **event_payload,
@@ -1732,7 +1756,7 @@ class _StagesMixin:
                 "Increase QEEG_STAGE4_MAX_TOKENS and/or QEEG_STAGE4_REPAIR_CALLS, then retry."
             )
             if require_complete:
-                raise RuntimeError(detail)
+                raise clinical_exhaustion(detail)
 
         if current_execution() is None:
             await self._write_artifact(
@@ -1871,11 +1895,15 @@ class _StagesMixin:
                         prompt_text=prompt_text,
                     ),
                 )
-                payload = _json_loads_loose(text)
-                _validate_stage5(payload)
+                try:
+                    payload = _json_loads_loose(text)
+                    _validate_stage5(payload)
+                except (ValueError, TypeError) as error:
+                    raise clinical_exhaustion(str(error)) from error
                 return model_id, json.dumps(payload, indent=2, sort_keys=True)
             except Exception as exc:
                 raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 return None
 
         results = await gather_units(
@@ -2102,13 +2130,14 @@ class _StagesMixin:
                     end_sentinel=end_sentinel,
                     required_headings=required_headings,
                 ):
-                    raise RuntimeError(
+                    raise clinical_exhaustion(
                         "Stage 6 final draft remained incomplete after repair attempts. "
                         f"end sentinel present: {end_sentinel in (text or '')}"
                     )
                 return model_id, text
             except Exception as exc:
                 raise_if_execution_blocked(exc)
+                finish_member_failure(stage, member_index, model_id, error=exc)
                 failures.append(f"{model_id}: {type(exc).__name__}: {exc}")
                 return None
 

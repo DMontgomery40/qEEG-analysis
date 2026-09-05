@@ -280,7 +280,7 @@ async def test_definite_failures_and_successes_rejoin_unfinished_stage(
             model_id=model_id, messages=[{"role": "user", "content": "review"}]
         )
         if model_id == "model-a":
-            raise ValueError("definite invalid exhausted output")
+            return json.dumps({"vote": "INVALID"})
         return json.dumps(fixture("stage5_approve_valid.json"))
 
     monkeypatch.setattr(stages, "run_stage5_final_review_json", reviewer)
@@ -426,7 +426,7 @@ async def test_six_stage_success_skip_and_count_policies(
     async def generated(*args, model_id, **kwargs):
         calls.append(model_id)
         if model_id in models[:failures]:
-            raise ValueError("definite failed generation")
+            raise completion().ClinicalExhaustion("definite failed generation")
         if stage_num == 5:
             return json.dumps(fixture("stage5_approve_valid.json"))
         return "Complete\n<!-- END CONSOLIDATED REPORT -->"
@@ -900,3 +900,285 @@ async def test_pipeline_resumes_the_remaining_member_after_predispatch_cancellat
         assert completion().verified_stage_prefix() == 1
     assert sent == ["model-a", "model-b"]
     assert events[-1]["success_count"] == events[-1]["requested_count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", range(1, 7))
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+async def test_ordinary_local_interruptions_remain_unfinished_before_and_after_ack(
+    owner, tmp_path, monkeypatch, stage_num, phase, error_type
+):
+    from backend.council.workflow import stages
+    from backend.tests.test_council_execution import fixture
+
+    models = ["model-a", "model-b"]
+    report = seed_stages(owner, tmp_path, monkeypatch)
+    sent = []
+    full_text = "\n".join(
+        [
+            "# Dataset and Sessions",
+            "# Key Empirical Findings",
+            "# Performance Assessments",
+            "# Auditory ERP: P300 and N100",
+            "# Background EEG Metrics",
+            "# Speculative Commentary and Interpretive Hypotheses",
+            "<!-- END STAGE1 ANALYSIS -->",
+            "<!-- END STAGE3 REVISION -->",
+            "<!-- END CONSOLIDATED REPORT -->",
+            "<!-- END STAGE6 FINAL DRAFT -->",
+        ]
+    )
+    llm = client(
+        lambda req: sent.append(json.loads(req.content)["model"]) or answer(full_text)
+    )
+    workflow = QEEGCouncilWorkflow(llm=llm)
+    if stage_num in (2, 5):
+
+        async def generate(*, model_id, **kwargs):
+            await llm.chat_completions(
+                model_id=model_id, messages=[{"role": "user", "content": "review"}]
+            )
+            return json.dumps(
+                fixture(
+                    "stage2_valid.json"
+                    if stage_num == 2
+                    else "stage5_approve_valid.json"
+                )
+            )
+
+        target_name = (
+            "run_stage2_peer_review_json"
+            if stage_num == 2
+            else "run_stage5_final_review_json"
+        )
+        target = stages
+    else:
+        target_name = (
+            "_call_model_chat" if stage_num == 4 else "_call_longform_chat_with_repairs"
+        )
+        target = workflow
+        generate = getattr(target, target_name)
+    armed = True
+
+    async def interrupted(*args, model_id, **kwargs):
+        nonlocal armed
+        if armed and model_id == models[0] and phase == "before":
+            armed = False
+            raise error_type("temporary local interruption")
+        result = await generate(*args, model_id=model_id, **kwargs)
+        if armed and model_id == models[0] and phase == "after":
+            armed = False
+            raise error_type("temporary local interruption")
+        return result
+
+    monkeypatch.setattr(target, target_name, interrupted)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    args = (
+        ("r", models, report, silent)
+        if stage_num == 1
+        else ("r", silent)
+        if stage_num == 4
+        else ("r", models, silent)
+    )
+    fanout = stage_num in (1, 2, 3, 5)
+    with e.execution_context(ctx):
+        with pytest.raises(Exception):
+            await getattr(workflow, f"_stage{stage_num}")(*args)
+        key = completion().member_key(stage_num, 0, models[0])
+        assert completion()._read("member/" + key) is None
+        with owner.transaction() as session:
+            assert session.get(storage.StageReceipt, ("r", stage_num)) is None
+        assert sent.count(models[0]) == (phase == "after")
+        if fanout:
+            sibling = completion()._read(
+                "member/" + completion().member_key(stage_num, 1, models[1])
+            )
+            assert sibling["disposition"] == "success"
+        else:
+            assert models[1] not in sent
+        await getattr(workflow, f"_stage{stage_num}")(*args)
+        assert completion()._read("member/" + key)["disposition"] == "success"
+    assert sorted(sent) == sorted(models if fanout else models[:1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", [1, 3, 4])
+@pytest.mark.parametrize("phase", ["before", "after"])
+async def test_progress_failures_never_become_terminal_clinical_failures(
+    owner, tmp_path, monkeypatch, stage_num, phase
+):
+    models = ["model-a", "model-b"]
+    report = seed_stages(owner, tmp_path, monkeypatch)
+    sent = []
+    text = "Complete\n<!-- END STAGE1 ANALYSIS -->\n<!-- END STAGE3 REVISION -->\n<!-- END CONSOLIDATED REPORT -->"
+    llm = client(
+        lambda req: sent.append(json.loads(req.content)["model"]) or answer(text)
+    )
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    task_name = {1: "stage1_model", 3: "stage3_model", 4: "stage4_consolidation"}[
+        stage_num
+    ]
+
+    async def broken(event):
+        if (
+            event.get("task") == task_name
+            and event.get("model_id") == models[0]
+            and event.get("status") == ("start" if phase == "before" else "complete")
+        ):
+            raise OSError("transient progress sink unavailable")
+
+    async def run(emit):
+        workflow = QEEGCouncilWorkflow(llm=llm)
+        if stage_num == 1:
+            await workflow._stage1("r", models, report, emit)
+        elif stage_num == 3:
+            await workflow._stage3("r", models, emit)
+        else:
+            await workflow._stage4("r", emit)
+
+    with e.execution_context(ctx):
+        with pytest.raises(Exception):
+            await run(broken)
+        key = completion().member_key(stage_num, 0, models[0])
+        record = completion()._read("member/" + key)
+        assert record is None or record["disposition"] == "success"
+        await run(silent)
+    assert sorted(sent) == sorted(models if stage_num != 4 else models[:1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", [2, 5])
+async def test_exhausted_sdk_output_validation_is_terminal_without_respending(
+    owner, tmp_path, monkeypatch, stage_num
+):
+    from backend.tests.test_council_execution import (
+        completion as sdk_completion,
+        fixture,
+    )
+
+    models = ["model-a", "model-b"]
+    seed_stages(owner, tmp_path, monkeypatch)
+    sent = []
+    invalid = fixture(
+        "stage2_missing_b.json"
+        if stage_num == 2
+        else "stage5_approve_with_required_changes.json"
+    )
+    if stage_num == 2:
+        invalid["reviews"] = []
+        invalid["ranking_best_to_worst"] = []
+    llm = client(lambda req: sent.append(req.content) or sdk_completion(req, invalid))
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        for attempt in range(2):
+            try:
+                await getattr(QEEGCouncilWorkflow(llm=llm), f"_stage{stage_num}")(
+                    "r", models, silent
+                )
+            except RuntimeError:
+                assert stage_num == 5
+            if attempt == 0:
+                count = len(sent)
+            assert len(sent) == count and count > 0
+        for i, model in enumerate(models):
+            record = completion()._read(
+                "member/" + completion().member_key(stage_num, i, model)
+            )
+            assert record["disposition"] == "failed"
+            assert record["reason"] == "model_attempts_exhausted"
+            assert record["paid"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_only_peer_skip_has_explicit_terminal_dispositions(
+    owner, tmp_path, monkeypatch
+):
+    seed_stages(owner, tmp_path, monkeypatch, models=("model-a", "model-a"))
+    sent = []
+    llm = client(lambda req: sent.append(req.content) or answer("unexpected"))
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        for _ in range(2):
+            await QEEGCouncilWorkflow(llm=llm)._stage2(
+                "r", ["model-a", "model-a"], silent
+            )
+        for i in range(2):
+            record = completion()._read(f"member/s2/reviewer/{i}/model-a")
+            assert record["reason"] == "no_peer_targets"
+            assert record["paid"] == []
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", [1, 3, 4, 6])
+async def test_definite_auth_rejection_survives_replay_at_terminal_policy(
+    owner, tmp_path, monkeypatch, stage_num
+):
+    from backend.council.workflow.exceptions import _NeedsAuth
+
+    report = seed_stages(owner, tmp_path, monkeypatch, models=("model-a",))
+    sent = []
+    llm = client(
+        lambda req: sent.append(req.content)
+        or httpx.Response(
+            401,
+            json={
+                "error": {"type": "authentication_error", "message": "invalid API key"}
+            },
+        )
+    )
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    args = (
+        ("r", ["model-a"], report, silent)
+        if stage_num == 1
+        else ("r", silent)
+        if stage_num == 4
+        else ("r", ["model-a"], silent)
+    )
+    with e.execution_context(ctx):
+        for attempt in range(2):
+            with pytest.raises(_NeedsAuth if stage_num == 4 else RuntimeError):
+                await getattr(QEEGCouncilWorkflow(llm=llm), f"_stage{stage_num}")(*args)
+            if attempt == 0:
+                count = len(sent)
+            assert len(sent) == count and count > 0
+        record = completion()._read(
+            "member/" + completion().member_key(stage_num, 0, "model-a")
+        )
+        assert record["error_type"] == "needs_auth"
+        assert all(row["state"] == "rejected" for row in record["paid"])
+
+
+@pytest.mark.asyncio
+async def test_failed_progress_after_clinical_exhaustion_preserves_terminal_evidence(
+    owner, tmp_path, monkeypatch
+):
+    models = ["model-a", "model-b"]
+    report = seed_stages(owner, tmp_path, monkeypatch)
+    monkeypatch.setenv("QEEG_LONGFORM_REPAIR_CALLS", "0")
+    sent = []
+
+    def send(req):
+        model = json.loads(req.content)["model"]
+        sent.append(model)
+        return answer(
+            "incomplete"
+            if model == "model-a"
+            else "Complete\n<!-- END STAGE1 ANALYSIS -->"
+        )
+
+    llm = client(send)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+
+    async def broken(event):
+        if event.get("task") == "stage1_model" and event.get("status") == "failed":
+            raise OSError("transient failure-event sink")
+
+    with e.execution_context(ctx):
+        with pytest.raises(OSError):
+            await QEEGCouncilWorkflow(llm=llm)._stage1("r", models, report, broken)
+        record = completion()._read("member/s1/member/0/model-a")
+        assert record["reason"] == "validation_exhausted"
+        await QEEGCouncilWorkflow(llm=llm)._stage1("r", models, report, silent)
+    assert sorted(sent) == models
