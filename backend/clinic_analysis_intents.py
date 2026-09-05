@@ -90,3 +90,139 @@ def confirmed_analysis_binding(upload_id):
             policySnapshot=snapshot,
             policyHash=analysis["policyBinding"]["sha256"],
         )
+
+
+def run_policy_binding(run):
+    """Original confirmed upload policy, verified against the admitted operation."""
+    from .run_execution import ExecutionConflict
+
+    with storage.session_scope() as s:
+        uploads = list(
+            s.scalars(
+                select(ClinicUpload).where(ClinicUpload.analysis_json.is_not(None))
+            )
+        )
+        matching = [
+            u
+            for u in uploads
+            if json.loads(u.analysis_json)["operationId"] == run.operation_id
+        ]
+        if not matching:
+            return None
+        if len(matching) != 1:
+            raise ExecutionConflict("Confirmed operation ownership is ambiguous")
+        binding = confirmed_analysis_binding(matching[0].id)
+        if not binding["ready"] or not binding["compatible"]:
+            raise ExecutionConflict(
+                "Original confirmed policy is not ready or compatible"
+            )
+        operation = s.get(storage.AnalysisInputReservation, run.operation_id)
+        material = (
+            json.loads(operation.immutable_request_json or "{}") if operation else {}
+        )
+        if (
+            material.get("clinicPolicyHash") != binding["policyHash"]
+            or run.patient_id != binding["patientUuid"]
+            or json.loads(run.source_report_ids_json or "[]")
+            != binding["sourceReportIds"]
+        ):
+            raise ExecutionConflict("Original confirmed operation binding differs")
+        return binding["policySnapshot"]
+
+
+def admit_confirmed_upload(upload_id):
+    """Free original E6 Run admission, only for the already confirmed manifest."""
+    from .analysis_inputs import admit_run
+    from . import runtime_identity
+    from .run_execution import ExecutionConflict
+    from .clinic_catalogue import _read_local
+    from .clinic_models import ClinicArtifact
+
+    binding = confirmed_analysis_binding(upload_id)
+    if not binding["ready"]:
+        return None
+    snapshot = binding["policySnapshot"]
+    policy = snapshot["publicPolicy"]
+    requested = [*policy["councilModelIds"], policy["consolidatorModelId"]]
+    # Validate each original upload item's byte binding before original admission.
+    with storage.session_scope() as s:
+        for rid in binding["sourceReportIds"]:
+            source = s.get(storage.Report, rid)
+            artifact = s.scalar(
+                select(ClinicArtifact).where(
+                    ClinicArtifact.source_kind == "report",
+                    ClinicArtifact.source_id == rid,
+                )
+            )
+            if (
+                not source
+                or not artifact
+                or source.patient_id != binding["patientUuid"]
+            ):
+                raise ExecutionConflict("Original confirmed source missing")
+            _, digest, size, _ = _read_local(source.stored_path)
+            if (digest, size) != (artifact.sha256, artifact.size):
+                raise ExecutionConflict("Original confirmed source bytes differ")
+
+    def models():
+        discovered = sorted(config.DISCOVERED_MODEL_IDS)
+        if any(m not in discovered for m in requested):
+            raise CatalogueUnavailable("Original confirmed models are unavailable")
+        runtime = runtime_identity.current_runtime_identity(discovered)
+        return dict(
+            council_model_ids=policy["councilModelIds"],
+            consolidator_model_id=policy["consolidatorModelId"],
+            requested_model_ids=requested,
+            resolved_model_ids=requested,
+            creating_instance_id=str(runtime["instance_id"]),
+            model_catalogue_fingerprint=str(runtime["model_catalogue_fingerprint"]),
+        )
+
+    material = dict(
+        patient_id=binding["patientUuid"],
+        source_ids=binding["sourceReportIds"],
+        special_instructions=binding["specialInstructions"],
+        source_session_aliases={},
+        requested_model_ids=requested,
+        allowed_model_fallbacks={},
+        clinicPolicyHash=binding["policyHash"],
+    )
+    run = admit_run(
+        patient_id=binding["patientUuid"],
+        source_ids=binding["sourceReportIds"],
+        special_instructions=binding["specialInstructions"],
+        source_session_aliases={},
+        operation_id=binding["operationId"],
+        model_fields=models,
+        immutable_request=material,
+    )
+    run_policy_binding(run)
+    return run
+
+
+async def activate_confirmed_uploads(runtime):
+    """Existing E6 consumer scans its original confirmed upload references."""
+    import asyncio
+    from . import main
+
+    if runtime.store.engine is not storage.engine:
+        return
+    with storage.session_scope() as s:
+        ids = list(
+            s.scalars(
+                select(ClinicUpload.id)
+                .where(ClinicUpload.analysis_json.is_not(None))
+                .order_by(ClinicUpload.id)
+            )
+        )
+    for upload_id in ids:
+        try:
+            run = await runtime.admission(admit_confirmed_upload, upload_id)
+            if run is not None and run.start_requested_at is None:
+                await runtime.admission(main._new_start_intent, runtime.store, run.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            main.LOGGER.exception(
+                "confirmed_upload_admission_pending", upload_id=upload_id
+            )

@@ -1,0 +1,415 @@
+"""Complete synthetic inventories, honest missing legacy sources and replay."""
+
+import json
+import pytest
+from sqlalchemy import select, func
+from backend import (
+    storage,
+    clinic_reconciliation as reconcile,
+    clinic_catalogue as catalogue,
+)
+from backend.clinic_models import (
+    ClinicArtifact,
+    ClinicProjection,
+    CatalogueUnavailable,
+    CatalogueConflict,
+)
+from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+
+
+def census(keys):
+    return [
+        {"type": "page", "page": 1, "keys": keys},
+        {"type": "complete", "pages": 1, "keyCount": len(keys)},
+    ]
+
+
+def source(root, label, name="one.txt", data=b"original"):
+    with storage.session_scope() as s:
+        patient = storage.create_patient(s, label=label)
+        path = root / name
+        if data is not None:
+            path.write_bytes(data)
+        report = storage.create_report(
+            s,
+            patient_id=patient.id,
+            report_id=name,
+            filename=name,
+            mime_type="text/plain",
+            stored_path=path,
+            extracted_text_path=path,
+        )
+    return patient, report
+
+
+def test_missing_legacy_retains_original_row_without_fake_artifact(temp_data_dir):
+    patient, report = source(temp_data_dir, "legacy-row", data=None)
+    inventory = reconcile.build_inventory(
+        "legacy",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    assert inventory["complete"]
+    result = reconcile.import_inventory(
+        "legacy", remote_readback=lambda *a: (), activate=True
+    )
+    assert result["retainedUnresolvedSources"][0]["sourceId"] == report.id
+    with storage.session_scope() as s:
+        assert s.get(storage.Report, report.id).stored_path == report.stored_path
+        assert s.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
+        assert s.scalar(select(ClinicProjection)).artifact_id is None
+    assert (
+        reconcile.import_inventory(
+            "legacy", remote_readback=lambda *a: (), activate=True
+        )
+        == result
+    )
+    with storage.session_scope() as s:
+        storage.update_patient(s, patient.id, label="ZZ_01-01-1900")
+    with pytest.raises(CatalogueConflict):
+        catalogue.complete_catalogue_import(
+            {
+                k: result[k]
+                for k in (
+                    "inventoryId",
+                    "legacyPatientIds",
+                    "retainedUnresolvedSources",
+                )
+            }
+        )
+
+
+def test_canonical_missing_and_failed_remote_census_never_complete(temp_data_dir):
+    source(temp_data_dir, "ZZ_01-01-1900", data=None)
+    inventory = reconcile.build_inventory(
+        "bad",
+        remote_events=[{"type": "page", "page": 1, "keys": []}],
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    assert not inventory["complete"] and len(inventory["errors"]) == 2
+    with pytest.raises(CatalogueUnavailable):
+        reconcile.import_inventory("bad", remote_readback=lambda *a: (), activate=True)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [],
+        [{"type": "complete", "pages": 1, "keyCount": 0}],
+        [{"type": "page", "page": 2, "keys": []}],
+        [{"type": "page", "page": 1, "keys": ["same", "same"]}],
+        [
+            {"type": "page", "page": 1, "keys": ["one"]},
+            {"type": "complete", "pages": 1, "keyCount": 0},
+        ],
+    ],
+)
+def test_malformed_census_is_not_empty_authority(events):
+    with pytest.raises(CatalogueUnavailable):
+        list(reconcile.validate_remote_census(events))
+
+
+def test_original_copy_and_remote_only_history_replay_exactly(temp_data_dir):
+    patient, report = source(temp_data_dir, "ZZ_01-01-1900")
+    key = f"patients/{patient.label}/files/original.txt"
+    oldkey = f"patients/{patient.label}/files/older.txt"
+    objects = {key: b"original", oldkey: b"remote-only"}
+    bindings = {
+        key: dict(patientUuid=patient.id, sourceKind="report", sourceId=report.id),
+        oldkey: dict(
+            patientUuid=patient.id,
+            sourceKind="netlify-history",
+            sourceId=oldkey,
+            metadata={"originalName": "older.txt", "logicalFamily": "historical"},
+        ),
+    }
+
+    def read(key, limit):
+        return iter([objects[key]])
+
+    reconcile.build_inventory(
+        "complete",
+        remote_events=census(list(objects)),
+        remote_readback=read,
+        max_file_bytes=1024,
+        bindings=bindings,
+    )
+    a = reconcile.import_inventory("complete", remote_readback=read, activate=True)
+    with storage.session_scope() as s:
+        assert s.scalar(select(func.count()).select_from(ClinicArtifact)) == 2
+    assert (
+        reconcile.import_inventory("complete", remote_readback=read, activate=True) == a
+    )
+    from backend.clinic_catalogue_reads import patient_files
+
+    files = patient_files(patient.label)["files"]
+    assert len(files) == 2 and all(f["hashVerified"] for f in files)
+    assert (
+        next(f for f in files if f["originalName"] == "older.txt")["generatedAt"]
+        is None
+    )
+
+
+def test_inventory_retains_symlink_directory_failure(temp_data_dir, monkeypatch):
+    portal = temp_data_dir / "portal"
+    portal.mkdir()
+    (portal / "escaped").symlink_to(temp_data_dir.parent, target_is_directory=True)
+    monkeypatch.setattr("backend.portal_sync.portal_patients_dir", lambda: portal)
+    result = reconcile.build_inventory(
+        "symlink",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=100,
+    )
+    assert not result["complete"]
+    assert any(e.get("reason") == "symlink_directory" for e in result["errors"])
+
+
+def test_inventory_replay_rejects_changed_legacy_evidence(temp_data_dir):
+    reconcile.build_inventory(
+        "immutable",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=100,
+        legacy_upload_records=[{"uploadId": "old", "status": "pending"}],
+    )
+    with pytest.raises(CatalogueConflict):
+        reconcile.build_inventory(
+            "immutable",
+            remote_events=census([]),
+            remote_readback=lambda *a: (),
+            max_file_bytes=100,
+            legacy_upload_records=[{"uploadId": "old", "status": "registered"}],
+        )
+
+
+def test_submission_import_binds_original_registered_sources_without_new_chart(
+    temp_data_dir,
+):
+    from backend.clinic_intake import submit_upload, get_upload
+    from backend.tests.test_clinic_upload_import import original
+
+    receipt = original()
+    registered = submit_upload(
+        key="existing-file",
+        identity=receipt["manifest"]["identity"],
+        resolution={},
+        file_meta=[{}],
+        files=[("same.txt", b"one", "text/plain")],
+    )["upload"]
+    with storage.session_scope() as s:
+        patient = s.scalar(
+            select(storage.Patient).where(
+                storage.Patient.label == registered["patientId"]
+            )
+        )
+    key = receipt["response"]["uploaded"][0]["fileKey"]
+    receipt_key = "uploads/submissions/original-id.json"
+    objects = {
+        key: b"one",
+        receipt_key: json.dumps(receipt, separators=(",", ":")).encode(),
+    }
+    binding = dict(
+        patientUuid=patient.id,
+        sourceKind="patient-file",
+        sourceId=registered["items"][0]["sourceId"],
+    )
+
+    def read(key, limit):
+        return iter([objects[key]])
+
+    reconcile.build_inventory(
+        "submission",
+        remote_events=census(list(objects)),
+        remote_readback=read,
+        max_file_bytes=2048,
+        bindings={key: binding},
+    )
+    reconcile.import_inventory("submission", remote_readback=read, activate=True)
+    imported = get_upload("original-id")["upload"]
+    assert imported["status"] == "registered"
+    assert imported["patientId"] == registered["patientId"]
+    assert imported["items"][0]["sourceId"] == registered["items"][0]["sourceId"]
+    with storage.session_scope() as s:
+        assert s.scalar(select(func.count()).select_from(storage.Patient)) == 1
+        assert s.scalar(select(func.count()).select_from(storage.PatientFile)) == 1
+
+
+def test_original_archived_bytes_and_feedback_hash_survive_import(temp_data_dir):
+    import hashlib
+    from backend.clinic_feedback import feedback_history
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="ZZ_01-01-1900")
+    key = f"patients/{patient.label}/.archive/old.pdf"
+    feedback_key = f"patients/{patient.label}/.archive/feedback/old.pdf.json"
+    raw = b'{ "action":"reject", "notes":"original reason", "submittedBy":"Doctor", "submittedAt":123 }'
+    objects = {key: b"oldbytes", feedback_key: raw}
+    binding = dict(
+        patientUuid=patient.id,
+        sourceKind="netlify-history",
+        sourceId=key,
+        metadata=dict(originalName="old.pdf", logicalFamily="original-family"),
+    )
+
+    def read(key, limit):
+        return iter([objects[key]])
+
+    reconcile.build_inventory(
+        "archived",
+        remote_events=census(list(objects)),
+        remote_readback=read,
+        max_file_bytes=1024,
+        bindings={key: binding, feedback_key: binding},
+    )
+    reconcile.import_inventory("archived", remote_readback=read, activate=True)
+    with storage.session_scope() as session:
+        artifact = session.scalar(select(ClinicArtifact))
+        assert artifact.archived
+    history = feedback_history(artifact.id)
+    expected = (
+        "legacy-feedback:"
+        + hashlib.sha256(
+            (feedback_key + "\n" + hashlib.sha256(raw).hexdigest()).encode()
+        ).hexdigest()
+    )
+    assert len(history) == 1 and history[0]["eventId"] == expected
+    assert history[0]["notification"] is None
+    assert history[0]["submittedAt"] == 123
+    reconcile.import_inventory("archived", remote_readback=read, activate=True)
+    assert feedback_history(artifact.id) == history
+
+
+@pytest.mark.parametrize("relabels", [0, 1, 2])
+def test_imported_file_alias_preserves_collision_ownership(temp_data_dir, relabels):
+    from backend.clinic_catalogue_reads import file_binding
+
+    old = "ZZ_01-01-1900"
+    patients = []
+    artifacts = []
+    for i in range(2):
+        patient, report = source(
+            temp_data_dir, old, name=f"file-{i}.txt", data=str(i).encode()
+        )
+        patients.append(patient)
+        with storage.session_scope() as session:
+            artifacts.append(
+                session.scalar(
+                    select(ClinicArtifact).where(ClinicArtifact.source_id == report.id)
+                )
+            )
+    for i in range(relabels):
+        with storage.session_scope() as session:
+            storage.update_patient(
+                session, patients[i].id, label=f"ZZ_01-01-1900_{i+2}"
+            )
+    for artifact in artifacts:
+        evidence = dict(
+            patientUuid=artifact.patient_uuid,
+            fileId=artifact.id,
+            patientAlias=old,
+            relativePath="original/file.pdf",
+            sha256=artifact.sha256,
+            evidence={"journalHash": "original-exact-journal-hash"},
+        )
+        assert reconcile.import_file_alias(evidence) == artifact.id
+        assert reconcile.import_file_alias(evidence) == artifact.id
+        if relabels == 0:
+            with pytest.raises(CatalogueConflict):
+                file_binding(old, file_id=artifact.id)
+        else:
+            assert file_binding(old, file_id=artifact.id)["fileId"] == artifact.id
+
+
+def test_original_remote_alias_import_after_both_collision_relabels(temp_data_dir):
+    old = "ZZ_01-01-1900"
+    patients = [
+        source(temp_data_dir, old, name=f"item-{i}.txt", data=str(i).encode())
+        for i in range(2)
+    ]
+    for i, (patient, _) in enumerate(patients):
+        with storage.session_scope() as session:
+            storage.update_patient(session, patient.id, label=f"ZZ_01-01-1900_{i+2}")
+    objects = {f"patients/{old}/files/item-{i}.txt": str(i).encode() for i in range(2)}
+    bindings = {
+        key: dict(patientUuid=patient.id, sourceKind="report", sourceId=report.id)
+        for key, (patient, report) in zip(objects, patients)
+    }
+
+    def read(key, limit):
+        return iter([objects[key]])
+
+    reconcile.build_inventory(
+        "remote-alias",
+        remote_events=census(list(objects)),
+        remote_readback=read,
+        max_file_bytes=10,
+        bindings=bindings,
+    )
+    reconcile.import_inventory("remote-alias", remote_readback=read, activate=True)
+    from backend.clinic_catalogue_reads import file_binding
+
+    for key, (patient, _) in zip(objects, patients):
+        assert file_binding(old, file_key=key)["patientId"] != old
+
+
+@pytest.mark.parametrize("boundary", ["before_location", "after_verification"])
+def test_real_import_process_replacement_reuses_durable_receipts(
+    temp_data_dir, boundary
+):
+    import os
+    import subprocess
+    import sys
+
+    patient, report = source(temp_data_dir, "ZZ_01-01-1900")
+    key = f"patients/{patient.label}/files/original.txt"
+    reconcile.build_inventory(
+        "interrupted",
+        remote_events=census([key]),
+        remote_readback=lambda *a: iter([b"original"]),
+        max_file_bytes=100,
+        bindings={
+            key: dict(patientUuid=patient.id, sourceKind="report", sourceId=report.id)
+        },
+    )
+    code = """
+import os, signal, sys
+from backend import storage, clinic_reconciliation as reconcile
+from backend.paid_transport import PaidSyncTransport, PaidAsyncTransport
+def forbidden(*a, **k): raise AssertionError('Paid transport forbidden')
+PaidSyncTransport.handle_request = forbidden
+PaidAsyncTransport.handle_async_request = forbidden
+storage.init_db()
+original = reconcile._add_exact_location
+def interrupted(*args):
+    if sys.argv[1] == 'after_verification': original(*args)
+    os.kill(os.getpid(),signal.SIGKILL)
+reconcile._add_exact_location = interrupted
+reconcile.import_inventory('interrupted',remote_readback=lambda *a: iter([b'original']),activate=True)
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", code, boundary],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={
+            **os.environ,
+            "DATA_DIR": str(temp_data_dir),
+            "QEEG_ANALYSIS_ROOT": str(temp_data_dir.parent),
+        },
+    )
+    assert child.returncode == -9, child.stderr
+    result = reconcile.import_inventory(
+        "interrupted", remote_readback=lambda *a: iter([b"original"]), activate=True
+    )
+    assert result["activated"]
+    assert (
+        reconcile.import_inventory(
+            "interrupted", remote_readback=lambda *a: iter([b"original"]), activate=True
+        )
+        == result
+    )
+    with storage.session_scope() as session:
+        assert session.scalar(select(func.count()).select_from(ClinicArtifact)) == 1

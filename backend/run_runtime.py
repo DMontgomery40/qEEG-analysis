@@ -282,6 +282,12 @@ class RunRuntime:
     async def _scan(self):
         while not self._stopping:
             self._wake.clear()
+            from .clinic_execution_cutover import shared_execution_enabled
+
+            if shared_execution_enabled():
+                from .clinic_analysis_intents import activate_confirmed_uploads
+
+                await activate_confirmed_uploads(self)
             now = asyncio.get_running_loop().time()
             self._retry_after = {
                 key: due for key, due in self._retry_after.items() if due > now

@@ -527,6 +527,10 @@ def _source_pdfs_missing_complete_runs(
 
 
 def spawn_portal_pipeline(patient_label: str) -> bool:
+    from .clinic_execution_cutover import shared_execution_enabled
+
+    if shared_execution_enabled():
+        return False
     patient_id = _normalize_portal_patient_id(patient_label)
     if patient_id is None:
         return False

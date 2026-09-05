@@ -194,12 +194,19 @@ def prepare_execution(owner, *, llm_client=None):
     if not admission["analysis_input_fingerprint"]:
         raise ExecutionConflict("original admission fingerprint required")
     _verify_admitted_sources(admission)
-    env = _settings_snapshot()
+    from ..clinic_analysis_intents import run_policy_binding
+    from types import SimpleNamespace
+
+    original = run_policy_binding(run)
+    env = dict(original["settings"]) if original else _settings_snapshot()
+    defaults = (
+        SimpleNamespace(**original["publicPolicy"]["modelRoles"])
+        if original
+        else stages.MODEL_ROLE_DEFAULTS
+    )
     council = json.loads(admission["council_model_ids_json"])
     discovered = sorted(stages.DISCOVERED_MODEL_IDS)
-    checker_pref = env.get(
-        "QEEG_VISION_CHECKER_MODEL", stages.MODEL_ROLE_DEFAULTS.stage1_vision
-    )
+    checker_pref = env.get("QEEG_VISION_CHECKER_MODEL", defaults.stage1_vision)
     checker = resolve_model_preference(checker_pref, discovered)
     if checker and not stages.is_vision_capable(checker):
         checker = None
@@ -209,9 +216,9 @@ def prepare_execution(owner, *, llm_client=None):
     writer = (
         env.get(
             "QEEG_STAGE6_FINAL_DRAFT_MODEL",
-            stages.MODEL_ROLE_DEFAULTS.stage6_final_draft,
+            defaults.stage6_final_draft,
         )
-        or stages.MODEL_ROLE_DEFAULTS.stage6_final_draft
+        or defaults.stage6_final_draft
     ).strip()
     fallback = (
         env.get("QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2")
@@ -238,16 +245,23 @@ def prepare_execution(owner, *, llm_client=None):
     root = Path(__file__).resolve().parents[1]
     from ..patient_postprocessing import snapshot_post_config
 
+    post_env = dict(env)
+    if original:
+        post_env.setdefault(
+            "QEEG_PATIENT_FACING_MODEL", defaults.patient_facing_rewrite
+        )
     manifest = {
         "postprocessing": snapshot_post_config(
-            env, discovered, base_url=transport["base_url"], timeout_s=600.0
+            post_env, discovered, base_url=transport["base_url"], timeout_s=600.0
         ),
         "schema_version": 1,
         "admission": admission,
         "settings": env,
         "roles": roles,
         "transport": transport,
-        "prompts": {
+        "prompts": original["prompts"]
+        if original
+        else {
             name: (root / "prompts" / name).read_bytes().decode("utf-8")
             for name in PROMPTS
         },

@@ -80,6 +80,7 @@ from .portal_export_manifest import (
     write_council_export_manifest,
 )
 from .clinic_api import router as clinic_router
+from .clinic_internal_api import router as clinic_internal_router
 from .portal_files import normalize_portal_patient_id
 from .portal_sync import (
     spawn_portal_sync,
@@ -98,6 +99,7 @@ LOGGER = get_logger(__name__)
 
 app = FastAPI(title="qEEG Council API")
 app.include_router(clinic_router)
+app.include_router(clinic_internal_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -559,48 +561,9 @@ async def _auto_generate_patient_facing_for_run(
     if normalized_patient_id is None:
         return False
 
-    preferred_model = (
-        os.getenv(
-            "QEEG_PATIENT_FACING_MODEL", MODEL_ROLE_DEFAULTS.patient_facing_rewrite
-        )
-        or MODEL_ROLE_DEFAULTS.patient_facing_rewrite
-    ).strip()
-    preferred_model = cfg.resolve_role_model(
-        preferred_model,
-        "z-ai/glm-5.2",
-        DISCOVERED_MODEL_IDS,
-    )
-    version_prefix = (
-        os.getenv("QEEG_PATIENT_FACING_AUTO_VERSION_PREFIX", "auto") or "auto"
-    ).strip() or "auto"
-    version = f"{version_prefix}-{run_id.split('-')[0]}"
-
-    cmd = [
-        sys.executable,
-        str(_repo_root() / "scripts" / "generate_patient_facing_writeups.py"),
-        "--patient-label",
-        normalized_patient_id,
-        "--model",
-        preferred_model,
-        "--version",
-        version,
-        "--max-tokens",
-        "12000",
-        "--overwrite",
-    ]
-    if not sync_outputs:
-        cmd.append("--no-sync")
-    configured_portal_dir = (os.getenv("QEEG_PORTAL_PATIENTS_DIR", "") or "").strip()
-    if configured_portal_dir:
-        cmd.extend(["--portal-dir", configured_portal_dir])
-
-    LOGGER.info(
-        "patient_facing_generation_started",
-        run_id=run_id,
-        patient_label=normalized_patient_id,
-        model_id=preferred_model,
-        version=version,
-    )
+    # The old helper may already have entered before explicit owned admission.
+    # Publish first, then rejoin the original E5 transaction. There is no
+    # unowned subprocess boundary left to race with another process.
     await broker.publish(
         run_id,
         {
@@ -608,86 +571,55 @@ async def _auto_generate_patient_facing_for_run(
             "stage_name": "patient_facing",
             "status": "start",
             "patient_label": normalized_patient_id,
-            "model_id": preferred_model,
         },
     )
+    from .council.execution import _settings_snapshot, drain_task
+    from .patient_postprocessing import snapshot_post_config, admit_patient_facing
+    from .run_execution import ExecutionStore
 
+    snapshot = snapshot_post_config(
+        _settings_snapshot(),
+        sorted(DISCOVERED_MODEL_IDS),
+        base_url=cfg.CLIPROXY_BASE_URL,
+        timeout_s=600.0,
+    )
+    if not sync_outputs:
+        snapshot["sync_enabled"] = False
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            admit_patient_facing,
+            ExecutionStore(storage.engine),
+            run_id,
+            config_snapshot=snapshot,
+        )
+    )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(_repo_root()),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        out_text = (stdout or b"").decode("utf-8", errors="replace")
-        err_text = (stderr or b"").decode("utf-8", errors="replace")
-        if proc.returncode == 0:
-            LOGGER.info(
-                "patient_facing_generation_completed",
-                run_id=run_id,
-                patient_label=normalized_patient_id,
-                model_id=preferred_model,
-                version=version,
-                returncode=proc.returncode,
-            )
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "patient_facing",
-                    "status": "complete",
-                    "patient_label": normalized_patient_id,
-                    "version": version,
-                    "log": out_text[-2000:],
-                },
-            )
-            return True
-        else:
-            LOGGER.error(
-                "patient_facing_generation_failed",
-                run_id=run_id,
-                patient_label=normalized_patient_id,
-                model_id=preferred_model,
-                version=version,
-                returncode=proc.returncode,
-                operatorHint="generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
-            )
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "patient_facing",
-                    "status": "failed",
-                    "patient_label": normalized_patient_id,
-                    "version": version,
-                    "error": (err_text or out_text)[-2000:],
-                    "operatorHint": "generate_patient_facing_writeups.py exited non-zero after the council run completed; inspect CLIProxy model access and the selected council markdown sources for this patient label.",
-                },
-            )
-            return False
-    except Exception as e:
-        LOGGER.exception(
-            "patient_facing_generation_crashed",
-            run_id=run_id,
-            patient_label=normalized_patient_id,
-            model_id=preferred_model,
-            version=version,
-            operatorHint="auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
-        )
+        result = await drain_task(task)
+    except Exception as error:
+        LOGGER.exception("patient_facing_owned_admission_failed", run_id=run_id)
         await broker.publish(
             run_id,
             {
                 "run_id": run_id,
                 "stage_name": "patient_facing",
                 "status": "failed",
-                "patient_label": normalized_patient_id,
-                "version": version,
-                "error": str(e),
-                "operatorHint": "auto patient-facing generation failed before the subprocess completed; inspect create_subprocess_exec, CLIProxy reachability, or broker.publish for this run.",
+                "reason": str(error),
             },
         )
         return False
+    runtime = getattr(app.state, "run_runtime", None)
+    if runtime is not None:
+        runtime.wake()
+    await broker.publish(
+        run_id,
+        {
+            "run_id": run_id,
+            "stage_name": "patient_facing",
+            "status": result["state"],
+            "patient_facing": result,
+        },
+    )
+    return result["state"] == "done" and bool(result.get("verified"))
 
 
 async def _auto_generate_cathode_video_for_run(

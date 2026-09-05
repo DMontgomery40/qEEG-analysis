@@ -1087,6 +1087,17 @@ def process_patient(
     dry_run: bool,
     allow_paid_runs: bool = False,
 ) -> PatientWorkerResult:
+    from backend.clinic_execution_cutover import shared_execution_enabled
+
+    if shared_execution_enabled():
+        return PatientWorkerResult(
+            patient_id=patient_id,
+            status="retired",
+            downloaded=[],
+            report_count=0,
+            ran_batch=False,
+            note="Common confirmed execution owns this work",
+        )
     downloaded: list[str] = []
     reports: list[PortalReport] = []
     temp_batch_dir: Path | None = None
@@ -1139,9 +1150,8 @@ def process_patient(
         if dry_run and would_download and note == "downloaded missing report PDFs":
             note = "would download missing report PDFs"
         if active_filenames and runnable_reports:
-            note = (
-                f"{note}; active report(s) skipped this cycle: "
-                + ", ".join(sorted(active_filenames))
+            note = f"{note}; active report(s) skipped this cycle: " + ", ".join(
+                sorted(active_filenames)
             )
         if dry_run:
             result = PatientWorkerResult(

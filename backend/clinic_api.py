@@ -421,3 +421,69 @@ def clinic_jobs(request: Request):
     from .clinic_jobs import patient_jobs
 
     return _call(patient_jobs, request.query_params.get("patientId"))
+
+
+@router.post("/identity-preview")
+async def clinic_identity_preview(request: Request):
+    from .clinic_identity_preview import preview_identities
+
+    try:
+        body = _object_json(await request.body())
+    except (ValueError, TypeError) as error:
+        return _error(error)
+    return _call(preview_identities, body)
+
+
+def _notification_actor(request):
+    from fastapi import HTTPException
+
+    if request.headers.get(
+        "x-clinic-principal"
+    ) != "thrylen-service" or not trusted_actor(request):
+        raise HTTPException(403, "Thrylen notification receipt required")
+
+
+@router.post("/feedback/{event_id}/notification/claim")
+async def clinic_notification_claim(event_id: str, request: Request):
+    from .clinic_feedback import claim_notification
+
+    _notification_actor(request)
+    try:
+        body = _object_json(await request.body())
+        if (
+            set(body) != {"claimId"}
+            or request.headers.get("idempotency-key") != body["claimId"]
+        ):
+            raise ValueError("Expected matching notification attempt key")
+    except ValueError as error:
+        return _error(error)
+    return _call(claim_notification, event_id, claim_id=body["claimId"])
+
+
+@router.post("/feedback/{event_id}/notification")
+async def clinic_notification_receipt(event_id: str, request: Request):
+    from .clinic_feedback import record_notification
+
+    _notification_actor(request)
+    try:
+        body = _object_json(await request.body())
+        if (
+            set(body) - {"claimId", "status", "detail"}
+            or not {"claimId", "status"} <= set(body)
+            or body["status"] not in ("sent", "failed", "unknown")
+        ):
+            raise ValueError("Expected original notification outcome")
+        if request.headers.get("idempotency-key") != body["claimId"]:
+            raise ValueError("Expected matching notification attempt key")
+        detail = body.get("detail", "")
+        if not isinstance(detail, str) or len(detail.encode()) > 2048:
+            raise ValueError("Invalid notification detail")
+    except (ValueError, TypeError) as error:
+        return _error(error)
+    return _call(
+        record_notification,
+        event_id,
+        claim_id=body["claimId"],
+        status=body["status"],
+        detail=detail,
+    )

@@ -100,3 +100,13 @@ class ClinicPatientCatalogState(Base):
     )
     revision: Mapped[int]
     updated_at: Mapped[int]
+
+
+class ClinicPublication(Base):
+    """One immutable transfer target for an existing artifact, never a queue."""
+
+    __tablename__ = "clinic_publications"
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("clinic_artifacts.id"), primary_key=True
+    )
+    remote_key: Mapped[str] = mapped_column(Text, unique=True)

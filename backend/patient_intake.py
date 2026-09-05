@@ -52,6 +52,14 @@ class IdentityNameConflict(Exception):
         self.payload = payload
 
 
+class IdentityMatchesAmbiguous(PatientIdentityError):
+    """Original matcher ambiguity with read-only candidate evidence."""
+
+    def __init__(self, message, candidates):
+        super().__init__(message)
+        self.candidates = candidates
+
+
 def stored_full_name(patient: Any) -> str:
     return " ".join(
         part for part in ((patient.first_name or ""), (patient.last_name or "")) if part
@@ -153,10 +161,11 @@ def find_patient_by_identity(
         and name_fits(patient.last_name, last_name)
     ]
     if len(matches) > 1:
-        raise PatientIdentityError(
+        raise IdentityMatchesAmbiguous(
             "This name and date of birth already match more than one patient: "
             + ", ".join(sorted(patient.label for patient in matches))
-            + ". Say which one this report belongs to."
+            + ". Say which one this report belongs to.",
+            matches,
         )
     if matches:
         return matches[0], False

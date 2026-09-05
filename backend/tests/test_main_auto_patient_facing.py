@@ -97,42 +97,31 @@ async def test_auto_patient_facing_runs_for_completed_run(temp_data_dir, monkeyp
         async def publish(self, _run_id: str, payload: dict) -> None:
             self.events.append(payload)
 
-    class _Proc:
-        returncode = 0
-
-        async def communicate(self):
-            return b"ok", b""
-
-    called: dict[str, tuple] = {}
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        called["args"] = args
-        called["kwargs"] = kwargs
-        return _Proc()
+    async def forbidden_subprocess(*args, **kwargs):
+        pytest.fail("Legacy helper must use original owned post admission")
 
     monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "1")
-    monkeypatch.setenv("QEEG_PATIENT_FACING_MODEL", "claude-opus-4-6")
-    monkeypatch.setattr(
-        main.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
-    )
-
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", forbidden_subprocess)
+    with storage.session_scope() as session:
+        consolidation_path = Path(temp_data_dir) / "consolidation.md"
+        consolidation_path.write_text("# Original consolidation", encoding="utf-8")
+        storage.create_artifact(
+            session,
+            run_id=run_id,
+            stage_num=4,
+            stage_name="consolidation",
+            model_id="mock-council-a",
+            kind="consolidation",
+            content_path=consolidation_path,
+            content_type="text/markdown",
+        )
     broker = _DummyBroker()
     completed = await main._auto_generate_patient_facing_for_run(run_id, broker)
-
-    assert completed is True
-    assert "args" in called
-    assert "--patient-label" in called["args"]
-    assert patient_label in called["args"]
-    max_tokens_index = called["args"].index("--max-tokens")
-    assert called["args"][max_tokens_index + 1] == "12000"
-    assert any(
-        e.get("stage_name") == "patient_facing" and e.get("status") == "start"
-        for e in broker.events
-    )
-    assert any(
-        e.get("stage_name") == "patient_facing" and e.get("status") == "complete"
-        for e in broker.events
-    )
+    assert completed is False  # Admission is pending, never fabricated completion.
+    with storage.session_scope() as session:
+        obligation = session.get(storage.PostObligation, (run_id, "patient_facing"))
+        assert obligation is not None and obligation.state == "pending"
+    assert any(e.get("status")=="pending" for e in broker.events)
 
 
 @pytest.mark.asyncio
@@ -314,17 +303,13 @@ async def test_auto_patient_facing_returns_false_on_subprocess_failure(
         async def publish(self, _run_id: str, payload: dict) -> None:
             self.events.append(payload)
 
-    class _Proc:
-        returncode = 7
+    from backend import patient_postprocessing
 
-        async def communicate(self):
-            return b"", b"model unavailable"
-
-    async def fake_create_subprocess_exec(*_args, **_kwargs):
-        return _Proc()
+    def admission_unavailable(*args, **kwargs):
+        raise RuntimeError("Original owned admission unavailable")
 
     monkeypatch.setattr(
-        main.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        patient_postprocessing, "admit_patient_facing", admission_unavailable
     )
 
     broker = _DummyBroker()

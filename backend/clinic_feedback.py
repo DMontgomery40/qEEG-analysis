@@ -137,7 +137,7 @@ def feedback_history(file_id):
         ]
 
 
-def record_notification(event_id, *, status, detail=""):
+def record_notification(event_id, *, status, detail="", claim_id=None):
     if status not in ("pending", "sent", "failed", "unknown") or not isinstance(
         detail, str
     ):
@@ -150,6 +150,46 @@ def record_notification(event_id, *, status, detail=""):
         if prior and prior["status"] == "sent" and status != "sent":
             raise CatalogueConflict("Sent notification is terminal")
         value = dict(status=status, detail=detail)
+        if claim_id is not None:
+            require_key(claim_id)
+            if (
+                row.principal != "thrylen-service"
+                or not prior
+                or prior.get("claimId") != claim_id
+            ):
+                raise CatalogueConflict("Original notification claim required")
+            value["claimId"] = claim_id
+            if prior["status"] in ("sent", "failed") and prior != value:
+                raise CatalogueConflict("Notification outcome is terminal")
+        elif prior and prior.get("claimId"):
+            raise CatalogueConflict("Original notification claim required")
         if prior != value:
             row.notification_json = _json(value)
             _bump(s, s.get(ClinicArtifact, row.artifact_id).patient_uuid)
+        return _envelope(s, notification=value)
+
+
+def claim_notification(event_id, *, claim_id):
+    """Consume one automatic send grant before the existing notifier runs.
+
+    Even an identical claim retry cannot obtain another grant: losing the first
+    response leaves an honestly unknown attempt, never an automatic resend.
+    """
+    require_key(claim_id)
+    with _write() as s:
+        row = s.get(ClinicFeedback, event_id)
+        if row is None:
+            raise CatalogueNotFound("Feedback event not found")
+        if row.principal != "thrylen-service":
+            raise CatalogueConflict("Original Thrylen feedback event required")
+        prior = json.loads(row.notification_json) if row.notification_json else None
+        acquired = prior is None
+        if acquired:
+            prior = dict(
+                status="unknown",
+                detail="Notification claimed; outcome unknown",
+                claimId=claim_id,
+            )
+            row.notification_json = _json(prior)
+            _bump(s, s.get(ClinicArtifact, row.artifact_id).patient_uuid)
+        return _envelope(s, acquired=acquired, notification=prior)

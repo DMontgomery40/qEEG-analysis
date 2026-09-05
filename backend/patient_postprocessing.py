@@ -419,6 +419,10 @@ def _publish_outputs(owner, data, md, meta):
         owner, root, "md", data["destinations"]["md"], lambda: (md + "\n").encode()
     )
 
+    from .clinic_producers import register_patient_output
+
+    register_patient_output(owner, data, "md", result["md"])
+
     def pdf():
         with owner.file_guard(), tempfile.TemporaryDirectory(dir=root) as directory:
             path = Path(directory) / "report.pdf"
@@ -431,6 +435,7 @@ def _publish_outputs(owner, data, md, meta):
     result["pdf"] = _accepted_output(
         owner, root, "pdf", data["destinations"]["pdf"], pdf
     )
+    register_patient_output(owner, data, "pdf", result["pdf"])
     result["meta"] = _accepted_output(
         owner,
         root,
@@ -438,6 +443,7 @@ def _publish_outputs(owner, data, md, meta):
         data["destinations"]["meta"],
         lambda: (json.dumps(meta, indent=2, sort_keys=True) + "\n").encode(),
     )
+    register_patient_output(owner, data, "meta", result["meta"])
     _publish(owner, root / "local.json", _json(result))
     return result
 

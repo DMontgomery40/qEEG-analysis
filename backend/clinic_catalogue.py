@@ -137,6 +137,9 @@ def complete_catalogue_import(manifest: dict):
         }
         if legacy != set(manifest["legacyPatientIds"]):
             raise CatalogueConflict("Legacy inventory does not match existing patients")
+        from .clinic_reconciliation import validate_retained_sources
+
+        retained = validate_retained_sources(session, manifest)
         for model, kind in (
             (storage.Report, "report"),
             (storage.PatientFile, "patient-file"),
@@ -148,13 +151,13 @@ def complete_catalogue_import(manifest: dict):
                         ClinicArtifact.source_id == row.id,
                     )
                 ):
-                    raise CatalogueUnavailable("Existing sources remain unimported")
-        if session.scalar(
-            select(ClinicProjection.id)
-            .where(ClinicProjection.artifact_id.is_(None))
-            .limit(1)
+                    if (kind, row.id) not in retained:
+                        raise CatalogueUnavailable("Existing sources remain unimported")
+        for projection in session.scalars(
+            select(ClinicProjection).where(ClinicProjection.artifact_id.is_(None))
         ):
-            raise CatalogueUnavailable("Source projections remain incomplete")
+            if (projection.source_kind, projection.source_id) not in retained:
+                raise CatalogueUnavailable("Source projections remain incomplete")
         state = session.get(ClinicCatalogState, 1)
         payload = _json(manifest)
         if state.import_complete and state.import_manifest == payload:
@@ -474,7 +477,7 @@ def _remote_key(key):
     if (
         len(parts) != 4
         or parts[0] != "patients"
-        or parts[2] != "files"
+        or parts[2] not in ("files", ".archive")
         or not parts[1]
         or not parts[3]
         or parts[3] in (".", "..")
@@ -492,9 +495,27 @@ def add_remote_location(file_id, key):
         if artifact is None:
             raise CatalogueNotFound("File not found")
         patient = session.get(storage.Patient, artifact.patient_uuid)
+        from .clinic_models import ClinicPublication
+
+        publication = session.scalar(
+            select(ClinicPublication).where(ClinicPublication.remote_key == key)
+        )
+        if publication is not None and publication.artifact_id != artifact.id:
+            raise CatalogueConflict(
+                "Immutable publication key belongs to another artifact"
+            )
         known = session.get(ClinicPatientAlias, alias)
-        if alias != patient.label and (
-            known is None or known.patient_uuid != patient.id
+        original_alias = session.scalar(
+            select(ClinicLocation.id).where(
+                ClinicLocation.artifact_id == artifact.id,
+                ClinicLocation.kind == "legacy-reference",
+                ClinicLocation.patient_alias == alias,
+            )
+        )
+        if (
+            alias != patient.label
+            and (known is None or known.patient_uuid != patient.id)
+            and original_alias is None
         ):
             raise CatalogueConflict("Remote key belongs to an unbound patient alias")
         affected = _location(session, artifact, "netlify", key, alias, False)

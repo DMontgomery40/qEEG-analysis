@@ -55,6 +55,9 @@ def write_council_export_manifest(
     patient_label: str,
     payload: dict[str, Any],
 ) -> Path:
+    from .clinic_producers import freeze_council_export
+
+    payload = freeze_council_export(payload)
     portal_patient_dir.mkdir(parents=True, exist_ok=True)
     path = portal_patient_dir / portal_export_manifest_filename(patient_label)
     tmp_path = path.with_name(f".{path.name}.partial")
@@ -63,4 +66,7 @@ def write_council_export_manifest(
         encoding="utf-8",
     )
     tmp_path.replace(path)
+    from .clinic_producers import register_council_export
+
+    register_council_export(payload, path)
     return path
