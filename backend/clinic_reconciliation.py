@@ -8,6 +8,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import re
 import uuid
 from sqlalchemy import select, inspect
 from . import storage
@@ -115,6 +116,45 @@ def validate_remote_census(events):
         raise CatalogueUnavailable("Remote census lacks successful completion")
 
 
+def _retained_remote_evidence(records):
+    """Validate explicit original global namespaces, never a chart exclusion."""
+    result = {}
+    for row in records:
+        if (not isinstance(row, dict) or not {"key", "category", "sha256", "size"}.issubset(row)
+                or set(row) - {"key", "category", "sha256", "size", "metadata"}
+                or not isinstance(row["key"], str) or not row["key"].isprintable()
+                or not re.fullmatch(r"[a-f0-9]{64}", str(row["sha256"]))
+                or type(row["size"]) is not int or row["size"] < 0):
+            raise ValueError("Invalid retained remote evidence")
+        key, category = row["key"], row["category"]
+        if key in result:
+            raise ValueError("Duplicate retained remote evidence")
+        if category == "legacy-video-library":
+            if not re.fullmatch(r"videos/[^/\\]+\.mp4", key) or "/.." in key:
+                raise ValueError("Retention requires an original root library video")
+        elif category == "legacy-unfiled-upload":
+            parts = key.split("/")
+            if len(parts) != 2 or parts[0] != "uploads" or str(uuid.UUID(parts[1])) != parts[1]:
+                raise ValueError("Retention requires an original root upload UUID")
+            meta = row.get("metadata")
+            if (not isinstance(meta, dict) or meta.get("id") != parts[1]
+                    or type(meta.get("size")) is not int or meta["size"] != row["size"]
+                    or type(meta.get("uploadedAt")) is not int or meta["uploadedAt"] < 0
+                    or any(not isinstance(meta.get(name), str) or not meta[name]
+                           for name in ("filename", "contentType", "uploadedBy"))):
+                raise ValueError("Original unfiled upload metadata proof required")
+        else:
+            raise ValueError("Unknown retained remote category")
+        result[key] = row
+    return result
+
+
+def _global_remote_key(key):
+    if key.startswith("videos/"):
+        return True
+    return key.startswith("uploads/") and len(key.split("/")) == 2 and not key.endswith(".json")
+
+
 def build_inventory(
     inventory_id,
     *,
@@ -124,6 +164,7 @@ def build_inventory(
     bindings=None,
     local_aliases=None,
     legacy_upload_records=(),
+    retained_remote_objects=(),
 ):
     """Read every original row, local tree entry and complete remote object census.
 
@@ -134,8 +175,12 @@ def build_inventory(
     if type(max_file_bytes) is not int or max_file_bytes <= 0:
         raise ValueError("Explicit file byte limit required")
     legacy_upload_records = list(legacy_upload_records)
+    retained_remote_objects = list(retained_remote_objects)
+    retained_objects = _retained_remote_evidence(retained_remote_objects)
     bindings = bindings or {}
     local_aliases = local_aliases or []
+    if any(key in bindings for key in retained_objects):
+        raise CatalogueConflict("Retained global object also has a chart binding")
     root = _inventory_root(inventory_id)
     with upload_lock("inventory:" + inventory_id):
         manifest_path = root / "manifest.json"
@@ -146,6 +191,7 @@ def build_inventory(
                 prior["bindings"] != bindings
                 or prior["aliases"] != local_aliases
                 or prior["legacyUploads"] != legacy_upload_records
+                or prior.get("retainedRemoteObjects", []) != retained_remote_objects
             ):
                 raise CatalogueConflict("Inventory binding evidence changed")
             return prior
@@ -297,10 +343,16 @@ def build_inventory(
                         record_row(row)
             except OSError as error:
                 errors.append(dict(source="local-tree", reason=type(error).__name__))
+        retained_seen = set()
         try:
             for key in validate_remote_census(remote_events):
                 row = dict(kind="remote-object", key=key, binding=bindings.get(key))
+                if key in retained_objects:
+                    retained_seen.add(key)
+                    row["retainedEvidence"] = retained_objects[key]
                 try:
+                    if _global_remote_key(key) and key not in retained_objects:
+                        raise CatalogueUnavailable("Original global object retention evidence missing")
                     if key.endswith(".json") and "/files/" not in key:
                         chunks = remote_readback(key, 8 * 1024 * 1024)
                         raw = bytearray()
@@ -322,6 +374,10 @@ def build_inventory(
                         row["sha256"], row["size"] = _digest(
                             remote_readback(key, max_file_bytes), max_file_bytes
                         )
+                    if key in retained_objects:
+                        proof = retained_objects[key]
+                        if (row["sha256"], row["size"]) != (proof["sha256"], proof["size"]):
+                            raise CatalogueUnavailable("Retained remote bytes differ from original evidence")
                     row["status"] = "available"
                 except (OSError, ValueError, CatalogueUnavailable) as error:
                     row.update(status="error", reason=type(error).__name__)
@@ -329,6 +385,8 @@ def build_inventory(
                 record_row(row)
         except Exception as error:
             errors.append(dict(source="remote-census", reason=type(error).__name__))
+        for key in sorted(set(retained_objects) - retained_seen):
+            errors.append(dict(key=key, reason="retained_object_missing_from_census"))
         row_stream.close()
         with pending_rows.open("rb") as stream:
             rows_hash, _ = _digest(iter(lambda: stream.read(65536), b""), 2**63 - 1)
@@ -355,6 +413,7 @@ def build_inventory(
             bindings=bindings,
             aliases=local_aliases,
             legacyUploads=list(legacy_upload_records),
+            retainedRemoteObjects=retained_remote_objects,
             errors=errors,
             complete=not errors,
         )
@@ -688,15 +747,21 @@ def import_inventory(inventory_id, *, remote_readback, activate=False):
         retained = []
         errors = []
 
-        def save():
-            payload = _json(
-                dict(
-                    inventoryId=inventory_id,
-                    outcomes=outcomes,
-                    retainedUnresolvedSources=retained,
-                    errors=errors,
-                )
-            )
+        retained_objects = _retained_remote_evidence(inventory.get("retainedRemoteObjects", []))
+        retained_seen = set()
+        journal = root / ("progress-" + str(uuid.uuid4()) + ".ndjson")
+        with journal.open("xb") as stream:
+            stream.write((_json(dict(type="start", inventoryId=inventory_id,
+                                    rowsSha256=inventory["rowsSha256"])) + "\n").encode())
+            stream.flush()
+            os.fsync(stream.fileno())
+        sequence = 0
+        counts = (0, 0, 0)
+
+        def checkpoint():
+            payload = _json(dict(inventoryId=inventory_id, outcomes=outcomes,
+                                retainedUnresolvedSources=retained, errors=errors,
+                                journalFile=journal.name, journalSequence=sequence))
             path = root / "progress.json"
             tmp = root / (".progress-" + str(uuid.uuid4()))
             with tmp.open("w") as stream:
@@ -710,6 +775,22 @@ def import_inventory(inventory_id, *, remote_readback, activate=False):
             finally:
                 os.close(fd)
 
+        def save():
+            nonlocal sequence, counts
+            sequence += 1
+            delta = dict(outcomes=outcomes[counts[0]:], retainedUnresolvedSources=retained[counts[1]:],
+                         errors=errors[counts[2]:])
+            with journal.open("ab") as stream:
+                stream.write((_json(dict(inventoryId=inventory_id, sequence=sequence, delta=delta)) + "\n").encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            counts = (len(outcomes), len(retained), len(errors))
+            # Geometric checkpoints bound total full-snapshot bytes to O(units).
+            if sequence & (sequence - 1) == 0:
+                checkpoint()
+
+        checkpoint()
+
         # Original engine source IDs first, so proven copies attach to them.
         for index, row in enumerate(inventory_rows(inventory)):
             try:
@@ -718,6 +799,14 @@ def import_inventory(inventory_id, *, remote_readback, activate=False):
                     result = "retained_missing"
                 elif row["status"] != "available":
                     raise CatalogueUnavailable("Original inventory source unavailable")
+                elif row.get("retainedEvidence"):
+                    proof = retained_objects.get(row.get("key"))
+                    if proof != row["retainedEvidence"] or row.get("binding") or row["kind"] != "remote-object":
+                        raise CatalogueConflict("Retained remote inventory evidence changed")
+                    if _digest(remote_readback(row["key"], row["size"]), row["size"]) != (proof["sha256"], proof["size"]):
+                        raise CatalogueConflict("Retained remote original bytes changed")
+                    retained_seen.add(row["key"])
+                    result = "retained_remote"
                 elif row["kind"] == "root-operational":
                     from .portal_sync import portal_patients_dir
 
@@ -856,6 +945,10 @@ def import_inventory(inventory_id, *, remote_readback, activate=False):
                     dict(key=key, reason=type(error).__name__, detail=str(error))
                 )
             save()
+        if retained_seen != set(retained_objects):
+            errors.append(dict(reason="retained_remote_evidence_not_closed"))
+            save()
+        checkpoint()
         if errors:
             raise CatalogueUnavailable(
                 f"Inventory retains {len(errors)} unresolved units"
