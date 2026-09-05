@@ -441,6 +441,8 @@ def _ensure_artifact_operation_key() -> None:
 
 
 def init_db() -> None:
+    from .clinic_catalogue import initialize_catalogue
+
     ensure_data_dirs()
     Base.metadata.create_all(engine)
     _ensure_patient_identity_columns()
@@ -448,6 +450,7 @@ def init_db() -> None:
     _ensure_analysis_input_columns()
     _ensure_run_execution_columns()
     _ensure_artifact_operation_key()
+    initialize_catalogue()
 
 
 @contextmanager

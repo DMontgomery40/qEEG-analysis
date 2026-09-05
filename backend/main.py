@@ -79,6 +79,7 @@ from .portal_export_manifest import (
     council_export_manifest_payload,
     write_council_export_manifest,
 )
+from .clinic_api import router as clinic_router
 from .portal_files import normalize_portal_patient_id
 from .portal_sync import (
     spawn_portal_sync,
@@ -96,6 +97,7 @@ configure_logging()
 LOGGER = get_logger(__name__)
 
 app = FastAPI(title="qEEG Council API")
+app.include_router(clinic_router)
 
 app.add_middleware(
     CORSMiddleware,
