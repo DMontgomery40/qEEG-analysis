@@ -63,61 +63,58 @@ def test_normal_start_carries_instructions_through_all_stages_and_reviews(
         api_key="",
         transport=httpx.MockTransport(handle),
     )
-    main.app.state.workflow = QEEGCouncilWorkflow(llm=llm)
-    pending = []
-    monkeypatch.setattr(
-        main, "_spawn_task", lambda coro, **kwargs: pending.append(coro)
+    from functools import partial
+    from backend.run_runtime import continue_owned_run
+    from backend.tests.test_patient_postprocessing import text as patient_text
+    from scripts import generate_patient_facing_writeups as writer
+    from backend.paid_transport import current_paid_scope
+
+    generated = []
+    original_handle = handle
+
+    def owned_handle(request):
+        scope = current_paid_scope()
+        if scope is not None and scope.semantic_key.startswith("post/"):
+            generated.append(request.content)
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": patient_text()}}]}
+            )
+        return original_handle(request)
+
+    llm._transport = httpx.MockTransport(owned_handle)
+    main.app.state.run_runtime.continuation = partial(
+        continue_owned_run,
+        llm=llm,
+        workflow=QEEGCouncilWorkflow(llm=llm),
+        sync=lambda _: True,
     )
     monkeypatch.setenv("QEEG_AUTO_CATHODE_VIDEO", "0")
     monkeypatch.setenv("QEEG_STAGE6_FINAL_DRAFT_MODEL", "mock-council-a")
+    monkeypatch.setenv("QEEG_PATIENT_FACING_MODEL", "mock-council-a")
     monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "1")
-    # The normal post-run generator boundary is exercised with a free synthetic artifact.
-    generated = []
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "0")
+    monkeypatch.setattr(
+        writer,
+        "render_patient_facing_markdown_to_pdf",
+        lambda md, path, **kw: path.write_bytes(b"%PDF synthetic owned downstream"),
+    )
 
-    async def generator(*args, **kwargs):
-        assert args[1].endswith("generate_patient_facing_writeups.py")
-        with storage.session_scope() as s:
-            assert storage.get_run(s, run_id).status == "complete"
-            assert {a.stage_num for a in storage.list_artifacts(s, run_id)} == {
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-            }
-            path = tmp / "patient-facing.pdf"
-            path.write_bytes(b"%PDF synthetic downstream fixture")
-            generated.append(
-                storage.create_patient_file(
-                    s,
-                    patient_id=payload["patient_id"],
-                    filename="patient-facing.pdf",
-                    mime_type="application/pdf",
-                    size_bytes=path.stat().st_size,
-                    stored_path=path,
-                ).id
-            )
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("API start used the old unowned post subprocess")
 
-        class Process:
-            returncode = 0
-
-            async def communicate(self):
-                return b"synthetic artifact registered", b""
-
-        return Process()
-
-    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", generator)
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", forbidden)
     response = client.post(f"/api/runs/{run_id}/start")
     assert response.status_code == 200, response.text
-    assert len(pending) == 1
-    client.portal.call(lambda: pending.pop())
+    client.portal.call(main.app.state.run_runtime._work, run_id)
     client.portal.call(llm.aclose)
     with storage.session_scope() as s:
         run = storage.get_run(s, run_id)
         assert run.status == "complete", run.error_message
         assert storage.get_patient(s, payload["patient_id"]).notes == ""
-    assert generated
+    assert len(generated) == 1
+    assert (
+        client.get(f"/api/runs/{run_id}").json()["patient_facing"]["verified"] is True
+    )
     assert {stage for stage, _ in requests} == {1, 2, 3, 4, 5, 6}
     for stage, body in requests:
         text = "\n".join(

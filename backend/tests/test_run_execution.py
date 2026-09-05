@@ -595,3 +595,52 @@ def test_post_terminal_state_and_identity_are_never_reopened_by_rejoin(db, termi
             owner.transition_post_obligation(
                 "cathode", expected_state=terminal, state="pending"
             )
+
+
+@pytest.mark.parametrize(
+    "changed", ["status", "analysis_input_fingerprint", "council_model_ids_json"]
+)
+def test_validated_start_snapshot_cannot_adopt_concurrently_changed_run(db, changed):
+    ex = execution()
+    add_run("run")
+    store = ex.ExecutionStore(storage.engine)
+    expected = {
+        field: getattr(read_run("run"), field)
+        for field in ("status", "analysis_input_fingerprint", "council_model_ids_json")
+    }
+    with storage.session_scope() as session:
+        setattr(
+            storage.get_run(session, "run"),
+            changed,
+            "running" if changed == "status" else "changed",
+        )
+        session.commit()
+    with pytest.raises(ex.ExecutionConflict):
+        store.request_run_start("run", expected=expected)
+    assert read_run("run").start_requested_at is None
+
+
+@pytest.mark.parametrize("status", ["created", "failed", "needs_auth"])
+@pytest.mark.parametrize("authority", ["intent", "manifest", "post"])
+def test_legacy_start_cas_preserves_all_receipt_covered_states(db, status, authority):
+    add_run("r", status)
+    with storage.session_scope() as session:
+        row = storage.get_run(session, "r")
+        if authority == "intent":
+            row.start_requested_at = datetime.now(timezone.utc)
+        elif authority == "manifest":
+            row.execution_manifest_hash = "a" * 64
+        else:
+            session.add(
+                storage.PostObligation(
+                    run_id="r",
+                    kind="patient_facing",
+                    manifest_path="original.json",
+                    manifest_hash="b" * 64,
+                    owner_token="original",
+                    owner_generation=1,
+                )
+            )
+        session.commit()
+        assert not storage.claim_run_start(session, "r")
+    assert read_run("r").status == status

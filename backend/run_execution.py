@@ -38,6 +38,25 @@ class ExecutionConflict(RuntimeError):
     """A stored execution identity or terminal obligation conflicts with this write."""
 
 
+def require_unowned_run(session, run):
+    """Legacy entrypoints cannot spend or mutate a receipt-covered operation."""
+    post = session.scalar(
+        select(storage.PostObligation.run_id)
+        .where(storage.PostObligation.run_id == run.id)
+        .limit(1)
+    )
+    if (
+        run.start_requested_at is not None
+        or run.execution_state is not None
+        or run.execution_manifest_hash is not None
+        or post is not None
+    ):
+        raise ExecutionConflict(
+            "Receipt-covered run requires the engine owned consumer; "
+            "rejoin its existing start/post action or reconcile its blocked reason"
+        )
+
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -85,25 +104,36 @@ class ExecutionStore:
         self.db_path = Path(database).resolve()
         self.lock_root = self.db_path.parent / (self.db_path.name + ".run-locks")
 
-    def request_run_start(self, run_id: str):
+    def request_run_start(self, run_id: str, *, expected: dict | None = None):
         """Commit intent once; never reset state, ownership, manifest, or clinical data.
 
         E6 must validate legacy adoption and current pinned inputs before calling.
-        This method is intentionally not connected to the legacy POST /start yet.
+        Optional expected fields fence an API-validated new admission against
+        a concurrent change. Existing start intent always rejoins unchanged.
         """
         with Session(self.engine, expire_on_commit=False) as session:
-            session.execute(
+            result = session.execute(
                 update(storage.Run)
                 .where(
                     storage.Run.id == run_id,
                     storage.Run.start_requested_at.is_(None),
                     storage.Run.execution_state.is_(None),
+                    *(
+                        getattr(storage.Run, name) == value
+                        for name, value in (expected or {}).items()
+                    ),
                 )
                 .values(start_requested_at=_now(), execution_state="pending")
             )
             run = session.get(storage.Run, run_id)
             if run is None:
                 raise KeyError(run_id)
+            if (
+                expected is not None
+                and result.rowcount != 1
+                and run.start_requested_at is None
+            ):
+                raise ExecutionConflict("run changed during start admission")
             session.commit()
             return run
 

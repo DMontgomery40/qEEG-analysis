@@ -688,6 +688,12 @@ def claim_run_start(session: Session, run_id: str) -> bool:
         .where(
             Run.id == run_id,
             Run.status.in_(("created", "failed", "needs_auth")),
+            Run.start_requested_at.is_(None),
+            Run.execution_state.is_(None),
+            Run.execution_manifest_hash.is_(None),
+            ~select(PostObligation.run_id)
+            .where(PostObligation.run_id == Run.id)
+            .exists(),
         )
         .values(
             status="running",

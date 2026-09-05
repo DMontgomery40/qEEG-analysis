@@ -516,9 +516,7 @@ def test_legacy_storage_migration_preserves_banked_run(temp_data_dir):
     assert row[2:] == ("", None)
 
 
-@pytest.mark.parametrize(
-    "change", ["missing-source", "different-patient"]
-)
+@pytest.mark.parametrize("change", ["missing-source", "different-patient"])
 def test_reserved_operation_conflicts_before_repairing_changed_input(admission, change):
     client, payload, tmp, _ = admission
     report = source(tmp, payload["patient_id"])
@@ -916,12 +914,17 @@ def test_start_availability_gate_only_for_new_dispatch(admission, monkeypatch, s
     monkeypatch.setattr(main, "_spawn_task", forbidden)
     main.DISCOVERED_MODEL_IDS.clear()
     response = client.post(f"/api/runs/{first['id']}/start")
-    if status in ["running", "complete"]:
+    if status == "complete":
         assert response.status_code == 200, response.text
         assert response.json()["status"] == status
     else:
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "ANALYSIS_MODEL_MISMATCH"
+        assert response.json()["detail"]["code"] == (
+            "ANALYSIS_MODEL_MISMATCH"
+            if status == "created"
+            else "LEGACY_RECONCILIATION_REQUIRED"
+        )
+    assert client.get(f"/api/runs/{first['id']}").json()["start_requested_at"] is None
 
 
 def test_admission_snapshot_migration_preserves_legacy_reservation_twice(temp_data_dir):

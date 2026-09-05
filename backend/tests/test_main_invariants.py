@@ -22,6 +22,9 @@ def _test_app(temp_data_dir, monkeypatch):
         lambda: Path(temp_data_dir) / "cliproxyapi.conf",
     )
     monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    from backend.run_runtime import RunRuntime
+
+    monkeypatch.setattr(RunRuntime, "start", AsyncMock())
     monkeypatch.setattr(main, "EXPORTS_DIR", Path(temp_data_dir) / "exports")
     return main.app, main
 
@@ -76,26 +79,11 @@ def test_create_run_rejects_report_from_different_patient(temp_data_dir, monkeyp
 
 def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
     app, main = _test_app(temp_data_dir, monkeypatch)
-    from backend import runtime_identity, storage
-    from backend.tests.fixtures.mock_llm import MOCK_MODEL_IDS
+    from backend import storage
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="P", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
-    with storage.session_scope() as session:
-        runtime = runtime_identity.current_runtime_identity(MOCK_MODEL_IDS)
-        run = storage.create_run(
-            session,
-            patient_id=patient.id,
-            report_id=report.id,
-            council_model_ids=["mock-council-a"],
-            consolidator_model_id="mock-consolidator",
-            requested_model_ids=["mock-council-a", "mock-consolidator"],
-            resolved_model_ids=["mock-council-a", "mock-consolidator"],
-            creating_instance_id=str(runtime["instance_id"]),
-            model_catalogue_fingerprint=str(runtime["model_catalogue_fingerprint"]),
-        )
-
     scheduled: list[str | None] = []
 
     def fake_create_task(coro, *, name=None):
@@ -110,17 +98,33 @@ def test_start_run_is_idempotent_once_claimed(temp_data_dir, monkeypatch):
     monkeypatch.setattr(main, "_spawn_task", fake_create_task)
 
     with TestClient(app, raise_server_exceptions=False) as client:
+        from types import SimpleNamespace
+
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
+        run = SimpleNamespace(id=created["id"])
         first = client.post(f"/api/runs/{run.id}/start")
         second = client.post(f"/api/runs/{run.id}/start")
 
     assert first.status_code == 200
-    assert first.json() == {"ok": True}
+    assert first.json()["ok"] is True
+    assert first.json()["start_requested_at"] == second.json()["start_requested_at"]
     assert second.status_code == 200
-    assert second.json()["status"] == "running"
-    assert scheduled == [f"qeeg-run-{run.id}"]
+    assert second.json()["execution_state"] == "pending"
+    assert second.json()["status"] == "created"
+    assert scheduled == []
 
 
-def test_run_creation_echoes_exact_models_and_runtime_before_start(temp_data_dir, monkeypatch):
+def test_run_creation_echoes_exact_models_and_runtime_before_start(
+    temp_data_dir, monkeypatch
+):
     app, _main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
 
@@ -150,10 +154,15 @@ def test_run_creation_echoes_exact_models_and_runtime_before_start(temp_data_dir
     ]
     assert created["resolved_model_ids"] == created["requested_model_ids"]
     assert created["creating_instance_id"] == health["runtime"]["instance_id"]
-    assert created["model_catalogue_fingerprint"] == health["runtime"]["model_catalogue_fingerprint"]
+    assert (
+        created["model_catalogue_fingerprint"]
+        == health["runtime"]["model_catalogue_fingerprint"]
+    )
 
 
-def test_start_refuses_runtime_or_catalogue_drift_without_scheduling_work(temp_data_dir, monkeypatch):
+def test_start_refuses_runtime_or_catalogue_drift_without_scheduling_work(
+    temp_data_dir, monkeypatch
+):
     app, main = _test_app(temp_data_dir, monkeypatch)
     from backend import config, storage
 
@@ -161,7 +170,9 @@ def test_start_refuses_runtime_or_catalogue_drift_without_scheduling_work(temp_d
         patient = storage.create_patient(session, label="P", notes="")
     report = _create_report(storage, temp_data_dir, patient_id=patient.id)
     scheduled: list[str] = []
-    monkeypatch.setattr(main, "_spawn_task", lambda *_args, **_kwargs: scheduled.append("called"))
+    monkeypatch.setattr(
+        main, "_spawn_task", lambda *_args, **_kwargs: scheduled.append("called")
+    )
 
     with TestClient(app, raise_server_exceptions=False) as client:
         created = client.post(
@@ -183,7 +194,9 @@ def test_start_refuses_runtime_or_catalogue_drift_without_scheduling_work(temp_d
         assert storage.get_run(session, created["id"]).status == "created"
 
 
-def test_run_creation_allows_only_an_explicit_available_fallback(temp_data_dir, monkeypatch):
+def test_run_creation_allows_only_an_explicit_available_fallback(
+    temp_data_dir, monkeypatch
+):
     app, _main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
 
@@ -519,7 +532,9 @@ def test_cached_export_download_rejects_unreviewed_run(temp_data_dir, monkeypatc
     assert "peer review did not complete" in response.json()["detail"]
 
 
-def test_export_schedules_portal_sync_for_delivery_ready_run(temp_data_dir, monkeypatch):
+def test_export_schedules_portal_sync_for_delivery_ready_run(
+    temp_data_dir, monkeypatch
+):
     app, main = _test_app(temp_data_dir, monkeypatch)
     from backend import storage
 
@@ -695,12 +710,16 @@ def test_bulk_upload_reuses_the_patient_already_wearing_that_canonical_id(
         first = client.post(
             "/api/patients/bulk_upload",
             files=[("files", ("session-one.txt", b"qEEG report text", "text/plain"))],
-            data={"identities": json.dumps([{"filename": "session-one.txt", **identity}])},
+            data={
+                "identities": json.dumps([{"filename": "session-one.txt", **identity}])
+            },
         )
         second = client.post(
             "/api/patients/bulk_upload",
             files=[("files", ("session-two.txt", b"qEEG report text", "text/plain"))],
-            data={"identities": json.dumps([{"filename": "session-two.txt", **identity}])},
+            data={
+                "identities": json.dumps([{"filename": "session-two.txt", **identity}])
+            },
         )
 
     assert first.json()["counts"]["created"] == 1
@@ -843,9 +862,7 @@ def test_bulk_upload_lands_on_the_chart_created_from_a_bare_canonical_label(
     assert (patients[0].first_name, patients[0].last_name) == ("Barto", "Tinker")
 
 
-def test_bulk_upload_failure_leaves_no_half_created_patient(
-    temp_data_dir, monkeypatch
-):
+def test_bulk_upload_failure_leaves_no_half_created_patient(temp_data_dir, monkeypatch):
     """A report that cannot be read files nothing at all.
 
     Identity resolution commits the patient before the upload is extracted, so a
@@ -1032,11 +1049,15 @@ def test_saved_model_envelope_survives_restart_and_unrelated_catalogue_changes(
 
     monkeypatch.setattr(main, "_spawn_task", capture_task)
     with TestClient(app, raise_server_exceptions=False) as client:
-        created = client.post("/api/runs", json={
-            "patient_id": patient.id, "report_id": report.id,
-            "council_model_ids": ["mock-council-a"],
-            "consolidator_model_id": "mock-consolidator",
-        }).json()
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
         with storage.session_scope() as session:
             storage.update_run_status(session, created["id"], status=initial_status)
         if catalogue_change == "restart":
@@ -1049,35 +1070,48 @@ def test_saved_model_envelope_survives_restart_and_unrelated_catalogue_changes(
         repeated = client.post(f"/api/runs/{created['id']}/start")
         saved = client.get(f"/api/runs/{created['id']}").json()
         monkeypatch.setattr(app.state, "mock_mode", False)
-        monkeypatch.setattr(app.state.llm, "list_models", AsyncMock(return_value=sorted(main.DISCOVERED_MODEL_IDS)))
+        monkeypatch.setattr(
+            app.state.llm,
+            "list_models",
+            AsyncMock(return_value=sorted(main.DISCOVERED_MODEL_IDS)),
+        )
         health = client.get("/api/health").json()
 
-    assert response.status_code == 200
-    assert repeated.status_code == 200
-    expected_tasks = [] if initial_status in {"running", "complete"} else [f"qeeg-run-{created['id']}"]
-    assert scheduled == expected_tasks
-    for field in ("id", "requested_model_ids", "resolved_model_ids", "creating_instance_id", "model_catalogue_fingerprint"):
+    expected_status = 409 if initial_status in {"running", "failed"} else 200
+    assert response.status_code == repeated.status_code == expected_status
+    assert scheduled == []
+    assert bool(saved["start_requested_at"]) == (initial_status == "created")
+    for field in (
+        "id",
+        "requested_model_ids",
+        "resolved_model_ids",
+        "creating_instance_id",
+        "model_catalogue_fingerprint",
+    ):
         assert saved[field] == created[field]
     assert health["runtime"]["available_model_ids"] == sorted(main.DISCOVERED_MODEL_IDS)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("requested_model_ids_json", "[]"),
-    ("requested_model_ids_json", '"mock-council-a"'),
-    ("requested_model_ids_json", '["mock-council-a"]'),
-    ("requested_model_ids_json", '["", "mock-consolidator"]'),
-    ("requested_model_ids_json", '[null, "mock-consolidator"]'),
-    ("requested_model_ids_json", '[{}, "mock-consolidator"]'),
-    ("requested_model_ids_json", '[" mock-council-a", "mock-consolidator"]'),
-    ("resolved_model_ids_json", '["mock-consolidator", "mock-council-a"]'),
-    ("resolved_model_ids_json", "[]"),
-    ("resolved_model_ids_json", "null"),
-    ("resolved_model_ids_json", "{"),
-    ("resolved_model_ids_json", '[{}, "mock-consolidator"]'),
-    ("council_model_ids_json", '{"mock-council-a": 1}'),
-    ("council_model_ids_json", '["mock-council-b"]'),
-    ("consolidator_model_id", "mock-council-b"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("requested_model_ids_json", "[]"),
+        ("requested_model_ids_json", '"mock-council-a"'),
+        ("requested_model_ids_json", '["mock-council-a"]'),
+        ("requested_model_ids_json", '["", "mock-consolidator"]'),
+        ("requested_model_ids_json", '[null, "mock-consolidator"]'),
+        ("requested_model_ids_json", '[{}, "mock-consolidator"]'),
+        ("requested_model_ids_json", '[" mock-council-a", "mock-consolidator"]'),
+        ("resolved_model_ids_json", '["mock-consolidator", "mock-council-a"]'),
+        ("resolved_model_ids_json", "[]"),
+        ("resolved_model_ids_json", "null"),
+        ("resolved_model_ids_json", "{"),
+        ("resolved_model_ids_json", '[{}, "mock-consolidator"]'),
+        ("council_model_ids_json", '{"mock-council-a": 1}'),
+        ("council_model_ids_json", '["mock-council-b"]'),
+        ("consolidator_model_id", "mock-council-b"),
+    ],
+)
 def test_start_rejects_malformed_or_modified_saved_execution_models(
     temp_data_dir, monkeypatch, field, value
 ):
@@ -1095,11 +1129,15 @@ def test_start_rejects_malformed_or_modified_saved_execution_models(
 
     monkeypatch.setattr(main, "_spawn_task", capture_task)
     with TestClient(app, raise_server_exceptions=False) as client:
-        created = client.post("/api/runs", json={
-            "patient_id": patient.id, "report_id": report.id,
-            "council_model_ids": ["mock-council-a"],
-            "consolidator_model_id": "mock-consolidator",
-        }).json()
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+            },
+        ).json()
         with storage.session_scope() as session:
             setattr(storage.get_run(session, created["id"]), field, value)
             session.commit()
@@ -1130,12 +1168,16 @@ def test_saved_explicit_fallback_stays_pinned_after_restart(
 
     monkeypatch.setattr(main, "_spawn_task", capture_task)
     with TestClient(app, raise_server_exceptions=False) as client:
-        created = client.post("/api/runs", json={
-            "patient_id": patient.id, "report_id": report.id,
-            "council_model_ids": ["retired-model"],
-            "consolidator_model_id": "mock-consolidator",
-            "allowed_model_fallbacks": {"retired-model": "mock-council-a"},
-        }).json()
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_id": report.id,
+                "council_model_ids": ["retired-model"],
+                "consolidator_model_id": "mock-consolidator",
+                "allowed_model_fallbacks": {"retired-model": "mock-council-a"},
+            },
+        ).json()
         monkeypatch.setattr(runtime_identity, "INSTANCE_ID", "restarted-engine")
         main.DISCOVERED_MODEL_IDS.add("retired-model")
         if not fallback_available:
@@ -1144,7 +1186,8 @@ def test_saved_explicit_fallback_stays_pinned_after_restart(
         saved = client.get(f"/api/runs/{created['id']}").json()
 
     assert response.status_code == (200 if fallback_available else 409)
-    assert scheduled == ([f"qeeg-run-{created['id']}"] if fallback_available else [])
+    assert scheduled == []
+    assert bool(saved["start_requested_at"]) == fallback_available
     assert saved["requested_model_ids"] == ["retired-model", "mock-consolidator"]
     assert saved["resolved_model_ids"] == ["mock-council-a", "mock-consolidator"]
     assert saved["creating_instance_id"] == created["creating_instance_id"]
@@ -1156,3 +1199,83 @@ def test_runtime_identity_reports_unique_sorted_available_model_ids():
     identity = current_runtime_identity(["writer", "a", "writer", "b"])
     assert identity["available_model_ids"] == ["a", "b", "writer"]
     assert identity["model_contract_version"] == 1
+
+
+@pytest.mark.parametrize(
+    "status", ["created", "running", "failed", "needs_auth", "complete"]
+)
+def test_legacy_without_immutable_admission_never_acquires_start_intent(
+    temp_data_dir, monkeypatch, status
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="ZZ_01-01-1900", notes="")
+    report = _create_report(storage, temp_data_dir, patient_id=patient.id)
+    with storage.session_scope() as session:
+        run = storage.create_run(
+            session,
+            patient_id=patient.id,
+            report_id=report.id,
+            council_model_ids=["mock-council-a"],
+            consolidator_model_id="mock-consolidator",
+        )
+        storage.update_run_status(session, run.id, status=status)
+    with TestClient(app) as client:
+        result = client.post(f"/api/runs/{run.id}/start")
+        assert result.status_code == (200 if status == "complete" else 409)
+        saved = client.get(f"/api/runs/{run.id}").json()
+        assert saved["analysis_input_fingerprint"] == ""
+        assert saved["start_requested_at"] is None
+        assert saved["execution_state"] is None
+        assert saved["patient_facing"]["state"] == "absent"
+        assert saved["status"] == status
+
+
+def test_concurrent_http_start_and_lost_ack_rejoin_original_source_order_offline(
+    temp_data_dir, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from backend import storage
+
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    with storage.session_scope() as session:
+        patient = storage.create_patient(session, label="ZZ_01-01-1900", notes="")
+    from backend.tests.test_analysis_inputs import source
+
+    reports = [
+        source(temp_data_dir, patient.id, date=f"2026-0{n+1}-02") for n in range(2)
+    ]
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "patient_id": patient.id,
+                "report_ids": [r.id for r in reversed(reports)],
+                "special_instructions": "Preserve the original ordering.",
+                "council_model_ids": ["mock-council-a"],
+                "consolidator_model_id": "mock-consolidator",
+                "operation_id": "same-start",
+            },
+        ).json()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            replies = list(
+                pool.map(
+                    lambda _: client.post(f'/api/runs/{created["id"]}/start'), range(8)
+                )
+            )
+        assert all(response.status_code == 200 for response in replies)
+        assert len({response.json()["start_requested_at"] for response in replies}) == 1
+        main.DISCOVERED_MODEL_IDS.clear()
+        repeated = client.post(f'/api/runs/{created["id"]}/start').json()
+        for field in (
+            "id",
+            "analysis_input_fingerprint",
+            "source_report_ids",
+            "special_instructions",
+            "requested_model_ids",
+            "resolved_model_ids",
+        ):
+            assert repeated[field] == created[field]
+        assert repeated["execution_state"] == "pending"

@@ -102,7 +102,13 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
     def __init__(self, *, llm: AsyncOpenAICompatClient):
         self._llm = llm
 
-    async def run_pipeline(self, run_id: str, on_event: OnEvent = None) -> None:
+    async def run_pipeline(
+        self,
+        run_id: str,
+        on_event: OnEvent = None,
+        *,
+        propagate_owned_errors: bool = False,
+    ) -> None:
         latest_counts: dict[str, Any] = {}
 
         async def emit(payload: dict[str, Any]) -> None:
@@ -125,6 +131,10 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
             if run is None:
                 LOGGER.warning("pipeline_run_missing", run_id=run_id)
                 return
+            if current_execution() is None:
+                from ...run_execution import require_unowned_run
+
+                require_unowned_run(session, run)
             report = get_report(session, run.report_id)
             if report is None:
                 project_run_status(
@@ -190,9 +200,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                     project_run_status(
                         session, run_id, status="needs_auth", error_message=str(e)
                     )
-                operator_hint = (
-                    "run_pipeline surfaced _NeedsAuth from a model call; refresh CLIProxy login for the provider used by this run before retrying."
-                )
+                operator_hint = "run_pipeline surfaced _NeedsAuth from a model call; refresh CLIProxy login for the provider used by this run before retrying."
                 LOGGER.warning(
                     "pipeline_needs_auth",
                     error=str(e),
@@ -206,6 +214,8 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                         "operatorHint": operator_hint,
                     }
                 )
+                if current_execution() is not None and propagate_owned_errors:
+                    raise
                 return
             except Exception as e:
                 raise_if_execution_blocked(e)
@@ -223,6 +233,8 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                         "operatorHint": operator_hint,
                     }
                 )
+                if current_execution() is not None and propagate_owned_errors:
+                    raise
                 return
             finally:
                 _USAGE_RUN_ID.reset(usage_token)

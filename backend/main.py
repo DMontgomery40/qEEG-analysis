@@ -223,7 +223,9 @@ class RunCreate(BaseModel):
     report_id: str | None = None
     report_ids: list[str] = Field(default_factory=list)
     special_instructions: str = ""
-    source_session_aliases: dict[str, dict[str, StrictInt]] = Field(default_factory=dict)
+    source_session_aliases: dict[str, dict[str, StrictInt]] = Field(
+        default_factory=dict
+    )
     operation_id: str | None = None
     council_model_ids: list[str]
     consolidator_model_id: str
@@ -524,6 +526,9 @@ async def _auto_generate_patient_facing_for_run(
         run = storage.get_run(session, run_id)
         if run is None or (run.status or "") != "complete":
             return False
+        from .run_execution import require_unowned_run
+
+        require_unowned_run(session, run)
         completion_gaps = run_downstream_delivery_gaps(
             run,
             progress=summarize_run_progress(run),
@@ -1085,6 +1090,9 @@ async def _refresh_discovered_models(*, llm: AsyncOpenAICompatClient) -> None:
 async def _model_refresh_loop(
     *, llm: AsyncOpenAICompatClient, interval_s: float
 ) -> None:
+    # Initial discovery shares this retained task so receipt recovery and API
+    # startup remain available while the catalogue is slow or offline.
+    await _refresh_discovered_models(llm=llm)
     # Default: weekly refresh to pick up CLIProxyAPI model catalog updates.
     if interval_s <= 0:
         return
@@ -1191,6 +1199,71 @@ def _model_visible_in_ui(model_id: str) -> bool:
     return True
 
 
+def _new_start_intent(store, run_id):
+    """Validate only genuinely new starts; existing intent rejoins without discovery."""
+    from .analysis_inputs import validate_admitted_run
+    from .council.execution import ADMISSION_FIELDS
+    from .run_runtime import compatibility_reason
+    from sqlalchemy.orm import Session
+
+    with Session(store.engine, expire_on_commit=False) as session:
+        run = session.get(storage.Run, run_id)
+        if run is None:
+            raise HTTPException(404, "Run not found")
+        if run.start_requested_at is not None:
+            return run
+        if run.status == "complete":
+            return run
+        try:
+            banked_source = (
+                json.loads(run.source_manifest_json).get("legacy", True) is False
+            )
+        except (ValueError, TypeError, AttributeError):
+            banked_source = False
+        if (
+            run.status != "created"
+            or not run.analysis_input_fingerprint
+            or not banked_source
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "code": "LEGACY_RECONCILIATION_REQUIRED",
+                    "reason": compatibility_reason(run),
+                },
+            )
+        try:
+            requested = json.loads(run.requested_model_ids_json)
+            resolved = json.loads(run.resolved_model_ids_json)
+            council = json.loads(run.council_model_ids_json)
+            valid = all(
+                isinstance(ids, list)
+                and ids
+                and all(isinstance(m, str) and m and m == m.strip() for m in ids)
+                for ids in (requested, resolved, council)
+            )
+            valid = (
+                valid
+                and len(requested) == len(resolved)
+                and resolved == [*council, run.consolidator_model_id]
+            )
+            valid = valid and all(m in DISCOVERED_MODEL_IDS for m in resolved)
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise HTTPException(
+                409,
+                {
+                    "code": "ANALYSIS_MODEL_MISMATCH",
+                    "message": "The saved model envelope is invalid or a selected model is unavailable.",
+                },
+            )
+        validate_admitted_run(run)
+        expected = {name: getattr(run, name) for name in ADMISSION_FIELDS}
+        expected["status"] = "created"
+    return store.request_run_start(run_id, expected=expected)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     LOGGER.info("backend_startup_begin")
@@ -1224,7 +1297,6 @@ async def _startup() -> None:
 
     loop = asyncio.get_running_loop()
     if not app.state.mock_mode:
-        await _refresh_discovered_models(llm=app.state.llm)
         try:
             interval_s = float(
                 os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0"
@@ -1236,6 +1308,16 @@ async def _startup() -> None:
         app.state.model_refresh_task = loop.create_task(
             _model_refresh_loop(llm=app.state.llm, interval_s=interval_s)
         )
+    from .run_execution import ExecutionStore
+    from .run_runtime import RunRuntime
+
+    app.state.run_runtime = RunRuntime(
+        ExecutionStore(storage.engine),
+        llm=app.state.llm,
+        workflow=app.state.workflow,
+        publish=app.state.broker.publish,
+    )
+    await app.state.run_runtime.start()
     app.state.portal_raw_sync_task = loop.create_task(watch_portal_patients_forever())
     LOGGER.info(
         "backend_startup_complete",
@@ -1246,6 +1328,9 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     LOGGER.info("backend_shutdown_begin")
+    runtime = getattr(app.state, "run_runtime", None)
+    if runtime is not None:
+        await runtime.stop()
     task = getattr(app.state, "model_refresh_task", None)
     await _cancel_task_if_possible(task)
     raw_sync_task = getattr(app.state, "portal_raw_sync_task", None)
@@ -1841,7 +1926,9 @@ async def bulk_upload_patients(
         except IdentityNameConflict as exc:
             # Structured so the operator can answer it per file, with attach_to
             # or force_new, without holding up the rest of the batch.
-            errors.append({"filename": filename, **exc.payload, "error": exc.payload["detail"]})
+            errors.append(
+                {"filename": filename, **exc.payload, "error": exc.payload["detail"]}
+            )
         except HTTPException as exc:
             errors.append({"filename": filename, "error": str(exc.detail)})
         except Exception as exc:
@@ -1995,17 +2082,45 @@ async def run_patient_action(
                 status_code=409,
                 detail="No complete run is available for patient-facing generation",
             )
-        broker: _EventBroker = app.state.broker
-        _spawn_task(
-            _auto_generate_patient_facing_for_run(patient_facing_run_id, broker),
-            name=f"patient-facing-{patient_facing_run_id}",
-        )
+        from .council.execution import _settings_snapshot
+        from .patient_postprocessing import snapshot_post_config
+        from .run_runtime import AdmissionUnavailable
+        from .run_execution import ExecutionConflict
+
+        runtime = app.state.run_runtime
+        from .patient_postprocessing import project_patient_facing
+
+        try:
+            post = await runtime.admission(
+                project_patient_facing, runtime.store, patient_facing_run_id
+            )
+            if post["state"] == "absent":
+                # Freeze once; every bounded contention retry uses this configuration.
+                snapshot = await asyncio.to_thread(
+                    snapshot_post_config,
+                    _settings_snapshot(),
+                    sorted(DISCOVERED_MODEL_IDS),
+                    base_url=app.state.llm._base_url,
+                    timeout_s=app.state.llm._timeout_s,
+                )
+                post = await runtime.admit_post(
+                    patient_facing_run_id, config_snapshot=snapshot
+                )
+        except AdmissionUnavailable as error:
+            raise HTTPException(
+                503, {"code": "ADMISSION_RETRY", "message": str(error)}
+            ) from error
+        except ExecutionConflict as error:
+            raise HTTPException(
+                409, {"code": "POST_ADMISSION_CONFLICT", "message": str(error)}
+            ) from error
         return {
             "ok": True,
             "action": action,
             "run_id": patient_facing_run_id,
             "patient_label": patient_label,
-            "scheduled": True,
+            "scheduled": post["state"] in ("pending", "owned"),
+            "postprocessing": post,
         }
 
     if action == "prepare_cathode_handoff":
@@ -2352,7 +2467,9 @@ async def reextract_report(report_id: str) -> dict[str, Any]:
 
     if await asyncio.to_thread(repair_combined_report, report):
         directory = original_path.parent
-        enhanced_text = (directory / "extracted_enhanced.txt").read_text(encoding="utf-8")
+        enhanced_text = (directory / "extracted_enhanced.txt").read_text(
+            encoding="utf-8"
+        )
         metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         return {
             "ok": True,
@@ -2581,7 +2698,7 @@ async def list_runs(patient_id: str) -> list[dict[str, Any]]:
         if p is None:
             raise HTTPException(status_code=404, detail="Patient not found")
         runs = storage.list_runs(session, patient_id)
-        return [_run_out(r) for r in runs]
+        return await asyncio.to_thread(lambda: [_run_out(r) for r in runs])
 
 
 @app.post("/api/runs")
@@ -2655,97 +2772,26 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
         immutable_request=immutable_request,
         model_fields=resolve_model_fields,
     )
-    return _run_out(run)
+    return await asyncio.to_thread(_run_out, run)
 
 
 @app.post("/api/runs/{run_id}/start")
 async def start_run(run_id: str) -> dict[str, Any]:
-    with storage.session_scope() as session:
-        run = storage.get_run(session, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        if run.status in ("running", "complete"):
-            return _run_out(run)
-        try:
-            requested_model_ids = json.loads(run.requested_model_ids_json or "[]")
-            resolved_model_ids = json.loads(run.resolved_model_ids_json or "[]")
-            council_model_ids = json.loads(run.council_model_ids_json or "[]")
-        except (TypeError, ValueError):
-            requested_model_ids = []
-            resolved_model_ids = []
-            council_model_ids = []
-        # Creation provenance is historical. Admission depends on the pinned
-        # execution models still being well formed and available today.
-        valid_envelopes = all(
-            isinstance(model_ids, list)
-            and bool(model_ids)
-            and all(
-                isinstance(model_id, str)
-                and bool(model_id.strip())
-                and model_id == model_id.strip()
-                for model_id in model_ids
-            )
-            for model_ids in (requested_model_ids, resolved_model_ids, council_model_ids)
-        )
-        mismatch = (
-            not valid_envelopes
-            or len(requested_model_ids) != len(resolved_model_ids)
-            or resolved_model_ids != [*council_model_ids, run.consolidator_model_id]
-            or any(model_id not in DISCOVERED_MODEL_IDS for model_id in resolved_model_ids)
-        )
-        if mismatch:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "ANALYSIS_MODEL_MISMATCH",
-                    "message": "The saved model envelope is invalid or a selected model is unavailable.",
-                },
-            )
-        if run.status in ("created", "failed", "needs_auth"):
-            from .analysis_inputs import validate_admitted_run
+    from .run_runtime import AdmissionUnavailable
+    from .run_execution import ExecutionConflict
 
-            await asyncio.to_thread(validate_admitted_run, run)
-        started = storage.claim_run_start(session, run_id)
-
-    with storage.session_scope() as session:
-        run = storage.get_run(session, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        if not started:
-            return _run_out(run)
-        patient_id = run.patient_id
-        report_id = run.report_id
-
-    broker: _EventBroker = app.state.broker
-    workflow: QEEGCouncilWorkflow = app.state.workflow
-
-    async def _runner() -> None:
-        with log_context(run_id=run_id, patient_id=patient_id, report_id=report_id):
-            LOGGER.info("run_task_started")
-
-            async def on_event(payload: dict[str, Any]) -> None:
-                await broker.publish(run_id, payload)
-
-            try:
-                await workflow.run_pipeline(run_id, on_event=on_event)
-                await _auto_generate_patient_facing_for_run(run_id, broker)
-                await _auto_generate_cathode_video_for_run(run_id, broker)
-            except Exception:
-                LOGGER.exception(
-                    "run_task_crashed",
-                    operatorHint="run_task wraps workflow.run_pipeline, patient-facing generation, and Cathode video queue launch; inspect the first failed workflow stage or post-run subprocess for this run.",
-                )
-                raise
-            LOGGER.info("run_task_completed")
-
-    LOGGER.info(
-        "run_task_scheduled",
-        run_id=run_id,
-        patient_id=patient_id,
-        report_id=report_id,
-    )
-    _spawn_task(_runner(), name=f"qeeg-run-{run_id}")
-    return {"ok": True}
+    runtime = app.state.run_runtime
+    try:
+        run = await runtime.admission(_new_start_intent, runtime.store, run_id)
+    except AdmissionUnavailable as error:
+        raise HTTPException(
+            503, {"code": "ADMISSION_RETRY", "message": str(error)}
+        ) from error
+    except ExecutionConflict as error:
+        raise HTTPException(
+            409, {"code": "START_ADMISSION_CONFLICT", "message": str(error)}
+        ) from error
+    return {"ok": True, **await asyncio.to_thread(_run_out, run)}
 
 
 @app.get("/api/runs/{run_id}")
@@ -2754,7 +2800,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
         run = storage.get_run(session, run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        return _run_out(run)
+        return await asyncio.to_thread(_run_out, run)
 
 
 @app.get("/api/runs/{run_id}/artifacts")
@@ -2796,7 +2842,11 @@ async def stream(run_id: str):
                 run = storage.get_run(session, run_id)
                 if run is not None:
                     yield _sse(
-                        {"run_id": run_id, "type": "snapshot", "run": _run_out(run)}
+                        {
+                            "run_id": run_id,
+                            "type": "snapshot",
+                            "run": await asyncio.to_thread(_run_out, run),
+                        }
                     )
 
             while True:
@@ -2849,7 +2899,7 @@ async def select(run_id: str, req: SelectRequest) -> dict[str, Any]:
         run2 = storage.select_artifact(session, run_id, artifact_id)
         if run2 is None:
             raise HTTPException(status_code=404, detail="Artifact not found for run")
-        return _run_out(run2)
+        return await asyncio.to_thread(_run_out, run2)
 
 
 @app.post("/api/runs/{run_id}/export")
@@ -3104,6 +3154,20 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
             ]
     except Exception:
         postprocessing = None
+    from .patient_postprocessing import project_patient_facing
+    from .run_execution import ExecutionStore
+    from .run_runtime import compatibility_reason
+
+    try:
+        patient_facing = project_patient_facing(ExecutionStore(storage.engine), r.id)
+    except Exception as error:
+        patient_facing = {
+            "run_id": r.id,
+            "state": "unavailable",
+            "verified": False,
+            "integrity_error": str(error),
+            "delivery_verified": False,
+        }
     liveness = derive_run_liveness(r, progress=progress, artifacts=artifacts)
     try:
         council_model_ids = json.loads(r.council_model_ids_json)
@@ -3126,7 +3190,8 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "id": r.id,
         "patient_id": r.patient_id,
         "report_id": r.report_id,
-        "source_report_ids": json.loads(r.source_report_ids_json or "[]") or [r.report_id],
+        "source_report_ids": json.loads(r.source_report_ids_json or "[]")
+        or [r.report_id],
         "source_manifest": json.loads(r.source_manifest_json or '{"legacy":true}'),
         "special_instructions": r.special_instructions or "",
         "analysis_input_fingerprint": r.analysis_input_fingerprint or "",
@@ -3145,6 +3210,8 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
         "blocked_reason": r.blocked_reason,
         "execution_manifest_hash": r.execution_manifest_hash,
         "postprocessing": postprocessing,
+        "patient_facing": patient_facing,
+        "execution_diagnostic": compatibility_reason(r, has_post=bool(postprocessing)),
         "raw_status": liveness["raw_status"],
         "display_status": liveness["display_status"],
         "display_label": liveness["display_label"],

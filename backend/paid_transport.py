@@ -52,6 +52,8 @@ def _task():
 
 
 _scope: ContextVar[PaidScope | None] = ContextVar("qeeg_paid_scope", default=None)
+dispatch_validation = ContextVar("qeeg_dispatch_validation", default=None)
+
 _worker_scope: ContextVar[PaidScope | None] = ContextVar(
     "qeeg_paid_worker", default=None
 )
@@ -314,6 +316,10 @@ class _Receipt:
         self._verify_files()
         if self.response_path.exists():
             return self.reconcile()
+        # Recovery above is free; only a genuinely new physical send needs a
+        # currently available pinned model. The runtime installs this guard.
+        if row.state == "prepared" and dispatch_validation.get() is not None:
+            dispatch_validation.get()(self.request)
         with self.owner.transaction() as session:
             row = session.get(storage.PaidRequest, self.key)
             self._verify_row(row)

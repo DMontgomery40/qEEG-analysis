@@ -818,7 +818,7 @@ def durable_stage(stage_num):
                         from .workflow.exceptions import _NeedsAuth
 
                         raise _NeedsAuth(failure["error"])
-                    raise RuntimeError(failure["error"])
+                    raise ClinicalExhaustion(failure["error"])
             committed = False
 
             async def emit(payload):

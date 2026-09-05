@@ -603,7 +603,7 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
     temp_data_dir,
     monkeypatch,
 ):
-    from backend import main, storage
+    from backend import storage
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
@@ -709,23 +709,12 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
         ready_run_id = ready_run.id
         newer_run_id = newer_run.id
 
-    scheduled: dict[str, object] = {}
+    from backend.run_runtime import RunRuntime
+    from unittest.mock import AsyncMock
 
-    def fake_patient_facing_task(run_id, broker, *, sync_outputs=True):
-        scheduled["run_id"] = run_id
-        scheduled["sync_outputs"] = sync_outputs
-        return "patient-facing-task"
-
-    def fake_spawn_task(task, *, name=None):
-        scheduled["task"] = task
-        scheduled["name"] = name
-        return object()
-
-    monkeypatch.setattr(
-        main, "_auto_generate_patient_facing_for_run", fake_patient_facing_task
-    )
-    monkeypatch.setattr(main, "_spawn_task", fake_spawn_task)
-
+    monkeypatch.setattr(RunRuntime, "start", AsyncMock())
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
+    scheduled = {}
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
@@ -744,13 +733,14 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
     assert response.json()["run_id"] != newer_run_id
     assert requested_response.status_code == 409
     assert "No delivery-ready complete run" in requested_response.text
-    assert first_scheduled == {
-        "run_id": ready_run_id,
-        "sync_outputs": True,
-        "task": "patient-facing-task",
-        "name": f"patient-facing-{ready_run_id}",
-    }
-    assert scheduled == {}
+    assert first_scheduled == scheduled == {}
+    assert response.json()["postprocessing"]["state"] == "pending"
+    with storage.session_scope() as session:
+        assert (
+            session.get(storage.PostObligation, (ready_run_id, "patient_facing"))
+            is not None
+        )
+        assert session.get(storage.Run, ready_run_id).analysis_input_fingerprint == ""
 
 
 def test_peer_review_artifact_majority_is_checked_without_progress_counts(
@@ -1187,7 +1177,9 @@ def test_patient_orchestration_detail_exposes_current_run_over_newer_failed_run(
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="TV_01-18-1991_2", notes="")
-        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-mixed-detail"
+        report_dir = (
+            Path(temp_data_dir) / "reports" / patient.id / "report-mixed-detail"
+        )
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
         extracted_path = report_dir / "extracted.txt"
@@ -1217,7 +1209,9 @@ def test_patient_orchestration_detail_exposes_current_run_over_newer_failed_run(
             council_model_ids=["gpt-5.4"],
             consolidator_model_id="claude-sonnet-4-6",
         )
-        storage.update_run_status(session, failed_run.id, status="failed", error_message="boom")
+        storage.update_run_status(
+            session, failed_run.id, status="failed", error_message="boom"
+        )
 
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -1880,8 +1874,7 @@ def test_export_council_artifacts_action_falls_back_to_export_ready_run(
 
     assert detail_response.status_code == 200
     assert (
-        detail_response.json()["actions"]["export_council_artifacts"]["enabled"]
-        is True
+        detail_response.json()["actions"]["export_council_artifacts"]["enabled"] is True
     )
     assert response.status_code == 200
     payload = response.json()
