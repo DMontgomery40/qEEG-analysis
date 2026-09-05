@@ -1040,7 +1040,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     Reduce clutter in the frontend model picker by hiding older provider versions.
 
     Policy (as requested):
-    - OpenAI: show only GPT-5.5 families, hide 5.4 and older
+    - OpenAI: show GPT-5.5 and GPT-5.6 families, hide 5.4 and older
     - Anthropic: hide claude-* models older than 4.6
     - Gemini: hide gemini-* models older than 3
 
@@ -1061,7 +1061,7 @@ def _model_visible_in_ui(model_id: str) -> bool:
     if m:
         major = int(m.group("major"))
         minor = int(m.group("minor"))
-        if major != 5 or minor != 5:
+        if major != 5 or minor not in {5, 6}:
             return False
         suffix = m.group("suffix") or ""
         tokens = [t for t in suffix.split("-") if t]

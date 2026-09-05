@@ -767,7 +767,9 @@ async def test_responses_unexpected_shape_sets_operator_hint():
         with pytest.raises(UpstreamError) as exc_info:
             await client.responses(
                 model_id="gpt-5.4",
-                input_data=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                input_data=[
+                    {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+                ],
                 stream=False,
                 max_output_tokens=20,
             )
@@ -777,3 +779,136 @@ async def test_responses_unexpected_shape_sets_operator_hint():
     assert "unexpected shape" in str(exc_info.value)
     assert exc_info.value.operator_hint is not None
     assert "/v1/responses" in exc_info.value.operator_hint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("shape", ["text", "blocks"])
+async def test_gpt5_extra_responses_keeps_selected_upstream(monkeypatch, direct, shape):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "openai/gpt-5.6-terra")
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "1" if direct else "0")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.test/api")
+    seen = []
+    usage = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                **(
+                    {"output_text": "ok"}
+                    if shape == "text"
+                    else {
+                        "output": [{"content": [{"type": "output_text", "text": "ok"}]}]
+                    }
+                ),
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            },
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert (
+            await client.chat_completions(
+                model_id="openai/gpt-5.6-terra",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=37,
+                usage_callback=usage.append,
+            )
+            == "ok"
+        )
+    finally:
+        await client.aclose()
+    assert seen[0].url.host == ("openrouter.test" if direct else "cliproxy.test")
+    assert seen[0].url.path == ("/api/v1/responses" if direct else "/v1/responses")
+    assert json.loads(seen[0].content)["max_output_tokens"] == 37
+    assert usage[-1]["provider"] == ("openrouter" if direct else "cliproxy")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direct", [False, True])
+async def test_glm_retry_usage_matches_actual_route(monkeypatch, direct):
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", "z-ai/glm-5.2")
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "1" if direct else "0")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic")
+    usage = []
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "" if len(seen) == 1 else "final report"}}
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            },
+        )
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert (
+            await client.chat_completions(
+                model_id="z-ai/glm-5.2", messages=[], usage_callback=usage.append
+            )
+            == "final report"
+        )
+    finally:
+        await client.aclose()
+    assert len(usage) == 2
+    assert {row["provider"] for row in usage} == {
+        "openrouter" if direct else "cliproxy"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("mode", ["responses", "glm-retry"])
+@pytest.mark.parametrize("failure", ["http", "transport", "shape"])
+async def test_selected_route_failure_attribution(monkeypatch, direct, mode, failure):
+    model = "openai/gpt-5.6-terra" if mode == "responses" else "z-ai/glm-5.2"
+    monkeypatch.setenv("QEEG_OPENROUTER_EXTRA_MODELS", model)
+    monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "1" if direct else "0")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic")
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if mode == "glm-retry" and calls == 1:
+            return httpx.Response(200, json={"choices": [{"message": {"content": ""}}]})
+        if failure == "http":
+            return httpx.Response(503, json={"error": {"message": "unavailable"}})
+        if failure == "transport":
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, json={"wrong": "shape"})
+
+    client = AsyncOpenAICompatClient(
+        base_url="http://cliproxy.test",
+        api_key="",
+        timeout_s=5,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(UpstreamError) as exc:
+            await client.chat_completions(model_id=model, messages=[])
+    finally:
+        await client.aclose()
+    expected = "OpenRouter" if direct else "CLIProxyAPI"
+    wrong = "CLIProxy" if direct else "OpenRouter"
+    assert expected in str(exc.value)
+    assert wrong not in str(exc.value)
+    assert wrong not in exc.value.operator_hint

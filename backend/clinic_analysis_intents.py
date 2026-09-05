@@ -4,7 +4,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-from sqlalchemy import select
+from sqlalchemy import select, and_, or_, case, func
 from . import config, storage
 from .council import execution
 from .clinic_models import CatalogueConflict, CatalogueNotFound, CatalogueUnavailable
@@ -208,16 +208,44 @@ async def activate_confirmed_uploads(runtime):
     if runtime.store.engine is not storage.engine:
         return
     with storage.session_scope() as s:
-        ids = list(
-            s.scalars(
-                select(ClinicUpload.id)
+        operation_id = case(
+            (
+                func.json_valid(ClinicUpload.analysis_json),
+                func.json_extract(ClinicUpload.analysis_json, "$.operationId"),
+            ),
+            else_=None,
+        )
+        pending = list(
+            s.execute(
+                select(ClinicUpload.id, storage.Run)
+                .outerjoin(
+                    storage.Run,
+                    and_(
+                        storage.Run.operation_id == operation_id,
+                        storage.Run.patient_id == ClinicUpload.patient_uuid,
+                    ),
+                )
                 .where(ClinicUpload.analysis_json.is_not(None))
+                .where(
+                    or_(
+                        storage.Run.id.is_(None),
+                        and_(
+                            storage.Run.start_requested_at.is_(None),
+                            storage.Run.status != "complete",
+                        ),
+                    )
+                )
                 .order_by(ClinicUpload.id)
             )
         )
-    for upload_id in ids:
+    for upload_id, run in pending:
         try:
-            run = await runtime.admission(admit_confirmed_upload, upload_id)
+            if run is None:
+                run = await runtime.admission(admit_confirmed_upload, upload_id)
+            else:
+                # Admission is already durable. Preserve original upload ownership
+                # checks while recovering only its missing start intent.
+                await runtime.admission(run_policy_binding, run)
             if run is not None and run.start_requested_at is None:
                 await runtime.admission(main._new_start_intent, runtime.store, run.id)
         except asyncio.CancelledError:

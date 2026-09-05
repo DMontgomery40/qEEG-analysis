@@ -30,7 +30,13 @@ class UpstreamError(RuntimeError):
         self.operator_hint = operator_hint
 
 
-def _operator_hint(endpoint: str, issue: str) -> str:
+def _operator_hint(endpoint: str, issue: str, *, upstream: str = "CLIProxyAPI") -> str:
+    if upstream != "CLIProxyAPI":
+        return (
+            _operator_hint(endpoint, issue)
+            .replace("CLIProxyAPI", upstream)
+            .replace("CLIProxy", upstream)
+        )
     if endpoint == "/v1/models":
         if issue == "request_failed":
             return "AsyncOpenAICompatClient.list_models calls CLIProxyAPI /v1/models before model refresh; inspect CLIProxy reachability or auth at that endpoint."
@@ -88,7 +94,12 @@ def _parse_openai_error(payload: Any) -> _OpenAICompatError | None:
 
 
 def _format_http_error(
-    response: httpx.Response, *, endpoint: str, prefix: str, fallback_message: str
+    response: httpx.Response,
+    *,
+    endpoint: str,
+    prefix: str,
+    fallback_message: str,
+    upstream: str = "CLIProxyAPI",
 ) -> UpstreamError:
     try:
         payload = response.json()
@@ -101,7 +112,7 @@ def _format_http_error(
         return UpstreamError(
             msg,
             status_code=response.status_code,
-            operator_hint=_operator_hint(endpoint, "http_error"),
+            operator_hint=_operator_hint(endpoint, "http_error", upstream=upstream),
         )
 
     body_preview: str | None = None
@@ -118,7 +129,7 @@ def _format_http_error(
     return UpstreamError(
         msg,
         status_code=response.status_code,
-        operator_hint=_operator_hint(endpoint, "http_error"),
+        operator_hint=_operator_hint(endpoint, "http_error", upstream=upstream),
     )
 
 
@@ -576,8 +587,8 @@ class AsyncOpenAICompatClient:
         usage_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         self.last_response_metadata = None
-        use_openrouter = _route_openrouter_extras_direct() and _is_openrouter_extra_model(
-            model_id
+        use_openrouter = (
+            _route_openrouter_extras_direct() and _is_openrouter_extra_model(model_id)
         )
         client = self._get_openrouter_client() if use_openrouter else self._get_client()
         reasoning_effort = _openai_reasoning_effort(model_id)
@@ -630,9 +641,7 @@ class AsyncOpenAICompatClient:
         except Exception as e:
             raise UpstreamError(
                 f"CLIProxyAPI request failed: {e}",
-                operator_hint=_operator_hint(
-                    "/v1/chat/completions", "request_failed"
-                ),
+                operator_hint=_operator_hint("/v1/chat/completions", "request_failed"),
             ) from e
 
         if resp.status_code >= 400:
@@ -658,9 +667,7 @@ class AsyncOpenAICompatClient:
         except Exception as e:
             raise UpstreamError(
                 f"CLIProxyAPI /v1/chat/completions returned invalid JSON: {e}",
-                operator_hint=_operator_hint(
-                    "/v1/chat/completions", "invalid_json"
-                ),
+                operator_hint=_operator_hint("/v1/chat/completions", "invalid_json"),
             ) from e
 
         self._remember_response_usage(
@@ -696,6 +703,7 @@ class AsyncOpenAICompatClient:
             or _looks_like_reasoning_leak(content_text, message)
         )
         if needs_glm_retry:
+            upstream = "OpenRouter" if use_openrouter else "CLIProxyAPI"
             retry_payload = dict(payload)
             retry_payload["messages"] = [
                 *messages,
@@ -716,17 +724,18 @@ class AsyncOpenAICompatClient:
                 raise
             except Exception as e:
                 raise UpstreamError(
-                    f"OpenRouter GLM final-content retry failed: {e}",
+                    f"{upstream} GLM final-content retry failed: {e}",
                     operator_hint=_operator_hint(
-                        "/v1/chat/completions", "request_failed"
+                        "/v1/chat/completions", "request_failed", upstream=upstream
                     ),
                 ) from e
             if retry_response.status_code >= 400:
                 raise _format_http_error(
                     retry_response,
                     endpoint="/v1/chat/completions",
-                    prefix="OpenRouter GLM final-content retry failed",
+                    prefix=f"{upstream} GLM final-content retry failed",
                     fallback_message=f"HTTP {retry_response.status_code}",
+                    upstream=upstream,
                 )
             try:
                 retry_data = retry_response.json()
@@ -734,16 +743,16 @@ class AsyncOpenAICompatClient:
                 retry_content = _chat_content_text(retry_message.get("content"))
             except Exception as e:
                 raise UpstreamError(
-                    f"OpenRouter GLM final-content retry returned unexpected shape: {e}",
+                    f"{upstream} GLM final-content retry returned unexpected shape: {e}",
                     operator_hint=_operator_hint(
-                        "/v1/chat/completions", "unexpected_shape"
+                        "/v1/chat/completions", "unexpected_shape", upstream=upstream
                     ),
                 ) from e
             self._remember_response_usage(
                 retry_data,
                 requested_model_id=model_id,
                 endpoint="/v1/chat/completions",
-                provider="openrouter",
+                provider="openrouter" if use_openrouter else "cliproxy",
                 usage_callback=usage_callback,
             )
             if (
@@ -752,7 +761,7 @@ class AsyncOpenAICompatClient:
                 or _looks_like_reasoning_leak(retry_content, retry_message)
             ):
                 raise UpstreamError(
-                    "OpenRouter GLM did not return publishable final content after one reasoning-disabled retry",
+                    f"{upstream} GLM did not return publishable final content after one reasoning-disabled retry",
                     operator_hint=(
                         "The GLM writer returned empty or reasoning-like text twice; "
                         "do not publish it and retry the patient-facing generation later."
@@ -780,7 +789,11 @@ class AsyncOpenAICompatClient:
         usage_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         self.last_response_metadata = None
-        client = self._get_client()
+        use_openrouter = (
+            _route_openrouter_extras_direct() and _is_openrouter_extra_model(model_id)
+        )
+        client = self._get_openrouter_client() if use_openrouter else self._get_client()
+        upstream = "OpenRouter" if use_openrouter else "CLIProxyAPI"
         payload = {"model": model_id, "input": input_data, "stream": stream}
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
@@ -793,24 +806,29 @@ class AsyncOpenAICompatClient:
             raise
         except Exception as e:
             raise UpstreamError(
-                f"CLIProxyAPI request failed: {e}",
-                operator_hint=_operator_hint("/v1/responses", "request_failed"),
+                f"{upstream} request failed: {e}",
+                operator_hint=_operator_hint(
+                    "/v1/responses", "request_failed", upstream=upstream
+                ),
             ) from e
 
         if resp.status_code >= 400:
             raise _format_http_error(
                 resp,
                 endpoint="/v1/responses",
-                prefix="CLIProxyAPI /v1/responses failed",
+                prefix=f"{upstream} /v1/responses failed",
                 fallback_message=f"HTTP {resp.status_code}",
+                upstream=upstream,
             )
 
         try:
             data = resp.json()
         except Exception as e:
             raise UpstreamError(
-                f"CLIProxyAPI /v1/responses returned invalid JSON: {e}",
-                operator_hint=_operator_hint("/v1/responses", "invalid_json"),
+                f"{upstream} /v1/responses returned invalid JSON: {e}",
+                operator_hint=_operator_hint(
+                    "/v1/responses", "invalid_json", upstream=upstream
+                ),
             ) from e
 
         # OpenAI Responses API: output_text may be present; otherwise reconstruct from output blocks.
@@ -820,15 +838,17 @@ class AsyncOpenAICompatClient:
                 data,
                 requested_model_id=model_id,
                 endpoint="/v1/responses",
-                provider="cliproxy",
+                provider="openrouter" if use_openrouter else "cliproxy",
                 usage_callback=usage_callback,
             )
             return output_text
 
         if not isinstance(data, dict) or not isinstance(data.get("output"), list):
             raise UpstreamError(
-                "CLIProxyAPI /v1/responses returned unexpected shape",
-                operator_hint=_operator_hint("/v1/responses", "unexpected_shape"),
+                f"{upstream} /v1/responses returned unexpected shape",
+                operator_hint=_operator_hint(
+                    "/v1/responses", "unexpected_shape", upstream=upstream
+                ),
             )
 
         chunks: list[str] = []
@@ -847,14 +867,16 @@ class AsyncOpenAICompatClient:
         if not text:
             await self.aclose()
             raise UpstreamError(
-                "CLIProxyAPI /v1/responses returned empty text content",
-                operator_hint=_operator_hint("/v1/responses", "unexpected_shape"),
+                f"{upstream} /v1/responses returned empty text content",
+                operator_hint=_operator_hint(
+                    "/v1/responses", "unexpected_shape", upstream=upstream
+                ),
             )
         self._remember_response_usage(
             data,
             requested_model_id=model_id,
             endpoint="/v1/responses",
-            provider="cliproxy",
+            provider="openrouter" if use_openrouter else "cliproxy",
             usage_callback=usage_callback,
         )
         return text
