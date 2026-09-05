@@ -8,6 +8,7 @@ stage completion and admission/consumer activation; no lifecycle is started here
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -452,36 +453,193 @@ def canonical_execution_report(run_id, report, *, report_text=None, page_images=
                 raise ExecutionConflict(
                     "supplied report differs from original admission"
                 )
+    payload = _admitted_report_payload(ctx, canonical)
     if report_text is not None or page_images is not None:
-        from ..analysis_inputs import repair_combined_report
-        from .report_assets import (
-            _derive_report_dir,
-            _load_best_report_text,
-            _load_page_images,
-        )
+        if payload is None:
+            from ..analysis_inputs import repair_combined_report
+            from .report_assets import (
+                _derive_report_dir,
+                _load_best_report_text,
+                _load_page_images,
+            )
 
-        try:
-            repair_combined_report(canonical, run_id=run_id)
-            directory = _derive_report_dir(canonical)
-            if report_text is not None and report_text != _load_best_report_text(
-                canonical, directory
-            ):
-                raise ExecutionConflict(
-                    "supplied text differs from admitted report source"
+            try:
+                repair_combined_report(canonical, run_id=run_id)
+                directory = _derive_report_dir(canonical)
+                payload = (
+                    _load_best_report_text(canonical, directory),
+                    _load_page_images(canonical, directory),
                 )
-            if page_images is not None and page_images != _load_page_images(
-                canonical, directory
-            ):
+            except ExecutionConflict:
+                raise
+            except Exception as error:
                 raise ExecutionConflict(
-                    "supplied images differ from admitted report source"
-                )
-        except ExecutionConflict:
-            raise
-        except Exception as exc:
+                    "admitted report source cannot be verified"
+                ) from error
+        if report_text is not None and report_text != payload[0]:
+            raise ExecutionConflict("supplied text differs from admitted report source")
+        if page_images is not None and page_images != payload[1]:
             raise ExecutionConflict(
-                "admitted report source cannot be verified"
-            ) from exc
+                "supplied images differ from admitted report source"
+            )
+
     return canonical
+
+
+def validate_prepared_report(run_id, report, *, report_text, page_images):
+    """Check final prepared inputs before their first binding for banked runs."""
+    ctx = _CURRENT.get()
+    if ctx is None or json.loads(ctx.manifest["admission"]["source_manifest_json"]).get(
+        "legacy", True
+    ):
+        return
+    canonical_execution_report(
+        run_id, report, report_text=report_text, page_images=page_images
+    )
+
+
+def _admitted_report_payload(ctx, report):
+    """Validate what loaders actually select against banked or rebuilt assets."""
+    from ..analysis_inputs import _source_snapshot, repair_combined_report
+    from .report_assets import (
+        _derive_report_dir,
+        _load_best_report_text,
+        _load_page_images,
+    )
+    from .types import PageImage
+
+    manifest = json.loads(ctx.manifest["admission"]["source_manifest_json"])
+    if manifest.get("legacy", True):
+        return None
+    try:
+        directory = _derive_report_dir(report)
+        original = next(
+            (
+                source
+                for source in manifest["sources"]
+                if source["report_id"] == report.id
+            ),
+            None,
+        )
+        if original is not None:
+            current, extracted = _source_snapshot(report)
+            if any(
+                current[key] != original[key]
+                for key in ("report_id", "original_sha256", "asset_digests")
+            ):
+                raise ExecutionConflict("original admitted source changed")
+            digests = original["asset_digests"]
+            if extracted is not None and extracted.repaired_assets:
+                # The existing OCR recipe already reproduced every admitted hash.
+                # Restore exactly those bytes before the ordinary loaders run.
+                _restore_admitted_assets(ctx, report, extracted.repaired_assets)
+        else:
+            if not repair_combined_report(report, run_id=ctx.owner.run_id):
+                raise ExecutionConflict(
+                    "admitted execution source has no composition authority"
+                )
+            ready = json.loads((directory / "analysis_input_ready.json").read_text())
+            if (
+                ready["fingerprint"]
+                != ctx.manifest["admission"]["analysis_input_fingerprint"]
+            ):
+                raise ExecutionConflict(
+                    "combined source fingerprint differs from admission"
+                )
+            digests = ready["assets"]
+
+        def asset(name):
+            path = (
+                Path(report.extracted_text_path)
+                if name == "extracted.txt"
+                else directory / name
+            )
+            content = path.read_bytes()
+            if _hash(content) != digests[name]:
+                raise ExecutionConflict("loader asset differs from admitted source")
+            return content
+
+        def text_asset(name):
+            return (
+                asset(name)
+                .decode("utf-8", errors="replace")
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+            )
+
+        expected_text = text_asset("extracted.txt")
+        if "extracted_enhanced.txt" in digests:
+            enhanced = text_asset("extracted_enhanced.txt")
+            if enhanced.strip():
+                expected_text = enhanced
+        metadata = (
+            json.loads(asset("metadata.json")) if "metadata.json" in digests else {}
+        )
+        synthetic = (
+            metadata.get("synthetic_combined") if isinstance(metadata, dict) else None
+        )
+        raw_labels = (
+            synthetic.get("page_labels") if isinstance(synthetic, dict) else None
+        )
+        labels = {}
+        if isinstance(raw_labels, dict):
+            for key, value in raw_labels.items():
+                try:
+                    number = int(key)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(value, str) and value.strip():
+                    labels[number] = value.strip()
+        pages = sorted(
+            (int(match.group(1)), name)
+            for name in digests
+            if (match := re.fullmatch(r"pages/page-(\d+)\.png", name))
+        )
+        expected_images = [
+            PageImage(
+                page=number,
+                base64_png=base64.b64encode(asset(name)).decode("utf-8"),
+                label=labels.get(number),
+            )
+            for number, name in pages
+        ]
+        selected = (
+            _load_best_report_text(report, directory),
+            _load_page_images(report, directory),
+        )
+        if selected != (expected_text, expected_images):
+            raise ExecutionConflict(
+                "loader selected content outside admitted source authority"
+            )
+        return selected
+    except ExecutionConflict:
+        raise
+    except Exception as error:
+        raise ExecutionConflict("admitted loader source cannot be verified") from error
+
+
+def _restore_admitted_assets(ctx, report, assets):
+    """Atomically restore only bytes proven by the original admission snapshot."""
+    with ctx.owner.file_guard():
+        for name, content in assets.items():
+            target = (
+                Path(report.extracted_text_path)
+                if name == "extracted.txt"
+                else Path(report.stored_path).parent / name
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(
+                dir=target.parent, prefix=".source-repair-"
+            )
+            try:
+                with os.fdopen(fd, "wb") as out:
+                    out.write(content)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(temporary, target)
+                _fsync_directory(target.parent)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
 
 
 def bind_artifact_sources(key, artifacts):

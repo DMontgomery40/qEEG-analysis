@@ -1514,3 +1514,307 @@ async def test_owned_combined_report_uses_canonical_composition_and_repairs_with
     finally:
         await context.aclose()
         combined_owner.close()
+
+
+def banked_loader_report(owner, tmp_path, monkeypatch, kind):
+    from backend.tests.test_analysis_inputs import source
+    from backend import reports
+
+    report = seed_stages(owner, tmp_path, monkeypatch, models=("mock-council-a",))
+    monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "fallback")
+    if kind == "pdf":
+        pdf = source(tmp_path, "p", pages=2)
+        report = supplied_report_copy(pdf, id="q")
+        with owner.transaction() as session:
+            session.merge(report)
+    elif kind == "image":
+        import base64
+
+        image_path = tmp_path / "original.png"
+        image_path.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9WQAAAAASUVORK5CYII="
+            )
+        )
+        report = supplied_report_copy(
+            report,
+            stored_path=str(image_path),
+            filename="original.png",
+            mime_type="image/png",
+        )
+        with owner.transaction() as session:
+            session.merge(report)
+    bank_original_report(owner, report)
+    return report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["stage1", "data_pack", "transcript"])
+@pytest.mark.parametrize(
+    "kind,addition",
+    [
+        ("text", "enhanced"),
+        ("text", "fallback_text"),
+        ("text", "page"),
+        ("text", "fallback_page"),
+        ("image", "enhanced"),
+        ("image", "page"),
+        ("pdf", "extra_page"),
+        ("pdf", "duplicate_page"),
+        ("pdf", "reordered_pages"),
+        ("pdf", "replaced_page"),
+        ("pdf", "labels"),
+    ],
+)
+async def test_loader_selected_asset_family_cannot_gain_admitted_authority(
+    owner, tmp_path, monkeypatch, kind, addition, entry
+):
+    from backend import reports
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.report_assets import _load_best_report_text, _load_page_images
+
+    report = banked_loader_report(owner, tmp_path, monkeypatch, kind)
+    directory = Path(report.stored_path).parent
+    sent = []
+    llm = client(
+        lambda request: sent.append(request.content)
+        or httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+    )
+    e = execution()
+    context = e.prepare_execution(owner, llm_client=llm)
+    if addition in {"enhanced", "fallback_text"}:
+        target = directory if addition == "enhanced" else reports.report_dir("p", "q")
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "extracted_enhanced.txt").write_text("OTHER PATIENT SOURCE FACTS")
+    elif addition == "labels":
+        path = directory / "metadata.json"
+        metadata = json.loads(path.read_text())
+        metadata["synthetic_combined"] = {
+            "page_labels": {"1": "OTHER PATIENT SOURCE FACTS"}
+        }
+        path.write_text(json.dumps(metadata))
+    else:
+        target = (
+            directory if addition != "fallback_page" else reports.report_dir("p", "q")
+        )
+        pages = target / "pages"
+        pages.mkdir(parents=True, exist_ok=True)
+        if addition == "reordered_pages":
+            first, second = (
+                (pages / "page-1.png").read_bytes(),
+                (pages / "page-2.png").read_bytes(),
+            )
+            (pages / "page-1.png").write_bytes(second)
+            (pages / "page-2.png").write_bytes(first)
+        elif addition == "replaced_page":
+            (pages / "page-1.png").write_bytes((pages / "page-2.png").read_bytes())
+        else:
+            name = (
+                "page-3.png"
+                if addition == "extra_page"
+                else "page-01.png"
+                if addition == "duplicate_page"
+                else "page-1.png"
+            )
+            (pages / name).write_bytes(b"OTHER PATIENT SOURCE FACTS")
+    text = _load_best_report_text(report, directory)
+    images = _load_page_images(report, directory)
+
+    async def emit(_):
+        pass
+
+    with pytest.raises(ExecutionConflict), e.execution_context(context):
+        workflow = QEEGCouncilWorkflow(llm=llm)
+        if entry == "stage1":
+            await workflow._stage1("r", ["mock-council-a"], report, emit)
+        elif entry == "data_pack":
+            await workflow._ensure_data_pack(
+                run_id="r",
+                report=report,
+                report_text=text,
+                page_images=images,
+                candidate_extractor_model_ids=["mock-council-a"],
+                strict=False,
+            )
+        else:
+            await workflow._ensure_vision_transcript(
+                run_id="r",
+                report=report,
+                page_images=images,
+                transcript_model_id="mock-council-a",
+                strict=False,
+            )
+    assert sent == []
+    assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "image", "pdf"])
+async def test_original_banked_loader_inputs_replay_unchanged(
+    owner, tmp_path, monkeypatch, kind
+):
+    from backend.council import QEEGCouncilWorkflow
+
+    report = banked_loader_report(owner, tmp_path, monkeypatch, kind)
+    if kind == "text":
+        # Universal newline decoding must not mistake original CRLF for drift.
+        Path(report.extracted_text_path).write_bytes(b"Source facts.\r\n")
+        bank_original_report(owner, report)
+    e = execution()
+    sent = []
+    llm = client(
+        lambda request: sent.append(request.content)
+        or httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+    )
+
+    async def emit(_):
+        pass
+
+    for _ in range(2):
+        context = e.prepare_execution(owner, llm_client=llm)
+        with e.execution_context(context):
+            await QEEGCouncilWorkflow(llm=llm)._stage1(
+                "r", ["mock-council-a"], report, emit
+            )
+        await context.aclose()
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing", ["extracted_enhanced.txt", "pages/page-1.png", "metadata.json"]
+)
+@pytest.mark.parametrize("repair_result", ["exact", "different", "interrupted"])
+async def test_original_ocr_repair_requires_exact_admitted_assets_before_replay(
+    owner, tmp_path, monkeypatch, missing, repair_result
+):
+    import base64
+    from backend import reports
+    from backend.council import QEEGCouncilWorkflow
+
+    report = banked_loader_report(owner, tmp_path, monkeypatch, "pdf")
+    directory = Path(report.stored_path).parent
+    metadata = json.loads((directory / "metadata.json").read_text())
+    (directory / "metadata.json").write_text(
+        json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    )
+    bank_original_report(owner, report)
+    expected = {
+        str(path.relative_to(directory)): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    full = reports.PdfFullExtraction(
+        enhanced_text=expected["extracted_enhanced.txt"].decode(),
+        page_images=[
+            {
+                "page": n,
+                "base64_png": base64.b64encode(
+                    expected[f"pages/page-{n}.png"]
+                ).decode(),
+            }
+            for n in (1, 2)
+        ],
+        per_page_sources=[
+            {
+                "page": n,
+                **{
+                    field: expected[f"sources/page-{n}.{engine}.txt"].decode()
+                    for engine, field in {
+                        "pypdf": "pypdf_text",
+                        "pymupdf": "pymupdf_text",
+                        "apple_vision": "vision_ocr_text",
+                        "tesseract": "tesseract_ocr_text",
+                    }.items()
+                },
+            }
+            for n in (1, 2)
+        ],
+        metadata=metadata,
+    )
+    if repair_result == "different":
+        full.page_images[0]["base64_png"] = base64.b64encode(
+            expected["pages/page-2.png"]
+        ).decode()
+    extracted = []
+
+    def extract(path):
+        extracted.append(path)
+        return full
+
+    monkeypatch.setattr(reports, "extract_pdf_full", extract)
+    e = execution()
+    sent = []
+    llm = client(
+        lambda request: sent.append(request.content)
+        or httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+    )
+    context = e.prepare_execution(owner, llm_client=llm)
+    (directory / missing).unlink()
+
+    async def emit(_):
+        pass
+
+    if repair_result == "different":
+        with pytest.raises(ExecutionConflict), e.execution_context(context):
+            await QEEGCouncilWorkflow(llm=llm)._stage1(
+                "r", ["mock-council-a"], report, emit
+            )
+        assert sent == []
+        assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+        assert not (directory / missing).exists()
+    else:
+        if repair_result == "interrupted":
+            replace = e.os.replace
+            writes = []
+
+            def interrupt(source, target):
+                writes.append(target)
+                if len(writes) == 2:
+                    raise OSError("synthetic interrupted original-asset restoration")
+                return replace(source, target)
+
+            monkeypatch.setattr(e.os, "replace", interrupt)
+            with e.execution_context(context), pytest.raises(ExecutionConflict):
+                await QEEGCouncilWorkflow(llm=llm)._stage1(
+                    "r", ["mock-council-a"], report, emit
+                )
+            assert sent == []
+            assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+            assert not list(directory.rglob(".source-repair-*"))
+            monkeypatch.setattr(e.os, "replace", replace)
+        for attempt in range(2):
+            if attempt:
+                (directory / missing).unlink()
+            with e.execution_context(context):
+                await QEEGCouncilWorkflow(llm=llm)._stage1(
+                    "r", ["mock-council-a"], report, emit
+                )
+            assert all(
+                (directory / name).read_bytes() == data
+                for name, data in expected.items()
+            )
+        assert len(sent) == 1
+        assert extracted
+    await context.aclose()

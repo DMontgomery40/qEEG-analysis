@@ -22,6 +22,7 @@ from ..execution import (
     bind_source,
     validate_stage_admission,
     canonical_execution_report,
+    validate_prepared_report,
     bind_artifact_sources,
     execution_llm,
 )
@@ -680,6 +681,9 @@ class _StagesMixin:
             ]
         if context is not None:
             extractor_models = context.roles["extractors"]
+        validate_prepared_report(
+            run_id, report, report_text=report_text, page_images=page_images
+        )
         bind_source(
             "s1/prepared-report",
             {
