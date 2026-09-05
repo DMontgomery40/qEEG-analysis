@@ -566,7 +566,7 @@ def _plan(stage_num):
         stage_num=stage_num,
         inputs=artifacts,
         members=members,
-        requested_count=1 if stage_num in (4, 6) else len(members),
+        requested_count=1 if stage_num == 4 else len(members),
         skipped=skip,
         reason="Not enough Stage 1 analyses for peer review" if skip else None,
     )
@@ -587,10 +587,9 @@ def _sources(stage_num):
 
 def _outcomes(stage_num, plan, *, reconstruct):
     results = []
-    success = False
     for member in plan["members"]:
         index, model = member["index"], member["model_id"]
-        if plan["skipped"] or (stage_num == 6 and success):
+        if plan["skipped"]:
             results.append({**member, "disposition": "not_requested"})
             continue
         found, result = _load_member(
@@ -600,7 +599,6 @@ def _outcomes(stage_num, plan, *, reconstruct):
             raise ExecutionConflict("stage contains an unfinished member")
         key = member_key(stage_num, index, model)
         record = _read("member/" + key)
-        success = result is not None
         results.append(
             {
                 **member,
@@ -612,7 +610,7 @@ def _outcomes(stage_num, plan, *, reconstruct):
     count = sum(r["disposition"] == "success" for r in results)
     if stage_num in (1, 3, 4, 5, 6) and not count:
         raise ExecutionConflict("stage success policy is not satisfied")
-    if stage_num in (4, 6) and count != 1:
+    if stage_num == 4 and count != 1:
         raise ExecutionConflict("single-writer stage success policy changed")
     return results, count
 

@@ -1961,7 +1961,7 @@ class _StagesMixin:
                 or MODEL_ROLE_DEFAULTS.stage6_final_draft
             )
         ).strip()
-        if not writer_model:
+        if context is None and not writer_model:
             raise RuntimeError("Stage 6 final-draft writer model is not configured")
 
         with session_scope() as session:
@@ -2146,7 +2146,8 @@ class _StagesMixin:
             result = await one(member_index, candidate)
             if result is not None:
                 successes.append(result)
-                break
+                if context is None:
+                    break  # Preserve the isolated legacy writer fallback contract.
         if not successes:
             detail = "; ".join(failures) or "no model call was attempted"
             raise RuntimeError(
@@ -2159,14 +2160,8 @@ class _StagesMixin:
                     run_id=run_id, stage=stage, model_id=model_id, text=text
                 )
 
-        # Stage 6 wants exactly one final draft; `writer_candidates` is a
-        # fallback chain tried in order until one works, not a fan-out. Counting
-        # the chain length here reported 1/2 on every healthy run, which
-        # `run_council_completion_gaps` reads as "partial council output" and
-        # `run_downstream_delivery_gaps` then treats as a reason to withhold the
-        # patient-facing document — so from 2026-08-02 no run could publish at
-        # all. The chain length is already reported as `candidate_count` on this
-        # stage's start event.
+        # Durable execution accounts for every admitted council member, with
+        # individual failure receipts retained alongside successful drafts.
         await emit(
             {
                 "run_id": run_id,
@@ -2174,6 +2169,6 @@ class _StagesMixin:
                 "stage_name": stage.name,
                 "status": "complete",
                 "success_count": len(successes),
-                "requested_count": 1,
+                "requested_count": len(writer_candidates) if context is not None else 1,
             }
         )

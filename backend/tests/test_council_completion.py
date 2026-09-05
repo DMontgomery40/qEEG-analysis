@@ -410,7 +410,7 @@ async def test_extraction_product_rebuild_uses_acknowledged_units(
         (3, ("mock-a", "mock-b"), 1, (1, 2), False),
         (4, ("mock-a", "mock-b"), 0, (1, 1), False),
         (5, ("mock-a", "mock-b"), 1, (1, 2), False),
-        (6, ("mock-a", "mock-b"), 1, (1, 1), False),
+        (6, ("mock-a", "mock-b"), 1, (1, 2), False),
     ],
 )
 async def test_six_stage_success_skip_and_count_policies(
@@ -702,7 +702,7 @@ async def test_owned_pipeline_uses_contiguous_receipts_and_projects_recovered_co
         await workflow.run_pipeline("r", emit)
         assert len(sent) == count
     assert events[-1]["status"] == "complete"
-    assert events[-1]["success_count"] == events[-1]["requested_count"] == 1
+    assert events[-1]["success_count"] == events[-1]["requested_count"] == 2
     assert [event["stage_num"] for event in events if event.get("stage_num")] == list(
         range(1, 7)
     )
@@ -999,7 +999,7 @@ async def test_ordinary_local_interruptions_remain_unfinished_before_and_after_a
             assert models[1] not in sent
         await getattr(workflow, f"_stage{stage_num}")(*args)
         assert completion()._read("member/" + key)["disposition"] == "success"
-    assert sorted(sent) == sorted(models if fanout else models[:1])
+    assert sorted(sent) == sorted(models if stage_num != 4 else models[:1])
 
 
 @pytest.mark.asyncio

@@ -1818,3 +1818,89 @@ async def test_original_ocr_repair_requires_exact_admitted_assets_before_replay(
         assert len(sent) == 1
         assert extracted
     await context.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "models,failed_model",
+    [
+        (("model-a", "model-b", "model-c"), None),
+        (("model-a", "model-b", "model-c"), "model-b"),
+        (("model-a", "model-a", "model-b"), None),
+    ],
+)
+async def test_owned_stage6_attempts_every_admitted_member_and_replays_without_spend(
+    owner, tmp_path, monkeypatch, models, failed_model
+):
+    from backend.council import QEEGCouncilWorkflow, completion as receipts
+    from backend.council.workflow import stages
+    from backend.tests.test_stage6_final_draft_repair import _complete_stage6
+
+    e = execution()
+    seed_stages(owner, tmp_path, monkeypatch, models=models)
+    # A separate preferred writer cannot replace the admitted council.
+    monkeypatch.setenv("QEEG_STAGE6_FINAL_DRAFT_MODEL", "unselected-writer")
+    monkeypatch.setattr(stages, "DISCOVERED_MODEL_IDS", {*models, "unselected-writer"})
+    sent = []
+
+    def send(request):
+        model = json.loads(request.content)["model"]
+        sent.append(model)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "incomplete"
+                            if model == failed_model
+                            else _complete_stage6(model)
+                        }
+                    }
+                ]
+            },
+        )
+
+    llm = client(send)
+    workflow = QEEGCouncilWorkflow(llm=llm)
+
+    async def one_call(**kwargs):
+        return await workflow._call_model_chat(
+            **{
+                k: v
+                for k, v in kwargs.items()
+                if k in ("model_id", "prompt_text", "temperature", "max_tokens")
+            }
+        )
+
+    monkeypatch.setattr(workflow, "_call_longform_chat_with_repairs", one_call)
+    context = e.prepare_execution(owner, llm_client=llm)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    with e.execution_context(context):
+        await workflow._stage6("r", list(models), emit)
+        receipt = receipts._read("stage/6")
+    assert sent == list(models)
+    complete = next(x for x in events if x.get("status") == "complete")
+    assert complete["requested_count"] == len(models)
+    assert complete["success_count"] == sum(m != failed_model for m in models)
+    assert "not_requested" not in json.dumps(receipt)
+    with owner.transaction() as session:
+        drafts = list(
+            session.scalars(
+                select(storage.Artifact).where(
+                    storage.Artifact.run_id == "r", storage.Artifact.stage_num == 6
+                )
+            )
+        )
+    assert len(drafts) == sum(m != failed_model for m in models)
+    assert len({a.content_path for a in drafts}) == len(drafts)
+    recovered = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(recovered):
+        await workflow._stage6("r", list(models), emit)
+    assert sent == list(
+        models
+    ), "owned stage completion must rejoin all original paid receipts"

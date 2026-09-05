@@ -287,11 +287,11 @@ async def test_actual_six_stage_resume_preserves_policy_and_avoids_second_dispat
         await runtime.stop()
         await llm.aclose()
     assert saved_run(clinical)[:2] == ("done", "complete"), saved_run(clinical)
-    # Existing six-stage fixture sends 2 Stage1 + 2 revisions + consolidation + final.
-    assert len(sent) == 6
+    # The six-stage fixture sends 2 Stage 1 + 2 revisions + consolidation + 2 finals.
+    assert len(sent) == 7  # Both admitted council members produce a Stage 6 draft.
     with Session(clinical.engine) as session:
         assert session.query(storage.StageReceipt).count() == 6
-        assert session.query(storage.PaidRequest).count() == 6
+        assert session.query(storage.PaidRequest).count() == 7
         assert {p.kind: p.state for p in session.query(storage.PostObligation)} == {
             "patient_facing": "skipped",
             "cathode": "skipped",
@@ -506,7 +506,7 @@ def test_process_replacement_finds_original_intent_without_another_post(
     )
     assert resumed.returncode == 0, resumed.stderr
     assert (temp_data_dir / "sends.txt").read_text().splitlines() == ["send"] * (
-        1 if boundary == "dispatched" else 6
+        1 if boundary == "dispatched" else 7
     )
     assert saved_run(clinical)[0] == ("blocked" if boundary == "dispatched" else "done")
 

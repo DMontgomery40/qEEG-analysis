@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
+import { retainRunCreation, completeRunCreation } from '../runCreation';
 import './PatientPage.css';
 import ResizeHandle from './ResizeHandle';
 import OrchestrationPanel from './OrchestrationPanel';
@@ -64,6 +65,7 @@ function PatientPage({
   const [selectedCouncilIds, setSelectedCouncilIds] = useState([]);
   const [selectedConsolidator, setSelectedConsolidator] = useState('');
   const [starting, setStarting] = useState(false);
+  const startingRef = useRef(false);
   const [geminiProjectId, setGeminiProjectId] = useState('');
   const [showAllModels, setShowAllModels] = useState(false);
 
@@ -549,20 +551,26 @@ function PatientPage({
               !selectedConsolidator
             }
             onClick={async () => {
+              if (startingRef.current) return;
+              startingRef.current = true;
               setStarting(true);
               try {
-                const run = await api.createRun({
+                const payload = {
                   patient_id: patientId,
                   report_id: selectedReportId,
                   council_model_ids: selectedCouncilIds,
                   consolidator_model_id: selectedConsolidator,
-                });
+                };
+                const retained = await retainRunCreation(payload);
+                const run = await api.createRun({ ...payload, operation_id: retained.operationId });
                 await api.startRun(run.id);
                 await refresh();
                 onSelectRun(run.id);
+                await completeRunCreation(retained);
               } catch (e) {
                 onError(e, { action: 'create_and_start_run', patientId, reportId: selectedReportId });
               } finally {
+                startingRef.current = false;
                 setStarting(false);
               }
             }}

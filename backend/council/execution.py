@@ -220,18 +220,9 @@ def prepare_execution(owner, *, llm_client=None):
         )
         or defaults.stage6_final_draft
     ).strip()
-    fallback = (
-        env.get("QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2")
-        or "z-ai/glm-5.2"
-    ).strip()
-    writers = []
-    if discovered:
-        for preference in (writer, fallback):
-            resolved = resolve_model_preference(preference, discovered)
-            if resolved and resolved not in writers:
-                writers.append(resolved)
-    else:
-        writers.append(writer)
+    # Stage 6 compares one draft per admitted council member. Preserve order
+    # and duplicate members so each original paid unit retains its own receipt.
+    writers = list(council)
     roles = {
         "checker": checker,
         "checker_preference": checker_pref,
