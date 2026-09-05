@@ -120,9 +120,11 @@ def derive_initial(name: Any, *, field: str = "patient") -> str:
         )
 
     decomposed = unicodedata.normalize("NFKD", raw[0])
-    candidate = "".join(
-        ch for ch in decomposed if not unicodedata.combining(ch)
-    ).strip()[:1].upper()
+    candidate = (
+        "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+        .strip()[:1]
+        .upper()
+    )
 
     if not candidate or not candidate.isascii() or not candidate.isalpha():
         raise PatientIdentityError(
@@ -171,9 +173,7 @@ def canonical_patient_id(
     dob = normalize_birthdate(birthdate)
 
     if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
-        raise PatientIdentityError(
-            f"A collision ordinal starts at 1. Got {ordinal!r}."
-        )
+        raise PatientIdentityError(f"A collision ordinal starts at 1. Got {ordinal!r}.")
 
     suffix = "" if ordinal == 1 else f"_{ordinal}"
     return f"{first}{last}_{dob}{suffix}"
@@ -194,7 +194,9 @@ def _canonical_id_is_taken(
     return session.get(PatientIdReservation, candidate) is not None
 
 
-def _claim_reservation(session: Session, parsed: CanonicalPatientId) -> bool:
+def _claim_reservation(
+    session: Session, parsed: CanonicalPatientId, *, commit: bool = True
+) -> bool:
     """Write the reservation row, reporting whether this caller won it.
 
     The reservation primary key — not the scan above it — is what stops two
@@ -221,20 +223,21 @@ def _claim_reservation(session: Session, parsed: CanonicalPatientId) -> bool:
     except IntegrityError:
         return False
 
-    session.commit()
+    if commit:
+        session.commit()
     return True
 
 
 def reserve_canonical_patient_id(
-    session: Session, value: Any
+    session: Session, value: Any, *, commit: bool = True
 ) -> CanonicalPatientId | None:
     """Record an already-formed canonical ID so it is never issued again.
 
     Returns None when the value is not a canonical ID, which is how pre-cutover
     labels pass through untouched.
 
-    COMMITS the caller's session when it writes a reservation. See the module
-    docstring for the full transaction contract.
+    Commits by default. Internal commit=False joins an existing explicit SQLite
+    writer transaction so an intake binding can commit with this reservation.
     """
     from .storage import PatientIdReservation
 
@@ -242,7 +245,7 @@ def reserve_canonical_patient_id(
     if parsed is None:
         return None
     if session.get(PatientIdReservation, parsed.value) is None:
-        _claim_reservation(session, parsed)
+        _claim_reservation(session, parsed, commit=commit)
     return parsed
 
 
@@ -253,6 +256,7 @@ def allocate_canonical_patient_id(
     last_initial: str,
     birthdate: str,
     exclude_patient_uuid: str | None = None,
+    commit: bool = True,
 ) -> str:
     """Issue this patient's canonical ID and reserve it permanently.
 
@@ -260,8 +264,9 @@ def allocate_canonical_patient_id(
     identity: a patient that already wears the ID keeps it instead of being
     bumped to the next ordinal.
 
-    COMMITS the caller's session, and never rolls it back. See the module
-    docstring for the full transaction contract.
+    Commits by default and never rolls the caller back. Internal commit=False
+    joins the existing explicit writer transaction; the ID must stay internal
+    until the caller commits its reservation and durable intake binding together.
     """
     from .storage import Patient
 
@@ -284,7 +289,7 @@ def allocate_canonical_patient_id(
             # stem, and those rows are still here. Reserve it here too, or the ID
             # goes unreserved and a later patient with the same initials and
             # birthdate could be issued this person's ID.
-            reserve_canonical_patient_id(session, candidate)
+            reserve_canonical_patient_id(session, candidate, commit=commit)
             return candidate
 
         if _canonical_id_is_taken(
@@ -293,7 +298,7 @@ def allocate_canonical_patient_id(
             continue
 
         parsed = parse_canonical_patient_id(candidate)
-        if parsed is not None and _claim_reservation(session, parsed):
+        if parsed is not None and _claim_reservation(session, parsed, commit=commit):
             return candidate
 
     raise PatientIdentityError(

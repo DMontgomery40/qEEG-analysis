@@ -441,6 +441,7 @@ def _ensure_artifact_operation_key() -> None:
 
 
 def init_db() -> None:
+    from . import clinic_records  # noqa: F401 - additive tables in the original Base
     from .clinic_catalogue import initialize_catalogue
 
     ensure_data_dirs()
@@ -491,6 +492,7 @@ def create_patient(
     last_name: str | None = None,
     first_initial: str | None = None,
     last_initial: str | None = None,
+    commit: bool = True,
 ) -> Patient:
     patient = Patient(
         label=label,
@@ -502,7 +504,10 @@ def create_patient(
         last_initial=last_initial,
     )
     session.add(patient)
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     session.refresh(patient)
     return patient
 
@@ -518,6 +523,7 @@ def update_patient(
     last_name: str | None = None,
     first_initial: str | None = None,
     last_initial: str | None = None,
+    commit: bool = True,
 ) -> Patient | None:
     """Update a patient. Fields left as None keep their stored value.
 
@@ -540,7 +546,10 @@ def update_patient(
         if value is not None:
             setattr(patient, field, value)
     _touch_updated_at(patient)
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     session.refresh(patient)
     return patient
 
@@ -572,6 +581,7 @@ def create_patient_file(
     mime_type: str,
     size_bytes: int,
     stored_path: Path,
+    commit: bool = True,
 ) -> PatientFile:
     f = PatientFile(
         id=file_id if file_id else _new_id(),
@@ -582,7 +592,10 @@ def create_patient_file(
         stored_path=str(stored_path),
     )
     session.add(f)
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     session.refresh(f)
     return f
 
@@ -609,6 +622,7 @@ def create_report(
     mime_type: str,
     stored_path: Path,
     extracted_text_path: Path,
+    commit: bool = True,
 ) -> Report:
     report = Report(
         id=report_id if report_id else _new_id(),
@@ -619,7 +633,10 @@ def create_report(
         extracted_text_path=str(extracted_text_path),
     )
     session.add(report)
-    session.commit()
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     session.refresh(report)
     return report
 

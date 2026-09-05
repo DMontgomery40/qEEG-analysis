@@ -1208,7 +1208,9 @@ def test_new_patient_upload_allocates_the_chart_and_files_the_report(
 
     _no_paid_work(monkeypatch, worker)
     monkeypatch.setattr(
-        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        __import__("backend.reports", fromlist=["save_report_upload"]),
+        "save_report_upload",
+        _fake_save_report_upload(temp_data_dir),
     )
     job_key = "pipeline/jobs/up-1/upload.json"
     client = _UploadClient({job_key: _upload_job()})
@@ -1263,7 +1265,9 @@ def test_new_patient_upload_force_new_takes_the_next_ordinal(
 
     _no_paid_work(monkeypatch, worker)
     monkeypatch.setattr(
-        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        __import__("backend.reports", fromlist=["save_report_upload"]),
+        "save_report_upload",
+        _fake_save_report_upload(temp_data_dir),
     )
     with storage.session_scope() as session:
         storage.create_patient(
@@ -1331,13 +1335,13 @@ def test_new_patient_upload_without_a_resolution_parks_and_is_skipped_next_cycle
     assert parked["conflict"]["candidates"] == [
         {"patient_id": "BT_12-11-1963", "name": "Bella Turner"}
     ]
-    # Nothing downloaded, nothing deleted: the file and the marker both stay put.
-    assert client.downloads == []
+    # Exact bytes are staged before acknowledging the durable identity conflict.
+    assert client.downloads == [REPORT_FILE_KEY]
     assert client.deleted == []
 
     # Second cycle: the parked marker is skipped without re-reading the blob.
     assert worker.load_new_patient_upload_jobs(client) == []
-    assert client.downloads == []
+    assert client.downloads == [REPORT_FILE_KEY]
 
     with storage.session_scope() as session:
         assert [p.label for p in storage.list_patients(session)] == ["BT_12-11-1963"]
@@ -1433,7 +1437,9 @@ def test_an_answered_upload_is_filed_on_the_next_worker_cycle(
 
     _no_paid_work(monkeypatch, worker)
     monkeypatch.setattr(
-        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        __import__("backend.reports", fromlist=["save_report_upload"]),
+        "save_report_upload",
+        _fake_save_report_upload(temp_data_dir),
     )
     client, job_key = _park_an_upload(temp_data_dir, tmp_path, monkeypatch, worker)
 
@@ -1480,7 +1486,9 @@ def test_one_broken_upload_does_not_abandon_the_rest_of_the_cycle(
 
     _no_paid_work(monkeypatch, worker)
     monkeypatch.setattr(
-        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        __import__("backend.reports", fromlist=["save_report_upload"]),
+        "save_report_upload",
+        _fake_save_report_upload(temp_data_dir),
     )
 
     # Each job names a key under its own upload prefix, as the hub builds it.
@@ -1543,14 +1551,10 @@ def test_one_broken_upload_does_not_abandon_the_rest_of_the_cycle(
         "pipeline/jobs/up-ok/upload.json",
     ]
 
-    # The broken upload's chart was allocated before the download failed, and it
-    # stays: the retry matches it by name and files the report there instead of
-    # burning a second ordinal on the same person.
+    # A byte-incomplete submission has no chart allocation to repeat.
     with storage.session_scope() as session:
         labels = sorted(p.label for p in storage.list_patients(session))
-        assert labels == ["BT_12-11-1963", "CD_04-02-1975"]
-        barto = next(p for p in storage.list_patients(session) if p.label == "BT_12-11-1963")
-        assert storage.list_reports(session, barto.id) == []
+        assert labels == ["CD_04-02-1975"]
 
 
 def test_a_malformed_upload_id_fails_that_job_without_raising(
@@ -1581,7 +1585,9 @@ def test_the_whole_submission_is_filed_not_just_the_report(
 
     _no_paid_work(monkeypatch, worker)
     monkeypatch.setattr(
-        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        __import__("backend.reports", fromlist=["save_report_upload"]),
+        "save_report_upload",
+        _fake_save_report_upload(temp_data_dir),
     )
     job_key = "pipeline/jobs/new-patient/1712345678-up-1.json"
     client = _UploadClient(
@@ -1619,8 +1625,8 @@ def test_the_whole_submission_is_filed_not_just_the_report(
 
     # Everything pending is gone, marker last.
     assert client.deleted == [
-        "uploads/pending/up-1/scan.pdf",
         "uploads/pending/up-1/intake-form.pdf",
+        "uploads/pending/up-1/scan.pdf",
         job_key,
     ]
 
@@ -1649,7 +1655,9 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
 
     _no_paid_work(monkeypatch, worker)
     monkeypatch.setattr(
-        worker, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        __import__("backend.reports", fromlist=["save_report_upload"]),
+        "save_report_upload",
+        _fake_save_report_upload(temp_data_dir),
     )
     job_key = "pipeline/jobs/new-patient/1712345678-up-1.json"
 
@@ -1678,17 +1686,14 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
         payload=_upload_job(),
     )
 
-    assert result.status == "registered"
+    assert result.status == "failed"
     assert "broken.pdf" in result.note
-
     with storage.session_scope() as session:
-        patient = storage.list_patients(session)[0]
-        assert [r.filename for r in storage.list_reports(session, patient.id)] == [
-            "scan.pdf"
-        ]
-        assert [
-            f.filename for f in storage.list_patient_files(session, patient.id)
-        ] == ["aaa-good.pdf"]
+        assert storage.list_patients(session) == []
+    # Successful reads survive while the exact complete byte manifest is unfinished.
+    cache = temp_data_dir / "clinic_intake" / "legacy" / "up-1"
+    assert (cache / "0.bytes").read_bytes() == b"%PDF-1.4 good"
+    assert (cache / "2.bytes").read_bytes() == b"%PDF-1.4 report"
 
     # Nothing under the pending prefix is dropped while any of the submission
     # is still outstanding. Deleting the report first left the next cycle
@@ -1835,3 +1840,87 @@ def test_a_job_naming_a_key_outside_its_upload_prefix_is_refused(
     assert "uploads/pending/up-1/" in result.note
     assert client.downloads == []
     assert client.deleted == []
+
+
+@pytest.mark.parametrize('recreated', [False, True])
+def test_force_new_cleanup_failure_and_recreated_marker_reuse_exact_receipts(
+    temp_data_dir, tmp_path, monkeypatch, recreated
+):
+    from backend import storage, reports
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        reports, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+
+    class CleanupClient(_UploadClient):
+        fail = True
+
+        def delete(self, key):
+            if self.fail and key == REPORT_FILE_KEY:
+                raise OSError("cleanup interrupted")
+            return super().delete(key)
+
+    job_key = "pipeline/jobs/up-1/upload.json"
+    payload = _upload_job(forceNew=True)
+    client = CleanupClient({job_key: payload}, blobs={REPORT_FILE_KEY: b"original"})
+    first = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=payload,
+    )
+    assert first.patient_id == "BT_12-11-1963"
+    assert job_key in client._jobs
+    client.fail = False
+    if recreated:
+        client._jobs[job_key] = payload
+    second = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=payload,
+    )
+    assert second.patient_id == first.patient_id
+    with storage.session_scope() as s:
+        patients = storage.list_patients(s)
+        assert len(patients) == 1
+        assert len(storage.list_reports(s, patients[0].id)) == 1
+
+
+def test_recreated_marker_with_changed_pending_bytes_conflicts(
+    temp_data_dir, tmp_path, monkeypatch
+):
+    from backend import reports
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        reports, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    job_key = "pipeline/jobs/up-1/upload.json"
+    payload = _upload_job(forceNew=True)
+    client = _UploadClient({job_key: payload}, blobs={REPORT_FILE_KEY: b"original"})
+    first = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=payload,
+    )
+    assert first.status == "registered"
+    client._blobs[REPORT_FILE_KEY] = b"changed"
+    result = worker.process_new_patient_upload(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=payload,
+    )
+    assert result.status == "failed"
+    assert (
+        tmp_path / "portal" / first.patient_id / "scan.pdf"
+    ).read_bytes() == b"original"

@@ -79,7 +79,7 @@ def identity_key(identity: IdentityInput) -> tuple[str, str, str]:
 
 
 def find_patient_by_identity(
-    session: Any, identity: IdentityInput
+    session: Any, identity: IdentityInput, *, target_patient: Any | None = None
 ) -> tuple[Any | None, bool]:
     """Resolve which chart this identity belongs to.
 
@@ -121,13 +121,31 @@ def find_patient_by_identity(
         on_file = (stored or "").strip().lower()
         return not on_file or on_file == given
 
-    candidates = session.scalars(
-        select(Patient).where(
-            Patient.first_initial == first_initial,
-            Patient.last_initial == last_initial,
-            Patient.birthdate == birthdate,
+    if target_patient is None:
+        candidates = session.scalars(
+            select(Patient).where(
+                Patient.first_initial == first_initial,
+                Patient.last_initial == last_initial,
+                Patient.birthdate == birthdate,
+            )
+        ).all()
+    else:
+        # Explicit shared-chart intake uses this same name comparison. Historical
+        # canonical rows may have no normalized columns; their issued ID supplies
+        # only those missing identity components, never a guessed name.
+        from .patient_identity import parse_canonical_patient_id
+
+        parsed = parse_canonical_patient_id(target_patient.label)
+        stored_key = (
+            target_patient.first_initial or (parsed.first_initial if parsed else None),
+            target_patient.last_initial or (parsed.last_initial if parsed else None),
+            target_patient.birthdate or (parsed.birthdate if parsed else None),
         )
-    ).all()
+        candidates = (
+            [target_patient]
+            if stored_key == (first_initial, last_initial, birthdate)
+            else []
+        )
     matches = [
         patient
         for patient in candidates

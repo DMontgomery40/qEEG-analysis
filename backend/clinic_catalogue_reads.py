@@ -166,6 +166,8 @@ def _location_verified(location):
 
 
 def _artifact_json(session, artifact, patient):
+    from .clinic_feedback import current_feedback
+
     if (
         not re.fullmatch("[a-f0-9]{64}", artifact.sha256 or "")
         or type(artifact.size) is not int
@@ -210,7 +212,7 @@ def _artifact_json(session, artifact, patient):
         generatedAt=artifact.generated_at,
         documentKind=artifact.document_kind,
         sessionDate=artifact.session_date,
-        feedback=None,
+        feedback=current_feedback(session, artifact.id),
         archived=artifact.archived,
         provenance=provenance,
         locations=[

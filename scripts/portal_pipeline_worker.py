@@ -11,7 +11,6 @@ import sys
 import mimetypes
 import tempfile
 import time
-import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -27,20 +26,13 @@ from backend.orchestration import (  # noqa: E402
     summarize_run_progress,
 )
 from backend.patient_identity import (  # noqa: E402
-    PatientIdentityError,
-    allocate_canonical_patient_id,
     parse_canonical_patient_id,
 )
 from backend import pipeline_uploads  # noqa: E402
 from backend.patient_intake import (  # noqa: E402
     IdentityInput,
-    IdentityNameConflict,
-    find_patient_by_identity,
-    identity_key,
 )
 from backend.portal_files import looks_generated_portal_pdf  # noqa: E402
-from backend.reports import report_dir, save_report_upload  # noqa: E402
-from scripts.register_patient_file import register_patient_file  # noqa: E402
 
 META_NAME = "$meta.json"
 INDEX_NAME = "$index.json"
@@ -737,107 +729,6 @@ def load_new_patient_upload_jobs(
     return jobs
 
 
-def _register_new_patient_report(
-    *, portal_dir: Path, patient_label: str, filename: str, file_bytes: bytes
-) -> tuple[str, bool]:
-    """File the report under an existing patient, or report it already was.
-
-    Returns the report id and whether this call created it. Re-entry after a
-    crash finds the report by filename instead of registering a second one.
-    """
-    with storage.session_scope() as session:
-        patient = next(
-            iter(storage.find_patients_by_label(session, patient_label)), None
-        )
-        if patient is None:
-            raise RuntimeError(f"{patient_label} disappeared before registration")
-        patient_uuid = patient.id
-        existing = next(
-            (
-                report
-                for report in storage.list_reports(session, patient_uuid)
-                if (report.filename or "") == filename
-            ),
-            None,
-        )
-        if existing is not None:
-            return existing.id, False
-
-    report_id = str(uuid.uuid4())
-    try:
-        original_path, extracted_path, mime_type, _preview = save_report_upload(
-            patient_id=patient_uuid,
-            report_id=report_id,
-            filename=filename,
-            provided_mime_type="application/pdf",
-            file_bytes=file_bytes,
-        )
-        with storage.session_scope() as session:
-            storage.create_report(
-                session,
-                report_id=report_id,
-                patient_id=patient_uuid,
-                filename=filename,
-                mime_type=mime_type,
-                stored_path=original_path,
-                extracted_text_path=extracted_path,
-            )
-    except Exception:
-        # A retry mints a fresh report id, so the extracted files this attempt
-        # wrote would sit there unreferenced forever. Take them with it.
-        shutil.rmtree(report_dir(patient_uuid, report_id), ignore_errors=True)
-        raise
-    # The raw-sync watcher publishes whatever is in the patient folder, so
-    # dropping the file there is the whole publication step.
-    portal_patient_dir = portal_dir / patient_label
-    portal_patient_dir.mkdir(parents=True, exist_ok=True)
-    portal_path = portal_patient_dir / _safe_filename(filename, "report.pdf")
-    tmp_path = portal_path.with_name(f".{portal_path.name}.partial")
-    tmp_path.write_bytes(file_bytes)
-    tmp_path.replace(portal_path)
-    return report_id, True
-
-
-def _allocate_patient_for_upload(identity: IdentityInput) -> str:
-    """Create or find this person's chart and return their clinic id."""
-    with storage.session_scope() as session:
-        existing, keep_stored_name = find_patient_by_identity(session, identity)
-        if existing is not None and keep_stored_name:
-            return existing.label
-
-        first_initial, last_initial, birthdate = identity_key(identity)
-        canonical = allocate_canonical_patient_id(
-            session,
-            first_initial=first_initial,
-            last_initial=last_initial,
-            birthdate=birthdate,
-            exclude_patient_uuid=existing.id if existing else None,
-        )
-        if existing is not None:
-            storage.update_patient(
-                session,
-                existing.id,
-                label=canonical,
-                birthdate=birthdate,
-                first_name=(identity.first_name or "").strip() or None,
-                last_name=(identity.last_name or "").strip() or None,
-                first_initial=first_initial,
-                last_initial=last_initial,
-            )
-        else:
-            storage.create_patient(
-                session,
-                label=canonical,
-                notes="",
-                birthdate=birthdate,
-                first_name=(identity.first_name or "").strip(),
-                last_name=(identity.last_name or "").strip(),
-                first_initial=first_initial,
-                last_initial=last_initial,
-            )
-        return canonical
-
-
 def _delete_quietly(client: NetlifyBlobClient, key: str) -> str | None:
     """Drop a blob we are finished with, reporting rather than raising.
 
@@ -850,71 +741,6 @@ def _delete_quietly(client: NetlifyBlobClient, key: str) -> str | None:
     except Exception as exc:
         return f"{key}: {str(exc).strip() or exc.__class__.__name__}"
     return None
-
-
-def _file_remaining_submission_files(
-    *,
-    client: NetlifyBlobClient,
-    portal_dir: Path,
-    upload_id: str,
-    patient_label: str,
-    report_file_key: str,
-) -> tuple[list[str], list[str], list[str]]:
-    """File everything else the clinic sent with the report.
-
-    One submission can carry intake forms, prior reports, anything. Nothing is
-    deleted here: the whole submission's blobs stay put until every file has
-    landed, so a failure part way through leaves a retry something to re-read.
-    Re-filing is safe — ``register_patient_file`` reuses the row it already
-    made for that filename.
-
-    Returns the filenames filed, the keys they came from, and the failures.
-    """
-    prefix = f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"
-    try:
-        keys = sorted(client.list_keys(prefix))
-    except Exception as exc:
-        return [], [], [f"listing the rest of the submission failed: {exc}"]
-
-    filed: list[str] = []
-    filed_keys: list[str] = []
-    failures: list[str] = []
-    for key in keys:
-        relative = key[len(prefix) :]
-        # The job names the report by its full blob key, so that is what it is
-        # compared against. Comparing the relative name would let the report
-        # through here and file it a second time as an attachment.
-        if not relative or key == report_file_key:
-            continue
-        filename = _safe_filename(Path(relative).name, "attachment")
-        try:
-            with tempfile.TemporaryDirectory(prefix="qeeg-pending-extra-") as scratch:
-                local_path = Path(scratch) / filename
-                client.download(key, local_path)
-                register_patient_file(
-                    patient_label=patient_label,
-                    src_path=local_path,
-                    filename=filename,
-                    mime_type=(
-                        mimetypes.guess_type(filename)[0] or "application/octet-stream"
-                    ),
-                )
-                # Same publication step as the report: the raw-sync watcher
-                # sends on whatever is sitting in the patient folder.
-                portal_patient_dir = portal_dir / patient_label
-                portal_patient_dir.mkdir(parents=True, exist_ok=True)
-                portal_path = portal_patient_dir / filename
-                tmp_path = portal_path.with_name(f".{portal_path.name}.partial")
-                tmp_path.write_bytes(local_path.read_bytes())
-                tmp_path.replace(portal_path)
-        except Exception as exc:
-            failures.append(
-                f"{relative}: {str(exc).strip() or exc.__class__.__name__}"
-            )
-            continue
-        filed.append(filename)
-        filed_keys.append(key)
-    return filed, filed_keys, failures
 
 
 def process_new_patient_upload(
@@ -1008,22 +834,131 @@ def _file_new_patient_upload(
     identity: IdentityInput,
     identity_payload: dict[str, Any],
 ) -> PatientWorkerResult:
-    """The upload's happy path. Its caller owns every failure."""
-    pipeline_uploads.record_seen(upload_id=upload_id, identity=identity_payload)
+    """Import original pending bytes, then consume the common free filing receipts."""
+    from backend import clinic_intake
+    from backend.clinic_models import CatalogueNotFound
+    from backend.clinic_upload_import import import_submission_evidence
 
     try:
-        patient_label = _allocate_patient_for_upload(identity)
-    except IdentityNameConflict as exc:
-        # Park it. Nothing is downloaded and the marker is kept, so the operator
-        # can answer with attachTo or forceNew and the next cycle picks it up.
+        previous = clinic_intake.get_upload(upload_id)["upload"]
+    except CatalogueNotFound:
+        previous = None
+    if previous and previous.get("legacy"):
+        if previous.get("patientId") or previous.get("status") == "uncertain":
+            raise RuntimeError(
+                "Original registered upload needs exact source reconciliation"
+            )
+        previous = None
+    if previous:
+        # A consumed/recreated marker never replaces the original byte manifest.
+        if previous["identity"] != identity_payload:
+            raise ValueError("Original upload identity changed")
+        if previous["uploadedBy"] != payload.get("uploadedBy") or previous[
+            "uploadedAt"
+        ] != payload.get("uploadedAt"):
+            raise ValueError("Original upload attribution changed")
+        import hashlib
+
+        originals = {i["metadata"]["originalFileKey"]: i for i in previous["items"]}
+        present = client.list_keys(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/")
+        if set(present) - set(originals):
+            raise ValueError("Original ordered upload inventory changed")
+        for key in present:
+            with tempfile.TemporaryDirectory(prefix="qeeg-upload-replay-") as scratch:
+                local = Path(scratch) / "bytes"
+                client.download(key, local)
+                if (
+                    hashlib.sha256(local.read_bytes()).hexdigest()
+                    != originals[key]["sha256"]
+                ):
+                    raise ValueError("Original upload bytes changed")
+        answer = pipeline_uploads.pending_resolution(upload_id)
+        if answer and previous["patientId"] is None:
+            import hashlib
+
+            answer_key = hashlib.sha256(
+                json.dumps(answer, sort_keys=True).encode()
+            ).hexdigest()
+            result_upload = clinic_intake.resolve_upload(
+                upload_id, key="legacy-resolution:" + answer_key, resolution=answer
+            )["upload"]
+        else:
+            result_upload = clinic_intake.resume_upload(upload_id)["upload"]
+    else:
+        receipt = client.get_json(f"uploads/submissions/{upload_id}.json")
+        if receipt:
+            evidence = import_submission_evidence(receipt, marker=payload)
+            if evidence.get("status") == "uncertain":
+                raise RuntimeError("Original upload publication needs reconciliation")
+            ordered = receipt["response"]["uploaded"]
+            keys = [f["fileKey"] for f in ordered]
+        else:
+            keys = sorted(
+                set(
+                    [
+                        file_key,
+                        *client.list_keys(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"),
+                    ]
+                )
+            )
+        cache = Path(storage.DATA_DIR) / "clinic_intake" / "legacy" / upload_id
+        # The original complete inventory is durable before each independent read.
+        clinic_intake._immutable(cache / "keys.json", json.dumps(keys).encode())
+        files = []
+        failures = []
+        for index, key in enumerate(keys):
+            if not key.startswith(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"):
+                raise ValueError("Original item key is outside this upload")
+            name = _safe_filename(Path(key).name, "upload.bin")
+            cached = cache / (str(index) + ".bytes")
+            try:
+                if not cached.exists():
+                    with tempfile.TemporaryDirectory(
+                        prefix="qeeg-pending-upload-"
+                    ) as scratch:
+                        local_path = Path(scratch) / name
+                        client.download(key, local_path)
+                        clinic_intake._immutable(cached, local_path.read_bytes())
+                files.append(
+                    (
+                        name,
+                        cached.read_bytes(),
+                        mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    )
+                )
+            except Exception as error:
+                failures.append(f"{name}: {error}")
+        if failures:
+            raise RuntimeError("Upload bytes remain unfinished: " + "; ".join(failures))
+        if receipt:
+            result_upload = import_submission_evidence(
+                receipt, marker=payload, files=files
+            )["upload"]
+        else:
+            result_upload = clinic_intake.submit_upload(
+                key=upload_id,
+                upload_id=upload_id,
+                identity=identity_payload,
+                resolution=payload.get("resolution"),
+                actor=payload.get("uploadedBy"),
+                uploaded_at=payload.get("uploadedAt"),
+                files=files,
+                file_meta=[
+                    dict(
+                        documentKind="report" if key == file_key else None,
+                        originalFileKey=key,
+                    )
+                    for key in keys
+                ],
+            )["upload"]
+    if result_upload["status"] == "needs_operator_answer":
         client.set_json(
             job_key,
-            {**payload, "status": "needs_operator_answer", "conflict": exc.payload},
-        )
-        pipeline_uploads.record_parked(
-            upload_id=upload_id,
-            identity=identity_payload,
-            conflict=exc.payload,
+            {
+                **payload,
+                "status": "needs_operator_answer",
+                "conflict": result_upload["conflict"],
+            },
         )
         result = PatientWorkerResult(
             patient_id=upload_id,
@@ -1031,78 +966,37 @@ def _file_new_patient_upload(
             downloaded=[],
             report_count=0,
             ran_batch=False,
-            note=exc.payload["detail"],
+            note=result_upload["conflict"]["detail"],
         )
-        _write_local_status(status_dir, result)
-        return result
-    except PatientIdentityError as exc:
+    elif result_upload["status"] != "registered":
+        raise RuntimeError(
+            "Some upload items remain unfinished; their bytes and receipts are preserved"
+        )
+    else:
+        outputs = clinic_intake.promote_upload(upload_id, portal_dir)
+        keys = [i["metadata"]["originalFileKey"] for i in result_upload["items"]]
+        failures = [
+            failure for key in keys if (failure := _delete_quietly(client, key))
+        ]
+        if not failures:
+            failure = _delete_quietly(client, job_key)
+            if failure:
+                failures.append(failure)
         result = PatientWorkerResult(
-            patient_id=upload_id,
-            status="failed",
-            downloaded=[],
-            report_count=0,
+            patient_id=result_upload["patientId"],
+            status="already_registered"
+            if previous and previous["status"] == "registered"
+            else "registered",
+            downloaded=outputs,
+            report_count=sum(
+                i["metadata"].get("documentKind") == "report"
+                for i in result_upload["items"]
+            ),
             ran_batch=False,
-            note=str(exc),
+            note="Upload filed: "
+            + ", ".join(i["originalName"] for i in result_upload["items"])
+            + ("; left for retry: " + "; ".join(failures) if failures else ""),
         )
-        _write_local_status(status_dir, result)
-        return result
-
-    filename = _safe_filename(Path(file_key).name, "report.pdf")
-    with tempfile.TemporaryDirectory(prefix="qeeg-pending-upload-") as scratch:
-        local_path = Path(scratch) / filename
-        # `fileKey` is the full blob key the hub stored the file under, not a
-        # bare filename. Prepending the prefix again looked for
-        # `uploads/pending/<id>/uploads/pending/<id>/<name>`, which is nothing.
-        client.download(file_key, local_path)
-        file_bytes = local_path.read_bytes()
-
-    _report_id, registered = _register_new_patient_report(
-        portal_dir=portal_dir,
-        patient_label=patient_label,
-        filename=filename,
-        file_bytes=file_bytes,
-    )
-
-    # The rest of the submission goes in before the marker does, because the
-    # marker is what brings us back here if any of it fails.
-    cleanup_failures: list[str] = []
-    extras, extra_keys, extra_failures = _file_remaining_submission_files(
-        client=client,
-        portal_dir=portal_dir,
-        upload_id=upload_id,
-        patient_label=patient_label,
-        report_file_key=file_key,
-    )
-    cleanup_failures.extend(extra_failures)
-
-    if not extra_failures:
-        # Nothing under the pending prefix is dropped until the whole
-        # submission has landed. Deleting the report first meant one failed
-        # attachment left the next cycle re-downloading a blob that was already
-        # gone — an exception every cycle, forever, while the upload record
-        # said failed even though the report was registered.
-        for key in [file_key, *extra_keys, job_key]:
-            drop_failure = _delete_quietly(client, key)
-            if drop_failure:
-                cleanup_failures.append(drop_failure)
-        pipeline_uploads.record_registered(
-            upload_id=upload_id, patient_id=patient_label
-        )
-
-    note = f"new patient upload {upload_id} filed under {patient_label}"
-    if extras:
-        note += f"; also filed {', '.join(extras)}"
-    if cleanup_failures:
-        note += "; left for retry: " + "; ".join(cleanup_failures)
-
-    result = PatientWorkerResult(
-        patient_id=patient_label,
-        status="registered" if registered else "already_registered",
-        downloaded=[str(portal_dir / patient_label / filename)],
-        report_count=1,
-        ran_batch=False,
-        note=note,
-    )
     _write_local_status(status_dir, result)
     return result
 

@@ -239,3 +239,185 @@ def file_bytes(request: Request):
         if stream:
             stream.close()
         return _error(error)
+
+
+@router.get("/uploads")
+def clinic_uploads():
+    from .clinic_intake import list_uploads
+
+    return _call(list_uploads)
+
+
+@router.get("/uploads/{upload_id}")
+def clinic_upload(upload_id: str):
+    from .clinic_intake import get_upload
+
+    return _call(get_upload, upload_id)
+
+
+def _object_json(raw):
+    import json
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON field")
+            result[key] = value
+        return result
+
+    value = json.loads(
+        raw,
+        object_pairs_hook=unique,
+        parse_constant=lambda _: (_ for _ in ()).throw(
+            ValueError("Invalid JSON number")
+        ),
+    )
+    if not isinstance(value, dict):
+        raise ValueError("Expected JSON object")
+    return value
+
+
+@router.post("/uploads")
+async def clinic_upload_submit(request: Request):
+    from starlette.concurrency import run_in_threadpool
+    from starlette.datastructures import UploadFile
+    from .clinic_intake import submit_upload, require_key
+
+    form = None
+    try:
+        key = require_key(request.headers.get("idempotency-key"))
+        form = await request.form()
+        allowed = {
+            "files",
+            "fileMeta",
+            "patientId",
+            "firstName",
+            "lastName",
+            "firstInitial",
+            "lastInitial",
+            "birthdate",
+            "resolution",
+            "submissionId",
+            "analysisIntent",
+        }
+        if set(form) - allowed:
+            raise ValueError("Unsupported upload field")
+        if any(len(form.getlist(k)) != 1 for k in set(form) - {"files", "fileMeta"}):
+            raise ValueError("Repeated singleton upload field")
+        if form.get("submissionId", key) != key:
+            raise ValueError("submissionId must equal Idempotency-Key")
+        uploads = form.getlist("files")
+        metas = form.getlist("fileMeta")
+        if (
+            not uploads
+            or len(uploads) != len(metas)
+            or not all(isinstance(f, UploadFile) for f in uploads)
+        ):
+            raise ValueError("Each file requires ordered fileMeta")
+        files = [
+            (f.filename, await f.read(), f.content_type or "application/octet-stream")
+            for f in uploads
+        ]
+        kwargs = dict(
+            key=key,
+            identity={
+                k: form[k]
+                for k in (
+                    "firstName",
+                    "lastName",
+                    "firstInitial",
+                    "lastInitial",
+                    "birthdate",
+                )
+                if k in form
+            },
+            files=files,
+            file_meta=[_object_json(m) for m in metas],
+            actor=trusted_actor(request),
+            principal=request.headers.get("x-clinic-principal"),
+            patient_id=form.get("patientId"),
+            resolution=_object_json(form["resolution"])
+            if "resolution" in form
+            else None,
+            analysis_intent=_object_json(form["analysisIntent"])
+            if "analysisIntent" in form
+            else None,
+        )
+        return await run_in_threadpool(_call, submit_upload, **kwargs)
+    except (ValueError, TypeError) as error:
+        return _error(error)
+    finally:
+        if form is not None:
+            await form.close()
+
+
+@router.post("/uploads/{upload_id}/resolution")
+async def clinic_upload_resolve(upload_id: str, request: Request):
+    from starlette.concurrency import run_in_threadpool
+    from .clinic_intake import resolve_upload
+
+    try:
+        body = _object_json(await request.body())
+    except (ValueError, TypeError) as error:
+        return _error(error)
+    return await run_in_threadpool(
+        _call,
+        resolve_upload,
+        upload_id,
+        key=request.headers.get("idempotency-key"),
+        resolution=body,
+        actor=trusted_actor(request),
+    )
+
+
+@router.patch("/patients/{patient_id}")
+async def clinic_patient_patch(patient_id: str, request: Request):
+    from .clinic_patient_updates import patch_patient
+
+    try:
+        body = _object_json(await request.body())
+    except (ValueError, TypeError) as error:
+        return _error(error)
+    return _call(
+        patch_patient,
+        patient_id,
+        key=request.headers.get("idempotency-key"),
+        changes=body,
+        actor=trusted_actor(request),
+    )
+
+
+@router.post("/feedback")
+async def clinic_feedback(request: Request):
+    from .clinic_feedback import record_feedback
+
+    try:
+        body = _object_json(await request.body())
+        if set(body) - {"patientId", "fileId", "version", "action", "notes"} or not {
+            "patientId",
+            "fileId",
+            "version",
+            "action",
+        } <= set(body):
+            raise ValueError("Exact patient, file, version and action required")
+    except (ValueError, TypeError) as error:
+        return _error(error)
+    return _call(
+        record_feedback,
+        key=request.headers.get("idempotency-key"),
+        patient_id=body["patientId"],
+        file_id=body["fileId"],
+        version=body["version"],
+        action=body["action"],
+        notes=body.get("notes", ""),
+        actor=trusted_actor(request),
+        principal=request.headers.get("x-clinic-principal"),
+    )
+
+
+@router.get("/jobs")
+def clinic_jobs(request: Request):
+    from .clinic_jobs import patient_jobs
+
+    return _call(patient_jobs, request.query_params.get("patientId"))

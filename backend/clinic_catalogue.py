@@ -622,6 +622,8 @@ def _producer_hook(session, flush_context, instances):
             provenance={kind + "Id": source.id},
             uploaded_at=_millis(source.created_at),
         )
+        # Trusted original intake metadata joins the source in this same flush.
+        args.update(session.info.get("clinic_source_metadata", {}).get(source.id, {}))
         try:
             _, affected = _register(session, **args)
             for patient_uuid in affected:
