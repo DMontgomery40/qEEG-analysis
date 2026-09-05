@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from inspect import isawaitable
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -369,7 +370,8 @@ async def generate_writeup(
     md = (md or "").strip()
     _validate_patient_facing_markdown(md)
     if publisher is not None:
-        return publisher(md, meta)
+        published = publisher(md, meta)
+        return await published if isawaitable(published) else published
     out_dir, stem = md_path.parent, md_path.stem
     with tempfile.TemporaryDirectory(dir=out_dir, prefix=f".{stem}.") as temp_dir_raw:
         temp_dir = Path(temp_dir_raw)

@@ -452,6 +452,26 @@ def _verify_outputs(outputs):
             raise ExecutionConflict("required output binding changed")
 
 
+async def _owned_free_work(owner, function, *args):
+    """Run free publication/sync off-loop and drain before returning cancellation.
+
+    The caller retains RunOwner around this await. Context copying preserves the
+    admitted settings/logo; this helper does not authorize worker paid requests.
+    A cancellation wins after the started worker settles, including when that
+    worker fails. Retrieving its outcome prevents an unobserved task exception.
+    """
+    owner.checkpoint()
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        try:
+            await drain_task(worker)
+        except BaseException:
+            pass
+        raise cancelled
+
+
 async def continue_patient_facing(owner, *, llm_client, sync=None):
     """One bounded original generation→MD→PDF→meta→sync continuation.
 
@@ -530,7 +550,9 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                     kind + "_path": Path(data["destinations"][kind])
                     for kind in ("md", "pdf", "meta")
                 },
-                publisher=lambda md, meta: _publish_outputs(owner, data, md, meta),
+                publisher=lambda md, meta: _owned_free_work(
+                    owner, _publish_outputs, owner, data, md, meta
+                ),
             )
             scope.raise_if_blocked()
         _verify_outputs(outputs)
@@ -545,7 +567,7 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                     ) != (cfg["portal_dir"], cfg["sync_repo"]):
                         raise ExecutionConflict("original sync routing changed")
                     sync = writer.sync_patient_to_thrylen
-                if not sync(data["patient_label"]):
+                if not await _owned_free_work(owner, sync, data["patient_label"]):
                     raise OSError("patient output sync remains pending")
             _publish(
                 owner,

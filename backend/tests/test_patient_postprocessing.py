@@ -630,3 +630,141 @@ async def test_changed_render_dependency_parks_without_new_generation(
         assert sent == []
     finally:
         owner.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["render", "sync"])
+async def test_post_free_work_allows_independent_coroutine_progress(
+    ready, monkeypatch, operation
+):
+    import asyncio
+    import threading
+    from backend import patient_facing_pdf
+
+    ready[2]["sync_enabled"] = operation == "sync"
+    owner = admit(ready)
+    started = threading.Event()
+    progressed = threading.Event()
+    observations = []
+
+    def blocking_work():
+        started.set()
+        progressed.wait(timeout=0.2)
+        observations.append(progressed.is_set())
+
+    def render(md, path, *, patient_label):
+        assert patient_facing_pdf._get_logo_base64() == ready[2]["logo_uri"]
+        if operation == "render":
+            blocking_work()
+        path.write_bytes(b"%PDF-synthetic-owned-output")
+
+    def sync(label):
+        blocking_work()
+        return True
+
+    async def independent_patient():
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        progressed.set()
+
+    monkeypatch.setattr(writer, "render_patient_facing_markdown_to_pdf", render)
+    monkeypatch.setattr(writer, "sync_patient_to_thrylen", sync)
+    try:
+        result, _ = await asyncio.gather(
+            post.continue_patient_facing(owner, llm_client=llm([])),
+            independent_patient(),
+        )
+        assert result["verified"]
+        assert observations == [True], f"{operation} starved another async patient task"
+    finally:
+        owner.release()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["render", "sync"])
+@pytest.mark.parametrize("worker_error", [False, True])
+async def test_cancelled_post_drains_worker_before_process_can_claim_owner(
+    ready, monkeypatch, operation, worker_error
+):
+    import asyncio
+    import os
+    import subprocess
+    import sys
+    import threading
+
+    ready[2]["sync_enabled"] = operation == "sync"
+    owner = admit(ready)
+    started = threading.Event()
+    finish = threading.Event()
+    settled = threading.Event()
+
+    def blocking_work():
+        started.set()
+        try:
+            assert finish.wait(timeout=5), "test worker was not released"
+            if worker_error:
+                raise OSError("synthetic free worker failed after cancellation")
+        finally:
+            settled.set()
+
+    def render(md, path, *, patient_label):
+        if operation == "render":
+            blocking_work()
+        path.write_bytes(b"%PDF-synthetic-owned-output")
+
+    def sync(label):
+        blocking_work()
+        return True
+
+    probe = """
+import sys
+from backend import storage
+from backend.run_execution import ExecutionStore
+storage.reset_engine('sqlite:///'+sys.argv[1])
+owner=ExecutionStore(storage.engine).claim_run_owner('original-run')
+print('claimed' if owner is not None else 'contended')
+if owner is not None:owner.close()
+"""
+
+    def contender():
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(owner.store.db_path)],
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    async def owned_call():
+        try:
+            return await post.continue_patient_facing(owner, llm_client=llm([]))
+        finally:
+            owner.release()
+
+    monkeypatch.setattr(writer, "render_patient_facing_markdown_to_pdf", render)
+    monkeypatch.setattr(writer, "sync_patient_to_thrylen", sync)
+    task = asyncio.create_task(owned_call())
+    try:
+        while not started.is_set() and not task.done():
+            await asyncio.sleep(0.001)
+        assert (
+            started.is_set() and not settled.is_set()
+        ), "free worker blocked cancellation delivery"
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        assert await asyncio.to_thread(contender) == "contended"
+        assert not settled.is_set()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert settled.is_set()
+        assert await asyncio.to_thread(contender) == "claimed"
+    finally:
+        finish.set()
+        await asyncio.gather(task, return_exceptions=True)
+        owner.close()
