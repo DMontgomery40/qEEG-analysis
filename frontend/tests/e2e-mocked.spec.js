@@ -1084,3 +1084,41 @@ for (const duplicateNames of [false, true]) {
     expect(requests[1]).not.toContain('THIRD-BYTES');
   });
 }
+
+test('same basename reports retain separate names and preview text', async ({ page }) => {
+  await setupMockApi(page);
+  const requests = [];
+  await page.route(/\/api\/reports\/preview(?:\?.*)?$/, async (route) => {
+    const body = route.request().postDataBuffer().toString();
+    await route.fulfill({ json: { text: body.includes('ALICE-BYTES') ? 'Alice report preview' : 'Bob report preview' } });
+  });
+  await page.route(/\/api\/patients\/bulk_upload(?:\?.*)?$/, async (route) => {
+    requests.push(route.request().postDataBuffer().toString());
+    await route.fulfill({ json: { created: [{ file_index: 0 }], errors: [{ file_index: 1, filename: 'report.txt', conflict: 'identity_name_mismatch', candidates: [{ patient_id: 'BE_01-01-1900', name: 'Bob Example' }] }], counts: { created: 1, errors: 1 } } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Bulk Upload', exact: true }).click();
+  await page.locator('.bulk-hidden-input').setInputFiles(['ALICE', 'BOB'].map((name) => ({ name: 'report.txt', mimeType: 'text/plain', buffer: Buffer.from(`${name}-BYTES`) })));
+  const rows = page.locator('.bulk-file-row');
+  for (let i = 0; i < 2; i += 1) {
+    await rows.nth(i).getByPlaceholder('First name').fill(['Alice', 'Bob'][i]);
+    await rows.nth(i).getByPlaceholder('Last name').fill('Example');
+    await rows.nth(i).getByPlaceholder('MM-DD-YYYY').fill('01-01-1900');
+    await rows.nth(i).getByRole('button', { name: 'Read report', exact: true }).click();
+  }
+  await expect(rows.nth(0).getByPlaceholder('First name')).toHaveValue('Alice');
+  await expect(rows.nth(0)).toContainText('Alice report preview');
+  await expect(rows.nth(1)).toContainText('Bob report preview');
+  await page.getByRole('button', { name: 'Upload', exact: true }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first().getByPlaceholder('First name')).toHaveValue('Bob');
+  await expect(rows.first()).toContainText('Bob report preview');
+  expect(requests[0]).toContain('"file_index":0');
+  expect(requests[0]).toContain('"file_index":1');
+  await rows.first().getByRole('button', { name: /Same as Bob Example/ }).click();
+  await page.getByRole('button', { name: 'Upload', exact: true }).click();
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1]).toContain('"file_index":0');
+  expect(requests[1]).toContain('"first_name":"Bob"');
+  expect(requests[1]).not.toContain('ALICE-BYTES');
+});

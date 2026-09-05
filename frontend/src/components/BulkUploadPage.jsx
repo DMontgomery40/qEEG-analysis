@@ -36,6 +36,7 @@ function clinicId(identity) {
 
 function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }) {
   const fileInputRef = useRef(null);
+  const fileIds = useRef(new WeakMap());
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [identities, setIdentities] = useState({});
   const [readings, setReadings] = useState({});
@@ -44,7 +45,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
   const [result, setResult] = useState(null);
 
   const missingIdentity = useMemo(
-    () => selectedFiles.filter((f) => !isComplete(identities[f?.name])).length,
+    () => selectedFiles.filter((f) => !isComplete(identities[fileIds.current.get(f)])).length,
     [selectedFiles, identities],
   );
 
@@ -70,15 +71,15 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
   };
 
   const readReport = async (file) => {
-    setReadings((prev) => ({ ...prev, [file.name]: { loading: true, text: '' } }));
+    setReadings((prev) => ({ ...prev, [fileIds.current.get(file)]: { loading: true, text: '' } }));
     try {
       const res = await api.previewReport(file);
       setReadings((prev) => ({
         ...prev,
-        [file.name]: { loading: false, text: res?.text || res?.preview || '' },
+        [fileIds.current.get(file)]: { loading: false, text: res?.text || res?.preview || '' },
       }));
     } catch (e) {
-      setReadings((prev) => ({ ...prev, [file.name]: { loading: false, text: '' } }));
+      setReadings((prev) => ({ ...prev, [fileIds.current.get(file)]: { loading: false, text: '' } }));
       onError(e, { action: 'preview_report', filename: file.name });
     }
   };
@@ -117,9 +118,10 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
               setResult(null);
               try {
                 const submittedFiles = selectedFiles;
-                const payload = submittedFiles.map((f) => ({
+                const payload = submittedFiles.map((f, file_index) => ({
                   filename: f.name,
-                  ...(identities[f.name] || {}),
+                  ...(identities[fileIds.current.get(f)] || {}),
+                  file_index,
                 }));
                 const res = await api.bulkUploadPatients(submittedFiles, payload);
                 const acceptedFiles = new Set(
@@ -133,8 +135,10 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
                 setConflicts(
                   Object.fromEntries(
                     (res?.errors || [])
-                      .filter((e) => e?.conflict === 'identity_name_mismatch')
-                      .map((e) => [e.filename, e]),
+                      .filter((e) => e?.conflict === 'identity_name_mismatch'
+                        && Number.isInteger(e.file_index) && e.file_index >= 0
+                        && e.file_index < submittedFiles.length)
+                      .map((e) => [fileIds.current.get(submittedFiles[e.file_index]), e]),
                   ),
                 );
                 await onRefreshPatients?.();
@@ -157,6 +161,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
             multiple
             onChange={(e) => {
               const files = Array.from(e.target.files || []);
+              files.forEach((file) => fileIds.current.set(file, crypto.randomUUID()));
               setSelectedFiles(files);
               setIdentities({});
               setReadings({});
@@ -179,29 +184,30 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
               </div>
             ) : null}
             <div className="list bulk-file-list">
-              {selectedFiles.map((file, idx) => {
-                const identity = identities[file.name] || {};
-                const reading = readings[file.name];
-                const conflict = conflicts[file.name];
+              {selectedFiles.map((file) => {
+                const fileId = fileIds.current.get(file);
+                const identity = identities[fileIds.current.get(file)] || {};
+                const reading = readings[fileIds.current.get(file)];
+                const conflict = conflicts[fileIds.current.get(file)];
                 return (
-                  <div key={`${file.name}-${idx}`} className="bulk-file-row">
+                  <div key={fileId} className="bulk-file-row">
                     <div className="bulk-file-name">{file.name}</div>
                     <div className="bulk-file-meta">
                       <span className="muted">{formatBytes(file.size)}</span>
                       <input
                         placeholder="First name"
                         value={identity.first_name || ''}
-                        onChange={(e) => setField(file.name, 'first_name', e.target.value)}
+                        onChange={(e) => setField(fileId, 'first_name', e.target.value)}
                       />
                       <input
                         placeholder="Last name"
                         value={identity.last_name || ''}
-                        onChange={(e) => setField(file.name, 'last_name', e.target.value)}
+                        onChange={(e) => setField(fileId, 'last_name', e.target.value)}
                       />
                       <input
                         placeholder="MM-DD-YYYY"
                         value={identity.birthdate || ''}
-                        onChange={(e) => setField(file.name, 'birthdate', e.target.value)}
+                        onChange={(e) => setField(fileId, 'birthdate', e.target.value)}
                       />
                       <span className="bulk-file-label">{clinicId(identity) || '—'}</span>
                       <button onClick={() => readReport(file)} disabled={reading?.loading}>
@@ -218,7 +224,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
                             <button
                               key={c.patient_id}
                               onClick={() =>
-                                resolveConflict(file.name, {
+                                resolveConflict(fileId, {
                                   attach_to: c.patient_id,
                                   force_new: false,
                                 })
@@ -229,7 +235,7 @@ function BulkUploadPage({ onSelectPatient, onClose, onError, onRefreshPatients }
                           ))}
                           <button
                             onClick={() =>
-                              resolveConflict(file.name, {
+                              resolveConflict(fileId, {
                                 attach_to: null,
                                 force_new: true,
                               })

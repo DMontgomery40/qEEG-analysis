@@ -42,6 +42,35 @@ ROOT_OPERATIONAL_FILES = frozenset(
 )
 
 
+def _local_retention_kind(path, portal, canonical_labels, raw):
+    """Recognize exact historical metadata without deriving patient identity."""
+    try:
+        relative = path.relative_to(portal)
+    except ValueError:
+        return None
+    if not path.is_file() or any(
+        (portal.joinpath(*relative.parts[:i])).is_symlink()
+        for i in range(1, len(relative.parts) + 1)
+    ):
+        return None
+    if path.parent == portal and path.name in ROOT_OPERATIONAL_FILES:
+        return "root-operational"
+    if path.name == ".DS_Store":
+        return "filesystem-metadata"
+    if (
+        len(relative.parts) == 2
+        and path.name == "$meta.json"
+        and path.parent.name in canonical_labels
+    ):
+        try:
+            metadata = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if isinstance(metadata, dict) and metadata.get("patientId") == path.parent.name:
+            return "patient-metadata"
+    return None
+
+
 def _digest(chunks, limit):
     digest = hashlib.sha256()
     size = 0
@@ -213,6 +242,14 @@ def build_inventory(
         seen_paths = set()
         with storage.session_scope() as s:
             patients = list(s.scalars(select(storage.Patient)))
+            from collections import Counter
+
+            label_counts = Counter(p.label for p in patients)
+            canonical_labels = {
+                label
+                for label, count in label_counts.items()
+                if count == 1 and parse_canonical_patient_id(label)
+            }
             patient_rows = [
                 {
                     c.key: getattr(p, c.key).isoformat()
@@ -313,22 +350,25 @@ def build_inventory(
                                 if (
                                     path.parent == portal
                                     and name in ROOT_OPERATIONAL_FILES
-                                    and not path.is_symlink()
-                                ):
+                                ) or name in {".DS_Store", "$meta.json"}:
                                     raw = stream.read(max_file_bytes + 1)
                                     row["sha256"], row["size"] = _digest(
                                         [raw], max_file_bytes
+                                    )
+                                    retention_kind = _local_retention_kind(
+                                        path, portal, canonical_labels, raw
                                     )
                                     object_name = (
                                         "operational-"
                                         + hashlib.sha256(str(path).encode()).hexdigest()
                                         + ".bin"
                                     )
-                                    _immutable(root / "objects" / object_name, raw)
-                                    row.update(
-                                        kind="root-operational",
-                                        rawOperational=object_name,
-                                    )
+                                    if retention_kind:
+                                        _immutable(root / "objects" / object_name, raw)
+                                        row.update(
+                                            kind=retention_kind,
+                                            rawOperational=object_name,
+                                        )
                                     stream.seek(0)
                                 row["sha256"], row["size"] = _digest(
                                     iter(lambda: stream.read(65536), b""),
@@ -352,7 +392,9 @@ def build_inventory(
                     row["retainedEvidence"] = retained_objects[key]
                 try:
                     if _global_remote_key(key) and key not in retained_objects:
-                        raise CatalogueUnavailable("Original global object retention evidence missing")
+                        raise CatalogueUnavailable(
+                            "Original global object retention evidence missing"
+                        )
                     if key.endswith(".json") and "/files/" not in key:
                         chunks = remote_readback(key, 8 * 1024 * 1024)
                         raw = bytearray()
@@ -801,23 +843,52 @@ def import_inventory(inventory_id, *, remote_readback, activate=False):
                     raise CatalogueUnavailable("Original inventory source unavailable")
                 elif row.get("retainedEvidence"):
                     proof = retained_objects.get(row.get("key"))
-                    if proof != row["retainedEvidence"] or row.get("binding") or row["kind"] != "remote-object":
-                        raise CatalogueConflict("Retained remote inventory evidence changed")
-                    if _digest(remote_readback(row["key"], row["size"]), row["size"]) != (proof["sha256"], proof["size"]):
-                        raise CatalogueConflict("Retained remote original bytes changed")
+                    if (
+                        proof != row["retainedEvidence"]
+                        or row.get("binding")
+                        or row["kind"] != "remote-object"
+                    ):
+                        raise CatalogueConflict(
+                            "Retained remote inventory evidence changed"
+                        )
+                    if _digest(
+                        remote_readback(row["key"], row["size"]), row["size"]
+                    ) != (proof["sha256"], proof["size"]):
+                        raise CatalogueConflict(
+                            "Retained remote original bytes changed"
+                        )
                     retained_seen.add(row["key"])
                     result = "retained_remote"
-                elif row["kind"] == "root-operational":
+                elif row["kind"] in {
+                    "root-operational",
+                    "filesystem-metadata",
+                    "patient-metadata",
+                }:
                     from .portal_sync import portal_patients_dir
 
                     path = Path(row["path"])
+                    original = (root / "objects" / row["rawOperational"]).read_bytes()
+                    labels = set()
+                    if row["kind"] == "patient-metadata":
+                        with storage.session_scope() as s:
+                            owners = list(
+                                s.scalars(
+                                    select(storage.Patient)
+                                    .where(storage.Patient.label == path.parent.name)
+                                    .limit(2)
+                                )
+                            )
+                        if len(owners) == 1 and parse_canonical_patient_id(
+                            owners[0].label
+                        ):
+                            labels.add(owners[0].label)
                     if (
-                        path.parent != portal_patients_dir()
-                        or path.name not in ROOT_OPERATIONAL_FILES
-                        or path.is_symlink()
+                        _local_retention_kind(
+                            path, portal_patients_dir(), labels, original
+                        )
+                        != row["kind"]
                     ):
                         raise CatalogueConflict("Original operational path changed")
-                    original = (root / "objects" / row["rawOperational"]).read_bytes()
                     if _digest([original], row["size"]) != (row["sha256"], row["size"]):
                         raise CatalogueConflict("Original operational evidence changed")
                     with path.open("rb") as stream:

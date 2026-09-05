@@ -558,7 +558,8 @@ def test_root_operational_inventory_retains_bytes_and_replays(
     "relative",
     [
         "unknown.json",
-        "ZZ_01-01-1900/.DS_Store",
+        "ZZ_01-01-1900/.DS_Store.backup",
+        "ZZ_01-01-1900/council/ordinary.json",
         "ZZ_01-01-1900/.qeeg_portal_sync_state.json",
     ],
 )
@@ -580,4 +581,155 @@ def test_operational_retention_never_hides_unknown_or_nested_files(
     with pytest.raises(CatalogueUnavailable):
         reconcile.import_inventory(
             "not-operational", remote_readback=lambda *a: (), activate=True
+        )
+
+
+@pytest.mark.parametrize(
+    "relative", ["ZZ_01-01-1900/.DS_Store", "ZZ_01-01-1900/council/nested/.DS_Store"]
+)
+def test_nested_filesystem_metadata_retains_exact_bytes_only(
+    temp_data_dir, monkeypatch, relative
+):
+    portal = temp_data_dir / "portal_patients"
+    path = portal / relative
+    path.parent.mkdir(parents=True)
+    raw = b"original filesystem metadata"
+    path.write_bytes(raw)
+    monkeypatch.setattr("backend.portal_sync.portal_patients_dir", lambda: portal)
+    manifest = reconcile.build_inventory(
+        "nested-metadata",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    row = next(reconcile.inventory_rows(manifest))
+    assert row["kind"] == "filesystem-metadata"
+    assert (
+        reconcile._inventory_root("nested-metadata") / "objects" / row["rawOperational"]
+    ).read_bytes() == raw
+    reconcile.import_inventory(
+        "nested-metadata", remote_readback=lambda *a: (), activate=True
+    )
+    path.write_bytes(b"changed filesystem metadata")
+    with pytest.raises(CatalogueUnavailable):
+        reconcile.import_inventory(
+            "nested-metadata", remote_readback=lambda *a: (), activate=True
+        )
+    with storage.session_scope() as s:
+        assert s.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "current",
+        "stale-initials",
+        "mismatched",
+        "unknown",
+        "nested",
+        "malformed",
+        "not-object",
+    ],
+)
+def test_local_patient_metadata_is_historical_evidence_not_identity(
+    temp_data_dir, monkeypatch, case
+):
+    import json
+
+    label = "ZZ_01-01-1900"
+    with storage.session_scope() as s:
+        patient = storage.create_patient(
+            s, label=label, first_name="Zoe", last_name="Zed"
+        )
+    portal = temp_data_dir / "portal_patients"
+    path = portal / ("XY_01-01-1900" if case == "unknown" else label)
+    if case == "nested":
+        path /= "council"
+    path /= "$meta.json"
+    path.parent.mkdir(parents=True)
+    raw = json.dumps(
+        dict(
+            patientId="other" if case == "mismatched" else path.parent.name,
+            birthdate="01-01-1900",
+            index=1,
+            identity={
+                "firstInitial": "B" if case == "stale-initials" else "Z",
+                "lastInitial": "Z",
+            },
+        )
+    ).encode()
+    if case == "malformed":
+        raw = b"{"
+    if case == "not-object":
+        raw = b"[]"
+    path.write_bytes(raw)
+    monkeypatch.setattr("backend.portal_sync.portal_patients_dir", lambda: portal)
+    manifest = reconcile.build_inventory(
+        "patient-metadata",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    row = next(reconcile.inventory_rows(manifest))
+    if case in {"current", "stale-initials"}:
+        assert row["kind"] == "patient-metadata"
+        assert (
+            reconcile._inventory_root("patient-metadata")
+            / "objects"
+            / row["rawOperational"]
+        ).read_bytes() == raw
+        reconcile.import_inventory(
+            "patient-metadata", remote_readback=lambda *a: (), activate=True
+        )
+        reconcile.import_inventory(
+            "patient-metadata", remote_readback=lambda *a: (), activate=True
+        )
+        with storage.session_scope() as s:
+            assert storage.get_patient(s, patient.id).first_name == "Zoe"
+            assert s.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
+        path.write_bytes(b"{}")
+    else:
+        assert row["kind"] == "local-file"
+    with pytest.raises(CatalogueUnavailable):
+        reconcile.import_inventory(
+            "patient-metadata", remote_readback=lambda *a: (), activate=True
+        )
+
+
+@pytest.mark.parametrize("change", ["duplicate", "relabel", "symlink"])
+def test_patient_metadata_replay_requires_current_unique_owner_and_regular_path(
+    temp_data_dir, monkeypatch, change
+):
+    import json
+
+    label = "ZZ_01-01-1900"
+    with storage.session_scope() as s:
+        patient = storage.create_patient(s, label=label)
+    portal = temp_data_dir / "portal_patients"
+    path = portal / label / "$meta.json"
+    path.parent.mkdir(parents=True)
+    raw = json.dumps({"patientId": label}).encode()
+    path.write_bytes(raw)
+    monkeypatch.setattr("backend.portal_sync.portal_patients_dir", lambda: portal)
+    reconcile.build_inventory(
+        "owner-change",
+        remote_events=census([]),
+        remote_readback=lambda *a: (),
+        max_file_bytes=1024,
+    )
+    if change == "symlink":
+        target = temp_data_dir / "unchanged-bytes.json"
+        target.write_bytes(raw)
+        path.unlink()
+        path.symlink_to(target)
+    else:
+        with storage.session_scope() as s:
+            if change == "duplicate":
+                storage.create_patient(s, label=label)
+            else:
+                storage.get_patient(s, patient.id).label = "XY_01-01-1900"
+                s.commit()
+    with pytest.raises(CatalogueUnavailable):
+        reconcile.import_inventory(
+            "owner-change", remote_readback=lambda *a: (), activate=True
         )

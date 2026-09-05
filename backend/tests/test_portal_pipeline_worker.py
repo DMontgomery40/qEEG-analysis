@@ -1173,7 +1173,7 @@ class _UploadClient:
             if key.startswith(prefix)
         ]
 
-    def get_json(self, key):
+    def get_json(self, key, *, strict=False):
         return self._jobs.get(key)
 
     def download(self, key, dest):
@@ -1924,3 +1924,124 @@ def test_recreated_marker_with_changed_pending_bytes_conflicts(
     assert (
         tmp_path / "portal" / first.patient_id / "scan.pdf"
     ).read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("analysis_intent", [False, True])
+def test_original_receipt_retry_preserves_original_evidence_and_paid_intent_gate(
+    temp_data_dir, tmp_path, monkeypatch, analysis_intent
+):
+    import hashlib
+    from scripts import portal_pipeline_worker as worker
+    from backend.tests.test_clinic_upload_import import original
+    from backend import storage
+    from backend.clinic_records import ClinicUpload
+
+    _no_paid_work(monkeypatch, worker)
+    receipt = original()
+    if analysis_intent:
+        receipt["manifest"]["analysisIntent"] = {
+            "confirmed": True,
+            "original": "must not discard",
+        }
+        receipt["manifestHash"] = hashlib.sha256(
+            json.dumps(receipt["manifest"], separators=(",", ":")).encode()
+        ).hexdigest()
+    upload_id = receipt["submissionId"]
+    file_key = receipt["response"]["uploaded"][0]["fileKey"]
+    job_key = f"pipeline/jobs/{upload_id}/upload.json"
+    receipt_key = f"uploads/submissions/{upload_id}.json"
+    job = dict(
+        kind="new_patient_upload",
+        uploadId=upload_id,
+        fileKey=file_key,
+        identity=receipt["manifest"]["identity"],
+        uploadedBy="Doctor",
+        uploadedAt=1234,
+    )
+
+    class RetryClient(_UploadClient):
+        unreadable = True
+
+        def get_json(self, key, *, strict=False):
+            if key == receipt_key and self.unreadable:
+                raise RuntimeError("Submission receipt retrieval failed")
+            return super().get_json(key)
+
+    client = RetryClient({job_key: job, receipt_key: receipt}, {file_key: b"one"})
+    args = dict(
+        client=client,
+        portal_dir=tmp_path / "portal",
+        status_dir=tmp_path / "status",
+        job_key=job_key,
+        payload=job,
+    )
+    assert worker.process_new_patient_upload(**args).status == "failed"
+    assert not client.deleted and not client.downloads
+    client.unreadable = False
+    result = worker.process_new_patient_upload(**args)
+    if analysis_intent:
+        assert result.status == "failed"
+        assert "analysis intent" in result.note.lower()
+        assert not client.deleted and not client.downloads
+        assert not list(Path(temp_data_dir).rglob("keys.json"))
+    else:
+        assert result.status == "registered", result.note
+        with storage.session_scope() as s:
+            upload = s.get(ClinicUpload, upload_id)
+            assert upload.uploaded_at == 1234 and upload.uploaded_by == "Doctor"
+        assert job_key in client.deleted
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Blob uploads/submissions/test.json does not exist in store clinic",
+        " ›   Error: Blob uploads/submissions/test.json does not exist in store clinic\n",
+        "\x1b[31m›\x1b[0m   \x1b[31mError:\x1b[0m Blob uploads/submissions/test.json does not exist in store clinic\n",
+    ],
+)
+def test_strict_receipt_get_recognizes_only_cli_explicit_missing(
+    monkeypatch, tmp_path, output
+):
+    from scripts.portal_pipeline_worker import NetlifyBlobClient
+
+    client = NetlifyBlobClient(netlify_bin="unused", store="clinic", cwd=tmp_path)
+    monkeypatch.setattr(
+        client, "_run", lambda args: subprocess.CompletedProcess(args, 1, "", output)
+    )
+    assert client.get_json("uploads/submissions/test.json", strict=True) is None
+
+
+@pytest.mark.parametrize(
+    "code,stdout,stderr",
+    [
+        (
+            1,
+            "",
+            "Could not retrieve blob uploads/submissions/test.json from store clinic",
+        ),
+        (1, "", "authentication failed"),
+        (1, "", ""),
+        (1, "", "Blob uploads/submissions/other.json does not exist in store clinic"),
+        (1, "", "Blob uploads/submissions/test.json does not exist in store other"),
+        (0, "{", ""),
+        (0, "[]", ""),
+        (0, "{}", ""),
+        (0, "", ""),
+    ],
+)
+def test_strict_receipt_get_retries_transport_and_malformed_results(
+    monkeypatch, tmp_path, code, stdout, stderr
+):
+    from scripts.portal_pipeline_worker import NetlifyBlobClient
+
+    client = NetlifyBlobClient(netlify_bin="unused", store="clinic", cwd=tmp_path)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda args: subprocess.CompletedProcess(args, code, stdout, stderr),
+    )
+    with pytest.raises(RuntimeError):
+        client.get_json("uploads/submissions/test.json", strict=True)
+    # Existing generic optional reads remain compatible.
+    assert client.get_json("uploads/submissions/test.json") in (None, {})

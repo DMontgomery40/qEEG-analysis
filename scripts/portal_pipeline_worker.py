@@ -588,14 +588,32 @@ class NetlifyBlobClient:
             raise RuntimeError((proc.stderr or proc.stdout or "").strip())
         return parse_blob_keys(proc.stdout)
 
-    def get_json(self, key: str) -> dict[str, Any] | None:
+    def get_json(self, key: str, *, strict: bool = False) -> dict[str, Any] | None:
         proc = self._run(["blobs:get", self.store, key])
         if proc.returncode != 0:
+            if strict:
+                # Netlify CLI blobs-get distinguishes store.get() null from a
+                # thrown retrieval error. Only its exact missing message is
+                # absence; auth, transport and unrecognized CLI output retry.
+                output = re.sub(
+                    r"\x1b\[[0-9;]*m", "", proc.stderr or proc.stdout or ""
+                ).strip()
+                missing = f"Blob {key} does not exist in store {self.store}"
+                if not re.fullmatch(
+                    r"(?:[›»]\s*)?(?:Error:\s*)?" + re.escape(missing), output
+                ):
+                    raise RuntimeError(
+                        "Submission receipt retrieval failed; retry before filing"
+                    )
             return None
         try:
             parsed = json.loads(proc.stdout or "{}")
-        except Exception:
+        except ValueError as error:
+            if strict:
+                raise RuntimeError("Submission receipt JSON is unreadable") from error
             return None
+        if strict and (not isinstance(parsed, dict) or not parsed):
+            raise RuntimeError("Submission receipt is not an object")
         return parsed if isinstance(parsed, dict) else None
 
     def download(self, key: str, dest: Path) -> None:
@@ -887,7 +905,7 @@ def _file_new_patient_upload(
         else:
             result_upload = clinic_intake.resume_upload(upload_id)["upload"]
     else:
-        receipt = client.get_json(f"uploads/submissions/{upload_id}.json")
+        receipt = client.get_json(f"uploads/submissions/{upload_id}.json", strict=True)
         if receipt:
             evidence = import_submission_evidence(receipt, marker=payload)
             if evidence.get("status") == "uncertain":

@@ -1312,11 +1312,13 @@ def test_bulk_partial_results_retain_exact_input_indexes(
                 "identities": json.dumps(
                     [
                         {
-                            "filename": "same.txt",
+                            "filename": names[i],
+                            "file_index": i,
                             "first_name": "Synthetic",
                             "last_name": "Example",
                             "birthdate": "01-01-1900",
                         }
+                        for i in range(3) if not (failure == "missing-identity" and i == 1)
                     ]
                 )
             },
@@ -1398,3 +1400,209 @@ async def test_preview_extraction_does_not_block_and_drains_scratch(
             if not task.done():
                 await asyncio.gather(task, return_exceptions=True)
     assert scratch_paths and all(not p.exists() for p in scratch_paths)
+
+
+@pytest.mark.parametrize("indexed", [True, False])
+def test_bulk_duplicate_names_bind_identity_to_position(
+    temp_data_dir, monkeypatch, indexed
+):
+    app, _ = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    identities = [
+        dict(
+            filename="report.txt",
+            first_name=name,
+            last_name="Example",
+            birthdate="01-01-1900",
+            **({"file_index": i} if indexed else {}),
+        )
+        for i, name in enumerate(["Alice", "Bob"])
+    ]
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[
+                ("files", ("report.txt", body, "text/plain"))
+                for body in [b"alice report", b"bob report"]
+            ],
+            data={"identities": json.dumps(identities)},
+        )
+    if not indexed:
+        assert response.status_code == 400
+        with storage.session_scope() as s:
+            assert storage.list_patients(s) == []
+        return
+    assert response.status_code == 200
+    assert [r["patient"]["first_name"] for r in response.json()["created"]] == [
+        "Alice",
+        "Bob",
+    ]
+    with storage.session_scope() as s:
+        for patient in storage.list_patients(s):
+            assert (
+                Path(storage.list_reports(s, patient.id)[0].stored_path).read_bytes()
+                == f"{patient.first_name.lower()} report".encode()
+            )
+
+
+@pytest.mark.parametrize("positions", [[0, 0], [-1, 1], [False, 1], ["0", 1], [0, 2]])
+def test_bulk_rejects_ambiguous_positions_before_filing(
+    temp_data_dir, monkeypatch, positions
+):
+    app, _ = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("report.txt", b"report", "text/plain"))] * 2,
+            data={
+                "identities": json.dumps(
+                    [
+                        dict(
+                            file_index=i,
+                            filename="report.txt",
+                            first_name="Alice",
+                            last_name="Example",
+                            birthdate="01-01-1900",
+                        )
+                        for i in positions
+                    ]
+                )
+            },
+        )
+    assert response.status_code == 400
+    with storage.session_scope() as s:
+        assert storage.list_patients(s) == []
+
+
+@pytest.mark.parametrize(
+    "dependent",
+    [
+        "upload",
+        "operation",
+        "artifact",
+        "report",
+        "file",
+        "alias",
+        "projection",
+        "catalogue",
+    ],
+)
+def test_bulk_failed_extraction_preserves_concurrent_patient_dependants(
+    temp_data_dir, monkeypatch, dependent
+):
+    app, main = _test_app(temp_data_dir, monkeypatch)
+    from backend import storage
+    from backend.clinic_models import (
+        ClinicArtifact,
+        ClinicPatientAlias,
+        ClinicProjection,
+        ClinicPatientCatalogState,
+    )
+    from backend.clinic_records import ClinicUpload, ClinicOperation
+
+    saved = []
+
+    def fail_after_other_request(**kwargs):
+        patient_id = kwargs["patient_id"]
+        saved.append(patient_id)
+        with storage.session_scope() as s:
+            if dependent == "upload":
+                s.add(
+                    ClinicUpload(
+                        id="concurrent",
+                        admission_key="key",
+                        patient_uuid=patient_id,
+                        manifest_json="{}",
+                        uploaded_at=1,
+                    )
+                )
+            elif dependent == "operation":
+                s.add(
+                    ClinicOperation(
+                        id="op",
+                        patient_uuid=patient_id,
+                        producer="video",
+                        kind="render",
+                        original_json="{}",
+                        generation=1,
+                        sequence=1,
+                        payload_json="{}",
+                    )
+                )
+            elif dependent == "artifact":
+                s.add(
+                    ClinicArtifact(
+                        id="artifact",
+                        patient_uuid=patient_id,
+                        source_kind="test",
+                        source_id="source",
+                        logical_family="test",
+                        version=1,
+                        file_key="test.txt",
+                        original_name="test",
+                        sha256="0" * 64,
+                        size=1,
+                        content_type="text/plain",
+                        registered_at=1,
+                        provenance_json="{}",
+                    )
+                )
+            elif dependent == "alias":
+                s.add(ClinicPatientAlias(alias="other", patient_uuid=patient_id))
+            elif dependent == "projection":
+                s.add(
+                    ClinicProjection(
+                        id="proj",
+                        patient_uuid=patient_id,
+                        source_kind="test",
+                        source_id="source",
+                        payload_json="{}",
+                    )
+                )
+            elif dependent == "catalogue":
+                s.get(ClinicPatientCatalogState, patient_id).revision += 1
+            elif dependent == "report":
+                storage.create_report(
+                    s,
+                    patient_id=patient_id,
+                    filename="other.txt",
+                    mime_type="text/plain",
+                    stored_path=Path(temp_data_dir) / "other.txt",
+                    extracted_text_path=Path(temp_data_dir) / "other.txt",
+                )
+            else:
+                storage.create_patient_file(
+                    s,
+                    patient_id=patient_id,
+                    filename="other.txt",
+                    mime_type="text/plain",
+                    size_bytes=1,
+                    stored_path=Path(temp_data_dir) / "other.txt",
+                )
+            s.commit()
+        raise ValueError("original extraction failed")
+
+    monkeypatch.setattr(main, "save_report_upload", fail_after_other_request)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/patients/bulk_upload",
+            files=[("files", ("report.txt", b"report", "text/plain"))],
+            data={
+                "identities": json.dumps(
+                    [
+                        dict(
+                            filename="report.txt",
+                            first_name="Alice",
+                            last_name="Example",
+                            birthdate="01-01-1900",
+                        )
+                    ]
+                )
+            },
+        )
+    assert response.json()["counts"]["errors"] == 1
+    with storage.session_scope() as s:
+        assert storage.get_patient(s, saved[0]) is not None

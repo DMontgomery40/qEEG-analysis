@@ -20,7 +20,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
-from sqlalchemy import select as sa_select
+from sqlalchemy import select as sa_select, text as sa_text
 
 from . import storage
 from . import config as cfg
@@ -1657,8 +1657,10 @@ async def create_patient(req: PatientCreate) -> dict[str, Any]:
         return _patient_out(p)
 
 
-def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
-    """Read the operator's per-file identities, keyed by the filename they name.
+def _parse_bulk_upload_identities(
+    raw: str, filenames: list[str]
+) -> dict[int, PatientCreate]:
+    """Bind per-file identities to multipart positions, never ambiguous basenames.
 
     Comes from the preview step: the operator reads the name and date of birth
     off the report before anything is filed, so the canonical id exists before
@@ -1679,7 +1681,7 @@ def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
             detail="Identities must be a list with one entry per file.",
         )
 
-    identities: dict[str, PatientCreate] = {}
+    identities: dict[int, PatientCreate] = {}
     for entry in parsed:
         if not isinstance(entry, dict):
             raise HTTPException(
@@ -1691,7 +1693,30 @@ def _parse_bulk_upload_identities(raw: str) -> dict[str, PatientCreate]:
                 status_code=400,
                 detail="Each identity must name the file it belongs to.",
             )
-        identities[filename] = PatientCreate(
+        if "file_index" in entry:
+            position = entry["file_index"]
+            if type(position) is not int or not 0 <= position < len(filenames):
+                raise HTTPException(
+                    status_code=400, detail="Identity file_index is invalid."
+                )
+            if filenames[position] != filename:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Identity filename does not match its file_index.",
+                )
+        else:
+            matches = [i for i, name in enumerate(filenames) if name == filename]
+            if len(matches) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Identity requires an unambiguous file_index.",
+                )
+            position = matches[0]
+        if position in identities:
+            raise HTTPException(
+                status_code=400, detail="Each file must have at most one identity."
+            )
+        identities[position] = PatientCreate(
             first_name=entry.get("first_name"),
             last_name=entry.get("last_name"),
             birthdate=entry.get("birthdate"),
@@ -1721,7 +1746,9 @@ def _find_patient_by_identity(
     return find_patient_by_identity(session, _identity_input(req))
 
 
-def _discard_half_created_patient(patient_uuid: str | None, patient_label: str) -> None:
+def _discard_half_created_patient(
+    patient_uuid: str | None, patient_label: str, created_revision: int | None
+) -> None:
     """Undo a patient created for a report that then failed to file.
 
     Identity has to be committed before the upload can be read, so a failure
@@ -1737,24 +1764,65 @@ def _discard_half_created_patient(patient_uuid: str | None, patient_label: str) 
         return
 
     portal_dir = _portal_patients_dir() / patient_label if patient_label else None
-    if portal_dir is not None and portal_dir.is_dir():
-        try:
-            portal_dir.rmdir()
-        except OSError:
-            # Files landed in it after all; leave the folder and its contents.
-            pass
-
     try:
         with storage.session_scope() as session:
+            # Serialize the dependency check and deletion with concurrent filing.
+            # Derive the guard from every registered FK, including shared uploads,
+            # producer operations and catalogue records (not just ORM relations).
+            session.execute(sa_text("BEGIN IMMEDIATE"))
             patient = storage.get_patient(session, patient_uuid)
-            if patient is not None:
-                session.delete(patient)
-                session.commit()
+            if patient is None:
+                return
+            from .clinic_models import ClinicPatientAlias, ClinicPatientCatalogState
+            from .clinic_catalogue import _bump
+
+            state = session.get(ClinicPatientCatalogState, patient_uuid)
+            if (state.revision if state else None) != created_revision:
+                return
+            aliases = session.scalars(
+                sa_select(ClinicPatientAlias).where(
+                    ClinicPatientAlias.patient_uuid == patient_uuid
+                )
+            ).all()
+            if any(
+                alias.alias != patient_label or alias.ambiguous for alias in aliases
+            ):
+                return
+            for table in storage.Base.metadata.tables.values():
+                if table.name in {
+                    "clinic_patient_aliases",
+                    "clinic_patient_catalog_state",
+                }:
+                    continue
+                for fk in table.foreign_keys:
+                    if (
+                        fk.target_fullname == "patients.id"
+                        and session.execute(
+                            sa_select(fk.parent)
+                            .where(fk.parent == patient_uuid)
+                            .limit(1)
+                        ).first()
+                        is not None
+                    ):
+                        return
+            if portal_dir is not None and portal_dir.is_dir():
+                try:
+                    portal_dir.rmdir()
+                except OSError:
+                    # Another writer left bytes; retain their chart as well.
+                    return
+            for alias in aliases:
+                session.delete(alias)
+            if state:
+                session.delete(state)
+                _bump(session)
+            session.delete(patient)
+            session.commit()
     except Exception:
         LOGGER.exception(
             "bulk_upload_patient_cleanup_failed",
             patient_label=patient_label,
-            operatorHint="A patient row created for a report that failed to file could not be removed; delete it from the roster before re-uploading.",
+            operatorHint="The report could not be filed. The existing chart was retained for a safe retry.",
         )
 
 
@@ -1770,7 +1838,8 @@ async def bulk_upload_patients(
     finds the canonical patient, and the report is registered under it. A file
     nobody has identified is an error — the filename never becomes a label.
     """
-    identities_by_filename = _parse_bulk_upload_identities(identities)
+    filenames = [(file.filename or "upload").strip() or "upload" for file in files]
+    identities_by_position = _parse_bulk_upload_identities(identities, filenames)
 
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -1778,7 +1847,7 @@ async def bulk_upload_patients(
 
     for file_index, file in enumerate(files):
         filename = (file.filename or "upload").strip() or "upload"
-        identity = identities_by_filename.get(filename)
+        identity = identities_by_position.get(file_index)
         if identity is None:
             errors.append(
                 {
@@ -1796,6 +1865,7 @@ async def bulk_upload_patients(
         report_folder: Path | None = None
         patient_label = ""
         created_patient_uuid: str | None = None
+        created_revision: int | None = None
         try:
             with storage.session_scope() as session:
                 existing, keep_stored_name = _find_patient_by_identity(
@@ -1822,9 +1892,14 @@ async def bulk_upload_patients(
                         )
                     else:
                         patient = storage.create_patient(
-                            session, notes=identity.notes, **fields
+                            session, notes=identity.notes, commit=False, **fields
                         )
                         created_patient_uuid = patient.id
+                        from .clinic_models import ClinicPatientCatalogState
+
+                        state = session.get(ClinicPatientCatalogState, patient.id)
+                        created_revision = state.revision if state else None
+                        session.commit()
                 patient_label = patient.label
                 patient_uuid = patient.id
                 _ensure_portal_patient_folder(patient_label)
@@ -1881,7 +1956,9 @@ async def bulk_upload_patients(
         except Exception as exc:
             if report_folder is not None:
                 shutil.rmtree(report_folder, ignore_errors=True)
-            _discard_half_created_patient(created_patient_uuid, patient_label)
+            _discard_half_created_patient(
+                created_patient_uuid, patient_label, created_revision
+            )
             errors.append(
                 {
                     "file_index": file_index,
