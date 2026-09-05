@@ -10,6 +10,7 @@ from ...llm_client import AsyncOpenAICompatClient
 from ...logging_utils import get_logger, log_context
 from ...storage import get_report, get_run, list_artifacts, update_run_status
 from ...storage import session_scope
+from ..execution import raise_if_execution_blocked
 from ..json_utils import _loads_json_list
 from ..types import OnEvent
 from .data_pack import _DataPackMixin
@@ -184,6 +185,7 @@ class QEEGCouncilWorkflow(_DataPackMixin, _LLMCallsMixin, _StagesMixin):
                 )
                 return
             except Exception as e:
+                raise_if_execution_blocked(e)
                 with session_scope() as session:
                     update_run_status(
                         session, run_id, status="failed", error_message=str(e)

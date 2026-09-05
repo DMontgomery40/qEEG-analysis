@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .execution import current_execution
 from .constants import DATA_PACK_SCHEMA_VERSION
 
 
@@ -11,6 +12,9 @@ def _prompt_path(name: str) -> Path:
 
 
 def _load_prompt(name: str) -> str:
+    context = current_execution()
+    if context is not None:
+        return context.manifest["prompts"][name]
     path = _prompt_path(name)
     return path.read_text(encoding="utf-8")
 

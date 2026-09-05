@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from .execution_settings import execution_getenv
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -181,7 +182,7 @@ def _openai_reasoning_effort(model_id: str) -> str | None:
     no explicit tier is encoded.
     """
     for env_name in ("QEEG_OPENAI_REASONING_EFFORT", "OPENAI_REASONING_EFFORT"):
-        override = (os.getenv(env_name) or "").strip().lower()
+        override = (execution_getenv(env_name) or "").strip().lower()
         if override in {"minimal", "low", "medium", "high", "xhigh"}:
             return override
 
@@ -204,7 +205,7 @@ def _openai_reasoning_effort(model_id: str) -> str | None:
 
 
 def _split_env_list(name: str) -> list[str]:
-    raw = os.getenv(name) or ""
+    raw = execution_getenv(name) or ""
     items: list[str] = []
     for part in raw.replace("\n", ",").split(","):
         item = part.strip()
@@ -214,7 +215,7 @@ def _split_env_list(name: str) -> list[str]:
 
 
 def _extra_openrouter_model_ids() -> list[str]:
-    configured = os.getenv("QEEG_OPENROUTER_EXTRA_MODELS")
+    configured = execution_getenv("QEEG_OPENROUTER_EXTRA_MODELS")
     if configured is None:
         configured = "z-ai/glm-5.2"
     items: list[str] = []
@@ -233,7 +234,7 @@ def _is_openrouter_extra_model(model_id: str) -> bool:
 
 
 def _env_bool(name: str) -> bool | None:
-    raw = os.getenv(name)
+    raw = execution_getenv(name)
     if raw is None:
         return None
     value = raw.strip().lower()
@@ -262,7 +263,7 @@ def _openrouter_reasoning_config(model_id: str) -> dict[str, Any] | None:
         f"QEEG_OPENROUTER_REASONING_EFFORT_{suffix}",
         "QEEG_OPENROUTER_REASONING_EFFORT",
     ):
-        effort = (os.getenv(name) or "").strip().lower()
+        effort = (execution_getenv(name) or "").strip().lower()
         if effort:
             break
 
@@ -315,7 +316,7 @@ def _non_openai_reasoning_effort(model_id: str) -> str | None:
     reasoning_models = {m.lower() for m in _split_env_list("QEEG_REASONING_MODEL_IDS")}
     if mid not in reasoning_models:
         return None
-    effort = (os.getenv("QEEG_REASONING_EFFORT") or "high").strip().lower()
+    effort = (execution_getenv("QEEG_REASONING_EFFORT") or "high").strip().lower()
     return effort if effort in {"minimal", "low", "medium", "high", "xhigh"} else "high"
 
 
@@ -485,14 +486,14 @@ class AsyncOpenAICompatClient:
                     operator_hint="Set OPENROUTER_API_KEY when QEEG_OPENROUTER_EXTRA_MODELS contains the selected model.",
                 )
             base_url = (
-                os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api"
+                execution_getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api"
             ).rstrip("/")
             headers: dict[str, str] = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
             }
-            referer = (os.getenv("OPENROUTER_HTTP_REFERER") or "").strip()
-            title = (os.getenv("OPENROUTER_APP_TITLE") or "").strip()
+            referer = (execution_getenv("OPENROUTER_HTTP_REFERER") or "").strip()
+            title = (execution_getenv("OPENROUTER_APP_TITLE") or "").strip()
             if referer:
                 headers["HTTP-Referer"] = referer
             if title:

@@ -9,6 +9,11 @@ from ...config import ARTIFACTS_DIR
 from ...llm_client import UpstreamError
 from ...storage import Artifact, create_artifact
 from ...storage import session_scope
+from ..execution import (
+    raise_if_execution_blocked,
+    require_semantic_scope,
+    execution_llm,
+)
 from ..paths import _artifact_path, _stage_dir
 from ..types import PageImage, StageDef
 from ..utils import _sleep_backoff
@@ -64,10 +69,11 @@ class _LLMCallsMixin:
         temperature: float,
         max_tokens: int,
     ) -> str:
+        require_semantic_scope()
         attempts = 0
         while True:
             try:
-                text = await self._llm.chat_completions(
+                text = await execution_llm(self._llm).chat_completions(
                     model_id=model_id,
                     messages=[{"role": "user", "content": prompt_text}],
                     temperature=temperature,
@@ -81,6 +87,7 @@ class _LLMCallsMixin:
                 )
                 return text
             except UpstreamError as e:
+                raise_if_execution_blocked(e)
                 if e.status_code == 401:
                     raise _NeedsAuth(str(e)) from e
                 if (e.status_code in {429, 500, 502, 503, 504} or e.status_code is None) and attempts < 4:
@@ -119,10 +126,11 @@ class _LLMCallsMixin:
 
         messages = [{"role": "user", "content": content}]
 
+        require_semantic_scope()
         attempts = 0
         while True:
             try:
-                text = await self._llm.chat_completions(
+                text = await execution_llm(self._llm).chat_completions(
                     model_id=model_id,
                     messages=messages,
                     temperature=temperature,
@@ -136,6 +144,7 @@ class _LLMCallsMixin:
                 )
                 return text
             except UpstreamError as e:
+                raise_if_execution_blocked(e)
                 if e.status_code == 401:
                     raise _NeedsAuth(str(e)) from e
                 if (e.status_code in {429, 500, 502, 503, 504} or e.status_code is None) and attempts < 4:

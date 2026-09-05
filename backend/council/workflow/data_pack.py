@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
+from ...execution_settings import execution_getenv
 import re
 from pathlib import Path
 from typing import Any
 
 from ...storage import Report, create_artifact
 from ...storage import session_scope
+from ..execution import execute_unit, raise_if_execution_blocked, bind_source
 from ..constants import DATA_PACK_SCHEMA_VERSION, STAGES
 from ..json_utils import _json_loads_loose
 from ..paths import _data_pack_path, _stage_dir, _vision_transcript_path
@@ -320,6 +321,22 @@ class _DataPackMixin:
         - This runs multi-pass multimodal extraction across ALL available page images.
         - If strict is True, missing required numeric fields raises an error (no silent degradation).
         """
+        bind_source(
+            "s1/data-pack-input",
+            {
+                "run_id": run_id,
+                "report_id": report.id,
+                "filename": report.filename,
+                "report_text": report_text,
+                "strict": strict,
+                "candidates": candidate_extractor_model_ids,
+                "images": [
+                    {"page": im.page, "label": im.label, "base64_png": im.base64_png}
+                    for im in page_images
+                ],
+            },
+            consumers="s1/data-pack/",
+        )
         out_path = _data_pack_path(run_id)
         expected_sessions = _expected_session_indices(report_text)
         expected_pages = sorted(
@@ -463,7 +480,7 @@ class _DataPackMixin:
                 )
             return None
 
-        chunk_size = int(os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
+        chunk_size = int(execution_getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8")
         if chunk_size <= 0:
             chunk_size = 8
         # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
@@ -523,7 +540,9 @@ class _DataPackMixin:
         # Multi-pass extraction across all pages.
         errors: list[str] = []
         chunks = list(_chunked(page_images, chunk_size))
-        for extractor_model_id in candidate_extractor_model_ids:
+        for extractor_index, extractor_model_id in enumerate(
+            candidate_extractor_model_ids
+        ):
             try:
                 if emit is not None:
                     await emit(
@@ -563,13 +582,16 @@ class _DataPackMixin:
                             }
                         )
                     raw = await self._await_with_heartbeat(
-                        self._call_model_multimodal(
-                            model_id=extractor_model_id,
-                            prompt_text=prompt_text,
-                            images=chunk,
-                            temperature=0.0,
-                            max_tokens=3500,
-                            allow_text_fallback=False,
+                        execute_unit(
+                            f"s1/data-pack/{extractor_index}/{extractor_model_id}/chunk/{chunk_index}",
+                            self._call_model_multimodal(
+                                model_id=extractor_model_id,
+                                prompt_text=prompt_text,
+                                images=chunk,
+                                temperature=0.0,
+                                max_tokens=3500,
+                                allow_text_fallback=False,
+                            ),
                         ),
                         emit=emit,
                         payload={
@@ -688,15 +710,18 @@ class _DataPackMixin:
                     candidate_pages = _find_p300_rare_comparison_pages(
                         report_text, page_count=len(page_images)
                     )
-                    merged = await self._targeted_retry_missing(
-                        extractor_model_id=extractor_model_id,
-                        page_images=page_images,
-                        merged=merged,
-                        expected_sessions=expected_sessions,
-                        missing=missing,
-                        candidate_pages=candidate_pages,
-                        debug_dir=debug_dir,
-                        attempt_log=attempt_log,
+                    merged = await execute_unit(
+                        f"s1/data-pack/{extractor_index}/{extractor_model_id}/targeted-p300-n100",
+                        self._targeted_retry_missing(
+                            extractor_model_id=extractor_model_id,
+                            page_images=page_images,
+                            merged=merged,
+                            expected_sessions=expected_sessions,
+                            missing=missing,
+                            candidate_pages=candidate_pages,
+                            debug_dir=debug_dir,
+                            attempt_log=attempt_log,
+                        ),
                     )
                     apply_page_session_aliases(merged)
                     fact_conflicts = apply_deterministic_facts(merged)
@@ -708,15 +733,18 @@ class _DataPackMixin:
                     )
 
                 if missing:
-                    merged = await self._targeted_retry_summary_missing(
-                        extractor_model_id=extractor_model_id,
-                        page_images=page_images,
-                        merged=merged,
-                        expected_sessions=expected_sessions,
-                        missing=missing,
-                        candidate_pages=candidate_summary_pages,
-                        debug_dir=debug_dir,
-                        attempt_log=attempt_log,
+                    merged = await execute_unit(
+                        f"s1/data-pack/{extractor_index}/{extractor_model_id}/targeted-summary",
+                        self._targeted_retry_summary_missing(
+                            extractor_model_id=extractor_model_id,
+                            page_images=page_images,
+                            merged=merged,
+                            expected_sessions=expected_sessions,
+                            missing=missing,
+                            candidate_pages=candidate_summary_pages,
+                            debug_dir=debug_dir,
+                            attempt_log=attempt_log,
+                        ),
                     )
                     apply_page_session_aliases(merged)
                     fact_conflicts = apply_deterministic_facts(merged)
@@ -821,6 +849,7 @@ class _DataPackMixin:
                     )
                 return merged
             except Exception as e:
+                raise_if_execution_blocked(e)
                 if emit is not None:
                     await emit(
                         {
@@ -863,6 +892,20 @@ class _DataPackMixin:
         - Data pack is strict + normalized for required metrics.
         - Vision transcript is broad + best-effort for everything visible on the pages.
         """
+        bind_source(
+            "s1/transcript-input",
+            {
+                "run_id": run_id,
+                "report_id": report.id,
+                "model": transcript_model_id,
+                "strict": strict,
+                "images": [
+                    {"page": im.page, "label": im.label, "base64_png": im.base64_png}
+                    for im in page_images
+                ],
+            },
+            consumers="s1/transcript/",
+        )
         out_path = _vision_transcript_path(run_id)
         if out_path.exists():
             try:
@@ -897,7 +940,9 @@ class _DataPackMixin:
                 )
             return None
 
-        chunk_size = int(os.getenv("QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL", "2") or "2")
+        chunk_size = int(
+            execution_getenv("QEEG_VISION_TRANSCRIPT_PAGES_PER_CALL", "2") or "2"
+        )
         if chunk_size <= 0:
             chunk_size = 2
         # Hard requirement: PDFs >10 pages must be processed in 2+ multimodal passes.
@@ -905,7 +950,7 @@ class _DataPackMixin:
             chunk_size = 10
 
         max_tokens = int(
-            os.getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000"
+            execution_getenv("QEEG_VISION_TRANSCRIPT_MAX_TOKENS", "4000") or "4000"
         )
         if max_tokens <= 0:
             max_tokens = 4000
@@ -954,13 +999,16 @@ class _DataPackMixin:
                         }
                     )
                 text = await self._await_with_heartbeat(
-                    self._call_model_multimodal(
-                        model_id=transcript_model_id,
-                        prompt_text=prompt_text,
-                        images=chunk,
-                        temperature=0.0,
-                        max_tokens=max_tokens,
-                        allow_text_fallback=not strict,
+                    execute_unit(
+                        f"s1/transcript/{transcript_model_id}/chunk/{chunk_index}",
+                        self._call_model_multimodal(
+                            model_id=transcript_model_id,
+                            prompt_text=prompt_text,
+                            images=chunk,
+                            temperature=0.0,
+                            max_tokens=max_tokens,
+                            allow_text_fallback=not strict,
+                        ),
                     ),
                     emit=emit,
                     payload={
@@ -992,6 +1040,7 @@ class _DataPackMixin:
                         }
                     )
             except Exception as e:
+                raise_if_execution_blocked(e)
                 if emit is not None:
                     await emit(
                         {

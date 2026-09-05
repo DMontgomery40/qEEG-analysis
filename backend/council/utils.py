@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
+from ..execution_settings import execution_getenv
 import random
 from typing import Any
 
@@ -13,7 +13,7 @@ def _chunked(items: list[Any], size: int) -> list[list[Any]]:
 
 
 def _truthy_env(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
+    raw = execution_getenv(name)
     if raw is None:
         return default
     raw = raw.strip().lower()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
+from ...execution_settings import execution_getenv
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -13,6 +13,17 @@ from ...reports import extract_pdf_full
 from ...storage import Report, get_report, get_run, set_run_label_map
 from ...storage import session_scope
 from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
+from ..execution import (
+    execute_unit,
+    gather_units,
+    drain_task,
+    raise_if_execution_blocked,
+    current_execution,
+    bind_source,
+    validate_stage_admission,
+    bind_artifact_sources,
+    execution_llm,
+)
 from ..constants import STAGES
 from ..db_utils import _aggregate_required_changes, _stage_artifacts, _validate_stage5
 from ..json_utils import _json_loads_loose
@@ -28,6 +39,13 @@ from ..types import PageImage
 from ..utils import _chunked, _truthy_env
 
 
+def _execution_vision_capable(model_id):
+    context = current_execution()
+    if context is not None:
+        return context.roles["vision"].get(model_id, False)
+    return is_vision_capable(model_id)
+
+
 class _StagesMixin:
     async def _await_with_heartbeat(
         self,
@@ -39,61 +57,49 @@ class _StagesMixin:
     ) -> Any:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
-
         interval_s = self._int_env("QEEG_PROGRESS_HEARTBEAT_S", 30)
-        if emit is None or interval_s <= 0:
-            if timeout_s is None:
-                return await awaitable
-            return await asyncio.wait_for(awaitable, timeout=timeout_s)
-
-        task = asyncio.create_task(awaitable)
+        task = asyncio.ensure_future(awaitable)
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         deadline = started_at + timeout_s if timeout_s is not None else None
         heartbeat_count = 0
-        while True:
-            wait_s = interval_s
-            if deadline is not None:
-                remaining_s = deadline - loop.time()
-                if remaining_s <= 0:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    raise TimeoutError(
-                        f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+        try:
+            while True:
+                wait_s = interval_s if emit is not None and interval_s > 0 else None
+                if deadline is not None:
+                    remaining_s = deadline - loop.time()
+                    if remaining_s <= 0:
+                        raise TimeoutError(
+                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+                        )
+                    wait_s = (
+                        min(wait_s, remaining_s) if wait_s is not None else remaining_s
                     )
-                wait_s = min(wait_s, remaining_s)
-
+                try:
+                    return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        return await task
+                    if deadline is not None and loop.time() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+                        )
+                    heartbeat_count += 1
+                    await emit(
+                        {
+                            **payload,
+                            "status": "heartbeat",
+                            "elapsed_s": int(loop.time() - started_at),
+                            "heartbeat_count": heartbeat_count,
+                        }
+                    )
+        except BaseException as error:
             try:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
-            except asyncio.TimeoutError:
-                if task.done():
-                    return await task
-
-                now = loop.time()
-                elapsed_s = int(now - started_at)
-                if deadline is not None and now >= deadline:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    raise TimeoutError(
-                        f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
-                    )
-
-                heartbeat_count += 1
-                heartbeat_payload = dict(payload)
-                heartbeat_payload.update(
-                    {
-                        "status": "heartbeat",
-                        "elapsed_s": elapsed_s,
-                        "heartbeat_count": heartbeat_count,
-                    }
-                )
-                await emit(heartbeat_payload)
+                await drain_task(task, cancel=True)
+            except BaseException as child_error:
+                raise_if_execution_blocked(child_error)
+            raise_if_execution_blocked(error)
+            raise
 
     @staticmethod
     def _select_discovered_model_id(preferred: str) -> str | None:
@@ -144,7 +150,7 @@ class _StagesMixin:
     @staticmethod
     def _int_env(name: str, default: int) -> int:
         try:
-            v = int(os.getenv(name, str(default)) or str(default))
+            v = int(execution_getenv(name, str(default)) or str(default))
         except Exception:
             v = default
         return v
@@ -355,7 +361,7 @@ class _StagesMixin:
 
         repaired = text
         headings = required_headings or []
-        for _ in range(repair_calls):
+        for repair_index in range(repair_calls):
             start_heading = None
             start_idx = None
             if headings:
@@ -431,6 +437,7 @@ class _StagesMixin:
         report: Report,
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[0]
         prompt = _load_prompt("stage1_analysis.md")
         end_sentinel = "<!-- END STAGE1 ANALYSIS -->"
@@ -443,18 +450,22 @@ class _StagesMixin:
         # Prefer a single "checker" vision model for multimodal extraction + verification.
         # This is intentionally independent from the selected council model set, so the council can use
         # text-only models while still getting page-grounded structured data + transcript.
-        vision_checker_pref = os.getenv(
+        vision_checker_pref = execution_getenv(
             "QEEG_VISION_CHECKER_MODEL", MODEL_ROLE_DEFAULTS.stage1_vision
         )
         vision_checker_id = self._select_discovered_model_id(vision_checker_pref)
-        if vision_checker_id and not is_vision_capable(vision_checker_id):
+        context = current_execution()
+        if context is not None:
+            vision_checker_id = context.roles["checker"]
+            vision_checker_pref = context.roles["checker_preference"]
+        if vision_checker_id and not _execution_vision_capable(vision_checker_id):
             vision_checker_id = None
 
         # Load images from the report folder (preferred), then fallback lookup.
         page_images = _load_page_images(report, report_dir)
 
         needs_images = bool(vision_checker_id) or any(
-            is_vision_capable(m) for m in council_model_ids
+            _execution_vision_capable(m) for m in council_model_ids
         )
         expected_page_count = _page_count_from_markers(report_text)
         pages_present = {img.page for img in page_images}
@@ -658,11 +669,28 @@ class _StagesMixin:
                     "Fix: ensure Apple Vision OCR + Tesseract are available, then re-run: POST /api/reports/{report_id}/reextract"
                 )
 
-        extractor_models = [m for m in council_model_ids if is_vision_capable(m)]
+        extractor_models = [
+            m for m in council_model_ids if _execution_vision_capable(m)
+        ]
         if vision_checker_id:
             extractor_models = [vision_checker_id] + [
                 m for m in extractor_models if m != vision_checker_id
             ]
+        if context is not None:
+            extractor_models = context.roles["extractors"]
+        bind_source(
+            "s1/prepared-report",
+            {
+                "report_id": report.id,
+                "filename": report.filename,
+                "text": report_text,
+                "images": [
+                    {"page": im.page, "label": im.label, "base64_png": im.base64_png}
+                    for im in page_images
+                ],
+            },
+            consumers="s1/",
+        )
         if strict_data and not extractor_models:
             raise RuntimeError(
                 "Strict data availability requested, but no vision-capable models were selected.\n"
@@ -690,6 +718,11 @@ class _StagesMixin:
         elif extractor_models:
             transcript_model_id = extractor_models[0]
 
+        bind_source(
+            "s1/transcript-selection",
+            {"model": transcript_model_id, "data_pack": data_pack},
+            consumers="s1/transcript/",
+        )
         vision_transcript_text = await self._ensure_vision_transcript(
             run_id=run_id,
             report=report,
@@ -767,7 +800,7 @@ class _StagesMixin:
             stage1_retry_max_tokens = 6000
         stage1_require_complete = _truthy_env("QEEG_STAGE1_REQUIRE_COMPLETE", True)
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             try:
                 await emit(
                     {
@@ -786,12 +819,12 @@ class _StagesMixin:
                     "QEEG_STAGE1_PER_MODEL_VISION_NOTES", False
                 )
                 if (
-                    is_vision_capable(model_id)
+                    _execution_vision_capable(model_id)
                     and page_images
                     and (per_model_notes or not vision_transcript_block)
                 ):
                     chunk_size = int(
-                        os.getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8"
+                        execution_getenv("QEEG_VISION_PAGES_PER_CALL", "8") or "8"
                     )
                     if chunk_size <= 0:
                         chunk_size = 8
@@ -826,13 +859,16 @@ class _StagesMixin:
                             }
                         )
                         notes = await self._await_with_heartbeat(
-                            self._call_model_multimodal(
-                                model_id=model_id,
-                                prompt_text=ingest_prompt,
-                                images=chunk,
-                                temperature=0.0,
-                                max_tokens=2500,
-                                allow_text_fallback=not strict_data,
+                            execute_unit(
+                                f"s1/member/{member_index}/{model_id}/vision-notes/chunk/{chunk_index}",
+                                self._call_model_multimodal(
+                                    model_id=model_id,
+                                    prompt_text=ingest_prompt,
+                                    images=chunk,
+                                    temperature=0.0,
+                                    max_tokens=2500,
+                                    allow_text_fallback=not strict_data,
+                                ),
                             ),
                             emit=emit,
                             payload={
@@ -878,18 +914,22 @@ class _StagesMixin:
                 }
                 try:
                     text = await self._await_with_heartbeat(
-                        self._call_longform_chat_with_repairs(
-                            model_id=model_id,
-                            prompt_text=final_prompt.strip(),
-                            temperature=0.2,
-                            max_tokens=stage1_max_tokens,
-                            end_sentinel=end_sentinel,
-                            required_headings=None,
+                        execute_unit(
+                            f"s1/member/{member_index}/{model_id}/primary",
+                            self._call_longform_chat_with_repairs(
+                                model_id=model_id,
+                                prompt_text=final_prompt.strip(),
+                                temperature=0.2,
+                                max_tokens=stage1_max_tokens,
+                                end_sentinel=end_sentinel,
+                                required_headings=None,
+                            ),
                         ),
                         emit=emit,
                         payload=stage1_payload,
                     )
                 except Exception as primary_exc:
+                    raise_if_execution_blocked(primary_exc)
                     if isinstance(model_id, str) and model_id.startswith("mock-"):
                         raise
                     await emit(
@@ -910,13 +950,16 @@ class _StagesMixin:
                         "do not invent missing values, and still end with the required sentinel line.\n"
                     )
                     text = await self._await_with_heartbeat(
-                        self._call_longform_chat_with_repairs(
-                            model_id=model_id,
-                            prompt_text=retry_prompt,
-                            temperature=0.2,
-                            max_tokens=stage1_retry_max_tokens,
-                            end_sentinel=end_sentinel,
-                            required_headings=None,
+                        execute_unit(
+                            f"s1/member/{member_index}/{model_id}/reduced-budget",
+                            self._call_longform_chat_with_repairs(
+                                model_id=model_id,
+                                prompt_text=retry_prompt,
+                                temperature=0.2,
+                                max_tokens=stage1_retry_max_tokens,
+                                end_sentinel=end_sentinel,
+                                required_headings=None,
+                            ),
                         ),
                         emit=emit,
                         payload={**stage1_payload, "attempt": "retry"},
@@ -945,6 +988,7 @@ class _StagesMixin:
                 )
                 return model_id, text
             except Exception as exc:
+                raise_if_execution_blocked(exc)
                 await emit(
                     {
                         "run_id": run_id,
@@ -958,7 +1002,9 @@ class _StagesMixin:
                 )
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in council_model_ids))
+        results = await gather_units(
+            *(one(i, m) for i, m in enumerate(council_model_ids))
+        )
         successes = [r for r in results if r is not None]
         if not successes:
             raise RuntimeError("All models failed during Stage 1 analysis")
@@ -985,6 +1031,7 @@ class _StagesMixin:
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[1]
         prompt = _load_prompt("stage2_peer_review.md")
 
@@ -1016,6 +1063,15 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
         from ...analysis_inputs import saved_operator_instructions
 
         workflow_context = _workflow_context_block(
@@ -1037,6 +1093,7 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
+        bind_artifact_sources("s2/artifacts", artifacts)
         analyses_by_model: dict[str, str] = {}
         for a in artifacts:
             analyses_by_model[a.model_id] = Path(a.content_path).read_text(
@@ -1070,7 +1127,9 @@ class _StagesMixin:
             }
         )
 
-        async def one(reviewer_model_id: str) -> tuple[str, str] | None:
+        async def one(
+            member_index: int, reviewer_model_id: str
+        ) -> tuple[str, str] | None:
             # Reviewer sees all analyses except its own, still labeled A/B/C...
             reviewer_label = next(
                 (lbl for lbl, mid in label_map.items() if mid == reviewer_model_id),
@@ -1102,17 +1161,27 @@ class _StagesMixin:
                     for label, mid in label_map.items()
                     if mid != reviewer_model_id
                 ]
-                text = await run_stage2_peer_review_json(
-                    llm_client=self._llm,
-                    model_id=reviewer_model_id,
-                    prompt_text=prompt_text,
-                    expected_labels=expected_labels,
+                text = await execute_unit(
+                    f"s2/reviewer/{member_index}/{reviewer_model_id}",
+                    run_stage2_peer_review_json(
+                        llm_client=execution_llm(self._llm),
+                        model_id=reviewer_model_id,
+                        prompt_text=prompt_text,
+                        expected_labels=expected_labels,
+                    ),
                 )
                 return reviewer_model_id, text
-            except Exception:
+            except Exception as exc:
+                raise_if_execution_blocked(exc)
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in available_models))
+        results = await gather_units(
+            *(
+                one(i, m)
+                for i, m in enumerate(council_model_ids)
+                if m in available_models
+            )
+        )
         successes = [r for r in results if r is not None]
 
         for model_id, text in successes:
@@ -1138,6 +1207,7 @@ class _StagesMixin:
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[2]
         prompt = _load_prompt("stage3_revision.md")
         required_headings = None
@@ -1175,6 +1245,15 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
         from ...analysis_inputs import saved_operator_instructions
 
         workflow_context = _workflow_context_block(
@@ -1196,6 +1275,7 @@ class _StagesMixin:
                 f"{vision_transcript_text.strip()}\n\n---\n\n"
             )
 
+        bind_artifact_sources("s3/artifacts", s1 + s2)
         analyses_by_model = {
             a.model_id: Path(a.content_path).read_text(
                 encoding="utf-8", errors="replace"
@@ -1228,7 +1308,7 @@ class _StagesMixin:
         stage3_require_complete = _truthy_env("QEEG_STAGE3_REQUIRE_COMPLETE", True)
         stage3_timeout_s = self._int_env("QEEG_STAGE3_MODEL_TIMEOUT_S", 0)
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             analysis = analyses_by_model.get(model_id)
             if not analysis:
                 return None
@@ -1264,13 +1344,16 @@ class _StagesMixin:
             await emit({**event_payload, "status": "start"})
             try:
                 text = await self._await_with_heartbeat(
-                    self._call_longform_chat_with_repairs(
-                        model_id=model_id,
-                        prompt_text=prompt_text.strip(),
-                        temperature=0.2,
-                        max_tokens=stage3_max_tokens,
-                        end_sentinel=end_sentinel,
-                        required_headings=required_headings,
+                    execute_unit(
+                        f"s3/member/{member_index}/{model_id}",
+                        self._call_longform_chat_with_repairs(
+                            model_id=model_id,
+                            prompt_text=prompt_text.strip(),
+                            temperature=0.2,
+                            max_tokens=stage3_max_tokens,
+                            end_sentinel=end_sentinel,
+                            required_headings=required_headings,
+                        ),
                     ),
                     emit=emit,
                     payload=event_payload,
@@ -1291,6 +1374,7 @@ class _StagesMixin:
                 await emit({**event_payload, "status": "complete"})
                 return model_id, text
             except Exception as exc:
+                raise_if_execution_blocked(exc)
                 await emit(
                     {
                         **event_payload,
@@ -1301,7 +1385,13 @@ class _StagesMixin:
                 )
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in available_models))
+        results = await gather_units(
+            *(
+                one(i, m)
+                for i, m in enumerate(council_model_ids)
+                if m in available_models
+            )
+        )
         successes = [r for r in results if r is not None]
         if not successes:
             raise RuntimeError("All models failed during Stage 3 revision")
@@ -1327,6 +1417,7 @@ class _StagesMixin:
         run_id: str,
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id)
         stage = STAGES[3]
         prompt = _load_prompt("stage4_consolidation.md")
         required_headings = [
@@ -1409,6 +1500,15 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
         from ...analysis_inputs import saved_operator_instructions
 
         workflow_context = _workflow_context_block(
@@ -1445,6 +1545,7 @@ class _StagesMixin:
         if not revisions:
             raise RuntimeError("Consolidation requires at least one revision artifact")
 
+        bind_artifact_sources("s4/artifacts", revisions)
         revision_text = "\n\n".join(
             [
                 "Revision by "
@@ -1467,20 +1568,23 @@ class _StagesMixin:
             f"REVISED ANALYSES TO CONSOLIDATE:\n\n{revision_text}\n"
         )
         try:
-            max_tokens = int(os.getenv("QEEG_STAGE4_MAX_TOKENS", "12000") or "12000")
+            max_tokens = int(
+                execution_getenv("QEEG_STAGE4_MAX_TOKENS", "12000") or "12000"
+            )
         except Exception:
             max_tokens = 12000
         if max_tokens <= 0:
             max_tokens = 12000
         try:
-            repair_calls = int(os.getenv("QEEG_STAGE4_REPAIR_CALLS", "6") or "6")
+            repair_calls = int(execution_getenv("QEEG_STAGE4_REPAIR_CALLS", "6") or "6")
         except Exception:
             repair_calls = 6
         if repair_calls < 0:
             repair_calls = 0
         try:
             continuation_context_chars = int(
-                os.getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000") or "12000"
+                execution_getenv("QEEG_STAGE4_CONTINUATION_CONTEXT_CHARS", "12000")
+                or "12000"
             )
         except Exception:
             continuation_context_chars = 12000
@@ -1508,11 +1612,14 @@ class _StagesMixin:
         }
         await emit({**task_payload, "status": "start"})
         text = await self._await_with_heartbeat(
-            self._call_model_chat(
-                model_id=consolidator,
-                prompt_text=base_prompt_text,
-                temperature=0.2,
-                max_tokens=max_tokens,
+            execute_unit(
+                "s4/consolidation/initial",
+                self._call_model_chat(
+                    model_id=consolidator,
+                    prompt_text=base_prompt_text,
+                    temperature=0.2,
+                    max_tokens=max_tokens,
+                ),
             ),
             emit=emit,
             payload=task_payload,
@@ -1523,7 +1630,7 @@ class _StagesMixin:
         # long consolidations. Repair by regenerating from the next missing (or last present) required section onward.
         if not is_complete(text):
             repaired = text
-            for _ in range(repair_calls):
+            for repair_index in range(repair_calls):
                 # Prefer resuming from the first missing section. If all required sections are present but the
                 # sentinel is missing, resume from the last heading and ask for a clean ending.
                 start_heading = (
@@ -1564,11 +1671,14 @@ class _StagesMixin:
                     f"{continuation_instruction}"
                 )
                 cont = await self._await_with_heartbeat(
-                    self._call_model_chat(
-                        model_id=consolidator,
-                        prompt_text=cont_prompt,
-                        temperature=0.2,
-                        max_tokens=max_tokens,
+                    execute_unit(
+                        f"s4/consolidation/repair/{repair_index}",
+                        self._call_model_chat(
+                            model_id=consolidator,
+                            prompt_text=cont_prompt,
+                            temperature=0.2,
+                            max_tokens=max_tokens,
+                        ),
                     ),
                     emit=emit,
                     payload={**task_payload, "task": "stage4_repair"},
@@ -1624,6 +1734,7 @@ class _StagesMixin:
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[4]
         prompt = _load_prompt("stage5_final_review.md")
 
@@ -1655,6 +1766,15 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
         from ...analysis_inputs import saved_operator_instructions
 
         workflow_context = _workflow_context_block(
@@ -1694,6 +1814,7 @@ class _StagesMixin:
         if not s4:
             raise RuntimeError("Stage 5 requires Stage 4 consolidation artifact")
 
+        bind_artifact_sources(f"s{stage.num}/artifacts", s4)
         consolidated = Path(s4[0].content_path).read_text(
             encoding="utf-8", errors="replace"
         )
@@ -1707,7 +1828,7 @@ class _StagesMixin:
             }
         )
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             prompt_text = (
                 f"{prompt}\n\n---\n\n"
                 f"{workflow_context}\n\n---\n\n"
@@ -1718,18 +1839,24 @@ class _StagesMixin:
                 f"CONSOLIDATED REPORT TO REVIEW:\n\n{consolidated}\n"
             )
             try:
-                text = await run_stage5_final_review_json(
-                    llm_client=self._llm,
-                    model_id=model_id,
-                    prompt_text=prompt_text,
+                text = await execute_unit(
+                    f"s5/reviewer/{member_index}/{model_id}",
+                    run_stage5_final_review_json(
+                        llm_client=execution_llm(self._llm),
+                        model_id=model_id,
+                        prompt_text=prompt_text,
+                    ),
                 )
                 payload = _json_loads_loose(text)
                 _validate_stage5(payload)
                 return model_id, json.dumps(payload, indent=2, sort_keys=True)
-            except Exception:
+            except Exception as exc:
+                raise_if_execution_blocked(exc)
                 return None
 
-        results = await asyncio.gather(*(one(m) for m in council_model_ids))
+        results = await gather_units(
+            *(one(i, m) for i, m in enumerate(council_model_ids))
+        )
         successes = [r for r in results if r is not None]
         if not successes:
             raise RuntimeError("All models failed during Stage 5 final review")
@@ -1756,6 +1883,7 @@ class _StagesMixin:
         council_model_ids: list[str],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
+        validate_stage_admission(run_id, council_model_ids)
         stage = STAGES[5]
         prompt = _load_prompt("stage6_final_draft.md")
         required_headings = [
@@ -1768,7 +1896,7 @@ class _StagesMixin:
         ]
         end_sentinel = "<!-- END STAGE6 FINAL DRAFT -->"
         writer_model = (
-            os.getenv(
+            execution_getenv(
                 "QEEG_STAGE6_FINAL_DRAFT_MODEL",
                 MODEL_ROLE_DEFAULTS.stage6_final_draft,
             )
@@ -1786,7 +1914,9 @@ class _StagesMixin:
         writer_candidates: list[str] = []
         if DISCOVERED_MODEL_IDS:
             fallback_writer = (
-                os.getenv("QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2")
+                execution_getenv(
+                    "QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2"
+                )
                 or "z-ai/glm-5.2"
             ).strip()
             candidate_preferences = [writer_model, fallback_writer]
@@ -1799,6 +1929,9 @@ class _StagesMixin:
             # configured writer for isolated workflows and test harnesses.
             writer_candidates.append(writer_model)
 
+        context = current_execution()
+        if context is not None:
+            writer_candidates = context.roles["writers"]
         if not writer_candidates:
             raise RuntimeError(
                 "Stage 6 has no available final-draft model. "
@@ -1828,6 +1961,15 @@ class _StagesMixin:
             except Exception:
                 vision_transcript_text = ""
 
+        bind_source(
+            f"s{stage.num}/source-text",
+            {
+                "report_text": report_text,
+                "data_pack_text": data_pack_text,
+                "vision_transcript_text": vision_transcript_text,
+            },
+            consumers=f"s{stage.num}/",
+        )
         from ...analysis_inputs import saved_operator_instructions
 
         workflow_context = _workflow_context_block(
@@ -1866,6 +2008,7 @@ class _StagesMixin:
 
         if not s4:
             raise RuntimeError("Stage 6 requires Stage 4 consolidation artifact")
+        bind_artifact_sources("s6/artifacts", s4 + s5)
         consolidated = Path(s4[0].content_path).read_text(
             encoding="utf-8", errors="replace"
         )
@@ -1889,7 +2032,7 @@ class _StagesMixin:
 
         failures: list[str] = []
 
-        async def one(model_id: str) -> tuple[str, str] | None:
+        async def one(member_index: int, model_id: str) -> tuple[str, str] | None:
             changes = (
                 "\n".join([f"- {c}" for c in required_changes])
                 if required_changes
@@ -1909,13 +2052,16 @@ class _StagesMixin:
                 f"CONSOLIDATED REPORT:\n\n{consolidated}\n"
             )
             try:
-                text = await self._call_longform_chat_with_repairs(
-                    model_id=model_id,
-                    prompt_text=prompt_text.strip(),
-                    temperature=0.2,
-                    max_tokens=stage6_max_tokens,
-                    end_sentinel=end_sentinel,
-                    required_headings=required_headings,
+                text = await execute_unit(
+                    f"s6/writer/{member_index}/{model_id}",
+                    self._call_longform_chat_with_repairs(
+                        model_id=model_id,
+                        prompt_text=prompt_text.strip(),
+                        temperature=0.2,
+                        max_tokens=stage6_max_tokens,
+                        end_sentinel=end_sentinel,
+                        required_headings=required_headings,
+                    ),
                 )
                 enforce_complete = stage6_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
@@ -1931,12 +2077,13 @@ class _StagesMixin:
                     )
                 return model_id, text
             except Exception as exc:
+                raise_if_execution_blocked(exc)
                 failures.append(f"{model_id}: {type(exc).__name__}: {exc}")
                 return None
 
         successes: list[tuple[str, str]] = []
-        for candidate in writer_candidates:
-            result = await one(candidate)
+        for member_index, candidate in enumerate(writer_candidates):
+            result = await one(member_index, candidate)
             if result is not None:
                 successes.append(result)
                 break
