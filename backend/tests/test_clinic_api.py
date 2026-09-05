@@ -275,3 +275,81 @@ def test_policy_exposes_only_public_rules_and_stable_snapshot_fingerprint(
     changed = client.get("/policy").json()
     assert changed["policy"]["render"]["automaticPatientDocument"] is False
     assert changed["analysisPolicyFingerprint"] != fingerprint
+
+
+@pytest.mark.parametrize(
+    "sizes, expected",
+    [([8], 200), ([9], 413), ([4, 4], 200), ([4, 5], 413), ([1] * 101, 400)],
+)
+def test_upload_batch_bound_precedes_materialization(monkeypatch, sizes, expected):
+    import asyncio
+    import io
+    from starlette.datastructures import FormData, UploadFile
+    from backend import clinic_api, clinic_intake
+
+    reads = []
+    submitted = []
+
+    class TrackedUpload(UploadFile):
+        async def read(self, size=-1):
+            reads.append(size)
+            return await super().read(size)
+
+    uploads = [
+        TrackedUpload(io.BytesIO(b"a" * size), filename=f"file-{i}.txt", size=size)
+        for i, size in enumerate(sizes)
+    ]
+    form = FormData(
+        [
+            (key, value)
+            for upload in uploads
+            for key, value in [("files", upload), ("fileMeta", "{}")]
+        ]
+    )
+
+    class Request:
+        headers = {"idempotency-key": "bounded-upload"}
+
+        async def form(self, **kwargs):
+            return form
+
+    monkeypatch.setattr(clinic_api, "CLINIC_UPLOAD_MAX_BYTES", 8, raising=False)
+    monkeypatch.setattr(
+        clinic_intake,
+        "submit_upload",
+        lambda **kw: submitted.append(kw) or {"ok": True, "catalogRevision": 1},
+    )
+    response = asyncio.run(clinic_api.clinic_upload_submit(Request()))
+    status = response.status_code if hasattr(response, "status_code") else 200
+    assert status == expected
+    assert all(upload.file.closed for upload in uploads)
+    if expected != 200:
+        assert not reads and not submitted
+    else:
+        assert len(submitted[0]["files"]) == len(sizes)
+
+
+@pytest.mark.parametrize("sizes", [[9], [4, 5]])
+def test_http_upload_rejects_oversize_before_intake(live_api, monkeypatch, sizes):
+    from backend import clinic_api, clinic_intake
+
+    client, _, _ = live_api
+    monkeypatch.setattr(clinic_api, "CLINIC_UPLOAD_MAX_BYTES", 8)
+
+    def unexpected_intake(**kwargs):
+        pytest.fail("Oversize upload reached durable intake")
+
+    monkeypatch.setattr(clinic_intake, "submit_upload", unexpected_intake)
+    result = client.post(
+        "/uploads",
+        headers={"Idempotency-Key": "http-bounded"},
+        files=[
+            part
+            for i, size in enumerate(sizes)
+            for part in [
+                ("files", (f"f{i}.txt", b"x" * size, "text/plain")),
+                ("fileMeta", (None, "{}")),
+            ]
+        ],
+    )
+    assert result.status_code == 413

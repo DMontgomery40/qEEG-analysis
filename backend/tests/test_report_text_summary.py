@@ -79,22 +79,31 @@ def test_summary_uses_each_source_page_columns_and_global_aliases(reverse):
     assert len(facts) == 10
 
 
+@pytest.mark.parametrize("units", ["all", "none", "mixed"])
 @pytest.mark.parametrize("with_sd", [False, True])
 @pytest.mark.parametrize("count", [1, 2, 3])
-def test_reaction_time_column_count_never_consumes_sd_or_target(with_sd, count):
+def test_reaction_time_column_count_never_consumes_sd_or_target(with_sd, count, units):
     from backend.council.report_text import _facts_from_report_text_summary
 
     values = [283, 280, 275][:count]
     header = "".join(f"Session {i}\n" for i in range(1, count + 1))
     row = (
         "Physical Reaction Time "
-        + " ".join(f"{v} (+20) ms" if with_sd else f"{v} ms" for v in values)
+        + " ".join(
+            str(v)
+            + (" (+20)" if with_sd else "")
+            + (" ms" if units == "all" or (units == "mixed" and i % 2) else "")
+            for i, v in enumerate(values)
+        )
         + " 255-367 ms\n"
     )
     facts = _facts_from_report_text_summary(
         header + row, expected_sessions=[1, 2, 3, 4]
     )
     assert [f["value"] for f in facts] == values
+    assert [f.get("sd_plus_minus") for f in facts] == (
+        [20] if with_sd else [None]
+    ) * count
 
 
 def test_n100_extracts_local_rows_on_later_source_pages():

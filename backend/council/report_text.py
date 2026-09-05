@@ -351,9 +351,11 @@ def _summary_page_facts(
         if m_range:
             target = f"{m_range.group(1)}-{m_range.group(2)} ms"
             value_part = value_part[: m_range.start()]
-        cells = re.findall(r"(\d+)\s*(?:\(\s*\+?(\d+)\s*\))?\s*ms", value_part, re.I)
-        if not cells:
-            cells = [(token, "") for token in _number_tokens(value_part)]
+        # OCR can omit units from some or all cells. Consume each value and
+        # its parenthesized SD together before advancing to the next column.
+        cells = re.findall(
+            r"(\d+)\s*(?:\(\s*\+?(\d+)\s*\))?(?:\s*ms)?", value_part, re.I
+        )
         for sess, (token, sd) in zip(expected_sessions, cells):
             val = _safe_int(token)
             if val is None:

@@ -268,6 +268,9 @@ fi
 # Start backend
 if qeeg_component_is_running backend "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
   echo "✓ Backend already running on http://localhost:8000"
+elif lsof -ti tcp:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port 8000 belongs to another process; backend checkout could not be verified." >&2
+  exit 1
 else
   echo "Starting backend on http://localhost:8000..."
   uv run python -m backend.main &

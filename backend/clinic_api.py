@@ -12,6 +12,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from . import clinic_catalogue_reads as catalogue
 from .clinic_naming import POLICY_REVISION
 
+# Matches the existing shared clinic transport ceiling; applies to each batch.
+CLINIC_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
+
 
 def trusted_actor(request: Request):
     value = request.headers.get("x-clinic-actor")
@@ -289,7 +292,7 @@ async def clinic_upload_submit(request: Request):
     form = None
     try:
         key = require_key(request.headers.get("idempotency-key"))
-        form = await request.form()
+        form = await request.form(max_files=100)
         allowed = {
             "files",
             "fileMeta",
@@ -312,15 +315,32 @@ async def clinic_upload_submit(request: Request):
         uploads = form.getlist("files")
         metas = form.getlist("fileMeta")
         if (
-            not uploads
+            not 1 <= len(uploads) <= 100
             or len(uploads) != len(metas)
             or not all(isinstance(f, UploadFile) for f in uploads)
         ):
             raise ValueError("Each file requires ordered fileMeta")
-        files = [
-            (f.filename, await f.read(), f.content_type or "application/octet-stream")
-            for f in uploads
-        ]
+        # Starlette counts actual multipart bytes while spooling files to disk.
+        # Check that authoritative size before materializing any batch member.
+        if (
+            any(f.size is None or f.size < 0 for f in uploads)
+            or sum(f.size for f in uploads) > CLINIC_UPLOAD_MAX_BYTES
+        ):
+            return JSONResponse(
+                {"error": "Upload batch exceeds 256 MiB"}, status_code=413
+            )
+        files = []
+        total = 0
+        for f in uploads:
+            data = await f.read(CLINIC_UPLOAD_MAX_BYTES - total + 1)
+            total += len(data)
+            if total > CLINIC_UPLOAD_MAX_BYTES:
+                return JSONResponse(
+                    {"error": "Upload batch exceeds 256 MiB"}, status_code=413
+                )
+            files.append(
+                (f.filename, data, f.content_type or "application/octet-stream")
+            )
         kwargs = dict(
             key=key,
             identity={

@@ -27,5 +27,18 @@ qeeg_component_pattern() {
 qeeg_component_is_running() {
   local pattern
   pattern="$(qeeg_component_pattern "$1" "$2" "$3")" || return 2
-  pgrep -f -- "$pattern" >/dev/null 2>&1
+  case "$1" in
+    backend|pipeline_worker)
+      local project_root pid process_root
+      project_root="$(cd "$2" && pwd -P)" || return 1
+      for pid in $(pgrep -f -- "$pattern" 2>/dev/null); do
+        process_root="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+        [ -n "$process_root" ] || continue
+        process_root="$(cd "$process_root" 2>/dev/null && pwd -P)" || continue
+        [ "$process_root" = "$project_root" ] && return 0
+      done
+      return 1
+      ;;
+    *) pgrep -f -- "$pattern" >/dev/null 2>&1 ;;
+  esac
 }
