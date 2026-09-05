@@ -877,7 +877,9 @@ def _file_new_patient_upload(
             import hashlib
 
             answer_key = hashlib.sha256(
-                json.dumps(answer, sort_keys=True).encode()
+                json.dumps(
+                    {"uploadId": upload_id, "answer": answer}, sort_keys=True
+                ).encode()
             ).hexdigest()
             result_upload = clinic_intake.resolve_upload(
                 upload_id, key="legacy-resolution:" + answer_key, resolution=answer

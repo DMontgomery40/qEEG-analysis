@@ -79,47 +79,90 @@ def import_submission_evidence(receipt, *, marker=None, files=None, registered=N
         or len(expected["uploaded"]) != len(m["files"])
     ):
         raise ValueError("Missing original upload response")
-    marker_matches = (
-        isinstance(marker, dict)
-        and marker.get("uploadId") == key
-        and marker.get("kind") == "new_patient_upload"
-        and marker.get("uploadedAt") == receipt["uploadedAt"]
-        and marker.get("uploadedBy") == m["uploadedBy"]
-        and marker.get("fileKey") in {f.get("fileKey") for f in expected["uploaded"]}
-    )
-    uncertain = (
-        receipt["phase"] in ("publishing", "published")
-        and not marker_matches
-        and registered is None
-    )
-    record = dict(
-        uploadId=key,
-        status="uncertain" if uncertain else "pending",
-        identity=m["identity"],
-        originalSubmission=receipt,
-    )
+
+    def matching_marker(value):
+        return (
+            isinstance(value, dict)
+            and value.get("uploadId") == key
+            and value.get("kind") == "new_patient_upload"
+            and value.get("uploadedAt") == receipt["uploadedAt"]
+            and value.get("uploadedBy") == m["uploadedBy"]
+            and value.get("fileKey") in {f.get("fileKey") for f in expected["uploaded"]}
+        )
+
     with _write() as s:
         prior = s.get(ClinicLegacyUpload, key)
+        evidence = json.loads(prior.evidence_json) if prior else {}
+        legacy = (
+            json.loads(prior.record_json)
+            if prior
+            else dict(uploadId=key, status="pending", identity=m["identity"])
+        )
         if prior:
-            legacy = json.loads(prior.record_json)
-            if legacy.get("patientId") and registered is None:
-                uncertain = True
-                record["status"] = "uncertain"
-            original = json.loads(prior.evidence_json).get("originalSubmission")
+            original = evidence.get("originalSubmission")
             if original and (
                 original["manifest"] != m
                 or original["uploadedAt"] != receipt["uploadedAt"]
                 or original.get("response") != expected
             ):
                 raise CatalogueConflict("Original submission identity changed")
+            if (
+                legacy.get("patientId")
+                and registered is not None
+                and registered.get("patientId") != legacy["patientId"]
+            ):
+                from .clinic_catalogue_reads import _patient
+
+                try:
+                    same_patient = (
+                        _patient(s, registered.get("patientId")).id
+                        == _patient(s, legacy["patientId"]).id
+                    )
+                except LookupError:
+                    same_patient = False
+                if not same_patient:
+                    raise CatalogueConflict("Original registered chart binding changed")
+
+        # Preserve the first receipt and every distinct observation, including absent
+        # or mismatched markers. Replaying old phases cannot erase surviving proof.
+        evidence.setdefault("originalSubmission", receipt)
+        observations = evidence.setdefault("submissionObservations", [])
+        observation = dict(receipt=receipt, marker=marker)
+        if observation not in observations:
+            observations.append(observation)
+        marker_seen = any(matching_marker(o["marker"]) for o in observations)
+        publishing_seen = any(
+            o["receipt"]["phase"] in ("publishing", "published") for o in observations
+        )
+        previous_status = (
+            legacy.get("preReconciliationStatus", "uncertain")
+            if legacy["status"] == "uncertain"
+            else legacy["status"]
+        )
+        uncertain = bool(legacy.get("patientId")) or (
+            (publishing_seen or previous_status == "uncertain") and not marker_seen
+        )
+        record = {
+            **legacy,
+            "originalSubmission": evidence["originalSubmission"],
+            "preReconciliationStatus": previous_status,
+            "status": "uncertain" if uncertain else previous_status,
+        }
+        if prior:
+            if prior.evidence_json != _json(evidence) or prior.record_json != _json(
+                record
+            ):
+                prior.evidence_json = _json(evidence)
+                prior.record_json = _json(record)
+                _bump(s)
         else:
             s.add(
                 ClinicLegacyUpload(
-                    id=key, evidence_json=_json(record), record_json=_json(record)
+                    id=key, evidence_json=_json(evidence), record_json=_json(record)
                 )
             )
             _bump(s)
-    if uncertain or files is None:
+    if files is None or (uncertain and registered is None):
         return record
     if len(files) != len(m["files"]):
         raise ValueError("Exact ordered original bytes required")

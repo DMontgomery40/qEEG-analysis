@@ -1,6 +1,7 @@
 from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
 import hashlib
 import json
+import pytest
 from backend import pipeline_uploads
 from backend.clinic_upload_import import import_submission_evidence
 from backend.tests.test_clinic_intake import counts
@@ -141,3 +142,269 @@ def test_legacy_conflict_can_be_answered_through_shared_api_domain(temp_data_dir
         == result
     )
     assert counts() == (0, 0, 0, 0, 0)
+
+
+def original_marker():
+    return dict(
+        kind="new_patient_upload",
+        uploadId="original-id",
+        uploadedAt=1234,
+        uploadedBy="Doctor",
+        fileKey="uploads/pending/original-id/000__same.txt",
+    )
+
+
+def durable_legacy_snapshot():
+    from backend import storage
+    from backend.clinic_intake import get_upload
+    from backend.clinic_records import ClinicLegacyUpload
+
+    with storage.session_scope() as session:
+        row = session.get(ClinicLegacyUpload, "original-id")
+        evidence = json.loads(row.evidence_json)
+        record = json.loads(row.record_json)
+    return dict(evidence=evidence, record=record, shared=get_upload("original-id"))
+
+
+@pytest.mark.parametrize("answer_kind", ["forceNew", "attachTo"])
+def test_independent_worker_uploads_share_answers_without_sharing_mutations(
+    temp_data_dir, tmp_path, monkeypatch, answer_kind
+):
+    from backend import clinic_intake, reports, storage
+    from backend.tests.test_portal_pipeline_worker import (
+        _UploadClient,
+        _upload_job,
+        _fake_save_report_upload,
+        _no_paid_work,
+    )
+    from scripts import portal_pipeline_worker as worker
+
+    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setattr(
+        reports, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+    )
+    target = clinic_intake.submit_upload(
+        key="seed",
+        identity=_upload_job()["identity"],
+        files=[("seed.txt", b"seed", "text/plain")],
+        file_meta=[{}],
+    )["upload"]["patientId"]
+    answer = {"forceNew": True} if answer_kind == "forceNew" else {"attachTo": target}
+    result_ids = []
+    for index, name in enumerate(("Barry", "Beth")):
+        upload_id = f"independent-{index}"
+        payload = _upload_job()
+        payload.update(
+            uploadId=upload_id, fileKey=f"uploads/pending/{upload_id}/scan.pdf"
+        )
+        payload["identity"]["firstName"] = name
+        job_key = f"pipeline/jobs/{upload_id}/upload.json"
+        client = _UploadClient(
+            {job_key: payload}, blobs={payload["fileKey"]: name.encode()}
+        )
+        args = dict(
+            client=client,
+            portal_dir=tmp_path / "portal",
+            status_dir=tmp_path / "status",
+            job_key=job_key,
+            payload=payload,
+        )
+        assert (
+            worker.process_new_patient_upload(**args).status == "needs_operator_answer"
+        )
+        record = pipeline_uploads.read_upload(upload_id)
+        pipeline_uploads.write_upload({**record, "resolution": answer})
+        accepted = worker.process_new_patient_upload(**args)
+        assert accepted.status == "registered", accepted.note
+        result_ids.append(accepted.patient_id)
+        original_upload = clinic_intake.get_upload(upload_id)
+        for _ in range(2):
+            client._jobs[job_key] = payload
+            replay = worker.process_new_patient_upload(**args)
+            assert replay.patient_id == accepted.patient_id
+            assert replay.status in ("registered", "already_registered")
+            assert clinic_intake.get_upload(upload_id) == original_upload
+    assert result_ids == (
+        [target + "_2", target + "_3"]
+        if answer_kind == "forceNew"
+        else [target, target]
+    )
+    with storage.session_scope() as session:
+        patients = storage.list_patients(session)
+        assert len(patients) == (3 if answer_kind == "forceNew" else 1)
+        assert sum(len(storage.list_reports(session, p.id)) for p in patients) == 2
+
+
+@pytest.mark.parametrize(
+    "legacy_status", ["pending", "needs_operator_answer", "registered"]
+)
+@pytest.mark.parametrize("phase", ["admitted", "publishing", "published"])
+def test_existing_legacy_receipt_and_reconciliation_survive_process_replacement(
+    temp_data_dir, legacy_status, phase
+):
+    import os
+    import subprocess
+    import sys
+    from backend.clinic_upload_import import import_legacy_record
+
+    legacy = dict(
+        uploadId="original-id",
+        status=legacy_status,
+        identity=original()["manifest"]["identity"],
+        conflict={"original": "parked"},
+    )
+    if legacy_status == "registered":
+        legacy["patientId"] = "AB_02-02-1900"
+    import_legacy_record(legacy)
+    receipt = original(phase)
+    expected_status = (
+        "uncertain"
+        if phase != "admitted" or legacy_status == "registered"
+        else legacy_status
+    )
+    returned = import_submission_evidence(receipt)
+    snapshot = durable_legacy_snapshot()
+    assert returned["status"] == expected_status
+    assert snapshot["shared"]["upload"]["status"] == expected_status
+    assert snapshot["record"]["originalSubmission"] == receipt
+    assert snapshot["record"].get("patientId") == legacy.get("patientId")
+    assert snapshot["record"]["conflict"] == legacy["conflict"]
+    assert all(snapshot["evidence"][key] == value for key, value in legacy.items())
+    assert snapshot["evidence"]["originalSubmission"] == receipt
+    assert snapshot["evidence"]["submissionObservations"] == [
+        dict(receipt=receipt, marker=None)
+    ]
+    assert import_submission_evidence(receipt) == returned
+    assert durable_legacy_snapshot() == snapshot
+    paired = temp_data_dir.parent / (temp_data_dir.name + "-read-paired")
+    paired.mkdir()
+    (paired / "data").symlink_to(temp_data_dir, target_is_directory=True)
+    code = """
+import json
+from backend import storage
+from backend.tests.test_clinic_upload_import import durable_legacy_snapshot
+storage.init_db()
+print(json.dumps(durable_legacy_snapshot(),sort_keys=True))
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        env={
+            **os.environ,
+            "DATA_DIR": str(paired / "data"),
+            "QEEG_ANALYSIS_ROOT": str(paired),
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout) == snapshot
+    assert counts() == (0, 0, 0, 0, 0)
+
+
+def test_import_preserves_phase_marker_history_and_rejects_changed_material(
+    temp_data_dir,
+):
+    import copy
+    from backend.clinic_models import CatalogueConflict
+    from backend.clinic_upload_import import import_legacy_record
+
+    legacy = dict(
+        uploadId="original-id",
+        status="needs_operator_answer",
+        identity={"firstName": "Ada"},
+        conflict={"candidates": []},
+        resolution={"forceNew": True},
+    )
+    import_legacy_record(legacy)
+    first = original("admitted")
+    import_submission_evidence(first)
+    published = original("published")
+    import_submission_evidence(published)
+    assert durable_legacy_snapshot()["shared"]["upload"]["status"] == "uncertain"
+    marker = original_marker()
+    import_submission_evidence(published, marker=marker)
+    state = durable_legacy_snapshot()
+    assert state["record"]["status"] == "needs_operator_answer"
+    assert state["record"]["resolution"] == legacy["resolution"]
+    assert state["evidence"]["originalSubmission"] == first
+    assert state["evidence"]["submissionObservations"] == [
+        dict(receipt=first, marker=None),
+        dict(receipt=published, marker=None),
+        dict(receipt=published, marker=marker),
+    ]
+    # Old observations can replay, but cannot erase newer reconciliation proof.
+    import_submission_evidence(first)
+    assert durable_legacy_snapshot() == state
+    for field in ("manifest", "uploadedAt", "response"):
+        changed = copy.deepcopy(published)
+        if field == "manifest":
+            changed[field]["uploadedBy"] = "Another"
+            changed["manifestHash"] = hashlib.sha256(
+                json.dumps(changed[field], separators=(",", ":")).encode()
+            ).hexdigest()
+        elif field == "uploadedAt":
+            changed[field] += 1
+        else:
+            changed[field]["uploaded"][0]["fileKey"] += "changed"
+        with pytest.raises(CatalogueConflict):
+            import_submission_evidence(changed, marker=marker)
+        assert durable_legacy_snapshot() == state
+
+
+def test_registered_import_cannot_replace_original_chart_evidence(temp_data_dir):
+    from backend.clinic_models import CatalogueConflict
+    from backend.clinic_upload_import import import_legacy_record
+
+    import_legacy_record(
+        dict(uploadId="original-id", status="registered", patientId="AB_02-02-1900")
+    )
+    import_submission_evidence(original(), marker=original_marker())
+    before = durable_legacy_snapshot()
+    with pytest.raises(CatalogueConflict):
+        import_submission_evidence(
+            original(),
+            marker=original_marker(),
+            registered={"patientId": "ZZ_01-01-1900", "sourceIds": ["unrelated"]},
+        )
+    assert durable_legacy_snapshot() == before
+    assert before["shared"]["upload"]["patientId"] == "AB_02-02-1900"
+    assert before["shared"]["upload"]["status"] == "uncertain"
+
+
+def test_reconciliation_keeps_later_operator_answer_and_original_conflict(
+    temp_data_dir,
+):
+    from backend.clinic_intake import resolve_upload
+    from backend.clinic_upload_import import import_legacy_record
+
+    conflict = {"candidates": [{"patient_id": "AB_02-02-1900", "name": "Ada Baker"}]}
+    import_legacy_record(
+        dict(
+            uploadId="original-id",
+            status="needs_operator_answer",
+            identity=original()["manifest"]["identity"],
+            conflict=conflict,
+        )
+    )
+    receipt = original()
+    import_submission_evidence(receipt)
+    mismatched = {**original_marker(), "uploadedBy": "Another"}
+    assert (
+        import_submission_evidence(receipt, marker=mismatched)["status"] == "uncertain"
+    )
+    assert (
+        import_submission_evidence(receipt, marker=original_marker())["status"]
+        == "needs_operator_answer"
+    )
+    answer = {"forceNew": True}
+    resolve_upload("original-id", key="operator-answer", resolution=answer)
+    assert import_submission_evidence(receipt)["status"] == "pending"
+    state = durable_legacy_snapshot()
+    assert state["record"]["resolution"] == answer
+    assert state["evidence"]["conflict"] == conflict
+    assert state["evidence"]["submissionObservations"] == [
+        dict(receipt=receipt, marker=None),
+        dict(receipt=receipt, marker=mismatched),
+        dict(receipt=receipt, marker=original_marker()),
+    ]
