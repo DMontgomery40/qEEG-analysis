@@ -440,6 +440,14 @@ def _ensure_artifact_operation_key() -> None:
         )
 
 
+def _ensure_clinic_location_lookup_index() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_clinic_locations_kind_key_active_artifact "
+            "ON clinic_locations(kind, key, active, artifact_id)"
+        )
+
+
 def init_db() -> None:
     from . import clinic_records  # noqa: F401 - additive tables in the original Base
     from .clinic_catalogue import initialize_catalogue
@@ -451,6 +459,7 @@ def init_db() -> None:
     _ensure_analysis_input_columns()
     _ensure_run_execution_columns()
     _ensure_artifact_operation_key()
+    _ensure_clinic_location_lookup_index()
     initialize_catalogue()
 
 

@@ -967,3 +967,133 @@ def test_missing_state_rolls_back_materialized_projection(chart, temp_data_dir):
         assert projection.artifact_id is None and projection.error is not None
         assert session.scalar(select(func.count()).select_from(ClinicArtifact)) == 0
         assert session.get(storage.PatientFile, source.id) is not None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_location_lookup_index_initialization_preserves_catalogue(
+    chart, temp_data_dir, existing
+):
+    artifact = register(chart, temp_data_dir)
+    index = "ix_clinic_locations_kind_key_active_artifact"
+    with storage.engine.begin() as conn:
+        if existing:
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {index}")
+        conn.exec_driver_sql(
+            "UPDATE clinic_catalog_state SET revision=37, import_complete=1, import_manifest='original-manifest'"
+        )
+        locations = conn.exec_driver_sql(
+            "SELECT * FROM clinic_locations ORDER BY id"
+        ).all()
+        authority = conn.exec_driver_sql("SELECT * FROM clinic_catalog_state").all()
+        assert locations and artifact["fileId"]
+    for _ in range(2):
+        storage.init_db()
+        with storage.engine.connect() as conn:
+            indexes = conn.exec_driver_sql("PRAGMA index_list(clinic_locations)").all()
+            matches = [row for row in indexes if row[1] == index]
+            assert len(matches) == 1 and matches[0][2] == 0
+            assert [
+                row[2] for row in conn.exec_driver_sql(f"PRAGMA index_info({index})")
+            ] == ["kind", "key", "active", "artifact_id"]
+            assert (
+                conn.exec_driver_sql("SELECT * FROM clinic_locations ORDER BY id").all()
+                == locations
+            )
+            assert (
+                conn.exec_driver_sql("SELECT * FROM clinic_catalog_state").all()
+                == authority
+            )
+
+
+@pytest.mark.parametrize("unrelated", [1000, 10000, 100000])
+def test_location_lookup_index_bounds_actual_conflict_query_work(
+    chart, temp_data_dir, unrelated
+):
+    from sqlalchemy import insert, select
+    from backend.clinic_models import ClinicLocation
+
+    artifacts = [
+        register(chart, temp_data_dir, source=f"location-{i}")["fileId"]
+        for i in range(4)
+    ]
+    index = "ix_clinic_locations_kind_key_active_artifact"
+    target = "patients/ZZ_01-01-1900_12/files/exact.pdf"
+    rows = [
+        dict(
+            id=f"noise-{i}",
+            artifact_id=artifacts[0],
+            kind="netlify",
+            key=f"unrelated/{i:08d}",
+            patient_alias=chart.label,
+            active=True,
+            verified=False,
+        )
+        for i in range(unrelated)
+    ]
+    rows += [
+        dict(
+            id=name,
+            artifact_id=artifact,
+            kind=kind,
+            key=target,
+            patient_alias=chart.label,
+            active=active,
+            verified=False,
+        )
+        for name, artifact, kind, active in [
+            ("own", artifacts[0], "netlify", True),
+            ("other-active", artifacts[1], "netlify", True),
+            ("other-inactive", artifacts[2], "netlify", False),
+            ("other-kind", artifacts[3], "local", True),
+        ]
+    ]
+    with storage.engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP INDEX IF EXISTS {index}")
+        conn.execute(insert(ClinicLocation), rows)
+    # These are the full-row SQLAlchemy predicates used by _location and
+    # _add_exact_location; both preserve active and different-artifact filtering.
+    for key, expected in [(target, ["other-active"]), ("absent", [])]:
+        statement = select(ClinicLocation).where(
+            ClinicLocation.kind == "netlify",
+            ClinicLocation.key == key,
+            ClinicLocation.artifact_id != artifacts[0],
+            ClinicLocation.active.is_(True),
+        )
+        sql = str(
+            statement.compile(storage.engine, compile_kwargs={"literal_binds": True})
+        )
+        with storage.engine.connect() as conn:
+            plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql).all()
+            assert any("SCAN clinic_locations" in row[3] for row in plan)
+            assert [row[0] for row in conn.exec_driver_sql(sql)] == expected
+    storage.init_db()
+    for key, expected in [(target, ["other-active"]), ("absent", [])]:
+        statement = select(ClinicLocation).where(
+            ClinicLocation.kind == "netlify",
+            ClinicLocation.key == key,
+            ClinicLocation.artifact_id != artifacts[0],
+            ClinicLocation.active.is_(True),
+        )
+        sql = str(
+            statement.compile(storage.engine, compile_kwargs={"literal_binds": True})
+        )
+        with storage.engine.connect() as conn:
+            plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql).all()
+            assert any(
+                f"SEARCH clinic_locations USING INDEX {index}" in row[3] for row in plan
+            )
+            instructions = 0
+
+            def step():
+                nonlocal instructions
+                instructions += 1
+                return 0
+
+            raw = conn.connection.driver_connection
+            raw.set_progress_handler(step, 1)
+            try:
+                assert [row[0] for row in conn.exec_driver_sql(sql)] == expected
+            finally:
+                raw.set_progress_handler(None, 0)
+            # Fixed candidate count, independent of 1K/10K/100K unrelated rows.
+            assert instructions < 200, (unrelated, key, instructions)
