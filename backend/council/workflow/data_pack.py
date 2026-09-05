@@ -8,7 +8,12 @@ from typing import Any
 
 from ...storage import Report, create_artifact
 from ...storage import session_scope
-from ..execution import execute_unit, raise_if_execution_blocked, bind_source
+from ..execution import (
+    execute_unit,
+    raise_if_execution_blocked,
+    bind_source,
+    canonical_execution_report,
+)
 from ..constants import DATA_PACK_SCHEMA_VERSION, STAGES
 from ..json_utils import _json_loads_loose
 from ..paths import _data_pack_path, _stage_dir, _vision_transcript_path
@@ -321,6 +326,9 @@ class _DataPackMixin:
         - This runs multi-pass multimodal extraction across ALL available page images.
         - If strict is True, missing required numeric fields raises an error (no silent degradation).
         """
+        report = canonical_execution_report(
+            run_id, report, report_text=report_text, page_images=page_images
+        )
         bind_source(
             "s1/data-pack-input",
             {
@@ -892,6 +900,7 @@ class _DataPackMixin:
         - Data pack is strict + normalized for required metrics.
         - Vision transcript is broad + best-effort for everything visible on the pages.
         """
+        report = canonical_execution_report(run_id, report, page_images=page_images)
         bind_source(
             "s1/transcript-input",
             {

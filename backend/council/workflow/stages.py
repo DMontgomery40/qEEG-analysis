@@ -21,6 +21,7 @@ from ..execution import (
     current_execution,
     bind_source,
     validate_stage_admission,
+    canonical_execution_report,
     bind_artifact_sources,
     execution_llm,
 )
@@ -438,6 +439,7 @@ class _StagesMixin:
         emit: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
         validate_stage_admission(run_id, council_model_ids)
+        report = canonical_execution_report(run_id, report)
         stage = STAGES[0]
         prompt = _load_prompt("stage1_analysis.md")
         end_sentinel = "<!-- END STAGE1 ANALYSIS -->"
@@ -1895,12 +1897,17 @@ class _StagesMixin:
             "# Speculative Commentary and Interpretive Hypotheses",
         ]
         end_sentinel = "<!-- END STAGE6 FINAL DRAFT -->"
+        context = current_execution()
         writer_model = (
-            execution_getenv(
-                "QEEG_STAGE6_FINAL_DRAFT_MODEL",
-                MODEL_ROLE_DEFAULTS.stage6_final_draft,
+            context.roles["writer_preference"]
+            if context is not None
+            else (
+                execution_getenv(
+                    "QEEG_STAGE6_FINAL_DRAFT_MODEL",
+                    MODEL_ROLE_DEFAULTS.stage6_final_draft,
+                )
+                or MODEL_ROLE_DEFAULTS.stage6_final_draft
             )
-            or MODEL_ROLE_DEFAULTS.stage6_final_draft
         ).strip()
         if not writer_model:
             raise RuntimeError("Stage 6 final-draft writer model is not configured")
@@ -1912,7 +1919,9 @@ class _StagesMixin:
             report = get_report(session, run.report_id) if run else None
 
         writer_candidates: list[str] = []
-        if DISCOVERED_MODEL_IDS:
+        if context is not None:
+            writer_candidates = context.roles["writers"]
+        elif DISCOVERED_MODEL_IDS:
             fallback_writer = (
                 execution_getenv(
                     "QEEG_STAGE6_FINAL_DRAFT_FALLBACK_MODEL", "z-ai/glm-5.2"
@@ -1929,9 +1938,6 @@ class _StagesMixin:
             # configured writer for isolated workflows and test harnesses.
             writer_candidates.append(writer_model)
 
-        context = current_execution()
-        if context is not None:
-            writer_candidates = context.roles["writers"]
         if not writer_candidates:
             raise RuntimeError(
                 "Stage 6 has no available final-draft model. "

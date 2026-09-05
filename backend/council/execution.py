@@ -429,6 +429,61 @@ def validate_stage_admission(run_id, council_model_ids=None):
         raise ExecutionConflict("stage council differs from original admission")
 
 
+def canonical_execution_report(run_id, report, *, report_text=None, page_images=None):
+    """Resolve owned input from admission before accepting caller source material."""
+    ctx = _CURRENT.get()
+    if ctx is None:
+        return report
+    validate_stage_admission(run_id)
+    admission = ctx.manifest["admission"]
+    with ctx.owner.transaction() as session:
+        canonical = session.get(storage.Report, admission["report_id"])
+        if canonical is None or canonical.patient_id != admission["patient_id"]:
+            raise ExecutionConflict("original admitted report identity is unavailable")
+        for field in (
+            "id",
+            "patient_id",
+            "filename",
+            "mime_type",
+            "stored_path",
+            "extracted_text_path",
+        ):
+            if getattr(report, field, None) != getattr(canonical, field):
+                raise ExecutionConflict(
+                    "supplied report differs from original admission"
+                )
+    if report_text is not None or page_images is not None:
+        from ..analysis_inputs import repair_combined_report
+        from .report_assets import (
+            _derive_report_dir,
+            _load_best_report_text,
+            _load_page_images,
+        )
+
+        try:
+            repair_combined_report(canonical, run_id=run_id)
+            directory = _derive_report_dir(canonical)
+            if report_text is not None and report_text != _load_best_report_text(
+                canonical, directory
+            ):
+                raise ExecutionConflict(
+                    "supplied text differs from admitted report source"
+                )
+            if page_images is not None and page_images != _load_page_images(
+                canonical, directory
+            ):
+                raise ExecutionConflict(
+                    "supplied images differ from admitted report source"
+                )
+        except ExecutionConflict:
+            raise
+        except Exception as exc:
+            raise ExecutionConflict(
+                "admitted report source cannot be verified"
+            ) from exc
+    return canonical
+
+
 def bind_artifact_sources(key, artifacts):
     ctx = _CURRENT.get()
     if ctx is None:

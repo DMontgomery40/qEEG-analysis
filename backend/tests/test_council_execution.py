@@ -355,7 +355,7 @@ async def test_owned_low_level_call_requires_semantic_identity(owner):
 
 @pytest.mark.asyncio
 async def test_direct_data_pack_source_candidate_drift_blocks_before_new_key(
-    owner, monkeypatch
+    owner, tmp_path, monkeypatch
 ):
     from backend.council import QEEGCouncilWorkflow
 
@@ -365,7 +365,6 @@ async def test_direct_data_pack_source_candidate_drift_blocks_before_new_key(
             200, json={"choices": [{"message": {"content": "{}"}}]}
         )
     )
-    ctx = e.prepare_execution(owner, llm_client=llm)
     workflow = QEEGCouncilWorkflow(llm=llm)
     # Both calls have no images and spend nothing. Input binding still prevents
     # recovery from silently adding a new candidate before its first new scope.
@@ -373,9 +372,15 @@ async def test_direct_data_pack_source_candidate_drift_blocks_before_new_key(
         id="q",
         patient_id="p",
         filename="synthetic.txt",
-        stored_path="/unused",
+        stored_path=str(tmp_path / "original.txt"),
+        extracted_text_path=str(tmp_path / "extracted.txt"),
         mime_type="text/plain",
     )
+    Path(report.stored_path).write_text("original")
+    Path(report.extracted_text_path).write_text("original")
+    with owner.transaction() as session:
+        session.add(report)
+    ctx = e.prepare_execution(owner, llm_client=llm)
     with e.execution_context(ctx):
         await workflow._ensure_data_pack(
             run_id="r",
@@ -833,15 +838,23 @@ async def test_extraction_repairs_and_transcript_never_advance_after_unknown(
         )
 
     llm = client(send)
-    ctx = e.prepare_execution(owner, llm_client=llm)
     workflow = QEEGCouncilWorkflow(llm=llm)
     report = storage.Report(
         id="q",
         patient_id="p",
         filename="synthetic.txt",
         stored_path=str(tmp_path / "synthetic.txt"),
+        extracted_text_path=str(tmp_path / "extracted.txt"),
         mime_type="text/plain",
     )
+    Path(report.stored_path).write_text("Session 1")
+    Path(report.extracted_text_path).write_text("Session 1")
+    (tmp_path / "pages").mkdir()
+    for page in (1, 2):
+        (tmp_path / "pages" / f"page-{page}.png").write_bytes(b"x")
+    with owner.transaction() as session:
+        session.add(report)
+    ctx = e.prepare_execution(owner, llm_client=llm)
     images = [PageImage(page=n, base64_png="eA==") for n in (1, 2)]
     with e.execution_context(ctx), pytest.raises(PaidOutcomeUnknown):
         if unit == "transcript":
@@ -1140,3 +1153,364 @@ async def test_nested_execution_context_cannot_inherit_another_unit_cursor(owner
     with e.execution_context(ctx), pytest.raises(ExecutionConflict):
         await e.execute_unit("outer", inner())
     assert not sent
+
+
+def bank_original_report(owner, report):
+    from backend.analysis_inputs import _source_snapshot
+
+    snapshot, _ = _source_snapshot(report)
+    with owner.transaction() as session:
+        run = session.get(storage.Run, owner.run_id)
+        run.source_manifest_json = json.dumps(
+            {
+                "legacy": False,
+                "execution_report_id": report.id,
+                "source_report_ids": [report.id],
+                "sources": [snapshot],
+            }
+        )
+
+
+def supplied_report_copy(report, **changes):
+    fields = {
+        name: getattr(report, name)
+        for name in (
+            "id",
+            "patient_id",
+            "filename",
+            "mime_type",
+            "stored_path",
+            "extracted_text_path",
+        )
+    }
+    return storage.Report(**{**fields, **changes})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["stage1", "data_pack", "transcript"])
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "report",
+        "patient",
+        "stored_path",
+        "extracted_text_path",
+        "filename",
+        "mime_type",
+        "stored_bytes",
+        "text_bytes",
+    ],
+)
+async def test_owned_report_mismatch_family_rejects_before_binding_or_sending(
+    owner, tmp_path, monkeypatch, entry, mismatch
+):
+    from backend.council import QEEGCouncilWorkflow
+
+    e = execution()
+    report = seed_stages(owner, tmp_path, monkeypatch, models=("model-a",))
+    bank_original_report(owner, report)
+    wrong = tmp_path / "other-source.txt"
+    wrong.write_text("OTHER PATIENT SOURCE FACTS")
+    changes = {
+        "report": {"id": "other-report"},
+        "patient": {"patient_id": "other-patient"},
+        "stored_path": {"stored_path": str(wrong)},
+        "extracted_text_path": {"extracted_text_path": str(wrong)},
+        "filename": {"filename": "other-source.txt"},
+        "mime_type": {"mime_type": "application/pdf"},
+        "stored_bytes": {},
+        "text_bytes": {},
+    }[mismatch]
+    supplied = supplied_report_copy(report, **changes)
+    sent = []
+
+    def send(request):
+        sent.append(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+
+    llm = client(send)
+    context = e.prepare_execution(owner, llm_client=llm)
+    if mismatch in {"stored_bytes", "text_bytes"}:
+        path = (
+            report.stored_path
+            if mismatch == "stored_bytes"
+            else report.extracted_text_path
+        )
+        Path(path).write_text("OTHER PATIENT SOURCE FACTS")
+    workflow = QEEGCouncilWorkflow(llm=llm)
+
+    async def emit(_):
+        pass
+
+    with pytest.raises(ExecutionConflict), e.execution_context(context):
+        if entry == "stage1":
+            await workflow._stage1("r", ["model-a"], supplied, emit)
+        elif entry == "data_pack":
+            await workflow._ensure_data_pack(
+                run_id="r",
+                report=supplied,
+                report_text="Source facts.\n",
+                page_images=[],
+                candidate_extractor_model_ids=["model-a"],
+                strict=False,
+            )
+        else:
+            await workflow._ensure_vision_transcript(
+                run_id="r",
+                report=supplied,
+                page_images=[],
+                transcript_model_id="model-a",
+                strict=False,
+            )
+    assert sent == []
+    assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["data_pack", "transcript"])
+@pytest.mark.parametrize(
+    "mismatch", ["run", "images", "image_order", "image_labels", "text"]
+)
+async def test_owned_direct_extraction_rejects_substituted_payload_before_binding(
+    owner, tmp_path, monkeypatch, entry, mismatch
+):
+    if entry == "transcript" and mismatch == "text":
+        # Transcript has no caller-supplied text; use a missing canonical report.
+        mismatch = "missing_report"
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.report_assets import _load_page_images
+    from backend.council.types import PageImage
+
+    e = execution()
+    report = seed_stages(owner, tmp_path, monkeypatch, models=("model-a",))
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    (pages / "page-1.png").write_bytes(b"first canonical image")
+    (pages / "page-2.png").write_bytes(b"second canonical image")
+    bank_original_report(owner, report)
+    images = _load_page_images(report, tmp_path)
+    if mismatch == "images":
+        images = [PageImage(page=1, base64_png="b3RoZXI=")]
+    if mismatch == "image_order":
+        images = list(reversed(images))
+    if mismatch == "image_labels":
+        images = [
+            PageImage(page=p.page, base64_png=p.base64_png, label="wrong")
+            for p in images
+        ]
+    text = "OTHER PATIENT SOURCE FACTS" if mismatch == "text" else "Source facts.\n"
+    sent = []
+    llm = client(
+        lambda request: sent.append(request.content)
+        or httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+    )
+    context = e.prepare_execution(owner, llm_client=llm)
+    if mismatch == "missing_report":
+        with storage.session_scope() as session:
+            session.execute(
+                storage.Report.__table__.delete().where(storage.Report.id == "q")
+            )
+            session.commit()
+    workflow = QEEGCouncilWorkflow(llm=llm)
+    with pytest.raises(ExecutionConflict), e.execution_context(context):
+        kw = dict(
+            run_id="another-run" if mismatch == "run" else "r",
+            report=report,
+            page_images=images,
+            strict=False,
+        )
+        if entry == "data_pack":
+            await workflow._ensure_data_pack(
+                **kw, report_text=text, candidate_extractor_model_ids=["model-a"]
+            )
+        else:
+            await workflow._ensure_vision_transcript(
+                **kw, transcript_model_id="model-a"
+            )
+    assert sent == []
+    assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_default", ["", "   ", "reappeared-writer"])
+async def test_owned_writer_recovery_uses_saved_preference_before_current_default(
+    owner, tmp_path, monkeypatch, new_default
+):
+    from dataclasses import replace
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import stages
+    from backend.tests.test_stage6_final_draft_repair import _complete_stage6
+
+    e = execution()
+    seed_stages(owner, tmp_path, monkeypatch, models=("model-a",))
+    monkeypatch.delenv("QEEG_STAGE6_FINAL_DRAFT_MODEL")
+    monkeypatch.setattr(
+        stages,
+        "MODEL_ROLE_DEFAULTS",
+        replace(stages.MODEL_ROLE_DEFAULTS, stage6_final_draft="model-a"),
+    )
+    sent = []
+    llm = client(
+        lambda request: sent.append(request.content)
+        or httpx.Response(
+            200, json={"choices": [{"message": {"content": _complete_stage6()}}]}
+        )
+    )
+    context = e.prepare_execution(owner, llm_client=llm)
+
+    async def emit(_):
+        pass
+
+    with e.execution_context(context):
+        await QEEGCouncilWorkflow(llm=llm)._stage6("r", ["model-a"], emit)
+    monkeypatch.setattr(
+        stages,
+        "MODEL_ROLE_DEFAULTS",
+        replace(stages.MODEL_ROLE_DEFAULTS, stage6_final_draft=new_default),
+    )
+    recovered = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(recovered):
+        await QEEGCouncilWorkflow(llm=llm)._stage6("r", ["model-a"], emit)
+    assert len(sent) == 1
+    assert json.loads(sent[0])["model"] == "model-a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair", [False, True])
+async def test_owned_combined_report_uses_canonical_composition_and_repairs_without_resend(
+    owner, tmp_path, monkeypatch, repair
+):
+    from backend import analysis_inputs, config, reports
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import stages
+    from backend.tests.test_analysis_inputs import source
+
+    monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(config, "ARTIFACTS_DIR", tmp_path / "artifacts")
+    monkeypatch.setattr(stages, "DISCOVERED_MODEL_IDS", {"mock-council-a"})
+    with owner.transaction() as session:
+        session.add(storage.Patient(id="p", label="ZZ_01-01-1900"))
+    originals = [
+        source(tmp_path, "p", date=f"2026-0{n}-02", value=270 + n) for n in (1, 2)
+    ]
+    models = dict(
+        council_model_ids=["mock-council-a"],
+        consolidator_model_id="mock-council-a",
+        requested_model_ids=["mock-council-a"],
+        resolved_model_ids=["mock-council-a"],
+    )
+    run = analysis_inputs.admit_run(
+        patient_id="p",
+        source_ids=[r.id for r in originals],
+        special_instructions="",
+        source_session_aliases={},
+        operation_id=None,
+        model_fields=lambda: models,
+        immutable_request={"source_ids": [r.id for r in originals]},
+    )
+    store = ExecutionStore(storage.engine)
+    store.request_run_start(run.id)
+    combined_owner = store.claim_run_owner(run.id)
+    with combined_owner.transaction() as session:
+        report = session.get(storage.Report, run.report_id)
+    assert report.id not in [r.id for r in originals]
+    directory = Path(report.stored_path).parent
+    original_text = Path(report.extracted_text_path).read_text()
+    sent = []
+    llm = client(
+        lambda request: sent.append(request.content)
+        or httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+    )
+    e = execution()
+    context = e.prepare_execution(combined_owner, llm_client=llm)
+
+    async def emit(_):
+        pass
+
+    try:
+        # Original component reports and forged combined IDs cannot substitute
+        # for the execution report reserved by real multi-report admission.
+        for supplied in [
+            originals[0],
+            supplied_report_copy(
+                report,
+                stored_path=originals[0].stored_path,
+                extracted_text_path=originals[0].extracted_text_path,
+            ),
+        ]:
+            with e.execution_context(context), pytest.raises(ExecutionConflict):
+                await QEEGCouncilWorkflow(llm=llm)._stage1(
+                    run.id, ["mock-council-a"], supplied, emit
+                )
+        assert sent == []
+        assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+        # Direct extraction also resolves derived combined assets from the
+        # banked originals, even if a caller loaded substituted on-disk content.
+        from backend.council.report_assets import _load_page_images
+
+        for entry in ("data_pack", "transcript"):
+            (directory / "extracted_enhanced.txt").write_text(
+                "OTHER PATIENT SOURCE FACTS"
+            )
+            (directory / "pages" / "page-1.png").write_bytes(b"substituted image")
+            supplied_images = _load_page_images(report, directory)
+            with e.execution_context(context), pytest.raises(ExecutionConflict):
+                workflow = QEEGCouncilWorkflow(llm=llm)
+                if entry == "data_pack":
+                    await workflow._ensure_data_pack(
+                        run_id=run.id,
+                        report=report,
+                        report_text="OTHER PATIENT SOURCE FACTS",
+                        page_images=supplied_images,
+                        candidate_extractor_model_ids=["mock-council-a"],
+                        strict=False,
+                    )
+                else:
+                    await workflow._ensure_vision_transcript(
+                        run_id=run.id,
+                        report=report,
+                        page_images=supplied_images,
+                        transcript_model_id="mock-council-a",
+                        strict=False,
+                    )
+            assert sent == []
+            assert not list((context.manifest_path.parent / "sources").glob("*.json"))
+            assert (directory / "extracted_enhanced.txt").read_text() == original_text
+        for attempt in range(2):
+            if repair:
+                # Restore from banked originals before both first use and replay.
+                (directory / "extracted_enhanced.txt").unlink()
+                (directory / "pages" / "page-1.png").unlink()
+            recovered = (
+                context
+                if attempt == 0
+                else e.prepare_execution(combined_owner, llm_client=llm)
+            )
+            with e.execution_context(recovered):
+                await QEEGCouncilWorkflow(llm=llm)._stage1(
+                    run.id, ["mock-council-a"], report, emit
+                )
+            assert Path(report.extracted_text_path).read_text() == original_text
+            assert (directory / "pages" / "page-1.png").exists()
+        assert len(sent) == 1
+        assert all(str(value).encode() in sent[0] for value in (271, 272))
+        from backend.council.report_text import _expected_session_indices
+
+        assert _expected_session_indices(original_text) == [1, 2]
+    finally:
+        await context.aclose()
+        combined_owner.close()
