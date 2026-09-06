@@ -149,8 +149,13 @@ def test_historical_collision_never_selects_first_chart(live_api, relabels):
         "/identity-preview",
         json={"records": [{"patientId": "AB_01-01-1900", "firstName": "Amy"}]},
     ).json()["rows"][0]
-    assert row["status"] == "needs_operator_answer"
-    assert row["patientId"] is None and row["current"] is None
+    if relabels == 1:
+        assert row["status"] == "change"
+        assert row["patientId"] == b.label
+        assert row["current"]["patientId"] == b.label
+    else:
+        assert row["status"] == "needs_operator_answer"
+        assert row["patientId"] is None and row["current"] is None
 
 
 @pytest.mark.parametrize(

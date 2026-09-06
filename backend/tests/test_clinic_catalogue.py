@@ -668,8 +668,11 @@ def test_persistent_duplicate_alias_matrix(temp_data_dir, relabelled, lookup):
         for i in relabelled:
             storage.update_patient(session, patients[i].id, label=f"{old}_{i + 2}")
         healthy = storage.create_patient(session, label="HH_02-02-1900")
-    with pytest.raises(catalogue.CatalogueConflict):
-        reads.roster(old)
+    if len(relabelled) == 1:
+        assert reads.roster(old)["patient"]["patientId"] == old
+    else:
+        with pytest.raises(catalogue.CatalogueConflict):
+            reads.roster(old)
     assert reads.patient_files(healthy.label)["files"] == []
     for i, file in enumerate(files):
         key = {
@@ -1097,3 +1100,157 @@ def test_location_lookup_index_bounds_actual_conflict_query_work(
                 raw.set_progress_handler(None, 0)
             # Fixed candidate count, independent of 1K/10K/100K unrelated rows.
             assert instructions < 200, (unrelated, key, instructions)
+
+
+@pytest.mark.parametrize("mode", ["initial", "archive"])
+@pytest.mark.parametrize("limit", [1, 5, 120])
+def test_short_listing_bounds_hydration_and_preserves_category_selection(
+    chart, temp_data_dir, monkeypatch, mode, limit
+):
+    from backend.clinic_models import ClinicArtifact
+
+    kinds = (
+        ["technical"] * 110
+        + ["video"] * 30
+        + ["patient-summary"] * 30
+        + [None] * 7
+        + ["report"] * 8
+        + ["data-pack", "vision-transcript", "council-export"]
+    )
+    with storage.session_scope() as session:
+        for index, kind in enumerate(kinds):
+            session.add(
+                ClinicArtifact(
+                    id=f"bounded-{index}",
+                    patient_uuid=chart.id,
+                    source_kind="bounded",
+                    source_id=str(index),
+                    logical_family=str(index),
+                    version=1,
+                    file_key=f"{index}.pdf",
+                    original_name=f"{index}.pdf",
+                    sha256="a" * 64,
+                    size=1,
+                    content_type="application/pdf",
+                    document_kind=kind,
+                    session_date=None,
+                    generated_at=len(kinds) - index,
+                    registered_at=1,
+                    uploaded_at=None,
+                    uploaded_by=None,
+                    provenance_json="{}",
+                )
+            )
+        session.commit()
+    full = reads.patient_files(chart.label, mode="full")["files"]
+    reviewable = [f for f in full if not reads._technical(f)]
+    technical = [f for f in full if reads._technical(f)]
+    expected = (
+        reviewable[:limit]
+        + technical[: min(80, max(0, limit - len(reviewable[:limit])))]
+    )
+    if mode == "initial":
+        heroes = []
+        for kind in ("patient-summary", "video"):
+            heroes.extend([f for f in full if f["documentKind"] == kind][:25])
+        expected = list({f["fileId"]: f for f in heroes + expected}.values())
+    original = reads._artifact_json
+    hydrated = []
+
+    def bounded(session, artifact, patient, **kwargs):
+        hydrated.append(artifact.id)
+        assert len(hydrated) <= limit + (
+            50 if mode == "initial" else 0
+        ), "Short listing hydrated historical rows outside selection"
+        return original(session, artifact, patient, **kwargs)
+
+    monkeypatch.setattr(reads, "_artifact_json", bounded)
+    result = reads.patient_files(chart.label, mode=mode, limit=limit)
+    assert result["files"] == expected
+    assert result["totalFiles"] == len(full)
+    assert result["reviewableFiles"] == len(reviewable)
+    assert result["technicalFiles"] == len(technical)
+    assert result["technicalDeferred"] is True
+    assert result["truncated"] == (len(expected) < len(full))
+    assert len(hydrated) == len(expected)
+
+
+@pytest.mark.parametrize("alias_ambiguous", [False, True])
+def test_unique_current_identity_precedes_historical_alias(
+    chart, temp_data_dir, alias_ambiguous
+):
+    from backend.clinic_models import ClinicPatientAlias
+
+    with storage.session_scope() as session:
+        other = storage.create_patient(session, label="QQ_02-02-1900")
+        alias = session.get(ClinicPatientAlias, chart.label)
+        alias.ambiguous = alias_ambiguous
+        alias.patient_uuid = other.id
+        session.commit()
+    assert reads.roster(chart.label)["patient"]["patientId"] == chart.label
+    assert reads.patient_files(chart.label, mode="initial")["patientId"] == chart.label
+
+
+@pytest.mark.parametrize("duplicate_current", [False, True])
+def test_ambiguous_history_and_multiple_current_charts_still_conflict(
+    chart, temp_data_dir, duplicate_current
+):
+    from backend.clinic_models import ClinicPatientAlias
+
+    key = chart.label if duplicate_current else "historical-only-alias"
+    with storage.session_scope() as session:
+        if duplicate_current:
+            storage.create_patient(session, label=chart.label)
+        else:
+            session.add(
+                ClinicPatientAlias(alias=key, patient_uuid=chart.id, ambiguous=True)
+            )
+        session.commit()
+    with pytest.raises(catalogue.CatalogueConflict):
+        reads.patient_files(key, mode="initial")
+
+
+@pytest.mark.parametrize(
+    "path_match", ["original", "canonical", "provenance", "mismatch"]
+)
+@pytest.mark.parametrize("valid_bytes", [True, False])
+def test_delivery_hydrates_only_digest_candidates(
+    chart, temp_data_dir, monkeypatch, path_match, valid_bytes
+):
+    file = register(
+        chart,
+        temp_data_dir,
+        "delivery-target",
+        data=b"target",
+        provenance={"relativePath": "nested/exact.pdf"},
+    )
+    for i in range(30):
+        register(chart, temp_data_dir, f"other-{i}", data=f"unrelated-{i}".encode())
+    if not valid_bytes:
+        (temp_data_dir / "delivery-target.pdf").write_bytes(b"changed")
+    paths = {
+        "original": file["originalName"],
+        "canonical": file["logicalName"],
+        "provenance": "nested/exact.pdf",
+        "mismatch": "missing.pdf",
+    }
+    hydrated = []
+    original = reads._artifact_json
+
+    def bounded(session, artifact, patient, **kwargs):
+        hydrated.append(artifact.id)
+        assert artifact.sha256 == file["sha256"]
+        return original(session, artifact, patient, **kwargs)
+
+    monkeypatch.setattr(reads, "_artifact_json", bounded)
+    result = reads.patient_files(
+        chart.label,
+        mode="delivery",
+        relative_path=paths[path_match],
+        sha256=file["sha256"],
+    )
+    assert hydrated == [file["fileId"]]
+    assert [f["fileId"] for f in result["files"]] == (
+        [file["fileId"]] if valid_bytes and path_match != "mismatch" else []
+    )
+    assert result["totalFiles"] == 31

@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import tempfile
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from . import storage
 from .clinic_models import (
     ClinicArtifact,
@@ -71,9 +71,6 @@ def _envelope(session, **payload):
 def _patient(session, patient_id):
     if not isinstance(patient_id, str) or not patient_id or len(patient_id) > 256:
         raise ValueError("Invalid patientId")
-    alias = session.get(ClinicPatientAlias, patient_id)
-    if alias is not None and alias.ambiguous:
-        raise CatalogueConflict("Historical patient alias is ambiguous")
     patients = list(
         session.scalars(
             select(storage.Patient).where(storage.Patient.label == patient_id)
@@ -83,6 +80,9 @@ def _patient(session, patient_id):
         raise CatalogueConflict("Patient identity is ambiguous")
     patient = patients[0] if patients else None
     if patient is None:
+        alias = session.get(ClinicPatientAlias, patient_id)
+        if alias is not None and alias.ambiguous:
+            raise CatalogueConflict("Historical patient alias is ambiguous")
         patient = session.get(storage.Patient, alias.patient_uuid) if alias else None
     if patient is None or not parse_canonical_patient_id(patient.label):
         raise CatalogueNotFound("Patient not found")
@@ -280,6 +280,13 @@ def _binding(session, patient_id, file_key=None, file_id=None):
     if bool(file_key) == bool(file_id):
         raise ValueError("Supply exactly one fileId or fileKey")
     try:
+        alias = (
+            session.get(ClinicPatientAlias, patient_id)
+            if isinstance(patient_id, str)
+            else None
+        )
+        if alias is not None and alias.ambiguous:
+            raise CatalogueConflict("Historical patient alias is ambiguous")
         patient = _patient(session, patient_id)
     except CatalogueConflict:
         return _historical_binding(session, patient_id, file_key, file_id)
@@ -493,11 +500,55 @@ def patient_files(
                 truncated=next_cursor is not None,
                 technicalDeferred=False,
             )
-        files = [
-            _artifact_json(session, artifact, patient)
-            for artifact in session.scalars(query)
-        ]
-        selected = files
+        if mode in ("initial", "archive"):
+            technical_kinds = (
+                "council-export",
+                "data-pack",
+                "vision-transcript",
+                "technical",
+            )
+            technical_filter = ClinicArtifact.document_kind.in_(technical_kinds)
+            reviewable_filter = or_(
+                ClinicArtifact.document_kind.is_(None), ~technical_filter
+            )
+            technical_count = session.scalar(
+                select(func.count())
+                .select_from(ClinicArtifact)
+                .where(ClinicArtifact.patient_uuid == patient.id, technical_filter)
+            )
+            reviewable_count = total - technical_count
+            selected_artifacts = list(
+                session.scalars(query.where(reviewable_filter).limit(limit))
+            )
+            remaining = min(80, max(0, limit - len(selected_artifacts)))
+            if remaining:
+                selected_artifacts.extend(
+                    session.scalars(query.where(technical_filter).limit(remaining))
+                )
+            if mode == "initial":
+                heroes = []
+                for kind in ("patient-summary", "video"):
+                    heroes.extend(
+                        session.scalars(
+                            query.where(ClinicArtifact.document_kind == kind).limit(25)
+                        )
+                    )
+                selected_artifacts = list(
+                    {a.id: a for a in heroes + selected_artifacts}.values()
+                )
+            selected = [_artifact_json(session, a, patient) for a in selected_artifacts]
+            return _envelope(
+                session,
+                **common,
+                files=selected,
+                returnedFiles=len(selected),
+                limit=limit,
+                truncated=len(selected) < total,
+                technicalDeferred=technical_count > 80,
+                deferredArchive=len(selected) < total,
+                reviewableFiles=reviewable_count,
+                technicalFiles=technical_count,
+            )
         if mode == "delivery":
             if (
                 not isinstance(relative_path, str)
@@ -507,6 +558,12 @@ def patient_files(
                 or not re.fullmatch("[a-f0-9]{64}", sha256 or "")
             ):
                 raise ValueError("Invalid relativePath or sha256")
+            files = [
+                _artifact_json(session, artifact, patient)
+                for artifact in session.scalars(
+                    query.where(ClinicArtifact.sha256 == sha256)
+                )
+            ]
             names = {relative_path, relative_path.rsplit("/", 1)[-1]}
             files_matching = [
                 f
@@ -530,18 +587,11 @@ def patient_files(
                 returnedFiles=len(selected),
                 truncated=len(files_matching) > len(selected),
             )
-        elif mode in ("initial", "archive"):
-            reviewable = [f for f in files if not _technical(f)]
-            technical = [f for f in files if _technical(f)]
-            selected = (
-                reviewable[:limit]
-                + technical[: min(80, max(0, limit - len(reviewable[:limit])))]
-            )
-            if mode == "initial":
-                heroes = []
-                for kind in ("patient-summary", "video"):
-                    heroes.extend([f for f in files if f["documentKind"] == kind][:25])
-                selected = list({f["fileId"]: f for f in heroes + selected}.values())
+        files = [
+            _artifact_json(session, artifact, patient)
+            for artifact in session.scalars(query)
+        ]
+        selected = files
         payload = dict(
             files=selected,
             returnedFiles=len(selected),
