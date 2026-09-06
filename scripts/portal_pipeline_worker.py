@@ -929,7 +929,13 @@ def _file_new_patient_upload(
         for index, key in enumerate(keys):
             if not key.startswith(f"{PENDING_UPLOAD_PREFIX}/{upload_id}/"):
                 raise ValueError("Original item key is outside this upload")
-            name = _safe_filename(Path(key).name, "upload.bin")
+            # The hub numbers each file in a submission (`<n>__<filename>`) so
+            # siblings keep their order and never collide. The number is the
+            # hub's, not the clinic's: the filed report keeps the name the
+            # clinic uploaded.
+            name = _safe_filename(
+                re.sub(r"^\d+__", "", Path(key).name), "upload.bin"
+            )
             cached = cache / (str(index) + ".bytes")
             try:
                 if not cached.exists():

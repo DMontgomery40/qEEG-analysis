@@ -1134,7 +1134,10 @@ def _fake_save_report_upload(temp_data_dir):
 # test_the_upload_job_matches_what_the_hub_actually_builds below, so this
 # literal cannot drift away from the thing that produces it.
 UPLOAD_ID = "up-1"
-REPORT_FILE_KEY = f"uploads/pending/{UPLOAD_ID}/scan.pdf"
+# The hub numbers each file in a submission (thrylen ca453a1, Sep 4): the
+# first file of an upload is `<n>__<filename>`. The contract test below runs the
+# hub's real builder against this value, so it must track the hub's shape.
+REPORT_FILE_KEY = f"uploads/pending/{UPLOAD_ID}/1__scan.pdf"
 
 
 def _upload_job(**resolution):
@@ -1238,7 +1241,7 @@ def test_new_patient_upload_allocates_the_chart_and_files_the_report(
     assert (tmp_path / "portal" / "BT_12-11-1963" / "scan.pdf").exists()
 
     # The pending blob and the marker only go once the report is durable.
-    assert client.deleted == ["uploads/pending/up-1/scan.pdf", job_key]
+    assert client.deleted == [REPORT_FILE_KEY, job_key]
 
     # A crash between registering and cleaning up replays the marker. The
     # filename lookup has to find the report rather than file a second one.
@@ -1593,8 +1596,8 @@ def test_the_whole_submission_is_filed_not_just_the_report(
     client = _UploadClient(
         {job_key: _upload_job()},
         blobs={
-            "uploads/pending/up-1/scan.pdf": b"%PDF-1.4 report",
-            "uploads/pending/up-1/intake-form.pdf": b"%PDF-1.4 intake",
+            REPORT_FILE_KEY: b"%PDF-1.4 report",
+            f"uploads/pending/{UPLOAD_ID}/2__intake-form.pdf": b"%PDF-1.4 intake",
         },
     )
 
@@ -1625,8 +1628,8 @@ def test_the_whole_submission_is_filed_not_just_the_report(
 
     # Everything pending is gone, marker last.
     assert client.deleted == [
-        "uploads/pending/up-1/intake-form.pdf",
-        "uploads/pending/up-1/scan.pdf",
+        REPORT_FILE_KEY,
+        f"uploads/pending/{UPLOAD_ID}/2__intake-form.pdf",
         job_key,
     ]
 
@@ -1672,9 +1675,9 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
     client = _OneBadFileClient(
         {job_key: _upload_job()},
         blobs={
-            "uploads/pending/up-1/scan.pdf": b"%PDF-1.4 report",
-            "uploads/pending/up-1/aaa-good.pdf": b"%PDF-1.4 good",
-            "uploads/pending/up-1/broken.pdf": b"%PDF-1.4 broken",
+            REPORT_FILE_KEY: b"%PDF-1.4 report",
+            f"uploads/pending/{UPLOAD_ID}/2__aaa-good.pdf": b"%PDF-1.4 good",
+            f"uploads/pending/{UPLOAD_ID}/3__broken.pdf": b"%PDF-1.4 broken",
         },
     )
 
@@ -1691,9 +1694,10 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
     with storage.session_scope() as session:
         assert storage.list_patients(session) == []
     # Successful reads survive while the exact complete byte manifest is unfinished.
+    # The hub's numbering keeps submission order: report first, then siblings.
     cache = temp_data_dir / "clinic_intake" / "legacy" / "up-1"
-    assert (cache / "0.bytes").read_bytes() == b"%PDF-1.4 good"
-    assert (cache / "2.bytes").read_bytes() == b"%PDF-1.4 report"
+    assert (cache / "0.bytes").read_bytes() == b"%PDF-1.4 report"
+    assert (cache / "1.bytes").read_bytes() == b"%PDF-1.4 good"
 
     # Nothing under the pending prefix is dropped while any of the submission
     # is still outstanding. Deleting the report first left the next cycle
@@ -1726,9 +1730,9 @@ def test_one_bad_extra_file_keeps_the_report_and_the_other_files(
     # Only once everything has landed does the submission get cleared.
     assert sorted(client.deleted) == sorted(
         [
-            "uploads/pending/up-1/scan.pdf",
-            "uploads/pending/up-1/aaa-good.pdf",
-            "uploads/pending/up-1/broken.pdf",
+            REPORT_FILE_KEY,
+            f"uploads/pending/{UPLOAD_ID}/2__aaa-good.pdf",
+            f"uploads/pending/{UPLOAD_ID}/3__broken.pdf",
             job_key,
         ]
     )

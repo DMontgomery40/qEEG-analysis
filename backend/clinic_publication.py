@@ -82,11 +82,20 @@ def publication_items(patient_id, *, limit=100, cursor=None):
                 if isinstance(e, CatalogueConflict):
                     raise
                 raise ValueError("Invalid publication cursor") from e
+        # The publisher pushes local bytes to the remote store. An artifact with no
+        # active local location (remote-only history imported from the hub) has
+        # nothing to publish and would fail prepare/snapshot/verify on every
+        # cycle forever, so the census only lists publishable candidates.
+        publishable = select(ClinicLocation.artifact_id).where(
+            ClinicLocation.kind == "local", ClinicLocation.active.is_(True)
+        )
         rows = list(
             s.scalars(
                 select(ClinicArtifact)
                 .where(
-                    ClinicArtifact.patient_uuid == patient.id, ClinicArtifact.id > after
+                    ClinicArtifact.patient_uuid == patient.id,
+                    ClinicArtifact.id > after,
+                    ClinicArtifact.id.in_(publishable),
                 )
                 .order_by(ClinicArtifact.id)
                 .limit(limit + 1)

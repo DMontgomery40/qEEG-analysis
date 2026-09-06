@@ -88,6 +88,39 @@ def test_publication_pages_bind_revision_and_do_not_write(temp_data_dir):
     assert publisher.publication_items(patient.label, limit=1) == first
 
 
+def test_publication_census_skips_remote_only_history(temp_data_dir):
+    """Sep 5 incident: the catalogue import registered ~182k remote-only
+    history rows (hub blobs with no local bytes). The publisher listed every
+    one, then failed prepare -> snapshot -> verify for each and looped forever,
+    holding the engine at 25-35% CPU. Only artifacts with an active local
+    location can be published, so only those may appear in the census."""
+    from backend import clinic_publication as publisher
+
+    patient, local = seed(temp_data_dir)
+    remote_key = "patients/ZZ_01-01-1900/files/old-history.bin"
+    remote_only = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="netlify-history",
+        source_id=remote_key,
+        logical_family="video",
+        original_name="old-history.bin",
+        sha256=hashlib.sha256(b"remote bytes").hexdigest(),
+        size=len(b"remote bytes"),
+        provenance=dict(originalRemoteKey=remote_key),
+    )
+    catalogue.add_remote_location(remote_only["fileId"], remote_key)
+
+    page = publisher.publication_items(patient.label, limit=10)
+    assert [item["fileId"] for item in page["items"]] == [local["fileId"]]
+    assert page["nextCursor"] is None
+    # A remote-only row is still a real catalogue entry; it is just not
+    # publication work.
+    with storage.session_scope() as s:
+        from backend.clinic_models import ClinicArtifact
+
+        assert s.get(ClinicArtifact, remote_only["fileId"]) is not None
+
+
 def test_publication_target_survives_later_import_of_same_filename(temp_data_dir):
     from backend import clinic_publication as publisher
 
