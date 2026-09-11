@@ -293,6 +293,7 @@ def test_original_generation_metadata_outranks_filename_and_import_time(
         chart,
         temp_data_dir,
         "new",
+        data=b"distinct newer render",
         document_kind="video",
         generated_at=2000,
         uploaded_at=2000,
@@ -1254,3 +1255,556 @@ def test_delivery_hydrates_only_digest_candidates(
         [file["fileId"]] if valid_bytes and path_match != "mismatch" else []
     )
     assert result["totalFiles"] == 31
+
+
+@pytest.mark.parametrize("mode", ["initial", "archive", "full"])
+def test_repeated_report_bytes_have_one_working_entry_and_keep_exact_bindings(
+    chart, temp_data_dir, mode
+):
+    from backend.clinic_models import ClinicArtifact
+    from sqlalchemy import select, func
+
+    originals = [
+        register(
+            chart,
+            temp_data_dir,
+            f"copy-{i}",
+            data=b"same report",
+            document_kind="source-report",
+        )
+        for i in range(12)
+    ]
+    publish_test_copy(originals[0], b"same report")
+    different = register(
+        chart,
+        temp_data_dir,
+        "revision",
+        data=b"different report",
+        document_kind="source-report",
+    )
+    other_role = register(
+        chart,
+        temp_data_dir,
+        "summary",
+        data=b"same report",
+        document_kind="patient-summary",
+    )
+    other_session = register(
+        chart,
+        temp_data_dir,
+        "session",
+        data=b"same report",
+        document_kind="source-report",
+        session_date="2026-09-01",
+    )
+    result = reads.patient_files(
+        chart.label,
+        mode=mode,
+        limit=2 if mode == "archive" else 500,
+        page="1" if mode == "archive" else None,
+    )
+    files = list(result["files"])
+    while result.get("nextCursor"):
+        result = reads.patient_files(
+            chart.label, mode=mode, limit=2, cursor=result["nextCursor"]
+        )
+        files.extend(result["files"])
+    assert result["totalFiles"] == 4
+    assert result["totalIndexedFiles"] == 15
+    assert len(files) == 4
+    assert {different["fileId"], other_role["fileId"], other_session["fileId"]} <= {
+        f["fileId"] for f in files
+    }
+    for old in originals:
+        assert (
+            reads.file_binding(chart.label, file_id=old["fileId"])["sha256"]
+            == old["sha256"]
+        )
+    with storage.session_scope() as session:
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(ClinicArtifact)
+                .where(ClinicArtifact.patient_uuid == chart.id)
+            )
+            == 15
+        )
+
+
+def test_imported_video_is_a_hero_using_original_receipt_time(chart, temp_data_dir):
+    from datetime import datetime
+
+    def video(source, data, provenance=None, **kwargs):
+        path = temp_data_dir / (source + ".mp4")
+        path.write_bytes(data)
+        return catalogue.register_artifact(
+            patient_uuid=chart.id,
+            source_kind="original-local-history",
+            source_id=source,
+            original_name=path.name,
+            logical_family=source,
+            local_path=path,
+            content_type="video/mp4",
+            provenance=provenance or {},
+            **kwargs,
+        )
+
+    for i in range(30):
+        register(
+            chart,
+            temp_data_dir,
+            f"report-{i}",
+            data=str(i).encode(),
+            document_kind="source-report",
+            session_date="2026-09-01",
+        )
+    old = video("older", b"older", uploaded_at=1786992815000)
+    path = temp_data_dir / "latest.mp4"
+    proof = {
+        "originalLocalPath": str(path),
+        "proofs": [
+            {
+                "type": "original-workbench-exact-artifact-receipt",
+                "patientUuid": chart.id,
+                "artifactRecord": {
+                    "kind": "video",
+                    "path": str(path),
+                    "ts": "2026-08-25T20:34:44Z",
+                },
+            }
+        ],
+    }
+    latest = video("latest", b"latest", proof)
+    result = reads.patient_files(chart.label, mode="initial", limit=1)
+    videos = [f for f in result["files"] if f["documentKind"] == "video"]
+    assert [f["fileId"] for f in videos] == [latest["fileId"], old["fileId"]]
+    assert videos[0]["generatedAt"] == int(
+        datetime.fromisoformat("2026-08-25T20:34:44+00:00").timestamp() * 1000
+    )
+    assert (
+        reads.file_binding(chart.label, file_id=latest["fileId"])["documentKind"]
+        == "video"
+    )
+
+
+def test_duplicate_working_entry_prefers_verified_remote_bytes(chart, temp_data_dir):
+    published = register(
+        chart, temp_data_dir, "published", document_kind="source-report"
+    )
+    key = f"patients/{chart.label}/files/published.pdf"
+    catalogue.add_remote_location(published["fileId"], key)
+    catalogue.verify_remote_location(published["fileId"], key, lambda: iter([b"one"]))
+    register(chart, temp_data_dir, "unreadable-copy", document_kind="source-report")
+    (temp_data_dir / "unreadable-copy.pdf").write_bytes(b"changed")
+    assert [f["fileId"] for f in reads.patient_files(chart.label)["files"]] == [
+        published["fileId"]
+    ]
+
+
+def test_duplicate_working_entry_prefers_unchanged_local_bytes(chart, temp_data_dir):
+    valid = register(chart, temp_data_dir, "valid-copy", document_kind="source-report")
+    stale = register(chart, temp_data_dir, "stale-copy", document_kind="source-report")
+    (temp_data_dir / "stale-copy.pdf").write_bytes(b"changed")
+    assert {f["fileId"] for f in reads.patient_files(chart.label)["files"]} == {
+        valid["fileId"],
+        stale["fileId"],
+    }
+    publish_test_copy(valid, b"one")
+    assert [f["fileId"] for f in reads.patient_files(chart.label)["files"]] == [
+        valid["fileId"]
+    ]
+
+
+def test_duplicate_representative_change_invalidates_archive_cursor(
+    chart, temp_data_dir
+):
+    first = register(chart, temp_data_dir, "first", document_kind="source-report")
+    register(chart, temp_data_dir, "second", document_kind="source-report")
+    register(
+        chart, temp_data_dir, "separate", data=b"other", document_kind="source-report"
+    )
+    page = reads.patient_files(chart.label, mode="archive", page="1", limit=1)
+    assert page["totalFiles"] == 3
+    publish_test_copy(first, b"one")
+    assert reads.patient_files(chart.label)["totalFiles"] == 2
+    with pytest.raises(catalogue.CatalogueConflict):
+        reads.patient_files(
+            chart.label, mode="archive", cursor=page["nextCursor"], limit=1
+        )
+
+
+@pytest.mark.parametrize(
+    "proofs", [["unstructured old note"], [None, 3], {"old": "shape"}, None]
+)
+def test_imported_video_with_nonreceipt_provenance_stays_readable(
+    chart, temp_data_dir, proofs
+):
+    file = register(
+        chart,
+        temp_data_dir,
+        "legacy",
+        content_type="video/mp4",
+        provenance={"proofs": proofs},
+    )
+    result = reads.patient_files(chart.label, mode="initial")
+    assert result["files"][0]["fileId"] == file["fileId"]
+    assert result["files"][0]["documentKind"] == "video"
+    assert result["files"][0]["generatedAt"] is None
+
+
+def test_recent_drawer_includes_imported_unclassified_video(chart, temp_data_dir):
+    from backend.clinic_recent_files import recent_files
+
+    file = register(chart, temp_data_dir, "legacy-video", content_type="video/mp4")
+    assert recent_files(kind="video")["files"][0]["fileId"] == file["fileId"]
+
+
+def publish_test_copy(file, data):
+    key = f"patients/{file['patientId']}/files/{file['fileId']}"
+    catalogue.add_remote_location(file["fileId"], key)
+    catalogue.verify_remote_location(file["fileId"], key, lambda: iter([data]))
+
+
+def test_duplicate_grouping_keeps_clinician_feedback(chart, temp_data_dir):
+    from backend.clinic_feedback import record_feedback
+
+    reviewed = register(
+        chart, temp_data_dir, "reviewed", document_kind="patient-summary"
+    )
+    unreviewed = register(
+        chart, temp_data_dir, "unreviewed", document_kind="patient-summary"
+    )
+    publish_test_copy(unreviewed, b"one")
+    record_feedback(
+        key="original-clinician-review",
+        patient_id=chart.label,
+        file_id=reviewed["fileId"],
+        version=reviewed["version"],
+        action="approve",
+        actor="Synthetic",
+    )
+    files = reads.patient_files(chart.label)["files"]
+    assert {f["fileId"] for f in files} == {reviewed["fileId"], unreviewed["fileId"]}
+    assert (
+        next(f for f in files if f["fileId"] == reviewed["fileId"])["feedback"][
+            "action"
+        ]
+        == "approve"
+    )
+
+
+@pytest.mark.parametrize("mode", ["initial", "unchanged", "delivery"])
+def test_small_reads_do_not_stat_whole_chart(chart, temp_data_dir, monkeypatch, mode):
+    files = [
+        register(
+            chart,
+            temp_data_dir,
+            f"bounded-read-{i}",
+            data=str(i).encode(),
+            document_kind="source-report",
+        )
+        for i in range(30)
+    ]
+    before = reads.patient_files(chart.label, mode="initial", limit=1)
+    original = reads._fingerprint
+    checked = []
+
+    def fingerprint(path):
+        checked.append(path)
+        assert len(set(checked)) <= (0 if mode == "unchanged" else 1)
+        assert len(checked) <= 2
+        return original(path)
+
+    monkeypatch.setattr(reads, "_fingerprint", fingerprint)
+    if mode == "unchanged":
+        assert reads.patient_files(
+            chart.label,
+            mode="initial",
+            limit=1,
+            if_index_version=before["indexVersion"],
+        )["unchanged"]
+    elif mode == "delivery":
+        assert (
+            len(
+                reads.patient_files(
+                    chart.label,
+                    mode="delivery",
+                    relative_path=files[0]["originalName"],
+                    sha256=files[0]["sha256"],
+                )["files"]
+            )
+            == 1
+        )
+    else:
+        assert (
+            len(reads.patient_files(chart.label, mode="initial", limit=1)["files"]) == 1
+        )
+
+
+def test_recent_drawer_groups_copies_before_limit_and_keeps_other_charts(
+    chart, temp_data_dir
+):
+    from backend.clinic_recent_files import recent_files
+
+    with storage.session_scope() as session:
+        other = storage.create_patient(session, label="AA_02-02-1900")
+    original = register(
+        other,
+        temp_data_dir,
+        "other-chart",
+        data=b"other-video",
+        content_type="video/mp4",
+        generated_at=1000,
+    )
+    for i in range(5):
+        copy = register(
+            chart,
+            temp_data_dir,
+            f"video-copy-{i}",
+            data=b"video",
+            content_type="video/mp4",
+            generated_at=2000,
+        )
+        publish_test_copy(copy, b"video")
+    files = recent_files(kind="video", limit=2)["files"]
+    assert len(files) == 2
+    assert files[1]["fileId"] == original["fileId"]
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_feedback_on_published_representative_keeps_copies_collapsed(
+    chart, temp_data_dir, action
+):
+    from backend.clinic_feedback import record_feedback
+
+    copies = [
+        register(
+            chart, temp_data_dir, f"feedback-copy-{i}", document_kind="patient-summary"
+        )
+        for i in range(8)
+    ]
+    publish_test_copy(copies[0], b"one")
+    record_feedback(
+        key="representative-review",
+        patient_id=chart.label,
+        file_id=copies[0]["fileId"],
+        version=copies[0]["version"],
+        action=action,
+        actor="Synthetic",
+        notes="Review note",
+    )
+    files = reads.patient_files(chart.label)["files"]
+    assert [f["fileId"] for f in files] == [copies[0]["fileId"]]
+    assert files[0]["feedback"]["action"] == action
+
+
+def test_recent_content_type_filter_preserves_matching_copy(chart, temp_data_dir):
+    from backend.clinic_recent_files import recent_files
+
+    mp4 = register(
+        chart, temp_data_dir, "mp4", document_kind="video", content_type="video/mp4"
+    )
+    other = register(
+        chart,
+        temp_data_dir,
+        "binary",
+        document_kind="video",
+        content_type="application/octet-stream",
+    )
+    publish_test_copy(other, b"one")
+    assert [
+        f["fileId"]
+        for f in recent_files(kind="video", content_type="video/mp4")["files"]
+    ] == [mp4["fileId"]]
+
+
+def test_original_receipt_milliseconds_control_serialization_and_order(
+    chart, temp_data_dir
+):
+    from datetime import datetime
+
+    expected = []
+    for index, stamp in enumerate(
+        [
+            "2026-08-25T20:34:44.999Z",
+            "2026-08-25T20:34:44.125Z",
+            "2026-08-25T20:34:44.001Z",
+        ]
+    ):
+        source = f"milliseconds-{index}"
+        path = temp_data_dir / (source + ".pdf")
+        proof = {
+            "originalLocalPath": str(path),
+            "proofs": [
+                {
+                    "type": "original-workbench-exact-artifact-receipt",
+                    "patientUuid": chart.id,
+                    "artifactRecord": {"path": str(path), "ts": stamp},
+                }
+            ],
+        }
+        file = register(
+            chart,
+            temp_data_dir,
+            source,
+            data=str(index).encode(),
+            document_kind="video",
+            content_type="video/mp4",
+            provenance=proof,
+            uploaded_at=1000 + index,
+        )
+        expected.append(
+            (
+                file["fileId"],
+                round(
+                    datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+                    * 1000
+                ),
+            )
+        )
+    files = reads.patient_files(chart.label)["files"]
+    assert [(f["fileId"], f["generatedAt"]) for f in files] == expected
+
+
+@pytest.mark.parametrize(
+    "first_kind,second_kind", [("report", "source-report"), ("source-report", "report")]
+)
+def test_report_aliases_share_duplicate_group(
+    chart, temp_data_dir, first_kind, second_kind
+):
+    first = register(chart, temp_data_dir, "alias-first", document_kind=first_kind)
+    register(chart, temp_data_dir, "alias-second", document_kind=second_kind)
+    publish_test_copy(first, b"one")
+    assert [f["fileId"] for f in reads.patient_files(chart.label)["files"]] == [
+        first["fileId"]
+    ]
+
+
+@pytest.mark.parametrize("mime", ["Video/MP4", "VIDEO/mp4", "video/mp4"])
+def test_imported_video_mime_case_matches_kind_in_every_read(
+    chart, temp_data_dir, mime
+):
+    from backend.clinic_recent_files import recent_files
+
+    file = register(chart, temp_data_dir, "case-video", content_type=mime)
+    for files in [
+        reads.patient_files(chart.label, mode="initial")["files"],
+        recent_files(kind="video")["files"],
+    ]:
+        assert files[0]["fileId"] == file["fileId"]
+        assert files[0]["documentKind"] == "video"
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-08-25T20:34:44",
+        "2026-08-25",
+        "2026-08-25T20:34:44Z",
+        "2026-08-25T14:34:44-06:00",
+    ],
+)
+def test_receipt_timezone_validation_matches_sql_and_json(chart, temp_data_dir, stamp):
+    from sqlalchemy import select
+    from backend.clinic_models import ClinicArtifact
+
+    path = temp_data_dir / "timezone.pdf"
+    proof = {
+        "originalLocalPath": str(path),
+        "proofs": [
+            {
+                "type": "original-workbench-exact-artifact-receipt",
+                "patientUuid": chart.id,
+                "artifactRecord": {"path": str(path), "ts": stamp},
+            }
+        ],
+    }
+    file = register(
+        chart, temp_data_dir, "timezone", content_type="video/mp4", provenance=proof
+    )
+    with storage.session_scope() as session:
+        selected = session.scalar(
+            select(reads._generation_time()).where(ClinicArtifact.id == file["fileId"])
+        )
+    serialized = reads.patient_files(chart.label)["files"][0]["generatedAt"]
+    assert selected == serialized
+    assert (selected is not None) == (stamp.endswith("Z") or stamp.endswith("-06:00"))
+
+
+def test_archive_unarchive_keeps_published_copies_collapsed(chart, temp_data_dir):
+    from backend.clinic_feedback import record_feedback
+
+    copies = [
+        register(
+            chart, temp_data_dir, f"archive-copy-{i}", document_kind="patient-summary"
+        )
+        for i in range(6)
+    ]
+    publish_test_copy(copies[0], b"one")
+    for action in ["archive", "unarchive", "archive"]:
+        record_feedback(
+            key=f"{action}-{reads.current_revision()}",
+            patient_id=chart.label,
+            file_id=copies[0]["fileId"],
+            version=copies[0]["version"],
+            action=action,
+            actor="Synthetic",
+        )
+        files = reads.patient_files(chart.label)["files"]
+        assert [f["fileId"] for f in files] == [copies[0]["fileId"]]
+        assert files[0]["archived"] == (action == "archive")
+
+
+@pytest.mark.parametrize("candidate", ["same-chart", "other-chart", "changed-bytes"])
+def test_remote_representative_serves_only_verified_same_chart_bytes(
+    chart, temp_data_dir, candidate
+):
+    source = register(
+        chart,
+        temp_data_dir,
+        "remote-source",
+        document_kind="video",
+        content_type="video/mp4",
+    )
+    publish_test_copy(source, b"one")
+    (temp_data_dir / "remote-source.pdf").unlink()
+    owner = chart
+    if candidate == "other-chart":
+        with storage.session_scope() as session:
+            owner = storage.create_patient(session, label="BB_02-02-1900")
+    register(
+        owner,
+        temp_data_dir,
+        "byte-copy",
+        document_kind="video",
+        content_type="video/mp4",
+    )
+    if candidate == "changed-bytes":
+        (temp_data_dir / "byte-copy.pdf").write_bytes(b"two")
+    if candidate == "same-chart":
+        assert [f["fileId"] for f in reads.patient_files(chart.label)["files"]] == [
+            source["fileId"]
+        ]
+        with reads.open_local_file(source["fileId"]) as stream:
+            assert stream.read() == b"one"
+    else:
+        with pytest.raises(catalogue.CatalogueUnavailable):
+            reads.open_local_file(source["fileId"])
+
+
+@pytest.mark.parametrize("filter_mime", [None, "video/mp4", "Video/MP4"])
+def test_mime_case_duplicates_share_chart_and_filtered_drawer(
+    chart, temp_data_dir, filter_mime
+):
+    from backend.clinic_recent_files import recent_files
+
+    published = register(chart, temp_data_dir, "mixed-mime", content_type="Video/MP4")
+    register(chart, temp_data_dir, "lower-mime", content_type="video/mp4")
+    publish_test_copy(published, b"one")
+    assert [f["fileId"] for f in reads.patient_files(chart.label)["files"]] == [
+        published["fileId"]
+    ]
+    assert [
+        f["fileId"]
+        for f in recent_files(kind="video", content_type=filter_mime)["files"]
+    ] == [published["fileId"]]

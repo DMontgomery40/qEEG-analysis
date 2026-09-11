@@ -1,9 +1,15 @@
 """Bounded global drawer projection from the existing catalogue and serializers."""
 
 from collections import defaultdict
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from . import storage
-from .clinic_catalogue_reads import _artifact_json, _envelope
+from .clinic_catalogue_reads import (
+    _artifact_json,
+    _envelope,
+    _document_kind,
+    _generation_time,
+    _working_file_ids,
+)
 from .clinic_models import ClinicArtifact, ClinicLocation, CatalogueConflict
 from .clinic_records import ClinicFeedback
 from .patient_identity import parse_canonical_patient_id
@@ -40,14 +46,18 @@ def recent_files(*, kind, content_type=None, limit=30):
             raise CatalogueConflict("Patient identity is ambiguous")
         query = select(ClinicArtifact).where(
             ClinicArtifact.patient_uuid.in_(patients),
-            ClinicArtifact.document_kind == kind,
+            _document_kind() == kind,
+            ClinicArtifact.id.in_(_working_file_ids(list(patients))),
         )
         if content_type is not None:
-            query = query.where(ClinicArtifact.content_type == content_type)
+            query = query.where(
+                func.lower(ClinicArtifact.content_type) == content_type.lower()
+            )
         artifacts = list(
             session.scalars(
                 query.order_by(
-                    ClinicArtifact.generated_at.desc(),
+                    _generation_time().desc(),
+                    ClinicArtifact.uploaded_at.desc(),
                     ClinicArtifact.session_date.desc(),
                     ClinicArtifact.version.desc(),
                     ClinicArtifact.id.desc(),
