@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import base64
-from datetime import timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import re
 import tempfile
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import Integer, case, cast, func, or_, select, text
 from . import storage
 from .clinic_models import (
     ClinicArtifact,
@@ -165,6 +165,188 @@ def _location_verified(location):
     return True
 
 
+def _document_kind():
+    # Imported catalogue history may predate documentKind. The stored MIME type
+    # still identifies video; an explicit classification always takes precedence.
+    return case(
+        (ClinicArtifact.document_kind.is_not(None), ClinicArtifact.document_kind),
+        (func.lower(ClinicArtifact.content_type).like("video/%"), "video"),
+        else_=None,
+    )
+
+
+def _generation_time():
+    safe_provenance = case(
+        (
+            func.json_valid(ClinicArtifact.provenance_json),
+            ClinicArtifact.provenance_json,
+        ),
+        else_="{}",
+    )
+    proof = (
+        func.json_each(safe_provenance, "$.proofs")
+        .table_valued("value", "type")
+        .alias("proof")
+    )
+    proof_value = case((proof.c.type == "object", proof.c.value), else_="{}")
+    receipt_stamp = func.json_extract(proof_value, "$.artifactRecord.ts")
+    timezone_present = or_(
+        receipt_stamp.op("GLOB")("*Z"),
+        func.substr(receipt_stamp, -6).op("GLOB")("[+-][0-9][0-9]:[0-9][0-9]"),
+    )
+    receipt_time = (
+        select(
+            func.max(
+                cast(
+                    func.round(
+                        (
+                            func.julianday(
+                                func.json_extract(proof_value, "$.artifactRecord.ts")
+                            )
+                            - 2440587.5
+                        )
+                        * 86400000
+                    ),
+                    Integer,
+                )
+            )
+        )
+        .where(
+            timezone_present,
+            func.json_extract(proof_value, "$.type")
+            == "original-workbench-exact-artifact-receipt",
+            func.json_extract(proof_value, "$.patientUuid")
+            == ClinicArtifact.patient_uuid,
+            func.json_extract(proof_value, "$.artifactRecord.path")
+            == func.json_extract(safe_provenance, "$.originalLocalPath"),
+        )
+        .correlate(ClinicArtifact)
+        .scalar_subquery()
+    )
+    return func.coalesce(ClinicArtifact.generated_at, receipt_time)
+
+
+def _record_generation_time(artifact, provenance):
+    if artifact.generated_at is not None:
+        return artifact.generated_at
+    times = []
+    for proof in (
+        provenance.get("proofs", [])
+        if isinstance(provenance.get("proofs"), list)
+        else []
+    ):
+        if not isinstance(proof, dict):
+            continue
+        record = proof.get("artifactRecord")
+        if (
+            proof.get("type") != "original-workbench-exact-artifact-receipt"
+            or proof.get("patientUuid") != artifact.patient_uuid
+            or not isinstance(record, dict)
+            or not provenance.get("originalLocalPath")
+            or record.get("path") != provenance["originalLocalPath"]
+        ):
+            continue
+        try:
+            if not re.search(r"(?:Z|[+-][0-9]{2}:[0-9]{2})$", record["ts"]):
+                continue
+            stamp = datetime.fromisoformat(record["ts"].replace("Z", "+00:00"))
+            if stamp.tzinfo is not None:
+                times.append(round(stamp.timestamp() * 1000))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return max(times) if times else None
+
+
+def _working_file_ids(patient_uuids):
+    # Group only when the same chart/role/session has a verified remote copy.
+    # Local-only rows stay individually addressable in the list until publication;
+    # no filesystem census, copied location, or source-identity mutation is needed.
+    from .clinic_records import ClinicFeedback
+
+    stored_kind = _document_kind()
+    kind = case(
+        (stored_kind.in_(("report", "source-report")), "source-report"),
+        else_=stored_kind,
+    )
+    reviewed = (
+        select(ClinicFeedback.id)
+        .where(ClinicFeedback.artifact_id == ClinicArtifact.id)
+        .exists()
+    )
+    separate = case(
+        (kind.in_(("source-report", "report", "patient-summary", "video")), None),
+        else_=ClinicArtifact.id,
+    )
+    remote = (
+        select(ClinicLocation.id)
+        .where(
+            ClinicLocation.artifact_id == ClinicArtifact.id,
+            ClinicLocation.kind == "netlify",
+            ClinicLocation.active.is_(True),
+            ClinicLocation.verified.is_(True),
+        )
+        .exists()
+    )
+    partition = (
+        ClinicArtifact.patient_uuid,
+        separate,
+        kind,
+        ClinicArtifact.sha256,
+        ClinicArtifact.size,
+        func.lower(ClinicArtifact.content_type),
+        ClinicArtifact.session_date,
+    )
+    candidates = (
+        select(
+            ClinicArtifact.id,
+            ClinicArtifact.patient_uuid,
+            ClinicArtifact.sha256,
+            ClinicArtifact.size,
+            func.lower(ClinicArtifact.content_type).label("content_type"),
+            ClinicArtifact.session_date,
+            ClinicArtifact.uploaded_at,
+            ClinicArtifact.version,
+            reviewed.label("reviewed"),
+            separate.label("separate"),
+            kind.label("kind"),
+            remote.label("remote"),
+            _generation_time().label("generated"),
+            func.max(cast(remote, Integer))
+            .over(partition_by=partition)
+            .label("published_group"),
+        )
+        .where(ClinicArtifact.patient_uuid.in_(patient_uuids))
+        .subquery()
+    )
+    c = candidates.c
+    ranked = select(
+        c.id,
+        c.reviewed,
+        func.row_number()
+        .over(
+            partition_by=(
+                c.patient_uuid,
+                case((c.published_group == 0, c.id), else_=c.separate),
+                c.kind,
+                c.sha256,
+                c.size,
+                c.content_type,
+                c.session_date,
+            ),
+            order_by=(
+                c.remote.desc(),
+                c.reviewed.desc(),
+                c.generated.desc(),
+                c.uploaded_at.desc(),
+                c.version.desc(),
+                c.id.desc(),
+            ),
+        )
+        .label("position"),
+    ).subquery()
+    return select(ranked.c.id).where(or_(ranked.c.position == 1, ranked.c.reviewed))
+
+
 def _artifact_json(session, artifact, patient, *, locations=None, feedback_events=None):
     from .clinic_feedback import current_feedback
 
@@ -213,8 +395,9 @@ def _artifact_json(session, artifact, patient, *, locations=None, feedback_event
         contentType=artifact.content_type,
         uploadedAt=artifact.uploaded_at,
         uploadedBy=artifact.uploaded_by,
-        generatedAt=artifact.generated_at,
-        documentKind=artifact.document_kind,
+        generatedAt=_record_generation_time(artifact, provenance),
+        documentKind=artifact.document_kind
+        or ("video" if artifact.content_type.lower().startswith("video/") else None),
         sessionDate=artifact.session_date,
         feedback=current_feedback(session, artifact.id, events=feedback_events),
         archived=artifact.archived,
@@ -338,6 +521,8 @@ def file_binding(patient_id, *, file_key=None, file_id=None):
 def open_local_file(file_id):
     """Return a verified temporary byte snapshot, safe against in-place writes.
 
+    Equivalent same-chart locations can supply the exact requested bytes when an
+    imported representative has only a remote location. Every candidate is hashed.
     Large media rolls to disk at 8 MiB; headers and every streamed range bind to
     the snapshot's hash. No mutable source is reopened after verification.
     """
@@ -347,10 +532,19 @@ def open_local_file(file_id):
             raise CatalogueNotFound("File not found")
         locations = list(
             session.scalars(
-                select(ClinicLocation).where(
-                    ClinicLocation.artifact_id == file_id,
+                select(ClinicLocation)
+                .join(ClinicArtifact, ClinicArtifact.id == ClinicLocation.artifact_id)
+                .where(
+                    ClinicArtifact.patient_uuid == artifact.patient_uuid,
+                    ClinicArtifact.sha256 == artifact.sha256,
+                    ClinicArtifact.size == artifact.size,
                     ClinicLocation.kind == "local",
                     ClinicLocation.active.is_(True),
+                )
+                .order_by(
+                    case((ClinicLocation.artifact_id == file_id, 0), else_=1),
+                    ClinicLocation.verified.desc(),
+                    ClinicLocation.id,
                 )
             )
         )
@@ -411,7 +605,8 @@ def patient_files(
             .where(ClinicArtifact.patient_uuid == patient.id)
             .order_by(
                 ClinicArtifact.session_date.desc(),
-                ClinicArtifact.generated_at.desc(),
+                _generation_time().desc(),
+                ClinicArtifact.uploaded_at.desc(),
                 ClinicArtifact.version.desc(),
                 ClinicArtifact.id.desc(),
             )
@@ -421,12 +616,19 @@ def patient_files(
             .select_from(ClinicArtifact)
             .where(ClinicArtifact.patient_uuid == patient.id)
         )
+        indexed_total = total
+        if mode != "delivery":
+            query = query.where(ClinicArtifact.id.in_(_working_file_ids([patient.id])))
+            total = session.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            )
         version = hashlib.sha256(
             _json(
                 dict(
                     patientId=patient.label,
                     revision=patient_revision,
                     contractVersion=2,
+                    fileViewRevision=1,
                 )
             ).encode()
         ).hexdigest()
@@ -434,7 +636,7 @@ def patient_files(
             patientId=patient.label,
             mode=mode,
             totalFiles=total,
-            totalIndexedFiles=total,
+            totalIndexedFiles=indexed_total,
             indexUpdatedAt=patient_state.updated_at if patient_state else 0,
             indexVersion=version,
             contractVersion=2,
@@ -507,10 +709,8 @@ def patient_files(
                 "vision-transcript",
                 "technical",
             )
-            technical_filter = ClinicArtifact.document_kind.in_(technical_kinds)
-            reviewable_filter = or_(
-                ClinicArtifact.document_kind.is_(None), ~technical_filter
-            )
+            technical_filter = _document_kind().in_(technical_kinds)
+            reviewable_filter = or_(_document_kind().is_(None), ~technical_filter)
             technical_count = session.scalar(
                 select(func.count())
                 .select_from(ClinicArtifact)
@@ -529,9 +729,7 @@ def patient_files(
                 heroes = []
                 for kind in ("patient-summary", "video"):
                     heroes.extend(
-                        session.scalars(
-                            query.where(ClinicArtifact.document_kind == kind).limit(25)
-                        )
+                        session.scalars(query.where(_document_kind() == kind).limit(25))
                     )
                 selected_artifacts = list(
                     {a.id: a for a in heroes + selected_artifacts}.values()
