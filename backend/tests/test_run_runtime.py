@@ -231,8 +231,10 @@ async def test_actual_six_stage_resume_preserves_policy_and_avoids_second_dispat
 
     sent = []
     llm = client(
-        lambda req: sent.append(req.content)
-        or answer("Complete\n<!-- END CONSOLIDATED REPORT -->")
+        lambda req: (
+            sent.append(req.content)
+            or answer("Complete\n<!-- END CONSOLIDATED REPORT -->")
+        )
     )
     original_progress = core._append_progress_event
     original_publish = completion._publish
@@ -847,3 +849,75 @@ async def test_legacy_post_hook_cannot_generate_outside_original_authority(
         await main._auto_generate_patient_facing_for_run(run_id, Broker())
     assert sends == []
     assert saved_run(store, run_id)[1] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_billing_reconciliation_continues_original_six_stage_run(
+    clinical, monkeypatch
+):
+    import json
+    from collections import Counter
+
+    import httpx
+
+    from backend import paid_transport
+    from backend.council import QEEGCouncilWorkflow
+    from backend.tests.test_council_completion import answer
+    from backend.tests.test_council_execution import client
+
+    sent = []
+
+    def send(request):
+        sent.append(request.content)
+        if json.loads(request.content)["model"] == "mock-b":
+            return httpx.Response(
+                402, json={"error": {"message": "Insufficient Balance"}}
+            )
+        return answer("Complete\n<!-- END CONSOLIDATED REPORT -->")
+
+    llm = client(send)
+
+    def runtime():
+        return runtime_type()(
+            clinical,
+            llm=llm,
+            workflow=QEEGCouncilWorkflow(llm=llm),
+            poll_interval=0.01,
+            retry_delay=0.02,
+        )
+
+    original = paid_transport._rejection
+    first = runtime()
+    try:
+        with monkeypatch.context() as legacy:
+            legacy.setattr(
+                paid_transport,
+                "_rejection",
+                lambda status, body: None if status == 402 else original(status, body),
+            )
+            await first.start()
+            await until(lambda: saved_run(clinical)[0] == "blocked")
+            await first.stop()
+        initial = Counter(sent)
+        assert len(initial) == 2
+        assert paid_transport.reconcile_blocked_run(clinical, "r")
+        second = runtime()
+        await second.start()
+        try:
+            await until(lambda: saved_run(clinical)[0] in ("done", "blocked"))
+        finally:
+            await second.stop()
+        assert saved_run(clinical)[:2] == ("done", "complete"), saved_run(clinical)
+        for request, count in initial.items():
+            assert sent.count(request) == count
+        with Session(clinical.engine) as session:
+            assert session.query(storage.Run).count() == 1
+            assert session.query(storage.StageReceipt).count() == 6
+            assert (
+                not session.query(storage.PaidRequest)
+                .filter_by(state="unknown")
+                .count()
+            )
+    finally:
+        await first.stop()
+        await llm.aclose()

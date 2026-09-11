@@ -21,7 +21,7 @@ def paid():
 
 @pytest.fixture
 def owner(tmp_path):
-    storage.reset_engine(f'sqlite:///{tmp_path / "app.db"}')
+    storage.reset_engine(f"sqlite:///{tmp_path / 'app.db'}")
     storage.init_db()
     with storage.session_scope() as session:
         session.add(
@@ -906,7 +906,7 @@ async def test_partial_body_is_unknown_not_a_complete_response(owner):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 429])
+@pytest.mark.parametrize("status", [401, 402, 429])
 @pytest.mark.parametrize(
     "body",
     [
@@ -1005,3 +1005,161 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
         await client.aclose()
     assert len(calls) == (1 if status == 401 else min(failures + 1, 5))
     assert len(sleeps) == (0 if status == 401 else min(failures, 4))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "missing", "changed", "ambiguous"])
+async def test_blocked_receipt_reconciliation_preserves_original_paid_work(
+    owner, monkeypatch, damage
+):
+    """A classifier repair may rejoin original intent only from intact receipts."""
+    p = paid()
+    calls = []
+    rejection = p._rejection
+
+    def send(request):
+        calls.append(request.content)
+        return httpx.Response(
+            200 if request.content == b"completed" else 402,
+            content=b"completed output"
+            if request.content == b"completed"
+            else b'{"error":{"message":"Insufficient Balance"}}',
+        )
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+        with scope(owner, "saved"):
+            await client.post("http://test/v1/responses", content=b"completed")
+        with monkeypatch.context() as old:
+            old.setattr(
+                p,
+                "_rejection",
+                lambda status, body: None if status == 402 else rejection(status, body),
+            )
+            with scope(owner, "billing"), pytest.raises(p.PaidOutcomeUnknown):
+                await client.post(
+                    "http://test/v1/responses", content=b"original rejected request"
+                )
+    before = {
+        r.scope_key: (r.request_hash, r.response_hash, r.dispatch_ordinal)
+        for r in rows(owner)
+    }
+    row = next(r for r in rows(owner) if r.scope_key == "billing")
+    if damage == "missing":
+        Path(row.response_path).unlink()
+    elif damage == "changed":
+        Path(row.response_path).write_text("{}")
+    elif damage == "ambiguous":
+        monkeypatch.setattr(p, "_rejection", lambda status, body: None)
+    original_store = owner.store
+    owner.release(state="blocked", blocked_reason="paid_outcome_unknown")
+    assert callable(getattr(p, "reconcile_blocked_run", None)), (
+        "saved rejected request cannot currently be reconciled"
+    )
+    if damage:
+        with pytest.raises((p.PaidOutcomeUnknown, ExecutionConflict, OSError)):
+            p.reconcile_blocked_run(original_store, "r")
+    else:
+        assert p.reconcile_blocked_run(original_store, "r") is True
+        assert p.reconcile_blocked_run(original_store, "r") is False
+    with Session(original_store.engine) as session:
+        run = session.get(storage.Run, "r")
+        assert run.execution_state == ("blocked" if damage else "pending")
+        assert run.analysis_input_fingerprint == "input"
+        assert run.execution_manifest_hash == "a" * 64
+        assert run.start_requested_at is not None
+        saved = list(session.scalars(select(storage.PaidRequest)))
+        assert {
+            r.scope_key: (r.request_hash, r.response_hash, r.dispatch_ordinal)
+            for r in saved
+        } == before
+        assert (
+            next(r for r in saved if r.scope_key == "saved").state == "response_saved"
+        )
+        assert next(r for r in saved if r.scope_key == "billing").state == (
+            "unknown" if damage else "rejected"
+        )
+    assert calls == [b"completed", b"original rejected request"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["receipt", "release"])
+async def test_reconciliation_process_death_resumes_original_checkpoint(
+    owner, monkeypatch, boundary
+):
+    import os
+    import subprocess
+    import sys
+    from datetime import datetime, timezone
+
+    p = paid()
+    original = p._rejection
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    402, json={"error": {"message": "Insufficient Balance"}}
+                )
+            )
+        )
+    ) as client:
+        with monkeypatch.context() as old:
+            old.setattr(
+                p,
+                "_rejection",
+                lambda status, body: None if status == 402 else original(status, body),
+            )
+            with scope(owner), pytest.raises(p.PaidOutcomeUnknown):
+                await client.post("http://test/v1/responses", content=b"original")
+    store = owner.store
+    owner.release(state="blocked", blocked_reason="paid_outcome_unknown")
+    script = """
+import os,sys
+from sqlalchemy import create_engine
+from backend import paid_transport as p
+from backend.run_execution import ExecutionStore,RunOwner
+store=ExecutionStore(create_engine('sqlite:///'+sys.argv[1]))
+if sys.argv[2]=='receipt':
+ original=p._Receipt.reconcile
+ def reconcile(self):
+  result=original(self)
+  os._exit(71)
+ p._Receipt.reconcile=reconcile
+else:
+ original=RunOwner.release
+ def release(self,*a,**kw):
+  if kw.get('state')=='pending':os._exit(71)
+  return original(self,*a,**kw)
+ RunOwner.release=release
+p.reconcile_blocked_run(store,'r')
+"""
+    env = os.environ.copy()
+    env["DATA_DIR"] = str(store.db_path.parent / "scratch")
+    for key in [
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "CLIPROXY_API_KEY",
+    ]:
+        env[key] = ""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(store.db_path), boundary],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 71, result.stderr
+    assert store.list_due_runs(datetime.now(timezone.utc)) == []
+    assert p.reconcile_blocked_run(store, "r")
+    with Session(store.engine) as session:
+        assert session.get(storage.Run, "r").execution_state == "pending"
+        assert session.get(storage.Run, "r").blocked_reason is None
+        requests = list(session.scalars(select(storage.PaidRequest)))
+        assert len(requests) == 1 and requests[0].state == "rejected"
+        assert Path(requests[0].request_path).read_bytes() == b"original"
+    assert len(store.list_due_runs(datetime.now(timezone.utc))) == 1

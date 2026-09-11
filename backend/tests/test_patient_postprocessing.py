@@ -479,9 +479,9 @@ asyncio.run(post.continue_patient_facing(owner,llm_client=llm(Sends())))
         text=True,
         timeout=30,
     )
-    assert result.returncode == (
-        71 if death == "during_dispatch" else 72
-    ), result.stderr
+    assert result.returncode == (71 if death == "during_dispatch" else 72), (
+        result.stderr
+    )
     assert marker.read_text() == "sent\n"
     owner = store.claim_run_owner(run_id)
     sent = []
@@ -749,9 +749,9 @@ if owner is not None:owner.close()
     try:
         while not started.is_set() and not task.done():
             await asyncio.sleep(0.001)
-        assert (
-            started.is_set() and not settled.is_set()
-        ), "free worker blocked cancellation delivery"
+        assert started.is_set() and not settled.is_set(), (
+            "free worker blocked cancellation delivery"
+        )
         task.cancel()
         await asyncio.sleep(0.01)
         task.cancel()
@@ -768,3 +768,89 @@ if owner is not None:owner.close()
         finish.set()
         await asyncio.gather(task, return_exceptions=True)
         owner.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "manifest", "other_block", "receipt_commit"])
+async def test_reconcile_saved_post_billing_rejection_uses_post_admission(
+    ready, monkeypatch, damage
+):
+    from backend import paid_transport as paid
+
+    owner = admit(ready)
+    store, run_id, _ = ready
+    sent = []
+    client = llm(sent)
+
+    def send(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "writer"}]})
+        sent.append(request.content)
+        return httpx.Response(402, json={"error": {"message": "Insufficient Balance"}})
+
+    client._transport = httpx.MockTransport(send)
+    original = paid._rejection
+    with monkeypatch.context() as old:
+        old.setattr(
+            paid,
+            "_rejection",
+            lambda status, body: None if status == 402 else original(status, body),
+        )
+        with pytest.raises(paid.PaidOutcomeUnknown):
+            await post.continue_patient_facing(owner, llm_client=client)
+    with owner.transaction() as session:
+        obligation = session.get(storage.PostObligation, (run_id, "patient_facing"))
+        manifest_path, manifest_hash = (
+            obligation.manifest_path,
+            obligation.manifest_hash,
+        )
+        request = session.scalar(select(storage.PaidRequest))
+        binding = (
+            request.request_hash,
+            request.response_hash,
+            request.dispatch_ordinal,
+        )
+        if damage == "other_block":
+            obligation.blocked_reason = "original source changed"
+    if damage == "manifest":
+        Path(manifest_path).write_text("{}")
+    owner.release(state="blocked", blocked_reason="paid_outcome_unknown")
+    invalid = damage in ("manifest", "other_block")
+    if damage == "receipt_commit":
+        reconcile = paid._Receipt.reconcile
+
+        def interrupted(receipt):
+            reconcile(receipt)
+            raise OSError("interrupted after receipt commit")
+
+        with monkeypatch.context() as failure:
+            failure.setattr(paid._Receipt, "reconcile", interrupted)
+            with pytest.raises(OSError):
+                paid.reconcile_blocked_run(store, run_id)
+    try:
+        if invalid:
+            with pytest.raises(ExecutionConflict):
+                paid.reconcile_blocked_run(store, run_id)
+        else:
+            assert paid.reconcile_blocked_run(store, run_id)
+        with storage.session_scope() as session:
+            obligation = session.get(storage.PostObligation, (run_id, "patient_facing"))
+            assert obligation.state == ("blocked" if invalid else "pending")
+            assert (obligation.manifest_path, obligation.manifest_hash) == (
+                manifest_path,
+                manifest_hash,
+            )
+            request = session.scalar(select(storage.PaidRequest))
+            assert (
+                request.request_hash,
+                request.response_hash,
+                request.dispatch_ordinal,
+            ) == binding
+            assert request.state == ("unknown" if invalid else "rejected")
+            run = session.get(storage.Run, run_id)
+            assert run.execution_state == ("blocked" if invalid else "pending")
+            assert run.execution_manifest_hash is None
+        assert len(sent) == 1
+    finally:
+        owner.close()
+        await client.aclose()
