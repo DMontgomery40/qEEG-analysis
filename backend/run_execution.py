@@ -76,6 +76,12 @@ def _due_filters(now):
     return (
         storage.Run.start_requested_at.is_not(None),
         storage.Run.execution_state.in_(["pending", "owned"]),
+        # A crashed explicit reconciliation retains this existing checkpoint.
+        # Its receipt/post transitions finish before an ordinary consumer runs.
+        or_(
+            storage.Run.blocked_reason.is_(None),
+            storage.Run.blocked_reason != "paid_outcome_unknown",
+        ),
         or_(storage.Run.next_check_at.is_(None), storage.Run.next_check_at <= now),
         # A complete council with only blocked/delayed obligations has no due work.
         # All terminal obligations still allow a final execution-done checkpoint.
@@ -156,11 +162,13 @@ class ExecutionStore:
         with Session(self.engine, expire_on_commit=False) as session:
             return list(session.scalars(query.order_by(storage.Run.id).limit(limit)))
 
-    def claim_run_owner(self, run_id: str):
+    def claim_run_owner(self, run_id: str, *, reconcile_paid: bool = False):
         """Nonblocking flock first, short DB claim second; None means unavailable.
 
         Tokens are random per claim and generations increase even after process
         death. PID and owner_started_at are diagnostics, never takeover authority.
+        Explicit receipt reconciliation can claim only paid-outcome blocks;
+        ordinary consumers continue to use the due-work filter.
         """
         self.lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         # IDs are opaque, so a digest also prevents path traversal or slash aliases.
@@ -180,7 +188,15 @@ class ExecutionStore:
                     update(storage.Run)
                     .where(
                         storage.Run.id == run_id,
-                        *_due_filters(_now()),
+                        *(
+                            (
+                                storage.Run.start_requested_at.is_not(None),
+                                storage.Run.execution_state.in_(["blocked", "owned"]),
+                                storage.Run.blocked_reason == "paid_outcome_unknown",
+                            )
+                            if reconcile_paid
+                            else _due_filters(_now())
+                        ),
                     )
                     .values(
                         execution_state="owned",

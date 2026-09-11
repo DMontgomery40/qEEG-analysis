@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from sqlalchemy import select
@@ -207,11 +208,13 @@ def _fsync_dir(path):
 def _rejection(status, body):
     """Acknowledged auth/rate-limit responses and explicit endpoint rejections.
 
-    A complete 401 or 429 response rejects this attempt independently of its
+    A complete 401, 402 or 429 response rejects this attempt independently of its
     optional error body. Ambiguous server errors remain outcome-unknown.
     """
     if status == 401:
         return "authentication_rejected"
+    if status == 402:
+        return "payment_rejected"
     if status == 429:
         return "rate_limit_rejected"
     try:
@@ -226,6 +229,117 @@ def _rejection(status, body):
     ):
         return "chat_endpoint_rejected"
     return None
+
+
+def reconcile_blocked_run(store, run_id):
+    """Recheck complete saved responses without sending or replacing any request.
+
+    Only original paid-outcome blocks are eligible. The existing flock and
+    receipt validators fence recovery; missing or ambiguous evidence keeps the
+    run blocked. Rejoining pending work preserves its original start intent.
+    """
+    owner = store.claim_run_owner(run_id, reconcile_paid=True)
+    if owner is None:
+        return False
+    try:
+        with owner.transaction() as session:
+            requests = list(
+                session.scalars(
+                    select(storage.PaidRequest).where(
+                        storage.PaidRequest.run_id == run_id,
+                        storage.PaidRequest.state.in_(
+                            [
+                                "unknown",
+                                "dispatched",
+                                "rejected",
+                                "response_saved",
+                            ]
+                        ),
+                    )
+                )
+            )
+        if not requests:
+            raise ExecutionConflict("blocked run has no dispatched paid receipts")
+        # Receipt classification may already have committed before interruption.
+        # The run's paid-outcome block remains the durable recovery checkpoint.
+        # Re-validate those receipts too, preserving their original body/hash.
+        paid_post_reasons = {
+            str(PaidOutcomeUnknown((r.run_id, r.scope_key, r.dispatch_ordinal), reason))
+            for r in requests
+            if r.scope_key == "post/patient_facing/generation"
+            for reason in (
+                "paid_outcome_unknown",
+                "unclassified_http_response",
+                "transport_or_receipt_failure",
+                "cancelled_after_dispatch",
+            )
+        }
+        posts_to_resume = {}
+        for row in requests:
+            route = json.loads(row.route_json)
+            with owner.file_guard():
+                body = Path(row.request_path).read_bytes()
+            request = httpx.Request(
+                route["method"],
+                route["url"],
+                headers=route["headers"],
+                content=body,
+                extensions={"timeout": route["timeout"]},
+            )
+            if row.scope_key.startswith("post/"):
+                if row.scope_key != "post/patient_facing/generation":
+                    raise ExecutionConflict("unsupported post receipt scope")
+                with owner.transaction() as session:
+                    post = session.get(
+                        storage.PostObligation, (run_id, "patient_facing")
+                    )
+                if post is None:
+                    raise ExecutionConflict("original post obligation is missing")
+                if post.state == "blocked":
+                    if post.blocked_reason not in paid_post_reasons:
+                        raise ExecutionConflict(
+                            "post obligation has another blocking reason"
+                        )
+                    posts_to_resume[post.kind] = post.blocked_reason
+                scope = post_paid_scope(
+                    owner,
+                    post.kind,
+                    post.manifest_path,
+                    row.execution_manifest_hash,
+                    row.input_fingerprint,
+                    reconciliation=True,
+                )
+            else:
+                scope = paid_scope(
+                    owner,
+                    row.scope_key,
+                    row.execution_manifest_hash,
+                    row.input_fingerprint,
+                )
+            with scope as cursor:
+                cursor.ordinal = row.dispatch_ordinal
+                _Receipt(cursor, request).reconcile()
+        raise_if_paid_blocked(owner)
+        # All paid evidence is verified before reopening the original post.
+        # Unrelated source, policy and clinical blocks remain untouched.
+        with owner.transaction() as session:
+            for kind, reason in posts_to_resume.items():
+                post = session.get(storage.PostObligation, (run_id, kind))
+                if post.state != "blocked" or post.blocked_reason != reason:
+                    raise ExecutionConflict("post blocking reason changed")
+                post.state, post.blocked_reason, post.next_check_at = (
+                    "pending",
+                    None,
+                    None,
+                )
+                post.owner_token, post.owner_generation = owner.token, owner.generation
+        owner.release(state="pending")
+        return True
+    except BaseException:
+        owner.release(state="blocked", blocked_reason="paid_outcome_unknown")
+        raise
+    finally:
+        owner.close()
 
 
 class _Receipt:
@@ -646,7 +760,15 @@ def current_paid_scope():
 
 
 @contextmanager
-def post_paid_scope(owner, kind, manifest_path, manifest_hash, source_fingerprint):
+def post_paid_scope(
+    owner,
+    kind,
+    manifest_path,
+    manifest_hash,
+    source_fingerprint,
+    *,
+    reconciliation=False,
+):
     """Narrow post-only scope; leaves council admission/attestation untouched."""
     from pathlib import Path
 
@@ -668,7 +790,12 @@ def post_paid_scope(owner, kind, manifest_path, manifest_hash, source_fingerprin
         row = session.get(storage.PostObligation, (owner.run_id, kind))
         if (
             row is None
-            or row.state not in ("pending", "owned")
+            or row.state
+            not in (
+                ("pending", "owned", "blocked")
+                if reconciliation
+                else ("pending", "owned")
+            )
             or (row.manifest_path, row.manifest_hash)
             != (str(manifest_path), manifest_hash)
         ):
