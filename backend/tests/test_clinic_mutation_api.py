@@ -6,6 +6,28 @@ import pytest
 live_api = api_fixtures.live_api
 
 
+@pytest.mark.parametrize("birthdate", ["2/2/1900", "02/02/1900", " 02/02/1900 ", "2-2-1900"])
+def test_report_date_inputs_file_once_and_replay_original_upload(live_api, birthdate):
+    client, _, _ = live_api
+    first = upload(client, "report-date", "workbench", birthdate=birthdate)
+    assert first.status_code == 200, first.text
+    saved = first.json()["upload"]
+    assert saved["status"] == "registered"
+    assert saved["patientId"] == "AB_02-02-1900"
+    replay = upload(client, "report-date", "thrylen-service", birthdate=birthdate)
+    assert replay.json()["upload"] == saved
+    assert len(client.get("/uploads").json()["uploads"]) == 1
+    assert len(client.get("/patients").json()["patients"]) == 2
+
+
+@pytest.mark.parametrize("birthdate", ["2/30/1900", "2/29/1900", "13/2/1900", "02/02/00", "1900/02/02", "2/2-1900"])
+def test_invalid_report_dates_do_not_allocate_a_chart(live_api, birthdate):
+    client, _, _ = live_api
+    response = upload(client, "bad-date", "workbench", birthdate=birthdate)
+    assert response.status_code == 400, response.text
+    assert len(client.get("/patients").json()["patients"]) == 1
+
+
 def upload(client, key, principal, **fields):
     return client.post(
         "/uploads",

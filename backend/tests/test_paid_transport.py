@@ -59,6 +59,40 @@ def rows(owner):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", ["z-ai/glm-5.2", "z-ai/glm-5.3-flash"])
+async def test_mandatory_reasoning_rejection_recovers_and_replays_exact_paid_requests(owner, monkeypatch, model_id):
+    from backend.llm_client import AsyncOpenAICompatClient
+    monkeypatch.setenv("QEEG_OPENROUTER_DIRECT", "0")
+    calls = []
+
+    def send(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx.Response(200, json={"choices": [{"message": {"content": None}, "finish_reason": "length"}]})
+        if body.get("reasoning", {}).get("effort") == "none":
+            return httpx.Response(400, json={"error": {"message": "Reasoning is mandatory for this endpoint and cannot be disabled.", "code": 400}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Recovered transcription"}}]})
+
+    client = AsyncOpenAICompatClient(base_url="http://test", api_key="", timeout_s=5, transport=httpx.MockTransport(send))
+    try:
+        with scope(owner, "transcription"):
+            result = await client.chat_completions(model_id=model_id, messages=[{"role": "user", "content": "Read pages"}], max_tokens=4000)
+        assert result == "Recovered transcription"
+        original = [(r.request_hash, r.response_hash, r.dispatch_ordinal) for r in rows(owner)]
+        with scope(owner, "transcription"):
+            replay = await client.chat_completions(model_id=model_id, messages=[{"role": "user", "content": "Read pages"}], max_tokens=4000)
+        assert replay == result
+        assert len(calls) == 3
+        assert [(r.request_hash, r.response_hash, r.dispatch_ordinal) for r in rows(owner)] == original
+        assert rows(owner)[1].state == "rejected"
+        assert calls[2]["reasoning"].get("effort") != "none"
+        assert calls[2]["reasoning"]["exclude"] is True
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "body",
     [
@@ -1020,8 +1054,12 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
         ("changed", True),
     ],
 )
+@pytest.mark.parametrize("rejected_status,rejected_body", [
+    (402, b'{"error":{"message":"Insufficient Balance"}}'),
+    (400, b'{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}}'),
+])
 async def test_blocked_receipt_reconciliation_preserves_original_paid_work(
-    owner, monkeypatch, damage, command
+    owner, monkeypatch, damage, command, rejected_status, rejected_body
 ):
     """A classifier repair may rejoin original intent only from intact receipts."""
     p = paid()
@@ -1031,10 +1069,10 @@ async def test_blocked_receipt_reconciliation_preserves_original_paid_work(
     def send(request):
         calls.append(request.content)
         return httpx.Response(
-            200 if request.content == b"completed" else 402,
+            200 if request.content == b"completed" else rejected_status,
             content=b"completed output"
             if request.content == b"completed"
-            else b'{"error":{"message":"Insufficient Balance"}}',
+            else rejected_body,
         )
 
     async with httpx.AsyncClient(
@@ -1046,7 +1084,7 @@ async def test_blocked_receipt_reconciliation_preserves_original_paid_work(
             old.setattr(
                 p,
                 "_rejection",
-                lambda status, body: None if status == 402 else rejection(status, body),
+                lambda status, body: None if status == rejected_status else rejection(status, body),
             )
             with scope(owner, "billing"), pytest.raises(p.PaidOutcomeUnknown):
                 await client.post(

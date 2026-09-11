@@ -13,6 +13,7 @@ from .paid_transport import (
     PaidClient,
     PaidOutcomeUnknown,
     owned_to_thread,
+    _rejection,
 )
 from .run_execution import ExecutionConflict, StaleOwner
 
@@ -720,6 +721,13 @@ class AsyncOpenAICompatClient:
                 retry_response = await client.post(
                     "/v1/chat/completions", json=retry_payload
                 )
+                if _rejection(retry_response.status_code, retry_response.content) == "reasoning_required":
+                    # Retain the original retry for receipt replay. A verified
+                    # rejection permits one corrected request as a new ordinal.
+                    retry_payload["reasoning"] = {"enabled": True, "exclude": True}
+                    retry_response = await client.post(
+                        "/v1/chat/completions", json=retry_payload
+                    )
             except (PaidOutcomeUnknown, ExecutionConflict, StaleOwner):
                 raise
             except Exception as e:
@@ -761,7 +769,7 @@ class AsyncOpenAICompatClient:
                 or _looks_like_reasoning_leak(retry_content, retry_message)
             ):
                 raise UpstreamError(
-                    f"{upstream} GLM did not return publishable final content after one reasoning-disabled retry",
+                    f"{upstream} GLM did not return publishable final content after its bounded retry",
                     operator_hint=(
                         "The GLM writer returned empty or reasoning-like text twice; "
                         "do not publish it and retry the patient-facing generation later."
