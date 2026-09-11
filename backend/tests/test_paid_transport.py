@@ -1008,9 +1008,20 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "missing", "changed", "ambiguous"])
+@pytest.mark.parametrize(
+    "damage,command",
+    [
+        (None, False),
+        ("missing", False),
+        ("changed", False),
+        ("ambiguous", False),
+        (None, True),
+        ("missing", True),
+        ("changed", True),
+    ],
+)
 async def test_blocked_receipt_reconciliation_preserves_original_paid_work(
-    owner, monkeypatch, damage
+    owner, monkeypatch, damage, command
 ):
     """A classifier repair may rejoin original intent only from intact receipts."""
     p = paid()
@@ -1057,7 +1068,30 @@ async def test_blocked_receipt_reconciliation_preserves_original_paid_work(
     assert callable(getattr(p, "reconcile_blocked_run", None)), (
         "saved rejected request cannot currently be reconciled"
     )
-    if damage:
+    if command:
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "backend.scripts.reconcile_paid_run",
+                "--data-dir",
+                str(Path(original_store.engine.url.database).parent),
+                "r",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == (1 if damage else 0), result.stderr
+        assert (
+            ("Recovery stopped" in result.stderr)
+            if damage
+            else ("Saved receipts reconciled" in result.stdout)
+        )
+    elif damage:
         with pytest.raises((p.PaidOutcomeUnknown, ExecutionConflict, OSError)):
             p.reconcile_blocked_run(original_store, "r")
     else:
