@@ -222,6 +222,10 @@ def _rejection(status, body):
         message = error.get("message", "").lower()
     except (ValueError, AttributeError, TypeError):
         return None
+    if status == 400 and (
+        "reasoning is mandatory" in message and "cannot be disabled" in message
+    ):
+        return "reasoning_required"
     if status in (400, 404, 405) and (
         ("not supported" in message or "not support chat" in message)
         and ("chat" in message)

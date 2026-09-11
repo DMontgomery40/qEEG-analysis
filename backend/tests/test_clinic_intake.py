@@ -476,6 +476,29 @@ def test_known_chart_report_birthdate_is_checked_before_filing(temp_data_dir):
     assert counts() == (1, 1, 0, 2, 0)
 
 
+@pytest.mark.parametrize("dates", [("2/2/1900", "02/02/1900"), ("02-02-1900", "2/2/1900")])
+def test_equivalent_report_dates_on_known_chart_file_once(temp_data_dir, dates):
+    patient = submit()["upload"]["patientId"]
+    args = dict(patient_id=patient, identity={}, file_meta=[
+        {"documentKind": "report", "reportBirthdate": date} for date in dates
+    ])
+    first = submit("mixed-spelling", **args)["upload"]
+    assert first["status"] == "registered"
+    assert first["patientId"] == patient
+    assert submit("mixed-spelling", **args)["upload"] == first
+    assert counts() == (1, 1, 2, 2, 0)
+
+
+def test_different_report_dates_on_known_chart_remain_rejected(temp_data_dir):
+    patient = submit()["upload"]["patientId"]
+    with pytest.raises(ValueError, match="different dates of birth"):
+        submit("different-dates", patient_id=patient, identity={}, file_meta=[
+            {"documentKind": "report", "reportBirthdate": date}
+            for date in ("2/2/1900", "03/03/1900")
+        ])
+    assert counts() == (1, 1, 0, 2, 0)
+
+
 def test_missing_accepted_private_policy_fails_loudly_without_losing_filing(
     temp_data_dir,
 ):

@@ -459,7 +459,7 @@ def _bind_patient(upload_id):
                     birthdate=target.birthdate or parsed.birthdate,
                 )
                 report_dobs = {
-                    i["metadata"].get("reportBirthdate")
+                    normalize_birthdate(i["metadata"]["reportBirthdate"])
                     for i in m["items"]
                     if i["metadata"].get("reportBirthdate")
                 }

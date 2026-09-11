@@ -82,6 +82,9 @@ def _is_plausible_birthdate(month: int, day: int, year: int) -> bool:
 def normalize_birthdate(value: Any) -> str:
     """Return a date of birth as zero-padded ``MM-DD-YYYY``."""
     raw = str(value or "").strip()
+    # Reports print MM/DD/YYYY; normalize input without relaxing patient IDs.
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", raw):
+        raw = raw.replace("/", "-")
     match = _LOOSE_BIRTHDATE_RE.match(raw)
     if match is None:
         raise PatientIdentityError(
