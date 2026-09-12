@@ -548,12 +548,24 @@ def verify_remote_location(file_id, key, readback):
             raise CatalogueConflict(
                 "Remote location must be registered before readback"
             )
-        if location.verified != matches:
-            location.verified, location.verified_at = (
-                matches,
-                _now() if matches else None,
+        # One remote object backs all of these exact byte bindings. Verification
+        # (or a positive mismatch) applies to the object, not just one file ID.
+        affected = set()
+        for peer, owner in session.execute(
+            select(ClinicLocation, ClinicArtifact)
+            .join(ClinicArtifact, ClinicArtifact.id == ClinicLocation.artifact_id)
+            .where(
+                ClinicLocation.kind == "netlify",
+                ClinicLocation.key == key,
+                ClinicLocation.active.is_(True),
             )
-            _bump(session, artifact.patient_uuid)
+        ):
+            valid = (digest, size) == (owner.sha256, owner.size)
+            if peer.verified != valid:
+                peer.verified, peer.verified_at = valid, _now() if valid else None
+                affected.add(owner.patient_uuid)
+        if affected:
+            _bump(session, affected)
     if not matches:
         raise CatalogueConflict("Remote bytes differ from the artifact")
 

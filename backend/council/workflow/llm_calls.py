@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ...config import ARTIFACTS_DIR
+from ...file_updates import atomic_destination
 from ...llm_client import UpstreamError
 from ...storage import Artifact, create_artifact
 from ...storage import session_scope
@@ -172,7 +173,8 @@ class _LLMCallsMixin:
         out_dir = _stage_dir(run_id, stage.num)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = _artifact_path(run_id, stage.num, model_id, stage.ext)
-        path.write_text(text, encoding="utf-8")
+        with atomic_destination(path) as pending:
+            pending.write_text(text, encoding="utf-8")
         with session_scope() as session:
             artifact = create_artifact(
                 session,

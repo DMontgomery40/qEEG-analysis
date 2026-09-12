@@ -410,31 +410,63 @@ def apply_patient_rekey(
             # Every file goes across on its own, and nothing is ever written
             # over. A name that exists on both sides is two patients' work
             # meeting, which is not something to resolve by picking one.
-            for path in sorted(old_dir.rglob("*")):
-                if not path.is_file():
-                    continue
+            # Read the entire inventory before moving its .content anchors:
+            # otherwise relative named links become temporarily dangling and are
+            # skipped by a second filesystem scan.
+            files = [
+                (
+                    path,
+                    _sha256_file(path)
+                    if path.suffix.lower() in DELIVERABLE_SUFFIXES
+                    else "",
+                )
+                for path in sorted(old_dir.rglob("*"))
+                if path.is_file()
+            ]
+            content_anchors = set()
+            for path, digest in files:
                 target = _merge_target(path, old_dir, new_dir, plan)
-                if target.exists():
+                relative = path.relative_to(old_dir).parts
+                if (
+                    len(relative) == 3
+                    and relative[0] == ".content"
+                    and relative[2] == "original"
+                    and len(relative[1]) == 64
+                    and all(c in "0123456789abcdef" for c in relative[1])
+                    and not path.is_symlink()
+                    and _sha256_file(path) == relative[1]
+                ):
+                    if not target.is_symlink() and (
+                        not target.exists()
+                        or (target.is_file() and _sha256_file(target) == relative[1])
+                    ):
+                        content_anchors.add(path)
+                        continue
+                if target.exists() or target.is_symlink():
                     raise PatientRekeyError(
                         f"{target} already exists, so {path} cannot join it. "
                         f"Two patients' files meet at that name; nothing was moved."
                     )
-            for path in sorted(old_dir.rglob("*")):
-                if not path.is_file():
-                    continue
+            for path, digest in files:
                 target = _merge_target(path, old_dir, new_dir, plan)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                digest = (
-                    _sha256_file(path)
-                    if path.suffix.lower() in DELIVERABLE_SUFFIXES
-                    else ""
-                )
-                os.replace(path, target)
+                if path in content_anchors:
+                    # Keep the source anchor through named moves. After an
+                    # interruption the remaining source links are still readable
+                    # and a fresh plan can resume the merge.
+                    if not target.exists():
+                        os.link(path, target)
+                else:
+                    os.replace(path, target)
+                result.folder_merged += 1
+            for path, digest in files:
+                target = _merge_target(path, old_dir, new_dir, plan)
                 if digest and _sha256_file(target) != digest:
                     raise PatientRekeyError(
                         f"{target.name} changed bytes joining {plan.new_id}."
                     )
-                result.folder_merged += 1
+            for path in content_anchors:
+                path.unlink()
             # Only empty directories are left behind, and only those go.
             for directory in sorted(
                 (d for d in old_dir.rglob("*") if d.is_dir()), reverse=True

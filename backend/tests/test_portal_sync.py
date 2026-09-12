@@ -767,3 +767,50 @@ def test_portal_sync_paths_route_only_on_canonical_ids(tmp_path: Path, monkeypat
 
     snapshots = portal_sync._snapshot_portal_patient_fingerprints(portal_root)
     assert list(snapshots) == ["BT_12-11-1963"]
+
+
+def test_mirror_preserves_managed_content_aliases_and_skips_unowned_links(tmp_path):
+    import hashlib
+    from backend.portal_sync import _mirror_tree_with_hardlinks
+
+    src = tmp_path / "patient"
+    src.mkdir()
+    dest = tmp_path / "mirror"
+    dest.mkdir()
+    digest = hashlib.sha256(b"original").hexdigest()
+    body = src / ".content" / digest / "original"
+    body.parent.mkdir(parents=True)
+    body.write_bytes(b"original")
+    (src / "report.pdf").symlink_to(body)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"private")
+    (src / "outside.pdf").symlink_to(outside)
+    other = src / "arbitrary.txt"
+    other.write_bytes(b"unmanaged")
+    (src / "unmanaged.pdf").symlink_to(other)
+    (src / "missing.pdf").symlink_to(src / ".content" / "missing" / "original")
+    _mirror_tree_with_hardlinks(src, dest)
+    assert (dest / "report.pdf").read_bytes() == b"original"
+    assert not (dest / "report.pdf").is_symlink()
+    assert not (dest / ".content").exists()
+    assert not any(
+        (dest / name).exists()
+        for name in ["outside.pdf", "unmanaged.pdf", "missing.pdf"]
+    )
+    body.write_bytes(b"corrupted")
+    with pytest.raises(ValueError, match="content"):
+        _mirror_tree_with_hardlinks(src, tmp_path / "bad-mirror")
+
+def test_mirror_skips_cyclic_links_and_preserves_other_files(tmp_path):
+    from backend.portal_sync import _mirror_tree_with_hardlinks
+
+    source = tmp_path / "source"
+    source.mkdir()
+    dest = tmp_path / "dest"
+    (source / "loop").symlink_to("loop")
+    (source / "cycle-a").symlink_to("cycle-b")
+    (source / "cycle-b").symlink_to("cycle-a")
+    (source / "report.pdf").write_bytes(b"valid")
+    _mirror_tree_with_hardlinks(source, dest)
+    assert (dest / "report.pdf").read_bytes() == b"valid"
+    assert not (dest / "loop").exists()

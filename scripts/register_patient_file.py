@@ -12,6 +12,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from backend import storage  # noqa: E402
+from backend.file_updates import atomic_destination  # noqa: E402
 from backend.patient_files import patient_file_original_path  # noqa: E402
 
 
@@ -43,7 +44,8 @@ def register_patient_file(
         file_id = existing.id if existing else str(uuid.uuid4())
         target_path = patient_file_original_path(patient_id, file_id, display_name)
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target_path)
+        with atomic_destination(target_path) as pending:
+            shutil.copy2(source, pending)
         size_bytes = int(target_path.stat().st_size)
 
         if existing:

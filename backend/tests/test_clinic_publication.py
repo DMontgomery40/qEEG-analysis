@@ -631,3 +631,765 @@ def test_original_producer_directory_keeps_owned_containment(
     )
     assert response.status_code == (409 if alias_kind == "other-chart" else 400)
     assert not list((root / "clinic_producer_bytes").rglob("original"))
+
+
+@pytest.mark.parametrize("already_verified", [False, True])
+def test_equal_patient_content_reuses_target_and_preserves_links(
+    temp_data_dir, monkeypatch, already_verified
+):
+    from backend import clinic_publication as publisher
+    from backend.clinic_catalogue_reads import file_binding
+
+    patient, first = seed(temp_data_dir)
+    key = publisher.prepare_publication(first["fileId"])["item"]["remoteKey"]
+    monkeypatch.setattr(
+        publisher, "strong_readback", lambda key, size: iter([b"original"])
+    )
+    if already_verified:
+        publisher.verify_publication(first["fileId"], key)
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="op:two",
+        logical_family="video",
+        original_name="second.bin",
+        local_path=temp_data_dir / "one.bin",
+    )
+    prepared = publisher.prepare_publication(second["fileId"])["item"]
+    assert prepared["remoteKey"] == key
+    assert prepared["verified"] == already_verified
+    publisher.verify_publication(second["fileId"], key)
+    assert publisher.prepare_publication(second["fileId"])["item"]["verified"]
+    for artifact in (first, second):
+        bound = file_binding(patient.label, file_key=artifact["fileKey"])
+        assert bound["fileId"] == artifact["fileId"]
+        assert any(l["key"] == key and l["verified"] for l in bound["locations"])
+    # Same bytes in another patient's chart are never used as its storage target.
+    with storage.session_scope() as s:
+        other = storage.create_patient(s, label="AB_01-01-1900")
+    third = catalogue.register_artifact(
+        patient_uuid=other.id,
+        source_kind="renderer",
+        source_id="op:three",
+        logical_family="video",
+        original_name="third.bin",
+        local_path=temp_data_dir / "one.bin",
+    )
+    assert publisher.prepare_publication(third["fileId"])["item"]["remoteKey"] != key
+    changed = temp_data_dir / "changed.bin"
+    changed.write_bytes(b"changed!")
+    fourth = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="op:four",
+        logical_family="video",
+        original_name="changed.bin",
+        local_path=changed,
+    )
+    assert publisher.prepare_publication(fourth["fileId"])["item"]["remoteKey"] != key
+
+
+def test_content_cleanup_keeps_old_keys_and_local_paths_and_replays(
+    temp_data_dir, monkeypatch
+):
+    from backend import clinic_publication as publisher
+    from backend.clinic_dedup import consolidate_remote, consolidate_local
+    from backend.clinic_catalogue_reads import file_binding, open_local_file
+
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "duplicate.bin"
+    path.write_bytes(b"original")
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="cleanup:second",
+        logical_family="video",
+        original_name="duplicate.bin",
+        local_path=path,
+    )
+    first_key = "patients/" + patient.label + "/files/" + first["fileKey"]
+    old_key = "patients/" + patient.label + "/files/" + second["fileKey"]
+    orphan_key = "patients/" + patient.label + "/files/old-unindexed-copy.bin"
+    catalogue.add_remote_location(first["fileId"], first_key)
+    catalogue.add_remote_location(second["fileId"], old_key)
+    digest = hashlib.sha256(b"original").hexdigest()
+    for _ in range(2):
+        consolidate_remote(
+            patient.label,
+            first_key,
+            [old_key, orphan_key],
+            digest,
+            8,
+            lambda: [b"original"],
+        )
+        for key in (first["fileKey"], second["fileKey"], "old-unindexed-copy.bin"):
+            bound = file_binding(patient.label, file_key=key)
+            assert any(
+                l["key"] == first_key and l["active"] and l["verified"]
+                for l in bound["locations"]
+            )
+        assert (
+            publisher.prepare_publication(second["fileId"])["item"]["remoteKey"]
+            == first_key
+        )
+    with pytest.raises(catalogue.CatalogueConflict):
+        consolidate_remote(
+            patient.label, first_key, [old_key], digest, 8, lambda: [b"changed!"]
+        )
+    result = consolidate_local(patient.label, producers_quiescent=True)
+    assert result == {"removedBodies": 1, "savedBytes": 8}
+    assert path.is_symlink() and path.read_bytes() == b"original"
+    assert (temp_data_dir / "one.bin").read_bytes() == b"original"
+    assert (
+        consolidate_local(patient.label, producers_quiescent=True)["removedBodies"] == 0
+    )
+    for artifact in (first, second):
+        snapshot = open_local_file(artifact["fileId"])
+        try:
+            assert snapshot.read() == b"original"
+        finally:
+            snapshot.close()
+
+
+def test_local_cleanup_restart_after_receipt_failure_and_changed_file(temp_data_dir):
+    from backend.clinic_dedup import consolidate_local
+
+    patient, first = seed(temp_data_dir)
+    for i in range(3):
+        path = temp_data_dir / f"copy-{i}.bin"
+        path.write_bytes(b"original")
+        catalogue.register_artifact(
+            patient_uuid=patient.id,
+            source_kind="renderer",
+            source_id=f"copy:{i}",
+            logical_family="video",
+            original_name=path.name,
+            local_path=path,
+        )
+    changed = temp_data_dir / "copy-2.bin"
+    changed.write_bytes(b"new data")
+
+    def interrupted(record):
+        raise RuntimeError("interrupted after replacement")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        consolidate_local(patient.label, interrupted, producers_quiescent=True)
+    consolidate_local(patient.label, producers_quiescent=True)
+    assert changed.read_bytes() == b"new data" and not changed.is_symlink()
+    assert (temp_data_dir / "one.bin").read_bytes() == b"original"
+    assert (temp_data_dir / "copy-0.bin").resolve() == (
+        temp_data_dir / "copy-1.bin"
+    ).resolve()
+    assert consolidate_local(patient.label, producers_quiescent=True)["savedBytes"] == 0
+
+
+def test_remote_cleanup_rejects_recorded_different_content(temp_data_dir):
+    from backend.clinic_dedup import consolidate_remote
+
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "different.bin"
+    path.write_bytes(b"different")
+    other = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="other-content",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    first_key = f"patients/{patient.label}/files/{first['fileKey']}"
+    other_key = f"patients/{patient.label}/files/{other['fileKey']}"
+    catalogue.add_remote_location(first["fileId"], first_key)
+    catalogue.add_remote_location(other["fileId"], other_key)
+    with pytest.raises(catalogue.CatalogueConflict, match="different recorded"):
+        consolidate_remote(
+            patient.label,
+            first_key,
+            [other_key],
+            hashlib.sha256(b"original").hexdigest(),
+            8,
+            lambda: [b"original"],
+        )
+
+
+@pytest.mark.parametrize("oversize", [False, True])
+def test_shared_remote_corruption_revokes_all_file_receipts(
+    temp_data_dir, monkeypatch, oversize
+):
+    from backend import clinic_publication as publisher
+
+    patient, first = seed(temp_data_dir)
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="corruption:two",
+        logical_family="video",
+        original_name="second.bin",
+        local_path=temp_data_dir / "one.bin",
+    )
+    key = publisher.prepare_publication(first["fileId"])["item"]["remoteKey"]
+    publisher.prepare_publication(second["fileId"])
+    monkeypatch.setattr(publisher, "strong_readback", lambda key, size: [b"original"])
+    publisher.verify_publication(first["fileId"], key)
+
+    def bad_read(key, size):
+        if oversize:
+            raise publisher.ReadbackOversize("too large")
+        return [b"changed!"]
+
+    monkeypatch.setattr(publisher, "strong_readback", bad_read)
+    with pytest.raises(catalogue.CatalogueConflict):
+        publisher.verify_publication(first["fileId"], key)
+    for a in (first, second):
+        assert not publisher.prepare_publication(a["fileId"])["item"]["verified"]
+
+
+def test_producer_replay_after_local_body_consolidation(live_api, monkeypatch):
+    from backend.clinic_dedup import consolidate_local
+
+    client, chart, root = live_api
+    portal = root / "portal_patients"
+    patient_folder = portal / chart.label
+    patient_folder.mkdir(parents=True)
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal))
+    (patient_folder / "video.mp4").write_bytes(b"original")
+    operation = {
+        "operationId": "cleanup-replay",
+        "patientId": chart.label,
+        "producer": "renderer",
+        "kind": "video",
+        "original": {"receiptId": "original"},
+    }
+    assert client.post("/internal/operations", json=operation).status_code == 200
+    material = {
+        "patientId": chart.label,
+        "operationId": "cleanup-replay",
+        "outputId": "video",
+        "relativePath": "video.mp4",
+        "originalName": "video.mp4",
+        "logicalFamily": "video",
+    }
+    first = client.post("/internal/artifacts", json=material)
+    assert first.status_code == 200
+    consolidate_local(chart.label, producers_quiescent=True)
+    replay = client.post("/internal/artifacts", json=material)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["artifact"]["fileId"] == first.json()["artifact"]["fileId"]
+
+
+def test_reactivated_old_target_cannot_recreate_a_removed_duplicate(temp_data_dir):
+    from backend import clinic_publication as publisher
+    from backend.clinic_models import ClinicPublication
+    from backend.clinic_dedup import consolidate_remote
+
+    patient, first = seed(temp_data_dir)
+    key = publisher.prepare_publication(first["fileId"])["item"]["remoteKey"]
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="reactivate",
+        logical_family="video",
+        original_name="second.bin",
+        local_path=temp_data_dir / "one.bin",
+    )
+    old = f"patients/{patient.label}/files/{second['fileKey']}"
+    catalogue.add_remote_location(second["fileId"], old)
+    with catalogue._write() as s:
+        s.add(ClinicPublication(artifact_id=second["fileId"], remote_key=old))
+    consolidate_remote(
+        patient.label,
+        key,
+        [old],
+        hashlib.sha256(b"original").hexdigest(),
+        8,
+        lambda: [b"original"],
+    )
+    catalogue.add_remote_location(second["fileId"], old)
+    item = publisher.prepare_publication(second["fileId"])["item"]
+    assert item["remoteKey"] == key and item["verified"]
+
+
+@pytest.mark.parametrize("configured", ["inside", "outside"])
+def test_cleanup_configured_root_and_noop_revision(
+    temp_data_dir, monkeypatch, tmp_path, configured
+):
+    from backend.clinic_dedup import consolidate_local
+    from backend import clinic_catalogue_reads as reads
+
+    portal = (
+        temp_data_dir / "custom-portal"
+        if configured == "inside"
+        else tmp_path.parent / (tmp_path.name + "-external")
+    )
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal))
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "copy.bin"
+    path.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="config-copy",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    assert (
+        consolidate_local(patient.label, producers_quiescent=True)["removedBodies"] == 1
+    )
+    target = path.resolve()
+    expected = temp_data_dir / ".content" / patient.id
+    assert target.is_relative_to(expected)
+    before = reads.current_revision()
+    fingerprint = target.stat().st_ctime_ns
+    assert consolidate_local(patient.label, producers_quiescent=True) == {
+        "removedBodies": 0,
+        "savedBytes": 0,
+    }
+    assert reads.current_revision() == before
+    assert target.stat().st_ctime_ns == fingerprint
+    with reads.open_local_file(first["fileId"]) as body:
+        assert body.read() == b"original"
+
+
+@pytest.mark.parametrize("mode", ["initial", "archive"])
+def test_lightweight_pages_omit_retired_aliases_but_exact_history_resolves(
+    temp_data_dir, mode
+):
+    from backend.clinic_dedup import consolidate_remote
+    from backend import clinic_catalogue_reads as reads
+
+    patient, artifact = seed(temp_data_dir)
+    canonical = f'patients/{patient.label}/files/{artifact["fileKey"]}'
+    retired = f"patients/{patient.label}/files/historic-copy"
+    consolidate_remote(
+        patient.label,
+        canonical,
+        [retired],
+        hashlib.sha256(b"original").hexdigest(),
+        8,
+        lambda: [b"original"],
+    )
+    page = reads.patient_files(
+        patient.label, mode=mode, page="1" if mode == "archive" else None
+    )
+    assert all(
+        location["active"] for file in page["files"] for location in file["locations"]
+    )
+    for file in (
+        reads.file_binding(patient.label, file_key="historic-copy"),
+        reads.patient_files(patient.label)["files"][0],
+    ):
+        assert any(
+            location["key"] == retired and not location["active"]
+            for location in file["locations"]
+        )
+        assert any(
+            location["key"] == canonical and location["verified"]
+            for location in file["locations"]
+        )
+
+
+def test_cleanup_historical_alias_uses_engine_patient_label(temp_data_dir):
+    from backend.clinic_dedup import consolidate_local
+
+    patient, _ = seed(temp_data_dir)
+    path = temp_data_dir / "duplicate-label.bin"
+    path.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="label-copy",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    from backend.clinic_models import ClinicPatientAlias
+
+    with storage.session_scope() as session:
+        session.add(ClinicPatientAlias(alias="old-label", patient_uuid=patient.id))
+        session.commit()
+    consolidate_local("old-label", producers_quiescent=True)
+    assert path.resolve().is_relative_to(temp_data_dir / ".content" / patient.id)
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_shared_content_keys_resolve_original_owner(temp_data_dir, qualified):
+    from backend.clinic_dedup import consolidate_remote
+    from backend import clinic_catalogue_reads as reads
+    from backend.clinic_models import CatalogueNotFound
+
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "shared-copy.bin"
+    path.write_bytes(b"original")
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="shared-copy",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    prefix = f"patients/{patient.label}/files/"
+    consolidate_remote(
+        patient.label,
+        prefix + first["fileKey"],
+        [prefix + second["fileKey"]],
+        hashlib.sha256(b"original").hexdigest(),
+        8,
+        lambda: [b"original"],
+    )
+    for file in (first, second):
+        key = prefix + file["fileKey"] if qualified else file["fileKey"]
+        assert (
+            reads.file_binding(patient.label, file_key=key)["fileId"] == file["fileId"]
+        )
+    with pytest.raises(CatalogueNotFound):
+        reads.file_binding(
+            patient.label, file_key="patients/OTHER/files/" + first["fileKey"]
+        )
+
+
+def test_shared_legacy_key_requires_unambiguous_canonical_target(temp_data_dir):
+    from backend.clinic_dedup import consolidate_remote
+
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "legacy-copy.bin"
+    path.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="legacy-copy",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    prefix = f"patients/{patient.label}/files/"
+    catalogue.add_remote_location(first["fileId"], prefix + "legacy-name.bin")
+    with pytest.raises(catalogue.CatalogueConflict, match="database-issued canonical"):
+        consolidate_remote(
+            patient.label,
+            prefix + "legacy-name.bin",
+            [prefix + "other.bin"],
+            hashlib.sha256(b"original").hexdigest(),
+            8,
+            lambda: [b"original"],
+        )
+
+
+def test_cleanup_keeps_canonical_body_after_alias_is_registered_again(temp_data_dir):
+    from backend.clinic_dedup import consolidate_local
+
+    patient, _ = seed(temp_data_dir)
+    path = temp_data_dir / "reimport.bin"
+    path.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="before",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    with pytest.raises(catalogue.CatalogueConflict, match="Stop local producers"):
+        consolidate_local(patient.label)
+    consolidate_local(patient.label, producers_quiescent=True)
+    canonical = path.resolve()
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="after",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    consolidate_local(patient.label, producers_quiescent=True)
+    assert not canonical.is_symlink() and canonical.read_bytes() == b"original"
+    assert path.read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("legacy", ["files/legacy.bin", ".archive/old.bin"])
+def test_publication_does_not_share_legacy_or_archive_targets(temp_data_dir, legacy):
+    from backend import clinic_publication as publisher
+
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "another.bin"
+    path.write_bytes(b"original")
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="another",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    key = f"patients/{patient.label}/{legacy}"
+    catalogue.add_remote_location(first["fileId"], key)
+    catalogue.verify_remote_location(first["fileId"], key, lambda: [b"original"])
+    assert publisher.prepare_publication(second["fileId"])["item"]["remoteKey"] != key
+
+
+def test_consolidated_target_survives_corruption_without_recreating_duplicates(
+    temp_data_dir,
+):
+    from backend import clinic_publication as publisher
+    from backend.clinic_dedup import consolidate_remote
+
+    patient, first = seed(temp_data_dir)
+    path = temp_data_dir / "shared.bin"
+    path.write_bytes(b"original")
+    second = catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="shared",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    key = f'patients/{patient.label}/files/{first["fileKey"]}'
+    old = f'patients/{patient.label}/files/{second["fileKey"]}'
+    consolidate_remote(
+        patient.label,
+        key,
+        [old],
+        hashlib.sha256(b"original").hexdigest(),
+        8,
+        lambda: [b"original"],
+    )
+    with pytest.raises(catalogue.CatalogueConflict, match="Remote bytes differ"):
+        catalogue.verify_remote_location(first["fileId"], key, lambda: [b"changed!"])
+    for item in (first, second):
+        prepared = publisher.prepare_publication(item["fileId"])["item"]
+        assert prepared["remoteKey"] == key and not prepared["verified"]
+
+
+def test_cleanup_includes_unindexed_patient_copies_and_keeps_distinct_files(
+    temp_data_dir,
+):
+    from backend.clinic_dedup import consolidate_local
+
+    patient, _ = seed(temp_data_dir)
+    folder = temp_data_dir / "portal_patients" / patient.label
+    folder.mkdir(parents=True)
+    same = folder / "unindexed.bin"
+    same.write_bytes(b"original")
+    unique = folder / "unique.bin"
+    unique.write_bytes(b"distinct")
+    result = consolidate_local(patient.label, producers_quiescent=True)
+    assert (
+        result["removedBodies"] == 1
+        and same.is_symlink()
+        and same.read_bytes() == b"original"
+    )
+    assert unique.read_bytes() == b"distinct" and not unique.is_symlink()
+
+
+def test_local_shared_body_and_portal_mirror_survive_patient_rekey(temp_data_dir):
+    from backend.clinic_dedup import consolidate_local
+    from backend import patient_rekey, portal_sync
+
+    patient, _ = seed(temp_data_dir)
+    portal = temp_data_dir / "portal_patients"
+    folder = portal / patient.label
+    folder.mkdir(parents=True)
+    path = folder / "report.pdf"
+    path.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="rekey",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    consolidate_local(patient.label, producers_quiescent=True)
+    outside = temp_data_dir / "one.bin"
+    retained = outside.resolve()
+    assert path.resolve().samefile(retained)
+    plan = patient_rekey.plan_patient_rekey(
+        patient.label, "YZ_01-01-1900", portal_root=portal
+    )
+    patient_rekey.apply_patient_rekey(plan)
+    assert outside.read_bytes() == b"original" and outside.resolve() == retained
+    moved = portal / "YZ_01-01-1900"
+    assert (moved / "report.pdf").read_bytes() == b"original"
+    portal_sync._mirror_tree_with_hardlinks(moved, temp_data_dir / "staged")
+    assert (temp_data_dir / "staged" / "report.pdf").read_bytes() == b"original"
+
+
+def test_remote_cleanup_rejects_historical_patient_prefix(temp_data_dir):
+    from backend.clinic_dedup import consolidate_remote
+    from backend.clinic_models import ClinicPatientAlias
+
+    patient, first = seed(temp_data_dir)
+    with storage.session_scope() as s:
+        s.add(ClinicPatientAlias(alias="old-label", patient_uuid=patient.id))
+        s.commit()
+    with pytest.raises(ValueError, match="canonical patient ID"):
+        consolidate_remote(
+            "old-label",
+            "patients/old-label/files/" + first["fileKey"],
+            [],
+            hashlib.sha256(b"original").hexdigest(),
+            8,
+            lambda: [b"original"],
+        )
+
+
+@pytest.mark.parametrize("unselected_link", [False, True])
+def test_cleanup_counts_only_released_physical_bodies(temp_data_dir, unselected_link):
+    import os
+    from backend.clinic_dedup import consolidate_local
+
+    patient, _ = seed(temp_data_dir)
+    first = temp_data_dir / "z1.bin"
+    first.write_bytes(b"original")
+    second = temp_data_dir / "z2.bin"
+    os.link(first, second)
+    for i, path in enumerate([first] if unselected_link else [first, second]):
+        catalogue.register_artifact(
+            patient_uuid=patient.id,
+            source_kind="renderer",
+            source_id=f"linked-{i}",
+            logical_family="video",
+            original_name=path.name,
+            local_path=path,
+        )
+    result = consolidate_local(patient.label, producers_quiescent=True)
+    assert result == {
+        "removedBodies": 0 if unselected_link else 1,
+        "savedBytes": 0 if unselected_link else 8,
+    }
+    assert first.read_bytes() == second.read_bytes() == b"original"
+
+
+def test_local_shared_body_survives_merge_into_existing_patient_folder(temp_data_dir):
+    from backend.clinic_dedup import consolidate_local
+    from backend import patient_rekey, portal_sync
+
+    patient, _ = seed(temp_data_dir)
+    portal = temp_data_dir / "portal_patients"
+    folder = portal / patient.label
+    folder.mkdir(parents=True)
+    path = folder / "report.pdf"
+    path.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="merge",
+        logical_family="video",
+        original_name=path.name,
+        local_path=path,
+    )
+    consolidate_local(patient.label, producers_quiescent=True)
+    new = portal / "YZ_01-01-1900"
+    new.mkdir()
+    plan = patient_rekey.plan_patient_rekey(
+        patient.label, "YZ_01-01-1900", portal_root=portal, merge_into_existing=True
+    )
+    patient_rekey.apply_patient_rekey(plan)
+    assert (
+        (new / "report.pdf").read_bytes()
+        == (temp_data_dir / "one.bin").read_bytes()
+        == b"original"
+    )
+    portal_sync._mirror_tree_with_hardlinks(new, temp_data_dir / "merge-stage")
+    assert (temp_data_dir / "merge-stage" / "report.pdf").read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("same_inode", [True, False])
+def test_merge_coalesces_only_verified_internal_content_anchors(
+    temp_data_dir, same_inode
+):
+    import os
+    from backend.clinic_dedup import consolidate_local
+    from backend import patient_rekey
+
+    patient, _ = seed(temp_data_dir)
+    portal = temp_data_dir / "portal_patients"
+    old = portal / patient.label
+    old.mkdir(parents=True)
+    named = old / "report.pdf"
+    named.write_bytes(b"original")
+    catalogue.register_artifact(
+        patient_uuid=patient.id,
+        source_kind="renderer",
+        source_id="merge-anchor",
+        logical_family="video",
+        original_name=named.name,
+        local_path=named,
+    )
+    consolidate_local(patient.label, producers_quiescent=True)
+    anchor = named.resolve()
+    new = portal / "YZ_01-01-1900"
+    target = new / anchor.relative_to(old)
+    target.parent.mkdir(parents=True)
+    if same_inode:
+        os.link(anchor, target)
+    else:
+        target.write_bytes(b"original")
+    plan = patient_rekey.plan_patient_rekey(
+        patient.label, "YZ_01-01-1900", portal_root=portal, merge_into_existing=True
+    )
+    patient_rekey.apply_patient_rekey(plan)
+    assert (
+        (new / "report.pdf").read_bytes()
+        == (temp_data_dir / "one.bin").read_bytes()
+        == b"original"
+    )
+
+
+@pytest.mark.parametrize("replan", [False, True])
+def test_interrupted_merge_keeps_remaining_aliases_readable_and_resumes(
+    temp_data_dir, monkeypatch, replan
+):
+    from backend.clinic_dedup import consolidate_local
+    from backend import patient_rekey
+
+    patient, _ = seed(temp_data_dir)
+    portal = temp_data_dir / "portal_patients"
+    old = portal / patient.label
+    old.mkdir(parents=True)
+    for name in ["report1.pdf", "report2.pdf"]:
+        path = old / name
+        path.write_bytes(b"original")
+        catalogue.register_artifact(
+            patient_uuid=patient.id,
+            source_kind="renderer",
+            source_id=name,
+            logical_family="video",
+            original_name=path.name,
+            local_path=path,
+        )
+    consolidate_local(patient.label, producers_quiescent=True)
+    new = portal / "YZ_01-01-1900"
+    new.mkdir()
+
+    def plan():
+        return patient_rekey.plan_patient_rekey(
+            patient.label, "YZ_01-01-1900", portal_root=portal, merge_into_existing=True
+        )
+
+    initial = plan()
+    replace = patient_rekey.os.replace
+
+    def interrupted(source, target):
+        if source == old / "report2.pdf":
+            raise OSError("interrupted merge")
+        return replace(source, target)
+
+    monkeypatch.setattr(patient_rekey.os, "replace", interrupted)
+    with pytest.raises(OSError, match="interrupted merge"):
+        patient_rekey.apply_patient_rekey(initial)
+    assert (
+        (old / "report2.pdf").read_bytes()
+        == (new / "report1.pdf").read_bytes()
+        == b"original"
+    )
+    monkeypatch.setattr(patient_rekey.os, "replace", replace)
+    patient_rekey.apply_patient_rekey(plan() if replan else initial)
+    assert (
+        (new / "report1.pdf").read_bytes()
+        == (new / "report2.pdf").read_bytes()
+        == b"original"
+    )
+    assert not old.exists()

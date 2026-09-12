@@ -21,6 +21,7 @@ import argparse
 import shutil
 from pathlib import Path
 
+from backend.file_updates import atomic_destination
 from backend.portal_files import normalize_portal_patient_id
 from backend.portal_sync import sync_patient_to_thrylen
 from backend.storage import Patient, init_db, session_scope
@@ -136,7 +137,8 @@ def stage_artifacts(dry_run: bool = False) -> None:
                     print(f"  [dry-run] Copy {src.name} -> {rel_dst}")
                 else:
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+                    with atomic_destination(dst) as pending:
+                        shutil.copy2(src, pending)
                     print(f"  Copy {src.name} -> {rel_dst}")
                 total_copied += 1
                 patient_copied += 1

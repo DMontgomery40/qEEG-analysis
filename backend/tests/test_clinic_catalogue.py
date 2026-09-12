@@ -409,9 +409,9 @@ def test_paged_reads_project_only_requested_rows(chart, temp_data_dir, monkeypat
     projected = []
     real = reads._artifact_json
 
-    def track(session, artifact, patient):
+    def track(session, artifact, patient, **kwargs):
         projected.append(artifact.id)
-        return real(session, artifact, patient)
+        return real(session, artifact, patient, **kwargs)
 
     monkeypatch.setattr(reads, "_artifact_json", track)
     result = reads.patient_files(chart.label, mode="archive", page="1", limit=2)
@@ -1808,3 +1808,49 @@ def test_mime_case_duplicates_share_chart_and_filtered_drawer(
         f["fileId"]
         for f in recent_files(kind="video", content_type=filter_mime)["files"]
     ] == [published["fileId"]]
+
+
+@pytest.mark.parametrize("mode", ["initial", "archive"])
+def test_page_metadata_reads_are_batched(chart, temp_data_dir, mode):
+    from sqlalchemy import event
+
+    for i in range(20):
+        register(chart, temp_data_dir, str(i))
+    statements = []
+
+    def collect(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(storage.engine, "before_cursor_execute", collect)
+    try:
+        result = reads.patient_files(
+            chart.label, mode=mode, page="1" if mode == "archive" else None, limit=20
+        )
+    finally:
+        event.remove(storage.engine, "before_cursor_execute", collect)
+    assert len(result["files"]) == 20
+    assert len(statements) < 25
+
+
+@pytest.mark.parametrize("mode", ["initial", "archive"])
+def test_page_selection_does_not_expand_the_entire_chart_into_sql_parameters(
+    chart, temp_data_dir, mode
+):
+    from sqlalchemy import event
+
+    for i in range(140):
+        register(chart, temp_data_dir, f"bounded-{i}")
+    parameter_counts = []
+
+    def collect(conn, cursor, statement, parameters, context, executemany):
+        parameter_counts.append(len(parameters))
+
+    event.listen(storage.engine, "before_cursor_execute", collect)
+    try:
+        result = reads.patient_files(
+            chart.label, mode=mode, page="1" if mode == "archive" else None, limit=10
+        )
+    finally:
+        event.remove(storage.engine, "before_cursor_execute", collect)
+    assert len(result["files"]) == 10
+    assert max(parameter_counts) < 140

@@ -206,19 +206,45 @@ def _mark_patient_sync_retryable(root_dir: Path, patient_id: str) -> None:
 
 
 def _mirror_tree_with_hardlinks(src_dir: Path, dest_dir: Path) -> None:
+    import hashlib
+    import re
+
+    root = src_dir.resolve()
     for path in src_dir.rglob("*"):
         rel_path = path.relative_to(src_dir)
-        dest_path = dest_dir / rel_path
-        if path.is_dir():
-            dest_path.mkdir(parents=True, exist_ok=True)
+        # The byte store itself is not an additional named deliverable.
+        if rel_path.parts[0] == ".content":
             continue
+        dest_path = dest_dir / rel_path
+        source = path
         if path.is_symlink():
+            try:
+                source = path.resolve(strict=True)
+                parts = source.relative_to(root).parts
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if (
+                len(parts) != 3
+                or parts[0] != ".content"
+                or parts[2] != "original"
+                or not re.fullmatch(r"[a-f0-9]{64}", parts[1])
+                or not source.is_file()
+            ):
+                continue
+            digest = hashlib.sha256()
+            with source.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != parts[1]:
+                raise ValueError("Managed content alias has changed bytes")
+        elif path.is_dir():
+            dest_path.mkdir(parents=True, exist_ok=True)
             continue
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(path, dest_path)
+            os.link(source, dest_path)
         except Exception:
-            shutil.copy2(path, dest_path)
+            shutil.copy2(source, dest_path)
 
 
 def _sync_command(*, temp_root_dir: Path) -> tuple[list[str], Path] | None:
