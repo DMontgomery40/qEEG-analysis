@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from backend import config as backend_config  # noqa: E402
 from backend import storage  # noqa: E402
+from backend.file_updates import atomic_destination  # noqa: E402
 from backend.config import (  # noqa: E402
     ARTIFACTS_DIR,
     CLIPROXY_API_KEY,
@@ -669,8 +670,10 @@ def _export_run(run_id: str) -> tuple[Path, Path]:
     export_dir.mkdir(parents=True, exist_ok=True)
     md_path = export_dir / "final.md"
     pdf_path = export_dir / "final.pdf"
-    md_path.write_text(md, encoding="utf-8")
-    render_markdown_to_pdf(md, pdf_path)
+    with atomic_destination(md_path) as pending:
+        pending.write_text(md, encoding="utf-8")
+    with atomic_destination(pdf_path) as pending:
+        render_markdown_to_pdf(md, pending)
 
     portal_md = _publish_file_to_portal_folder(
         patient_label=patient.label,
@@ -728,7 +731,8 @@ def _stage_run_artifacts(*, patient_label: str, run_id: str) -> int:
     copied = 0
     for src, dest in files_to_copy:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        with atomic_destination(dest) as pending:
+            shutil.copy2(src, pending)
         copied += 1
     return copied
 

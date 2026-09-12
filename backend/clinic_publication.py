@@ -7,7 +7,7 @@ import selectors
 import shutil
 import subprocess
 import time
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from . import storage
 from .clinic_catalogue import _write, _location, _bump, verify_remote_location
 from .clinic_catalogue_reads import _patient, _envelope, _state, _json
@@ -24,24 +24,43 @@ from .clinic_models import (
 def _publication_item(session, artifact):
     patient = session.get(storage.Patient, artifact.patient_uuid)
     binding = session.get(ClinicPublication, artifact.id)
-    selected = (
-        session.scalar(
-            select(ClinicLocation).where(
-                ClinicLocation.artifact_id == artifact.id,
-                ClinicLocation.kind == "netlify",
-                ClinicLocation.key == binding.remote_key,
-                ClinicLocation.active.is_(True),
-            )
+    # A file identity can reuse an exact-content location without owning another
+    # blob. Prefer its durable prepared target while active; cleanup may retire it.
+    query = select(ClinicLocation).where(
+        ClinicLocation.artifact_id == artifact.id,
+        ClinicLocation.kind == "netlify",
+        ClinicLocation.active.is_(True),
+        select(ClinicArtifact.id)
+        .where(
+            ClinicArtifact.patient_uuid == artifact.patient_uuid,
+            ClinicArtifact.sha256 == artifact.sha256,
+            ClinicArtifact.size == artifact.size,
+            ClinicLocation.key
+            == (
+                "patients/"
+                + ClinicLocation.patient_alias
+                + "/files/"
+                + ClinicArtifact.file_key
+            ),
         )
-        if binding
-        else None
+        .exists(),
+        or_(
+            ClinicLocation.verified.is_(True),
+            select(ClinicPublication.artifact_id)
+            .where(ClinicPublication.remote_key == ClinicLocation.key)
+            .exists(),
+        ),
     )
+    query = query.order_by(ClinicLocation.verified.desc())
+    if binding:
+        query = query.order_by((ClinicLocation.key == binding.remote_key).desc())
+    selected = session.scalar(query.order_by(ClinicLocation.key))
     return dict(
         fileId=artifact.id,
         patientId=patient.label,
         source=dict(kind=artifact.source_kind, id=artifact.source_id),
         fileKey=artifact.file_key,
-        remoteKey=binding.remote_key if binding else None,
+        remoteKey=selected.key if selected else None,
         sha256=artifact.sha256,
         size=artifact.size,
         catalogRevision=_state(session).revision,
@@ -129,7 +148,50 @@ def prepare_publication(file_id):
         patient = s.get(storage.Patient, artifact.patient_uuid)
         _patient(s, patient.label)
         item = _publication_item(s, artifact)
+        if item["remoteKey"] is not None:
+            _bind_publication_owner(s, artifact, item["remoteKey"])
         if item["remoteKey"] is None:
+            # Reuse verified content or a target already reserved by another
+            # producer of the same bytes. BEGIN IMMEDIATE serializes preparation.
+            prepared = (
+                select(ClinicPublication.artifact_id)
+                .where(ClinicPublication.remote_key == ClinicLocation.key)
+                .exists()
+            )
+            reusable = s.scalar(
+                select(ClinicLocation)
+                .join(ClinicArtifact, ClinicArtifact.id == ClinicLocation.artifact_id)
+                .where(
+                    ClinicArtifact.patient_uuid == artifact.patient_uuid,
+                    ClinicArtifact.sha256 == artifact.sha256,
+                    ClinicArtifact.size == artifact.size,
+                    ClinicLocation.kind == "netlify",
+                    ClinicLocation.active.is_(True),
+                    ClinicLocation.key
+                    == (
+                        "patients/"
+                        + patient.label
+                        + "/files/"
+                        + ClinicArtifact.file_key
+                    ),
+                    or_(ClinicLocation.verified.is_(True), prepared),
+                )
+                .order_by(ClinicLocation.verified.desc(), ClinicLocation.key)
+            )
+            if reusable is not None:
+                _bind_publication_owner(s, artifact, reusable.key)
+                affected = _location(
+                    s,
+                    artifact,
+                    "netlify",
+                    reusable.key,
+                    reusable.patient_alias,
+                    reusable.verified,
+                )
+                if affected:
+                    _bump(s, affected)
+                s.flush()
+                return _envelope(s, item=_publication_item(s, artifact))
             key = f"patients/{patient.label}/files/{artifact.file_key}"
             occupied = s.scalar(
                 select(ClinicLocation).where(
@@ -148,6 +210,28 @@ def prepare_publication(file_id):
                 _bump(s, affected)
             s.flush()
         return _envelope(s, item=_publication_item(s, artifact))
+
+
+def _bind_publication_owner(session, artifact, key):
+    """Retain an imported canonical target when shared byte receipts are revoked."""
+    owner = session.scalar(
+        select(ClinicArtifact).where(
+            ClinicArtifact.patient_uuid == artifact.patient_uuid,
+            ClinicArtifact.sha256 == artifact.sha256,
+            ClinicArtifact.size == artifact.size,
+            ClinicArtifact.file_key == key.rsplit("/", 1)[-1],
+        )
+    )
+    if owner is None:
+        return
+    binding = session.get(ClinicPublication, owner.id)
+    if binding is None or binding.remote_key != key:
+        if binding is None:
+            session.add(ClinicPublication(artifact_id=owner.id, remote_key=key))
+        else:
+            binding.remote_key = key
+        _bump(session, {owner.patient_uuid})
+        session.flush()
 
 
 def _helper_bytes(
@@ -267,17 +351,21 @@ def verify_publication(file_id, key, *, stop_event=None):
         # Observed bytes exceeded the original size: this is positive mismatch
         # evidence, so an old durable receipt must be revoked as well.
         with _write() as s:
-            location = s.scalar(
-                select(ClinicLocation).where(
-                    ClinicLocation.artifact_id == file_id,
+            affected = set()
+            for location, owner in s.execute(
+                select(ClinicLocation, ClinicArtifact)
+                .join(ClinicArtifact, ClinicArtifact.id == ClinicLocation.artifact_id)
+                .where(
                     ClinicLocation.kind == "netlify",
                     ClinicLocation.key == key,
+                    ClinicLocation.verified.is_(True),
                 )
-            )
-            if location is not None and location.verified:
+            ):
                 location.verified = False
                 location.verified_at = None
-                _bump(s, s.get(ClinicArtifact, file_id).patient_uuid)
+                affected.add(owner.patient_uuid)
+            if affected:
+                _bump(s, affected)
         raise CatalogueConflict("Remote bytes exceed original artifact") from None
     with storage.session_scope() as s:
         return _envelope(s, item=_publication_item(s, s.get(ClinicArtifact, file_id)))

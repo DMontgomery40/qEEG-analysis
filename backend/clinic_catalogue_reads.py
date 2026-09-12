@@ -491,6 +491,25 @@ def _binding(session, patient_id, file_key=None, file_id=None):
                 )
             )
         )
+        if not artifacts and isinstance(file_key, str) and "/" in file_key:
+            artifacts = list(
+                session.scalars(
+                    select(ClinicArtifact)
+                    .join(
+                        ClinicLocation, ClinicLocation.artifact_id == ClinicArtifact.id
+                    )
+                    .where(
+                        ClinicArtifact.patient_uuid == patient.id,
+                        ClinicArtifact.file_key == file_key.rsplit("/", 1)[-1],
+                        ClinicLocation.kind == "netlify",
+                        ClinicLocation.key == file_key,
+                    )
+                ).unique()
+            )
+        # Exact database-issued file keys remain unambiguous when several file
+        # identities share one content location after storage deduplication.
+        if len(artifacts) == 1:
+            return patient, artifacts[0]
         locations = session.scalars(
             select(ClinicLocation)
             .join(ClinicArtifact, ClinicArtifact.id == ClinicLocation.artifact_id)
@@ -578,6 +597,37 @@ def _technical(file):
     )
 
 
+def _file_records(session, artifacts, patient):
+    from collections import defaultdict
+    from .clinic_records import ClinicFeedback
+
+    artifacts = list(artifacts)
+    ids = [a.id for a in artifacts]
+    # Page responses carry serving locations only. Retired aliases remain in
+    # file_binding and full-history responses for old links and audit lookup;
+    # returning them on each page would restore the duplicate payload cost.
+    locations, events = defaultdict(list), defaultdict(list)
+    if ids:
+        for row in session.scalars(
+            select(ClinicLocation)
+            .where(ClinicLocation.artifact_id.in_(ids), ClinicLocation.active.is_(True))
+            .order_by(ClinicLocation.kind, ClinicLocation.key)
+        ):
+            locations[row.artifact_id].append(row)
+        for row in session.scalars(
+            select(ClinicFeedback)
+            .where(ClinicFeedback.artifact_id.in_(ids))
+            .order_by(ClinicFeedback.sequence)
+        ):
+            events[row.artifact_id].append(row)
+    return [
+        _artifact_json(
+            session, a, patient, locations=locations[a.id], feedback_events=events[a.id]
+        )
+        for a in artifacts
+    ]
+
+
 def patient_files(
     patient_id,
     *,
@@ -618,9 +668,10 @@ def patient_files(
         )
         indexed_total = total
         if mode != "delivery":
-            query = query.where(ClinicArtifact.id.in_(_working_file_ids([patient.id])))
+            working_ids = _working_file_ids([patient.id])
+            query = query.where(ClinicArtifact.id.in_(working_ids))
             total = session.scalar(
-                select(func.count()).select_from(query.order_by(None).subquery())
+                select(func.count()).select_from(working_ids.subquery())
             )
         version = hashlib.sha256(
             _json(
@@ -673,10 +724,9 @@ def patient_files(
                 offset = value["offset"]
                 if offset >= total or offset % limit:
                     raise ValueError("Invalid archive offset")
-            selected = [
-                _artifact_json(session, artifact, patient)
-                for artifact in session.scalars(query.offset(offset).limit(limit))
-            ]
+            selected = _file_records(
+                session, session.scalars(query.offset(offset).limit(limit)), patient
+            )
             if offset + len(selected) < total:
                 next_cursor = (
                     base64.urlsafe_b64encode(
@@ -734,7 +784,7 @@ def patient_files(
                 selected_artifacts = list(
                     {a.id: a for a in heroes + selected_artifacts}.values()
                 )
-            selected = [_artifact_json(session, a, patient) for a in selected_artifacts]
+            selected = _file_records(session, selected_artifacts, patient)
             return _envelope(
                 session,
                 **common,

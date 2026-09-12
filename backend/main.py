@@ -60,6 +60,7 @@ from .orchestration import (
     summarize_run_progress,
 )
 from .patient_files import save_patient_file_upload
+from .file_updates import atomic_destination
 from . import pipeline_uploads
 from .patient_intake import (
     IdentityInput,
@@ -2992,8 +2993,10 @@ async def export(run_id: str) -> dict[str, Any]:
     export_dir.mkdir(parents=True, exist_ok=True)
     md_path = export_dir / "final.md"
     pdf_path = export_dir / "final.pdf"
-    md_path.write_text(md, encoding="utf-8")
-    render_markdown_to_pdf(md, pdf_path)
+    with atomic_destination(md_path) as pending:
+        pending.write_text(md, encoding="utf-8")
+    with atomic_destination(pdf_path) as pending:
+        render_markdown_to_pdf(md, pending)
 
     portal_md = _publish_file_to_portal_folder(
         patient_label=patient_label,
