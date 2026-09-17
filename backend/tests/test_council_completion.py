@@ -1406,3 +1406,123 @@ async def test_sdk_malformed_output_then_unknown_repair_remains_blocked(
                     for row in requests
                     if "model-b" in row.scope_key
                 )
+
+
+def _second_run_of_same_report(run_id="r2"):
+    from backend.run_execution import ExecutionStore
+
+    with storage.session_scope() as session:
+        first = session.get(storage.Run, "r")
+        session.add(
+            storage.Run(
+                id=run_id,
+                patient_id=first.patient_id,
+                report_id=first.report_id,
+                status="created",
+                council_model_ids_json=first.council_model_ids_json,
+                consolidator_model_id=first.consolidator_model_id,
+                analysis_input_fingerprint=first.analysis_input_fingerprint,
+                source_manifest_json=first.source_manifest_json,
+            )
+        )
+        session.commit()
+    store = ExecutionStore(storage.engine)
+    store.request_run_start(run_id)
+    return store.claim_run_owner(run_id)
+
+
+def _data_pack_rows():
+    with storage.session_scope() as session:
+        return [
+            (a.run_id, a.id)
+            for a in session.scalars(
+                select(storage.Artifact).where(
+                    storage.Artifact.operation_key == "s1/data-pack"
+                )
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_second_run_of_the_same_report_registers_its_own_artifacts(
+    owner, tmp_path, monkeypatch
+):
+    """Two runs admitted from one report share a manifest hash. Each must own
+    its own artifact rows; the second run once minted the first run's primary
+    key and crash-looped on UNIQUE(artifacts.id) forever."""
+    seed_stages(owner, tmp_path, monkeypatch)
+    second = _second_run_of_same_report()
+    try:
+        llm = client(lambda req: answer("unused"))
+        first_ctx = e.prepare_execution(owner, llm_client=llm)
+        second_ctx = e.prepare_execution(second, llm_client=llm)
+        assert first_ctx.manifest_hash == second_ctx.manifest_hash
+        with e.execution_context(first_ctx):
+            completion().save_product("data_pack", '{"facts": 1}')
+        with e.execution_context(second_ctx):
+            completion().save_product("data_pack", '{"facts": 1}')
+            assert completion().load_product("data_pack") == '{"facts": 1}'
+        rows = _data_pack_rows()
+        assert sorted(run for run, _ in rows) == ["r", "r2"]
+        assert len({row_id for _, row_id in rows}) == 2
+    finally:
+        second.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_minted_with_a_colliding_id_still_registers_for_its_run(
+    owner, tmp_path, monkeypatch
+):
+    """The on-disk shape production was stuck on: the second run's completion
+    receipt carries the id the first run already owns. Replay must register a
+    run-scoped row instead of dying, and keep validating the receipt after."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    from backend.council.paths import _data_pack_path
+
+    seed_stages(owner, tmp_path, monkeypatch)
+    second = _second_run_of_same_report()
+    try:
+        llm = client(lambda req: answer("unused"))
+        first_ctx = e.prepare_execution(owner, llm_client=llm)
+        with e.execution_context(first_ctx):
+            completion().save_product("data_pack", '{"facts": 1}')
+        # Rows minted before ids were run-scoped carry uuid5(manifest_hash/key).
+        colliding_id = str(uuid5(NAMESPACE_URL, first_ctx.manifest_hash + "/s1/data-pack"))
+        with storage.session_scope() as session:
+            row = session.scalar(
+                select(storage.Artifact).where(
+                    storage.Artifact.run_id == "r",
+                    storage.Artifact.operation_key == "s1/data-pack",
+                )
+            )
+            row.id = colliding_id
+            session.commit()
+        ctx = e.prepare_execution(second, llm_client=llm)
+        with e.execution_context(ctx):
+            c = completion()
+            content = b'{"facts": 1}'
+            c._save(
+                "artifact/s1/data-pack",
+                artifact=dict(
+                    id=colliding_id,
+                    run_id="r2",
+                    operation_key="s1/data-pack",
+                    stage_num=1,
+                    stage_name=c.STAGES[0].name,
+                    model_id="_data_pack",
+                    kind="data_pack",
+                    content_path=str(_data_pack_path("r2")),
+                    content_type="application/json",
+                ),
+                content_base64=__import__("base64").b64encode(content).decode(),
+                content_hash=c._hash(content),
+                paid=c._paid("s1/data-pack"),
+            )
+            assert c.load_product("data_pack") == '{"facts": 1}'
+            assert c.load_product("data_pack") == '{"facts": 1}', "replay stays valid"
+        rows = _data_pack_rows()
+        assert sorted(run for run, _ in rows) == ["r", "r2"]
+        assert len({row_id for _, row_id in rows}) == 2
+    finally:
+        second.close()

@@ -259,6 +259,24 @@ def member_key(stage_num, index, model_id):
     return f"s{stage_num}/{_ROLES[stage_num]}/{index}/{model_id}"
 
 
+def _artifact_id(operation_key):
+    """Artifact rows are owned by one run. The id used to derive from the manifest
+    hash alone, so a second run of the same report (identical admission, identical
+    manifest) minted the identical primary key and every replay died on
+    ``UNIQUE constraint failed: artifacts.id`` — one production run retried this
+    30,000 times over three days. Scope the id to the run."""
+    ctx = current_execution()
+    return str(
+        uuid5(NAMESPACE_URL, ctx.owner.run_id + "/" + ctx.manifest_hash + "/" + operation_key)
+    )
+
+
+def _artifact_identity(metadata):
+    """Everything that binds an artifact except its derived primary key, so a
+    receipt written before ids were run-scoped still validates against its row."""
+    return {name: value for name, value in metadata.items() if name != "id"}
+
+
 def _artifact_metadata(artifact):
     return {
         name: getattr(artifact, name)
@@ -332,10 +350,12 @@ def _reconcile_artifact(record, *, reconstruct):
         if row is None:
             if not reconstruct:
                 raise ExecutionConflict("completed artifact registration missing")
-            row = storage.Artifact(**metadata)
+            row = storage.Artifact(
+                **{**metadata, "id": _artifact_id(metadata["operation_key"])}
+            )
             session.add(row)
             session.flush()
-        elif _artifact_metadata(row) != metadata:
+        elif _artifact_identity(_artifact_metadata(row)) != _artifact_identity(metadata):
             raise ExecutionConflict("artifact registration changed")
     return row
 
@@ -346,7 +366,7 @@ def save_artifact(*, stage, model_id, text, operation_key, path=None):
     ctx = current_execution()
     key = "artifact/" + operation_key
     metadata = dict(
-        id=str(uuid5(NAMESPACE_URL, ctx.manifest_hash + "/" + operation_key)),
+        id=_artifact_id(operation_key),
         run_id=ctx.owner.run_id,
         operation_key=operation_key,
         stage_num=stage.num,
@@ -635,7 +655,9 @@ def _stage_record(stage_num, plan, *, reconstruct):
         if intent is None or intent["paid"] != _paid(artifact.operation_key):
             raise ExecutionConflict("stage artifact original receipt binding changed")
         _reconcile_artifact(intent, reconstruct=False)
-        if intent["artifact"] != _artifact_metadata(artifact):
+        if _artifact_identity(intent["artifact"]) != _artifact_identity(
+            _artifact_metadata(artifact)
+        ):
             raise ExecutionConflict("stage artifact identity changed")
         artifacts.append(
             {
