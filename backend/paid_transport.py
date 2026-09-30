@@ -249,7 +249,10 @@ def _rejection(status, body):
     """Acknowledged auth/rate-limit responses and explicit endpoint rejections.
 
     A complete 401, 402 or 429 response rejects this attempt independently of its
-    optional error body. Ambiguous server errors remain outcome-unknown.
+    optional error body. The allowlisted complete server error also ends this
+    ordinal without output, but billing remains unknown. Rejected never implies
+    unbilled; only the caller's bounded retry policy may send a new ordinal.
+    Other server errors and transport ambiguity remain outcome-unknown.
     """
     if status == 401:
         return "authentication_rejected"
@@ -258,10 +261,18 @@ def _rejection(status, body):
     if status == 429:
         return "rate_limit_rejected"
     try:
-        error = json.loads(body).get("error", {})
+        document = json.loads(body)
+        error = document.get("error", {})
         message = error.get("message", "").lower()
     except (ValueError, AttributeError, TypeError):
         return None
+    if (
+        status == 500
+        and set(document) == {"error"}
+        and error.get("type") == "server_error"
+        and error.get("code") == "internal_server_error"
+    ):
+        return "acknowledged_server_error_billing_unknown"
     if status == 400 and (
         "reasoning is mandatory" in message and "cannot be disabled" in message
     ):

@@ -14,6 +14,8 @@ from backend import storage
 from backend.run_execution import ExecutionStore, ExecutionConflict
 
 
+SERVER_ERROR_BODY = b'{"error":{"type":"server_error","code":"internal_server_error","message":"synthetic timeout"}}'
+
 def paid():
     assert importlib.util.find_spec("backend.paid_transport"), "paid boundary absent"
     return importlib.import_module("backend.paid_transport")
@@ -983,7 +985,7 @@ async def test_acknowledged_rejection_status_replays_independently_of_body(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,failures", [(429, 2), (429, 5), (401, 1)])
+@pytest.mark.parametrize("status,failures", [(429, 2), (429, 5), (401, 1), (500, 1), (500, 5)])
 @pytest.mark.parametrize("branch", ["chat", "responses"])
 async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
     owner, monkeypatch, status, failures, branch
@@ -1002,7 +1004,7 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
     def send(request):
         calls.append(1)
         if len(calls) <= failures:
-            return httpx.Response(status, content=b"plain acknowledged rejection")
+            return httpx.Response(status, content=SERVER_ERROR_BODY if status == 500 else b"plain acknowledged rejection")
         return httpx.Response(
             200,
             json={"output_text": "ok"}
@@ -1055,6 +1057,7 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
     ],
 )
 @pytest.mark.parametrize("rejected_status,rejected_body", [
+    (500, SERVER_ERROR_BODY),
     (402, b'{"error":{"message":"Insufficient Balance"}}'),
     (400, b'{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}}'),
 ])
@@ -1269,3 +1272,74 @@ async def test_unit_deadline_stops_new_dispatch_but_saves_the_inflight_call(owne
     states = [r.state for r in rows(owner)]
     assert calls == [b"first"]
     assert states == ["response_saved"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body,acknowledged", [
+    (500, SERVER_ERROR_BODY, True),
+    (500, b'{"error":{"type":"server_error"}}', False),
+    (500, b'{"error":{"code":"internal_server_error"}}', False),
+    (500, b'{"error":{"type":"server_error","code":"overloaded"}}', False),
+    (500, b'{"error":"server_error"}', False),
+    (500, b'not json', False),
+    (500, b'{"error":{"type":"server_error","code":"internal_server_error"},"choices":[{"message":{"content":"unexpected output"}}]}', False),
+    (502, SERVER_ERROR_BODY, False), (503, SERVER_ERROR_BODY, False), (504, SERVER_ERROR_BODY, False),
+])
+@pytest.mark.parametrize("sync", [False, True])
+async def test_complete_allowlisted_server_failure_replays_without_rebilling_claim(owner, status, body, acknowledged, sync):
+    p = paid()
+    calls = []
+    def send(request):
+        calls.append(1)
+        return httpx.Response(status, content=body)
+    for _ in range(2):
+        with scope(owner):
+            try:
+                if sync:
+                    with httpx.Client(transport=p.PaidSyncTransport(httpx.MockTransport(send))) as client:
+                        response = client.post("http://test/v1/chat/completions", content=b"original")
+                else:
+                    async with httpx.AsyncClient(transport=p.PaidAsyncTransport(httpx.MockTransport(send))) as client:
+                        response = await client.post("http://test/v1/chat/completions", content=b"original")
+            except p.PaidOutcomeUnknown:
+                assert not acknowledged
+                continue
+        assert acknowledged and response.status_code == status and response.content == body
+    assert calls == [1]
+    row = rows(owner)[0]
+    assert row.state == ("rejected" if acknowledged else "unknown")
+    assert row.error_classification == ("acknowledged_server_error_billing_unknown" if acknowledged else "unclassified_http_response")
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_server_failure_retry_budget_survives_reconstruction(owner, monkeypatch):
+    from backend.llm_client import AsyncOpenAICompatClient
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import llm_calls
+    class InterruptedBackoff(BaseException):
+        pass
+    calls, sleeps = [], []
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            raise InterruptedBackoff
+    monkeypatch.setattr(llm_calls, "_sleep_backoff", sleep)
+    def send(request):
+        calls.append(request.content)
+        return httpx.Response(500, content=SERVER_ERROR_BODY)
+    client = AsyncOpenAICompatClient(base_url="http://test", api_key="", transport=httpx.MockTransport(send))
+    workflow = QEEGCouncilWorkflow(llm=client)
+    args = dict(model_id="model", prompt_text="original", max_tokens=100, temperature=0.2)
+    try:
+        with scope(owner, "stage4"), pytest.raises(InterruptedBackoff):
+            await workflow._call_model_chat(**args)
+        assert len(calls) == 3
+        for _ in range(2):
+            with scope(owner, "stage4"), pytest.raises(Exception) as failure:
+                await workflow._call_model_chat(**args)
+            assert getattr(failure.value, "status_code", None) == 500
+            assert not isinstance(failure.value, paid().PaidOutcomeUnknown)
+    finally:
+        await client.aclose()
+    assert len(calls) == 5 and len(set(calls)) == 1
+    assert [(r.dispatch_ordinal, r.state) for r in rows(owner)] == [(n, "rejected") for n in range(5)]
