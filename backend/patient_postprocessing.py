@@ -215,7 +215,9 @@ def _manifest(owner, cfg, *, explicit=False):
             date=now.date().isoformat(),
             generated_at=now.isoformat(),
             destinations=destinations,
-            max_tokens=12000,
+            # Reasoning writers spend part of this budget before the text;
+            # 12000 truncated full-length summaries mid-appendix.
+            max_tokens=32000,
             temperature=0.2,
         )
     _publish(owner, path, _json(data))

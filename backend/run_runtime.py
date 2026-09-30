@@ -237,7 +237,9 @@ class RunRuntime:
         publish=None,
         sync=None,
         continuation=None,
-        concurrency=2,
+        # Several clinic patients are routinely analyzed at once; two left
+        # later uploads queued behind whole council runs.
+        concurrency=6,
         poll_interval=1.0,
         retry_delay=5.0,
         page_size=100,
