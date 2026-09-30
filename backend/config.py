@@ -124,10 +124,10 @@ COUNCIL_MODELS: list[CouncilModelConfig] = _load_models_from_env() or [
         endpoint_preference="chat",
     ),
     CouncilModelConfig(
-        id="openai/gpt-5.6-terra",
-        name="GPT-5.6 Terra",
-        source="Subscription via CLIProxyAPI",
-        endpoint_preference="responses",
+        id="openai/gpt-6.1-sol",
+        name="GPT-6.1 Sol",
+        source="OpenRouter via CLIProxyAPI",
+        endpoint_preference="chat",
     ),
 ]
 
@@ -137,6 +137,7 @@ DEFAULT_CONSOLIDATOR = MODEL_ROLE_DEFAULTS.stage4_consolidator
 # These will receive page images in addition to text for Stage 1 analysis
 VISION_CAPABLE_MODELS: set[str] = {
     "z-ai/glm-5.3-flash",
+    "openai/gpt-6.1-sol",
     # OpenAI vision models (GPT-4o, GPT-4-turbo, GPT-5+ all support vision)
     "gpt-4o",
     "gpt-4o-mini",
