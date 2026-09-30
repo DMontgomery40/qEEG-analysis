@@ -777,7 +777,9 @@ class AsyncOpenAICompatClient:
                 )
             return retry_content
         if not content_text.strip():
-            await self.aclose()
+            # Do not close the client here: it is shared by concurrent council
+            # members, and closing it tears down their in-flight paid requests,
+            # which the journal must then record as unknown outcomes.
             raise UpstreamError(
                 "CLIProxyAPI /v1/chat/completions returned empty text content",
                 operator_hint=_operator_hint(
@@ -873,7 +875,7 @@ class AsyncOpenAICompatClient:
                         chunks.append(text)
         text = "".join(chunks).strip()
         if not text:
-            await self.aclose()
+            # Shared client; see chat_completions.
             raise UpstreamError(
                 f"{upstream} /v1/responses returned empty text content",
                 operator_hint=_operator_hint(
