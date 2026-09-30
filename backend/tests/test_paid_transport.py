@@ -1235,3 +1235,37 @@ p.reconcile_blocked_run(store,'r')
         assert len(requests) == 1 and requests[0].state == "rejected"
         assert Path(requests[0].request_path).read_bytes() == b"original"
     assert len(store.list_due_runs(datetime.now(timezone.utc))) == 1
+
+
+@pytest.mark.asyncio
+async def test_unit_deadline_stops_new_dispatch_but_saves_the_inflight_call(owner, monkeypatch):
+    # 2026-09-29: a Stage 1 chunk deadline cancelled a transcript call mid-flight;
+    # the journal recorded an unknown outcome and the whole run blocked. A deadline
+    # must stop new paid calls before they are sent and let the in-flight one land.
+    from backend.council.workflow.stages import _StagesMixin
+
+    p = paid()
+    monkeypatch.setenv("QEEG_UNIT_DEADLINE_GRACE_S", "10")
+    calls = []
+
+    async def send(request):
+        calls.append(request.content)
+        await asyncio.sleep(1.6)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+
+        async def unit():
+            with scope(owner):
+                await client.post("http://test/v1/responses", content=b"first")
+                await client.post("http://test/v1/responses", content=b"second")
+
+        with pytest.raises((TimeoutError, p.DispatchStopped)):
+            await _StagesMixin()._await_with_heartbeat(
+                unit(), emit=None, payload={"task": "unit"}, timeout_s=1
+            )
+    states = [r.state for r in rows(owner)]
+    assert calls == [b"first"]
+    assert states == ["response_saved"]

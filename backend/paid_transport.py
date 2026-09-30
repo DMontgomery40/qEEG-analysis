@@ -60,6 +60,46 @@ _worker_scope: ContextVar[PaidScope | None] = ContextVar(
 )
 
 
+class DispatchStopped(RuntimeError):
+    """A unit deadline passed before this paid request; nothing was sent."""
+
+
+class DispatchGate:
+    """Lets a caller stop new paid dispatches without cancelling one in flight.
+
+    Cancelling an in-flight paid call leaves an unknown outcome that blocks the
+    whole run, so a deadline closes this gate instead: later requests fail before
+    any receipt is written, and the call already on the wire completes and saves.
+    """
+
+    def __init__(self):
+        self.stopped = False
+        self.inflight = 0
+        self._lock = threading.Lock()
+
+    def stop(self):
+        with self._lock:
+            self.stopped = True
+            return self.inflight
+
+    def enter(self):
+        # Count first, then check, under one lock: a deadline that stops the gate
+        # either sees this call in flight or this call sees the gate stopped.
+        with self._lock:
+            if self.stopped:
+                raise DispatchStopped("unit deadline reached before this paid request")
+            self.inflight += 1
+
+    def leave(self):
+        with self._lock:
+            self.inflight -= 1
+
+
+dispatch_gate: ContextVar[DispatchGate | None] = ContextVar(
+    "qeeg_dispatch_gate", default=None
+)
+
+
 @dataclass
 class PaidScope:
     owner: RunOwner
@@ -600,6 +640,16 @@ class PaidAsyncTransport(httpx.AsyncBaseTransport):
         scope = _scope.get()
         if scope is None or request.method == "GET":
             return await self.inner.handle_async_request(request)
+        gate = dispatch_gate.get()
+        if gate is None:
+            return await self._paid_request(scope, request)
+        gate.enter()
+        try:
+            return await self._paid_request(scope, request)
+        finally:
+            gate.leave()
+
+    async def _paid_request(self, scope, request):
         await request.aread()
         try:
             receipt = _Receipt(scope, request)
@@ -655,6 +705,16 @@ class PaidSyncTransport(httpx.BaseTransport):
         scope = _scope.get()
         if scope is None or request.method == "GET":
             return self.inner.handle_request(request)
+        gate = dispatch_gate.get()
+        if gate is None:
+            return self._paid_request(scope, request)
+        gate.enter()
+        try:
+            return self._paid_request(scope, request)
+        finally:
+            gate.leave()
+
+    def _paid_request(self, scope, request):
         request.read()
         try:
             receipt = _Receipt(scope, request)

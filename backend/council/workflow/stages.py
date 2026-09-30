@@ -13,6 +13,7 @@ from ...reports import extract_pdf_full
 from ...storage import Report, get_report, get_run
 from ...storage import session_scope
 from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
+from ...paid_transport import DispatchGate, dispatch_gate
 from ..execution import (
     execute_unit,
     gather_units,
@@ -69,7 +70,15 @@ class _StagesMixin:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
         interval_s = self._int_env("QEEG_PROGRESS_HEARTBEAT_S", 30)
-        task = asyncio.ensure_future(awaitable)
+        # The unit's task inherits this gate. At the deadline the gate stops new
+        # paid calls while one already in flight completes and saves its receipt;
+        # cancelling mid-flight would record an unknown outcome and block the run.
+        gate = DispatchGate()
+        gate_token = dispatch_gate.set(gate)
+        try:
+            task = asyncio.ensure_future(awaitable)
+        finally:
+            dispatch_gate.reset(gate_token)
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         deadline = started_at + timeout_s if timeout_s is not None else None
@@ -80,9 +89,7 @@ class _StagesMixin:
                 if deadline is not None:
                     remaining_s = deadline - loop.time()
                     if remaining_s <= 0:
-                        raise TimeoutError(
-                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
-                        )
+                        return await self._finish_after_deadline(task, gate, timeout_s, payload)
                     wait_s = (
                         min(wait_s, remaining_s) if wait_s is not None else remaining_s
                     )
@@ -92,9 +99,7 @@ class _StagesMixin:
                     if task.done():
                         return await task
                     if deadline is not None and loop.time() >= deadline:
-                        raise TimeoutError(
-                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
-                        )
+                        return await self._finish_after_deadline(task, gate, timeout_s, payload)
                     heartbeat_count += 1
                     await emit(
                         {
@@ -111,6 +116,19 @@ class _StagesMixin:
                 raise_if_execution_blocked(child_error)
             raise_if_execution_blocked(error)
             raise
+
+    async def _finish_after_deadline(self, task, gate, timeout_s, payload):
+        """Stop new paid calls; if one is on the wire, let it land and save first."""
+        grace_s = self._int_env("QEEG_UNIT_DEADLINE_GRACE_S", 660)
+        loop = asyncio.get_running_loop()
+        give_up_at = loop.time() + max(1, grace_s)
+        inflight = gate.stop()
+        while inflight and not task.done() and loop.time() < give_up_at:
+            await asyncio.wait({task}, timeout=0.05)
+            inflight = gate.inflight
+        raise TimeoutError(
+            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+        )
 
     @staticmethod
     def _select_discovered_model_id(preferred: str) -> str | None:
