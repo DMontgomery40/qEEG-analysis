@@ -323,8 +323,23 @@ def _summary_page_facts(
     """Parse numeric cells using only this source page's local session columns."""
 
     def find_line_contains(needle: str) -> str | None:
-        m = re.search(rf"(?im)^.*{re.escape(needle)}.*$", page_text)
-        return m.group(0).strip() if m else None
+        # Only a table row counts: the label, an optional parenthetical such as
+        # "(Power)", then a value cell. WAVi's glossary page repeats every label
+        # in prose ("Audio P300 Delay and Audio P300 Voltage metrics are derived
+        # from ... C3 ..."), which otherwise yields phantom values like 300 ms.
+        for m in re.finditer(rf"(?im)^.*{re.escape(needle)}.*$", page_text):
+            line = m.group(0)
+            rest = line[line.lower().find(needle.lower()) + len(needle) :]
+            rest = re.sub(r"^\s*\([^)\n]*\)", "", rest)
+            # Allow up to two short OCR fragments before the first clean cell: the
+            # low-yield marker is often read as "fl", "f=" or "m", and 1.1 as "i.1".
+            if re.match(
+                r"(?:\s+(?![:(])\S{1,3}){0,2}\s+(?:m?N/?A\b|[<>≤≥]?\s*-?\d)",
+                rest,
+                re.I,
+            ):
+                return line.strip()
+        return None
 
     def find_line_startswith(label: str) -> str | None:
         m = re.search(rf"(?im)^{re.escape(label)}\b.*$", page_text)
@@ -354,7 +369,7 @@ def _summary_page_facts(
         # OCR can omit units from some or all cells. Consume each value and
         # its parenthesized SD together before advancing to the next column.
         cells = re.findall(
-            r"(\d+)\s*(?:\(\s*\+?(\d+)\s*\))?(?:\s*ms)?", value_part, re.I
+            r"(\d+)\s*(?:\(\s*[+±]?\s*(\d+)\s*\))?(?:\s*ms)?", value_part, re.I
         )
         for sess, (token, sd) in zip(expected_sessions, cells):
             val = _safe_int(token)

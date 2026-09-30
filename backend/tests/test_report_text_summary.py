@@ -230,3 +230,76 @@ def test_local_column_order_comes_from_source_legend():
     assert [
         (f["local_session_index"], f["session_index"], f["value"]) for f in facts
     ] == [(2, 3, 280), (1, 2, 290)]
+
+
+# WAVi's glossary page (verbatim) mentions every summary label in prose. On
+# 2026-09-29 it produced a phantom second P300 value (300 ms from "P300", 3 µV
+# from "C3") for every session, so identical visits in two reports "conflicted".
+WAVI_GLOSSARY_PAGE = (
+    "P300 Metrics\n"
+    "Physical Reaction Time: The average time of the physical response to rare tones, derived from mouse or keyboard input.\n"
+    'Reported as "N/A" if there were less than 15 physical responses to rare tones.\n'
+    "Audio P300 Delay and Audio P300 Voltage metrics are derived from Central-Parietal (C-P) locations CZ, C3, C4, PZ, P3, and P4 with\n"
+    "sufficient yield.\n"
+    "Audio P300 Delay: The fastest C-P latency between 240-499 ms after a rare tone, among locations that are at least 3 μV.\n"
+    'Reported as "N/A" if no C-P location is at least 3 μV, or no C-P location has a yield of at least 20 rare events.\n'
+    "Audio P300 Voltage: The largest C-P amplitude between 240-499 ms after a rare tone.\n"
+    'Reported as "< 0 μV" if the voltage at all C-P locations is less than 0 μV.\n'
+)
+
+
+def _metric_values(facts, metric):
+    out = {}
+    for f in facts:
+        if f.get("metric") == metric:
+            out.setdefault(f["session_index"], []).append((f["value"], f.get("sd_plus_minus")))
+    return out
+
+
+def test_glossary_page_adds_no_summary_values():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 12 ===\n"
+        "Physical Reaction Time                282 (±56) ms        252–362 ms\n"
+        "Audio P300 Delay                      344 ms              265–344 ms\n"
+        "Audio P300 Voltage                    4.2 μV              7–18 μV\n"
+        "=== PAGE 12 / 12 ===\n" + WAVI_GLOSSARY_PAGE
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1])
+
+    assert _metric_values(facts, "audio_p300_delay") == {1: [(344, None)]}
+    assert _metric_values(facts, "audio_p300_voltage") == {1: [(4.2, None)]}
+    assert _metric_values(facts, "physical_reaction_time") == {1: [(282, 56)]}
+
+
+def test_plus_minus_sd_is_read_like_plus_sd():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 2 ===\n"
+        "Physical Reaction Time      282 (±56) ms      337 (+109) ms      252–362 ms\n"
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2])
+    assert _metric_values(facts, "physical_reaction_time") == {1: [(282, 56)], 2: [(337, 109)]}
+
+
+def test_ocr_low_yield_marker_fragment_does_not_hide_the_row():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 12 ===\n"
+        "Audio P300 Delay fl 284 ms f= 240 ms 240 ms 252-327 ms\n"
+        "=== PAGE 12 / 12 ===\n" + WAVI_GLOSSARY_PAGE
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1])
+    assert _metric_values(facts, "audio_p300_delay") == {1: [(284, None)]}
+
+
+def test_ocr_garbled_first_cell_keeps_the_rest_of_the_row():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = "=== PAGE 1 / 6 ===\nCZ Eyes Closed Theta/Beta (Power) i.1 1.2 0.9 0.8-1.9\n"
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2, 3])
+    vals = _metric_values(facts, "cz_theta_beta_ratio_ec")
+    assert vals[2] == [(1.2, None)] and vals[3] == [(0.9, None)]
