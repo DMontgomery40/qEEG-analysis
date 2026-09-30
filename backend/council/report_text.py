@@ -437,60 +437,40 @@ def _summary_page_facts(
                         }
                     )
 
-    # Audio P300 Delay/Voltage.
-    delay_line = find_line_contains("Audio P300 Delay")
-    if delay_line:
-        # Avoid pulling digits from the label itself (e.g., "P300" -> 300).
-        toks = _number_tokens(tail_after(delay_line, "Audio P300 Delay"))
-        if len(toks) >= len(expected_sessions):
-            vals = toks[: len(expected_sessions)]
-            range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
-            target = None
-            if len(range_toks) == 2:
-                target = f"{range_toks[0]}-{range_toks[1]} ms"
-            for sess, tok in zip(expected_sessions, vals):
-                val = _safe_int(tok)
-                if val is None:
-                    continue
-                out.append(
-                    {
-                        "fact_type": "evoked_potential",
-                        "metric": "audio_p300_delay",
-                        "session_index": sess,
-                        "value": val,
-                        "unit": "ms",
-                        "target_range": target,
-                        "shown_as": delay_line.strip(),
-                        "source_page": source_page,
-                    }
-                )
-
-    volt_line = find_line_contains("Audio P300 Voltage")
-    if volt_line:
-        # Avoid pulling digits from the label itself (e.g., "P300" -> 300).
-        toks = _number_tokens(tail_after(volt_line, "Audio P300 Voltage"))
-        if len(toks) >= len(expected_sessions):
-            vals = toks[: len(expected_sessions)]
-            range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
-            target = None
-            if len(range_toks) == 2:
-                target = f"{range_toks[0]}-{range_toks[1]} µV"
-            for sess, tok in zip(expected_sessions, vals):
-                val = _safe_float(tok)
-                if val is None:
-                    continue
-                out.append(
-                    {
-                        "fact_type": "evoked_potential",
-                        "metric": "audio_p300_voltage",
-                        "session_index": sess,
-                        "value": val,
-                        "unit": "µV",
-                        "target_range": target,
-                        "shown_as": volt_line.strip(),
-                        "source_page": source_page,
-                    }
-                )
+    # Audio P300 Delay/Voltage. Missing cells still occupy a session column;
+    # reference bounds are not measurements, even when fewer cells are present.
+    for label, metric, unit, convert in (
+        ("Audio P300 Delay", "audio_p300_delay", "ms", _safe_int),
+        ("Audio P300 Voltage", "audio_p300_voltage", "µV", _safe_float),
+    ):
+        line = find_line_contains(label)
+        if not line:
+            continue
+        value_part = tail_after(line, label)
+        target = None
+        reference = re.search(
+            r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)"
+            r"\s*(?:ms|[uµμ]V)?\s*$", value_part, re.I,
+        )
+        if reference:
+            target = f"{reference.group(1)}-{reference.group(2)} {unit}"
+            value_part = value_part[:reference.start()]
+        cells = re.findall(r"(?i)(?:[m■]?N/?A|\d+(?:\.\d+)?)\b", value_part)
+        for sess, token in zip(expected_sessions, cells):
+            missing = re.fullmatch(r"[m■]?N/?A", token, re.I) is not None
+            value = None if missing else convert(token)
+            if value is None and not missing:
+                continue
+            out.append({
+                "fact_type": "evoked_potential",
+                "metric": metric,
+                "session_index": sess,
+                "value": value,
+                "unit": unit,
+                "target_range": target,
+                "shown_as": "N/A" if missing else line.strip(),
+                "source_page": source_page,
+            })
 
     # State summary metrics (ratios).
     state_lines = [

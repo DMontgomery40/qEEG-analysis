@@ -303,3 +303,23 @@ def test_ocr_garbled_first_cell_keeps_the_rest_of_the_row():
     facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2, 3])
     vals = _metric_values(facts, "cz_theta_beta_ratio_ec")
     assert vals[2] == [(1.2, None)] and vals[3] == [(0.9, None)]
+
+
+@pytest.mark.parametrize("metric,label,values,unit,target", [
+    ("audio_p300_delay", "Audio P300 Delay", [344, None, 289], "ms", "265-344"),
+    ("audio_p300_voltage", "Audio P300 Voltage", [4.2, None, 9.3], "uV", "7-18"),
+])
+@pytest.mark.parametrize("missing_index", [0, 1, 2])
+@pytest.mark.parametrize("separator", ["-", "–", "—"])
+def test_p300_missing_cell_keeps_session_and_reference(metric, label, values, unit, target, missing_index, separator):
+    from backend.council.report_text import _facts_from_report_text_summary
+    values = [344, 310, 289] if metric.endswith("delay") else [4.2, 6.5, 9.3]
+    values[missing_index] = None
+    target = target.replace("-", separator)
+    text = "=== PAGE 1 / 1 ===\nSession 1 Session 2 Session 3\n" + label + " " + " ".join(
+        "N/A" if v is None else f"{v} {unit}" for v in values
+    ) + f" {target} {unit}\n"
+    facts = _facts_from_report_text_summary(text, expected_sessions=[1, 2, 3])
+    selected = {f["session_index"]: f for f in facts if f.get("metric") == metric}
+    assert {i: selected.get(i, {}).get("value") for i in [1, 2, 3]} == dict(enumerate(values, 1))
+    assert all(f["target_range"] == target.replace(separator, "-") + (" ms" if metric.endswith("delay") else " µV") for f in selected.values())
