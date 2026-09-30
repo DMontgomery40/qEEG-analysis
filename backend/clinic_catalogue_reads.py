@@ -223,7 +223,16 @@ def _generation_time():
         .correlate(ClinicArtifact)
         .scalar_subquery()
     )
-    return func.coalesce(ClinicArtifact.generated_at, receipt_time)
+    # Renderer registrations carry no generation time; a video is made when it
+    # is registered, so it must not sort below older dated videos.
+    return func.coalesce(
+        ClinicArtifact.generated_at,
+        receipt_time,
+        case(
+            (ClinicArtifact.document_kind == "video", ClinicArtifact.registered_at),
+            else_=None,
+        ),
+    )
 
 
 def _record_generation_time(artifact, provenance):
@@ -254,7 +263,9 @@ def _record_generation_time(artifact, provenance):
                 times.append(round(stamp.timestamp() * 1000))
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
-    return max(times) if times else None
+    if times:
+        return max(times)
+    return artifact.registered_at if artifact.document_kind == "video" else None
 
 
 def _working_file_ids(patient_uuids):

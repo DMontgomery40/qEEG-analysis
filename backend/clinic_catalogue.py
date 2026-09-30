@@ -23,6 +23,12 @@ from sqlalchemy.dialects.sqlite import insert
 from .clinic_models import ClinicPatientCatalogState
 
 from . import storage
+
+# The platform MIME table may lack .md (macOS does). Without this, patient
+# summaries registered as application/octet-stream, and the clinic's lookup for
+# text/markdown summaries never found them.
+mimetypes.add_type("text/markdown", ".md")
+
 from .clinic_catalogue_reads import (
     _allowed_path,
     _artifact_json,

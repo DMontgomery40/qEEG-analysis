@@ -1808,3 +1808,38 @@ def test_mime_case_duplicates_share_chart_and_filtered_drawer(
         f["fileId"]
         for f in recent_files(kind="video", content_type=filter_mime)["files"]
     ] == [published["fileId"]]
+
+
+def test_markdown_summary_without_explicit_type_registers_as_markdown(chart, temp_data_dir):
+    # Python's table has no .md entry on macOS; patient summaries registered as
+    # application/octet-stream were invisible to the clinic's text/markdown lookup.
+    path = temp_data_dir / "summary.md"
+    path.write_bytes(b"# Your Brain Assessment Summary\n")
+    file = catalogue.register_artifact(
+        patient_uuid=chart.id,
+        source_kind="test",
+        source_id="markdown-summary",
+        original_name="summary.md",
+        logical_family="patient-facing:md",
+        local_path=path,
+    )
+    assert file["contentType"] == "text/markdown"
+
+
+def test_new_undated_video_lists_above_older_dated_video(chart, temp_data_dir):
+    # Renderer registrations carry no generation time; on 2026-09-29 a new
+    # explainer sorted below the patient's August videos on the clinic hub.
+    def video(source, data, family, **kwargs):
+        path = temp_data_dir / (source + ".mp4")
+        path.write_bytes(data)
+        return catalogue.register_artifact(
+            patient_uuid=chart.id, source_kind="test", source_id=source,
+            original_name=source + ".mp4", logical_family=family, local_path=path,
+            content_type="video/mp4", document_kind="video", **kwargs,
+        )
+
+    older = video("midpoint-explainer", b"old", "video-midpoint", generated_at=1_000)
+    newer = video("explainer-20tx", b"new", "video-20tx")
+    videos = [f for f in reads.patient_files(chart.label, mode="archive")["files"] if f["documentKind"] == "video"]
+    assert [f["fileId"] for f in videos] == [newer["fileId"], older["fileId"]]
+    assert videos[0]["generatedAt"] is not None
