@@ -1106,12 +1106,14 @@ async def test_reconcile_script_skips_settled_rows_of_earlier_attempts(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unknown", [False, True])
+@pytest.mark.parametrize("case", ["asked", "unknown", "not_asked"])
 async def test_regenerate_action_reopens_a_blocked_write_up(
-    ready, temp_data_dir, monkeypatch, unknown
+    ready, temp_data_dir, monkeypatch, case
 ):
-    """The hub/workbench action used to answer a blocked write-up with
-    scheduled: false and nothing else; it only admitted a post not yet made."""
+    """The action used to answer a blocked write-up with scheduled: false and
+    nothing else; it only admitted a post not yet made. Another attempt spends,
+    so it happens only when the request carries the clinic's explicit yes."""
+    unknown = case == "unknown"
     from unittest.mock import AsyncMock
 
     from fastapi.testclient import TestClient
@@ -1137,9 +1139,14 @@ async def test_regenerate_action_reopens_a_blocked_write_up(
     with TestClient(main.app, raise_server_exceptions=False) as client:
         response = client.post(
             f"/api/patients/{patient_id}/actions/regenerate_patient_facing",
-            json={"run_id": run_id},
+            json={"run_id": run_id, "regenerate_blocked": case != "not_asked"},
         )
-    if unknown:
+    if case == "not_asked":
+        assert response.status_code == 200, response.text
+        assert response.json()["scheduled"] is False
+        assert response.json()["postprocessing"]["state"] == "blocked"
+        assert _post_row(run_id)[0] == "blocked"
+    elif unknown:
         assert response.status_code == 409, response.text
         assert "reconcile it first" in response.text
         assert _post_row(run_id)[0] == "blocked"
