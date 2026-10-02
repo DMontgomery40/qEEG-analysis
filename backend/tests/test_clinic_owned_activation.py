@@ -258,7 +258,15 @@ def test_pending_retries_end_in_a_blocked_run_with_a_plain_reason(monkeypatch):
     assert run_runtime._capped_disposition("pending", "All models failed during Stage 1", 3, 7) == (
         "blocked", "gave up after 3 failed attempts: All models failed during Stage 1")
     assert run_runtime._capped_disposition("blocked", "paid_outcome_unknown", 9, 9) == ("blocked", "paid_outcome_unknown")
-    assert run_runtime._capped_disposition("pending", "x", 1, 500)[0] == "blocked", "the generation backstop survives restarts"
+    assert run_runtime._capped_disposition("pending", "x", 1, 500)[0] == "pending", "one blip at high generation is not a verdict"
+    assert run_runtime._capped_disposition("pending", "x", 3, 500)[0] == "blocked", "the generation backstop survives restarts"
+    # a missing model or an unreachable catalogue is a wait, never an attempt
+    waiting = run_runtime.ModelUnavailable("Pinned council catalogue is unavailable before first execution")
+    assert run_runtime._is_availability_wait(waiting)
+    wrapped = RuntimeError("outer")
+    wrapped.__cause__ = waiting
+    assert run_runtime._is_availability_wait(wrapped)
+    assert not run_runtime._is_availability_wait(RuntimeError("All models failed during Stage 1"))
 
 
 def test_a_complete_run_with_a_blocked_document_is_blocked_not_stranded():

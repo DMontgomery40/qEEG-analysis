@@ -14,6 +14,7 @@ from dataclasses import replace
 import fcntl
 import hashlib
 import json
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -576,6 +577,52 @@ def lookup_admitted_operation(
         return prior, storage.get_run(session, prior.run_id)
 
 
+RECENT_RUN_WINDOW_S = int(os.getenv("QEEG_RECENT_RUN_WINDOW_S", str(24 * 3600)))
+
+
+def _refuse_duplicate_council(session, envelope_fingerprint, immutable_request):
+    """The same patient, sources, instructions and models already have a
+    council in progress, or one that finished within the window. On
+    2026-09-29 one PDF drew five paid runs in 82 minutes under five
+    operation ids (engine map H11). A new operation id is not a new request;
+    the caller says force_new when the operator asked for a fresh run."""
+    if (immutable_request or {}).get("force_new"):
+        return
+    siblings = session.scalars(
+        select(storage.AnalysisInputReservation).where(
+            storage.AnalysisInputReservation.envelope_fingerprint == envelope_fingerprint
+        )
+    ).all()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for reservation in siblings:
+        run = storage.get_run(session, reservation.run_id)
+        if run is None:
+            continue
+        if run.status in ("created", "running", "queued") and (run.execution_state or "") != "blocked":
+            raise HTTPException(
+                409,
+                {
+                    "code": "ANALYSIS_ALREADY_RUNNING",
+                    "message": "A council for these same reports and models is already in progress",
+                    "run_id": run.id,
+                },
+            )
+        finished = run.completed_at
+        if run.status == "complete" and finished is not None:
+            if finished.tzinfo is not None:
+                finished = finished.astimezone(timezone.utc).replace(tzinfo=None)
+            if (now - finished).total_seconds() < RECENT_RUN_WINDOW_S:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "ANALYSIS_RECENTLY_COMPLETED",
+                        "message": "A council for these same reports and models finished recently",
+                        "run_id": run.id,
+                        "completed_at": run.completed_at.isoformat(),
+                    },
+                )
+
+
 def admit_run(
     *,
     patient_id: str,
@@ -609,6 +656,8 @@ def admit_run(
         with storage.session_scope() as session:
             if prior and prior.envelope_fingerprint != envelope_fingerprint:
                 raise _operation_conflict()
+            if prior is None:
+                _refuse_duplicate_council(session, envelope_fingerprint, immutable_request)
             if storage.get_patient(session, patient_id) is None:
                 raise HTTPException(404, "Patient not found")
             originals = []

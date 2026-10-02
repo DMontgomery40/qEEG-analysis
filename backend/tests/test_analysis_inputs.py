@@ -123,7 +123,14 @@ def test_complete_source_admission_and_operation_retry(admission, count):
     ]:
         response = client.post("/api/runs", json={**req, **changed})
         assert response.status_code in (400, 409)
-    new = client.post("/api/runs", json={**req, "operation_id": "intentional-new"})
+    # The same request under a new operation id is a duplicate council while
+    # the first one runs (2026-09-29: five runs on one PDF); the operator's
+    # "run it again" is force_new.
+    duplicate = client.post("/api/runs", json={**req, "operation_id": "intentional-new"})
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"]["code"] == "ANALYSIS_ALREADY_RUNNING"
+    assert duplicate.json()["detail"]["run_id"] == run["id"]
+    new = client.post("/api/runs", json={**req, "operation_id": "intentional-new", "force_new": True})
     assert new.status_code == 200
     assert new.json()["id"] != run["id"]
 
@@ -723,7 +730,7 @@ def test_stricter_admission_preserves_identical_banked_operation_receipt(
     assert repeated.status_code == 200, repeated.text
     assert repeated.json()["id"] == first.json()["id"]
     assert repeated.json()["source_manifest"] == first.json()["source_manifest"]
-    new = client.post("/api/runs", json={**request, "operation_id": "new-admission"})
+    new = client.post("/api/runs", json={**request, "operation_id": "new-admission", "force_new": True})
     assert new.status_code == 409
     assert new.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
 

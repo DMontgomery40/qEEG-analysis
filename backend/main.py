@@ -234,6 +234,9 @@ class RunCreate(BaseModel):
     council_model_ids: list[str]
     consolidator_model_id: str
     allowed_model_fallbacks: dict[str, str] = Field(default_factory=dict)
+    # The operator asked for a fresh council although one for the same request
+    # runs or just finished (2026-10-02, engine map H11).
+    force_new: bool = False
 
 
 class SelectRequest(BaseModel):
@@ -2762,6 +2765,7 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
         list_supplied="report_ids" in req.model_fields_set,
     )
     immutable_request = {
+        "force_new": bool(getattr(req, "force_new", False)),
         "patient_id": req.patient_id,
         "source_ids": source_ids,
         "special_instructions": req.special_instructions,

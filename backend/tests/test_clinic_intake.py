@@ -736,3 +736,47 @@ def test_two_matching_charts_park_the_upload_with_both_candidates(temp_data_dir)
     assert resolved["patientId"] == "AB_02-02-1900_2"
     assert resolved["status"] == "registered"
     assert counts()[0] == 2
+
+
+def test_the_same_request_is_one_council_until_the_operator_asks_again(temp_data_dir, monkeypatch):
+    # 2026-09-29: one PDF, five paid runs in 82 minutes under five operation ids.
+    from datetime import datetime, timedelta, timezone
+    from fastapi import HTTPException
+    from backend import analysis_inputs
+
+    upload = submit(file_meta=[{"documentKind": "report"}, {}])["upload"]
+    report_id = upload["items"][0]["sourceId"]
+    with storage.session_scope() as s:
+        patient_uuid = s.scalar(select(storage.Patient.id).where(storage.Patient.label == upload["patientId"]))
+    models = dict(council_model_ids=["m1"], consolidator_model_id="m2", requested_model_ids=["m1", "m2"],
+                  resolved_model_ids=["m1", "m2"], creating_instance_id="t", model_catalogue_fingerprint="f")
+
+    def admit(operation_id, **extra):
+        return analysis_inputs.admit_run(
+            patient_id=patient_uuid, source_ids=[report_id], special_instructions="",
+            source_session_aliases={}, operation_id=operation_id, model_fields=lambda: dict(models),
+            immutable_request={"patient_id": patient_uuid, "source_ids": [report_id], **extra},
+        )
+
+    first = admit("op-one")
+    with pytest.raises(HTTPException) as refused:
+        admit("op-two")
+    assert refused.value.detail["code"] == "ANALYSIS_ALREADY_RUNNING"
+    assert refused.value.detail["run_id"] == first.id
+    with storage.session_scope() as s:
+        run = s.get(storage.Run, first.id)
+        run.status = "complete"; run.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        s.commit()
+    with pytest.raises(HTTPException) as recent:
+        admit("op-three")
+    assert recent.value.detail["code"] == "ANALYSIS_RECENTLY_COMPLETED"
+    third = admit("op-four", force_new=True)
+    assert third.id != first.id, "force_new is the operator's yes"
+    with storage.session_scope() as s:
+        run = s.get(storage.Run, first.id)
+        run.completed_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=2)
+        s.commit()
+        third_run = s.get(storage.Run, third.id)
+        third_run.status = "failed"
+        s.commit()
+    assert admit("op-five").id not in (first.id, third.id), "an old council does not block a new one"

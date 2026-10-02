@@ -221,10 +221,27 @@ def _strand_guard(state, reason, run_status, post_state, post_reason):
     return state, reason
 
 
+def _is_availability_wait(error):
+    """A pinned model missing from the catalogue, or the catalogue itself
+    unreachable, is a wait, not a failure: a two-minute cliproxy gap must
+    not block a run behind a paid re-council (Fable review, 2026-10-02)."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModelUnavailable):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def _capped_disposition(state, reason, consecutive_failures, generation):
     if state != "pending":
         return state, reason
-    if consecutive_failures >= PENDING_RETRY_LIMIT or generation >= GENERATION_BACKSTOP:
+    # The generation backstop needs a few real failures too, so a long
+    # healthy run is never blocked by its first transient one.
+    if consecutive_failures >= PENDING_RETRY_LIMIT or (
+        generation >= GENERATION_BACKSTOP and consecutive_failures >= 3
+    ):
         return "blocked", f"gave up after {max(consecutive_failures, 1)} failed attempts: {reason}"
     return state, reason
 
@@ -379,10 +396,13 @@ class RunRuntime:
             except Exception as error:
                 LOGGER.exception("run_continuation_interrupted", run_id=run_id)
                 state, reason = _failure_disposition(error)
-                failures = self._pending_failures[run_id] = self._pending_failures.get(run_id, 0) + 1
-                state, reason = _capped_disposition(
-                    state, reason, failures, int(getattr(owner, "generation", 0) or 0)
-                )
+                if _is_availability_wait(error):
+                    failures = self._pending_failures.get(run_id, 0)  # a wait, not an attempt
+                else:
+                    failures = self._pending_failures[run_id] = self._pending_failures.get(run_id, 0) + 1
+                    state, reason = _capped_disposition(
+                        state, reason, failures, int(getattr(owner, "generation", 0) or 0)
+                    )
                 if state == "pending":
                     from .patient_postprocessing import project_patient_facing
 
