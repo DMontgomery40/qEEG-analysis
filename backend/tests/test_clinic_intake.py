@@ -914,6 +914,29 @@ def test_an_upload_missing_an_initial_is_offered_the_real_chart(temp_data_dir):
     assert other["patientId"] == "XT_04-08-1986"
 
 
+def test_an_exact_id_on_a_nameless_placeholder_chart_asks_before_naming_it(temp_data_dir):
+    # The nameless ML_01-01-1989 took any upload whose initials and placeholder
+    # birthday computed to its id, and wrote that upload's names onto it.
+    _placeholder_chart("ML_01-01-1989")
+    identity = {"firstName": "Mary", "lastName": "Lee", "birthdate": "01-01-1989"}
+    parked = submit("exact-placeholder", identity=identity)["upload"]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["conflict"] == "placeholder_chart"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["ML_01-01-1989"]
+    resolved = intake().resolve_upload(
+        "exact-placeholder", key="exact-placeholder-yes", resolution={"attachTo": "ML_01-01-1989"}
+    )["upload"]
+    assert resolved["status"] == "registered"
+    assert resolved["patientId"] == "ML_01-01-1989"
+    assert counts()[0] == 1
+    # A placeholder chart that already carries a name is that person: no question.
+    _placeholder_chart("JD_01-01-1970", first_name="John", last_name="Doe")
+    named = submit("named-placeholder",
+                   identity={"firstName": "John", "lastName": "Doe", "birthdate": "01-01-1970"})["upload"]
+    assert named["status"] == "registered"
+    assert named["patientId"] == "JD_01-01-1970"
+
+
 def test_an_identity_that_shares_nothing_known_still_files_a_new_chart(temp_data_dir):
     _placeholder_chart("XS_04-08-1986")
     _placeholder_chart("XX_01-01-1991")

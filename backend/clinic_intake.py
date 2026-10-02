@@ -535,6 +535,8 @@ def _bind_patient(upload_id):
                 patient, keep = find_patient_by_identity(s, identity)
                 if patient is None and not identity.force_new:
                     _offer_placeholder_charts(s, identity)
+                elif patient is not None and not identity.force_new:
+                    _ask_before_naming_a_placeholder(patient, identity)
         except IdentityNameConflict as error:
             u.status = "needs_operator_answer"
             u.conflict_json = _json(error.payload)
@@ -607,6 +609,32 @@ def _typo_or_placeholder(printed, on_chart):
     if on_chart.startswith("01-01-"):
         return True
     return printed[:2] == on_chart[:2] or printed[-4:] == on_chart[-4:]
+
+
+def _ask_before_naming_a_placeholder(patient, identity):
+    """An exact id match on a placeholder chart that has no name yet is still a
+    guess: two people known only by unknown initials or a 01-01 birthday share an
+    id, and attaching would write this upload's names onto someone else's chart.
+    Ask once; the ordinary attachTo answer files it there (2026-10-02, HUB-H5)."""
+    from .patient_intake import stored_full_name
+
+    label = patient.label or ""
+    placeholder = "X" in label[:2] or label[3:8] == "01-01"
+    if not placeholder or stored_full_name(patient):
+        return
+    raise IdentityNameConflict(
+        dict(
+            conflict="placeholder_chart",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[dict(patient_id=label, name=stored_full_name(patient))],
+            detail=(
+                f"Is this the chart on file as {label}? That chart has no name yet, "
+                "so this upload could be someone else. Same person, or someone different?"
+            ),
+        )
+    )
 
 
 def _offer_placeholder_charts(s, identity):
