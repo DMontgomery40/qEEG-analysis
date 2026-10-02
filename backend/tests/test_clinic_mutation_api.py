@@ -54,6 +54,20 @@ def upload(client, key, principal, **fields):
     )
 
 
+def test_each_upload_names_the_door_it_came_through(live_api):
+    # The workbench told hub uploads from its own chat drops by a "wb_" key
+    # prefix; the engine already knew which principal sent each one.
+    client, _, _ = live_api
+    chat = upload(client, "chat-drop", "workbench").json()["upload"]
+    hub = upload(client, "hub-upload", "thrylen-service", firstName="Bea", lastName="Carter").json()["upload"]
+    assert chat["uploadedPrincipal"] == "workbench"
+    assert hub["uploadedPrincipal"] == "thrylen-service"
+    listed = {u["uploadId"]: u["uploadedPrincipal"] for u in client.get("/uploads").json()["uploads"]}
+    assert listed == {"chat-drop": "workbench", "hub-upload": "thrylen-service"}
+    # A replay through the other door does not change where it came from.
+    assert upload(client, "chat-drop", "thrylen-service").json()["upload"]["uploadedPrincipal"] == "workbench"
+
+
 def test_actual_multipart_two_adapter_principals_share_one_database(live_api):
     client, chart, root = live_api
     a = upload(client, "same-key", "workbench")

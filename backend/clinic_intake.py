@@ -13,6 +13,7 @@ import os
 import queue
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -712,6 +713,25 @@ def _chart_difference(target, *, chart_birthdate, identity, birthdate_from_repor
     return " ".join(said) + " Same person, or someone different?"
 
 
+def _same_report(s, patient_uuid, meta):
+    """The report already on this chart with exactly these bytes, as
+    (artifact id, source id), or None."""
+    existing = s.scalar(
+        select(ClinicArtifact)
+        .where(
+            ClinicArtifact.patient_uuid == patient_uuid,
+            ClinicArtifact.source_kind == "report",
+            ClinicArtifact.sha256 == meta["sha256"],
+            ClinicArtifact.size == meta["size"],
+            ClinicArtifact.archived.is_(False),
+        )
+        .order_by(ClinicArtifact.id)
+    )
+    if existing is None or s.get(storage.Report, existing.source_id) is None:
+        return None
+    return existing.id, existing.source_id
+
+
 def _file_item(item_id, patient_uuid):
     with storage.session_scope() as s:
         item = s.get(ClinicUploadItem, item_id)
@@ -728,23 +748,7 @@ def _file_item(item_id, patient_uuid):
         # 2026-09-29 one Wellness Basic PDF became two engine reports (hub
         # upload, then a chat drop) and five paid runs landed on the copy.
         with storage.session_scope() as s:
-            existing = s.scalar(
-                select(ClinicArtifact)
-                .where(
-                    ClinicArtifact.patient_uuid == patient_uuid,
-                    ClinicArtifact.source_kind == "report",
-                    ClinicArtifact.sha256 == meta["sha256"],
-                    ClinicArtifact.size == meta["size"],
-                    ClinicArtifact.archived.is_(False),
-                )
-                .order_by(ClinicArtifact.id)
-            )
-            existing_binding = (
-                (existing.id, existing.source_id)
-                if existing is not None
-                and s.get(storage.Report, existing.source_id) is not None
-                else None
-            )
+            existing_binding = _same_report(s, patient_uuid, meta)
         if existing_binding is not None:
             with _write() as s:
                 item = s.get(ClinicUploadItem, item_id)
@@ -777,53 +781,66 @@ def _file_item(item_id, patient_uuid):
         os.fsync(directory)
     with _write() as s:
         item = s.get(ClinicUploadItem, item_id)
-        u = s.get(ClinicUpload, item.upload_id)
-        s.info["clinic_source_metadata"] = {
-            source_id: dict(
-                uploaded_at=u.uploaded_at,
-                uploaded_by=u.uploaded_by,
-                session_date=meta["metadata"].get("sessionDate") or None,
-                provenance={
-                    kind + "Id": source_id,
-                    "uploadId": u.id,
-                    "itemIndex": item.position,
-                    "metadata": meta["metadata"],
-                },
-            )
-        }
-        if kind == "report":
-            storage.create_report(
-                s,
-                report_id=source_id,
-                patient_id=patient_uuid,
-                filename=meta["originalName"],
-                mime_type=mime,
-                stored_path=path,
-                extracted_text_path=extracted,
-                commit=False,
-            )
+        # Checked again inside this write, which holds the database's write
+        # lock: two filings of the same bytes can both pass the check above
+        # while each saves its copy, and the second one here joins the first
+        # (HUB-H12).
+        duplicate = _same_report(s, patient_uuid, meta) if kind == "report" else None
+        if duplicate is not None:
+            item.artifact_id, item.source_id = duplicate
+            item.status = "registered"
+            item.error = None
         else:
-            storage.create_patient_file(
-                s,
-                file_id=source_id,
-                patient_id=patient_uuid,
-                filename=meta["originalName"],
-                mime_type=mime,
-                stored_path=path,
-                size_bytes=size,
-                commit=False,
+            u = s.get(ClinicUpload, item.upload_id)
+            s.info["clinic_source_metadata"] = {
+                source_id: dict(
+                    uploaded_at=u.uploaded_at,
+                    uploaded_by=u.uploaded_by,
+                    session_date=meta["metadata"].get("sessionDate") or None,
+                    provenance={
+                        kind + "Id": source_id,
+                        "uploadId": u.id,
+                        "itemIndex": item.position,
+                        "metadata": meta["metadata"],
+                    },
+                )
+            }
+            if kind == "report":
+                storage.create_report(
+                    s,
+                    report_id=source_id,
+                    patient_id=patient_uuid,
+                    filename=meta["originalName"],
+                    mime_type=mime,
+                    stored_path=path,
+                    extracted_text_path=extracted,
+                    commit=False,
+                )
+            else:
+                storage.create_patient_file(
+                    s,
+                    file_id=source_id,
+                    patient_id=patient_uuid,
+                    filename=meta["originalName"],
+                    mime_type=mime,
+                    stored_path=path,
+                    size_bytes=size,
+                    commit=False,
+                )
+            artifact = s.scalar(
+                select(ClinicArtifact).where(
+                    ClinicArtifact.source_kind == kind,
+                    ClinicArtifact.source_id == source_id,
+                )
             )
-        artifact = s.scalar(
-            select(ClinicArtifact).where(
-                ClinicArtifact.source_kind == kind,
-                ClinicArtifact.source_id == source_id,
-            )
-        )
-        if artifact is None:
-            raise CatalogueUnavailable("Source catalogue registration incomplete")
-        item.artifact_id = artifact.id
-        item.status = "registered"
-        item.error = None
+            if artifact is None:
+                raise CatalogueUnavailable("Source catalogue registration incomplete")
+            item.artifact_id = artifact.id
+            item.status = "registered"
+            item.error = None
+    if duplicate is not None:
+        # The copy this filing saved under its own fresh id is never referenced.
+        shutil.rmtree(reports.report_dir(patient_uuid, source_id), ignore_errors=True)
 
 
 # One lock per upload so a filing in flight is never started twice in this
@@ -1089,6 +1106,8 @@ def _upload_json(s, u):
         items=items,
         uploadedAt=u.uploaded_at,
         uploadedBy=u.uploaded_by,
+        # Who sent it: "thrylen-service" is the hub, "workbench" the clinic chat.
+        uploadedPrincipal=u.uploaded_principal,
         analysis=analysis,
     )
 
