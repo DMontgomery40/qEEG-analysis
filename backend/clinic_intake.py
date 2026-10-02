@@ -613,22 +613,27 @@ def _offer_placeholder_charts(s, identity):
     """Ask before starting a chart beside one with an unknown initial or a
     placeholder birthday that this upload may be (HUB-H5). A yes is the
     ordinary attachTo answer; a relabel then fills in what was unknown."""
-    from .patient_intake import placeholder_candidates, stored_full_name
+    from .patient_intake import identity_key, placeholder_candidates, stored_full_name
 
     offered = placeholder_candidates(s, identity)
     if not offered:
         return
     labels = [p.label for p in offered]
+    if "X" in identity_key(identity)[:2]:
+        why = "This upload is missing an initial."
+    elif len(labels) == 1:
+        why = "That chart was started without the full initials or birthday."
+    else:
+        why = "Those charts were started without the full initials or birthday."
     if len(labels) == 1:
         detail = (
-            f"Is this the chart on file as {labels[0]}? That chart was started "
-            "without the full initials or birthday. Same person, or someone different?"
+            f"Is this the chart on file as {labels[0]}? {why} "
+            "Same person, or someone different?"
         )
     else:
         detail = (
-            f"Is this one of the charts on file as {', '.join(labels)}? Those charts "
-            "were started without the full initials or birthday. Say which one, "
-            "or someone different."
+            f"Is this one of the charts on file as {', '.join(labels)}? {why} "
+            "Say which one, or someone different."
         )
     raise IdentityNameConflict(
         dict(

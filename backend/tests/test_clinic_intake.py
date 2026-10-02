@@ -887,6 +887,33 @@ def test_a_placeholder_birthday_chart_is_offered_by_its_initials(temp_data_dir):
     assert different["patientId"] == "ML_05-12-1989", "someone different gets their own chart"
 
 
+def test_an_upload_missing_an_initial_is_offered_the_real_chart(temp_data_dir):
+    # HUB-H5 the other way: an upload whose first initial is unknown started
+    # a placeholder XS chart beside the real JS chart with the same birthday.
+    _placeholder_chart("JS_04-08-1986", first_name="Jane", last_name="Smith")
+    identity = {"firstInitial": "X", "lastName": "Smith", "birthdate": "04-08-1986"}
+    parked = submit("x-upload", identity=identity)["upload"]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["conflict"] == "placeholder_chart"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["JS_04-08-1986"]
+    assert parked["conflict"]["detail"] == (
+        "Is this the chart on file as JS_04-08-1986? This upload is missing an "
+        "initial. Same person, or someone different?"
+    )
+    assert counts()[0] == 1, "no placeholder chart before the clinic answers"
+    resolved = intake().resolve_upload(
+        "x-upload", key="x-upload-yes", resolution={"attachTo": "JS_04-08-1986"}
+    )["upload"]
+    assert resolved["status"] == "registered"
+    assert resolved["patientId"] == "JS_04-08-1986"
+    assert counts()[0] == 1
+    other = submit(
+        "x-other", identity={"firstInitial": "X", "lastName": "Taylor", "birthdate": "04-08-1986"}
+    )["upload"]
+    assert other["status"] == "registered", "a different known initial is someone else"
+    assert other["patientId"] == "XT_04-08-1986"
+
+
 def test_an_identity_that_shares_nothing_known_still_files_a_new_chart(temp_data_dir):
     _placeholder_chart("XS_04-08-1986")
     _placeholder_chart("XX_01-01-1991")
