@@ -1070,9 +1070,7 @@ async def test_sdk_deliberate_backoff_keeps_request_sequence_across_agent_runs(
     }
 
 
-def test_saved_prompt_bytes_survive_live_prompt_and_recipe_drift_blocks(
-    owner, monkeypatch
-):
+def test_saved_prompt_bytes_survive_live_prompt_drift(owner, monkeypatch):
     from backend.council.prompts import _load_prompt
 
     e = execution()
@@ -1091,10 +1089,144 @@ def test_saved_prompt_bytes_survive_live_prompt_and_recipe_drift_blocks(
     recovered = e.prepare_execution(owner)
     with e.execution_context(recovered):
         assert _load_prompt("stage1_analysis.md") == original
-    recipe = e._recipe()
-    monkeypatch.setattr(e, "_recipe", lambda: {**recipe, "incompatible": True})
-    with pytest.raises(ExecutionConflict):
-        e.prepare_execution(owner)
+
+
+def _deploy_edits_a_council_recipe_file(e, monkeypatch):
+    """A deploy between admission and the next unit changes a council recipe file."""
+    real = e._recipe
+
+    def edited():
+        recipe = real()
+        files = {**recipe["files"], "council/completion.py": "edited-on-disk"}
+        return {**recipe, "files": files}
+
+    monkeypatch.setattr(e, "_recipe", edited)
+
+
+def _answer(sent):
+    def send(request):
+        sent.append(request.content)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "answer"}}]}
+        )
+
+    return send
+
+
+def _member(e, llm, index):
+    return e.execute_unit(
+        f"s1/member/{index}/model-a/primary",
+        llm.chat_completions(
+            model_id="model-a", messages=[{"role": "user", "content": str(index)}]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_with_nothing_paid_in_flight_adopts_the_new_council_code(
+    owner, monkeypatch
+):
+    """EN-H8 for councils: a deploy that touched backend/council/completion.py
+    blocked every council in flight, though nothing paid was unsettled. The
+    council restarts on the code now on disk and its next unit sends; the
+    manifest that binds the paid rows is never rewritten."""
+    e = execution()
+    sent = []
+    llm = client(_answer(sent))
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        await _member(e, llm, 0)
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    restarted = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(restarted):
+        await _member(e, llm, 1)
+    assert len(sent) == 2
+    assert restarted.manifest_bytes == ctx.manifest_bytes
+    (record,) = ctx.manifest_path.parent.glob("recipe-adopted-*.json")
+    adoption = json.loads(record.read_text())
+    assert adoption["pinned"] == ctx.manifest["recipe"]
+    assert adoption["adopted"] == e._recipe()
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_council_runs_parallel_units_and_rechecks_on_restart(
+    owner, monkeypatch
+):
+    """Once adopted, a sibling's call in flight is this process's own work and
+    does not stop the next unit. A restart re-checks from the pinned recipe: a
+    call the restart cut off mid-flight blocks, whatever was adopted before."""
+    e = execution()
+    sent = []
+    first_in_flight, second_sent = asyncio.Event(), asyncio.Event()
+    sibling_states = []
+
+    async def send(request):
+        sent.append(request.content)
+        if json.loads(request.content)["messages"][0]["content"] == "0":
+            first_in_flight.set()
+            await asyncio.wait_for(second_sent.wait(), timeout=5)
+        else:
+            with storage.session_scope() as session:
+                sibling_states.extend(
+                    row.state
+                    for row in session.scalars(select(storage.PaidRequest))
+                    if row.scope_key.startswith("s1/member/0/")
+                )
+            second_sent.set()
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "answer"}}]}
+        )
+
+    llm = client(send)
+    e.prepare_execution(owner, llm_client=llm)
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    adopted = e.prepare_execution(owner, llm_client=llm)
+
+    async def second():
+        await first_in_flight.wait()
+        return await _member(e, llm, 1)
+
+    with e.execution_context(adopted):
+        await e.gather_units(_member(e, llm, 0), second())
+    assert sibling_states == ["dispatched"]
+    assert len(sent) == 2
+    with storage.session_scope() as session:
+        cut_off = session.scalar(
+            select(storage.PaidRequest).where(
+                storage.PaidRequest.scope_key.startswith("s1/member/0/")
+            )
+        )
+        cut_off.state = "dispatched"
+        session.commit()
+    with pytest.raises(ExecutionConflict, match="paid call s1/member/0/"):
+        e.prepare_execution(owner, llm_client=llm)
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsettled", ["prepared", "dispatched", "unknown"])
+async def test_a_deploy_never_steps_over_an_unsettled_council_call(
+    owner, monkeypatch, unsettled
+):
+    e = execution()
+    sent = []
+    llm = client(_answer(sent))
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        await _member(e, llm, 0)
+    with storage.session_scope() as session:
+        session.scalar(select(storage.PaidRequest)).state = unsettled
+        session.commit()
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    with pytest.raises(
+        ExecutionConflict,
+        match=rf"incompatible execution recipe or SDK: paid call s1/member/0/\S+ is {unsettled}",
+    ):
+        restarted = e.prepare_execution(owner, llm_client=llm)
+        with e.execution_context(restarted):
+            await _member(e, llm, 1)
+    assert len(sent) == 1
+    assert not list(ctx.manifest_path.parent.glob("recipe-adopted-*.json"))
 
 
 @pytest.mark.asyncio
