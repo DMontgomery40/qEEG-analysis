@@ -92,6 +92,26 @@ def snapshot_post_config(env, discovered, *, base_url, timeout_s):
     }
 
 
+def _note_writer_fallback(run_id, label, cfg):
+    """Name a write-up whose writer is the fallback, not the preference (EN-H10).
+
+    snapshot_post_config takes z-ai/glm-5.2 when the preferred writer is not in
+    the live catalogue, and nothing said so. Called once, when a write-up pins
+    its writer; a preference that resolves to its own discovered id (an alias,
+    a different case) is not a fallback.
+    """
+    preferred, used = cfg["model_preference"], cfg["model_id"]
+    if config.resolve_model_preference(preferred, [used]) == used:
+        return
+    LOGGER.warning(
+        "patient_facing_writer_fallback",
+        run_id=run_id,
+        patient_id=label,
+        preferred=preferred,
+        used=used,
+    )
+
+
 def _root(owner):
     return (
         owner.store.db_path.parent
@@ -231,6 +251,8 @@ def _manifest(owner, cfg, *, explicit=False):
             temperature=0.2,
         )
     _publish(owner, path, _json(data))
+    if enabled:
+        _note_writer_fallback(run.id, patient.label, cfg)
     return path, data
 
 
@@ -434,6 +456,7 @@ def _regenerated_manifest(owner, prior_path, prior_hash, prior_reason, cfg):
     else:
         raise PostAdmissionUnavailable("no free filename for another write-up")
     _publish(owner, path, _json(data))
+    _note_writer_fallback(owner.run_id, label, cfg)
     return path, data
 
 

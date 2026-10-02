@@ -194,6 +194,46 @@ async def test_a_write_up_send_that_never_left_is_retried_not_blocked(ready):
     assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
 
 
+class _Events(list):
+    def warning(self, event, **fields):
+        self.append({"event": event, **fields})
+
+
+@pytest.mark.parametrize(
+    "preference,discovered,fallback",
+    [("writer", ["z-ai/glm-5.2"], True), ("Writer", ["writer"], False)],
+)
+def test_a_fallback_writer_is_named_once_when_the_write_up_pins_it(
+    ready, monkeypatch, preference, discovered, fallback
+):
+    """EN-H10: when the preferred writer was missing from the catalogue the
+    write-up quietly went to z-ai/glm-5.2. The engine now names it once per
+    write-up, with the patient id; the hub's policy preview, which snapshots
+    on every view, stays quiet."""
+    store, run_id, _ = ready
+    events = _Events()
+    monkeypatch.setattr(post, "LOGGER", events)
+    cfg = post.snapshot_post_config(
+        {"QEEG_PATIENT_FACING_MODEL": preference}, discovered, base_url="", timeout_s=600.0
+    )
+    assert events == []
+    for _ in range(2):  # a repeated request rejoins the same write-up
+        post.admit_patient_facing(store, run_id, config_snapshot=cfg)
+    named = [e for e in events if e["event"] == "patient_facing_writer_fallback"]
+    if fallback:
+        assert named == [
+            {
+                "event": "patient_facing_writer_fallback",
+                "run_id": run_id,
+                "patient_id": "ZZ_01-01-1900",
+                "preferred": "writer",
+                "used": "z-ai/glm-5.2",
+            }
+        ]
+    else:
+        assert named == []
+
+
 @pytest.mark.asyncio
 async def test_pdf_failure_new_run_settings_catalogue_cannot_change_original(
     ready, monkeypatch
