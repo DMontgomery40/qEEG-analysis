@@ -36,12 +36,14 @@ def current_policy_snapshot():
     offered = [*council, config.DEFAULT_CONSOLIDATOR]
     discovered = set(config.DISCOVERED_MODEL_IDS)
     missing = [m for m in offered if m not in discovered]
-    if discovered and missing:
+    if missing:
         # The policy the hub shows is the policy a confirmed upload runs on,
         # so only offer models this engine has. On 2026-09-29 the hub offered
         # a council pinned to openai/gpt-5.6-terra, an id the engine never
         # discovered; the confirmed intent could never be admitted and the
-        # clinic's "analyze" box did nothing.
+        # clinic's "analyze" box did nothing. An empty discovered set (boot,
+        # or the model proxy down since boot) has none of them either, so it
+        # is the same refusal; admission would block on it all the same.
         from . import main
         from .clinic_models import AnalysisPolicyUnavailable
 

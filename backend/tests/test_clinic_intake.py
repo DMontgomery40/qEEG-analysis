@@ -1,6 +1,9 @@
 """Durable filing uses ordered source identity, never a filename or retry count."""
 
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib
@@ -536,6 +539,7 @@ def test_confirmed_policy_fingerprint_rejects_new_drift_but_replays_original(
         monkeypatch.setattr(policy, "_snapshot_prompts", lambda: {"new": "changed"})
     elif drift == "models":
         monkeypatch.setattr(config, "COUNCIL_MODELS", [SimpleNamespace(id="new-model")])
+        config.DISCOVERED_MODEL_IDS.add("new-model")  # drift, not an unrunnable policy
     else:
         monkeypatch.setitem(clinic_naming.POLICY, "tts", {"voice": "changed"})
     assert (
@@ -747,8 +751,29 @@ def test_policy_offers_only_models_the_engine_has(temp_data_dir, monkeypatch):
             },
         )
     assert counts() == (0, 0, 0, 0, 0), "nothing is filed on a policy the engine cannot run"
+
+
+def test_no_discovered_models_reads_as_analysis_unavailable(temp_data_dir, monkeypatch):
+    # HUB-H6: before the first model refresh, or with the proxy down since
+    # boot, the discovered set is empty. The guard used to skip itself then,
+    # so the hub offered analysis that admission could only block.
+    from backend import config, clinic_analysis_intents as policy
+    from backend.clinic_models import AnalysisPolicyUnavailable
+
     monkeypatch.setattr(config, "DISCOVERED_MODEL_IDS", set())
-    assert policy.public_current_policy()["policy"]["analysis"]["councilModelIds"] == council
+    with pytest.raises(AnalysisPolicyUnavailable, match="on David's end"):
+        policy.public_current_policy()
+    with pytest.raises(AnalysisPolicyUnavailable):
+        submit(
+            file_meta=[{"documentKind": "report"}, {}],
+            analysis_intent={
+                "operationId": "op-before-discovery",
+                "confirmed": True,
+                "reportItemIndexes": [0],
+                "specialInstructions": "",
+            },
+        )
+    assert counts() == (0, 0, 0, 0, 0), "nothing is filed while no model is known"
 
 
 def test_two_matching_charts_park_the_upload_with_both_candidates(temp_data_dir):

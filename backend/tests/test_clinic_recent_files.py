@@ -10,7 +10,10 @@ from backend import (
 from backend.clinic_recent_files import recent_files
 from backend.clinic_models import CatalogueConflict
 from backend.tests.test_clinic_api import live_api  # noqa: F401
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 
 
 def seed(
