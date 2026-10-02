@@ -259,3 +259,14 @@ def test_pending_retries_end_in_a_blocked_run_with_a_plain_reason(monkeypatch):
         "blocked", "gave up after 3 failed attempts: All models failed during Stage 1")
     assert run_runtime._capped_disposition("blocked", "paid_outcome_unknown", 9, 9) == ("blocked", "paid_outcome_unknown")
     assert run_runtime._capped_disposition("pending", "x", 1, 500)[0] == "blocked", "the generation backstop survives restarts"
+
+
+def test_a_complete_run_with_a_blocked_document_is_blocked_not_stranded():
+    # 2026-10-02: c8215c9e and 2cb44aac sat "complete / pending" for days.
+    from backend import run_runtime
+
+    assert run_runtime._strand_guard("pending", "missing sections", "complete", "blocked", "missing required sections") == (
+        "blocked", "patient-facing document blocked: missing required sections")
+    assert run_runtime._strand_guard("pending", "x", "running", "blocked", "y") == ("pending", "x")
+    assert run_runtime._strand_guard("pending", "x", "complete", "pending", None) == ("pending", "x")
+    assert run_runtime._strand_guard("done", None, "complete", "blocked", "y") == ("done", None)

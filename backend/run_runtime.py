@@ -211,6 +211,16 @@ PENDING_RETRY_LIMIT = int(os.getenv("QEEG_RUN_PENDING_RETRY_LIMIT", "20"))
 GENERATION_BACKSTOP = int(os.getenv("QEEG_RUN_GENERATION_BACKSTOP", "500"))
 
 
+def _strand_guard(state, reason, run_status, post_state, post_reason):
+    """A completed council whose patient-facing post is blocked is blocked,
+    not pending: the due filter never picks a complete run with no due post
+    again, so "pending" there means stranded for good (two live rows on
+    2026-10-02, engine map H5)."""
+    if state == "pending" and run_status == "complete" and post_state == "blocked":
+        return "blocked", "patient-facing document blocked: " + (str(post_reason or "").strip() or "reason not recorded")
+    return state, reason
+
+
 def _capped_disposition(state, reason, consecutive_failures, generation):
     if state != "pending":
         return state, reason
@@ -373,6 +383,17 @@ class RunRuntime:
                 state, reason = _capped_disposition(
                     state, reason, failures, int(getattr(owner, "generation", 0) or 0)
                 )
+                if state == "pending":
+                    from .patient_postprocessing import project_patient_facing
+
+                    try:
+                        run_now = await asyncio.to_thread(_read_run, self.store, run_id)
+                        post_now = await asyncio.to_thread(project_patient_facing, self.store, run_id)
+                        state, reason = _strand_guard(
+                            state, reason, run_now.status, post_now.get("state"), post_now.get("blocked_reason")
+                        )
+                    except Exception:
+                        LOGGER.exception("run_strand_guard_failed", run_id=run_id)
                 if state == "blocked":
                     self._pending_failures.pop(run_id, None)
             await asyncio.to_thread(
