@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,82 @@ from .exceptions import _NeedsAuth
 
 
 _USAGE_RUN_ID: ContextVar[str | None] = ContextVar("qeeg_usage_run_id", default=None)
+
+# A Stage 1 member could be sent ten times on 429/5xx: five sends in the
+# primary unit, then five more in the reduced-budget pass (EN-H12). Every send
+# the member's primary and reduced-budget units make is now charged to one
+# budget; a retry or the reduced pass is refused once six are spent. A repair
+# continuation's first send is new work, bounded by QEEG_LONGFORM_REPAIR_CALLS,
+# and is charged without being refused.
+MEMBER_SEND_LIMIT = 6
+_MEMBER_SENDS: ContextVar["MemberSendBudget | None"] = ContextVar(
+    "qeeg_member_sends", default=None
+)
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# A 429 that names a usage window (a weekly or monthly allowance, a quota)
+# will not clear in seconds; re-sending only repeats the refusal.
+_WINDOW_LIMIT_WORDS = ("usage limit", "usage_limit", "quota", "weekly", "monthly")
+
+
+class MemberSendBudget:
+    def __init__(self, limit: int = MEMBER_SEND_LIMIT):
+        self.limit = limit
+        self.sent = 0
+
+    @property
+    def spent(self) -> bool:
+        return self.sent >= self.limit
+
+
+@contextmanager
+def member_send_budget(limit: int = MEMBER_SEND_LIMIT):
+    """Charge every send in this context (and tasks started inside it) to one budget."""
+    budget = MemberSendBudget(limit)
+    token = _MEMBER_SENDS.set(budget)
+    try:
+        yield budget
+    finally:
+        _MEMBER_SENDS.reset(token)
+
+
+def member_budget_spent() -> bool:
+    budget = _MEMBER_SENDS.get()
+    return budget is not None and budget.spent
+
+
+def is_window_limit(error: BaseException | None) -> bool:
+    """True for a 429 whose body says a usage window or quota is spent."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, UpstreamError) and error.status_code == 429:
+            text = " ".join(
+                str(part)
+                for part in (
+                    error,
+                    getattr(error, "error_type", None),
+                    getattr(error, "error_code", None),
+                )
+                if part
+            ).lower()
+            if any(word in text for word in _WINDOW_LIMIT_WORDS):
+                return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
+def _charge_send() -> None:
+    budget = _MEMBER_SENDS.get()
+    if budget is not None:
+        budget.sent += 1
+
+
+def _may_resend(error: UpstreamError, attempts: int) -> bool:
+    if not (error.status_code in _RETRYABLE_STATUS or error.status_code is None):
+        return False
+    if attempts >= 4 or is_window_limit(error):
+        return False
+    return not member_budget_spent()
 
 
 class _LLMCallsMixin:
@@ -72,6 +149,7 @@ class _LLMCallsMixin:
         require_semantic_scope()
         attempts = 0
         while True:
+            _charge_send()
             try:
                 text = await execution_llm(self._llm).chat_completions(
                     model_id=model_id,
@@ -90,7 +168,7 @@ class _LLMCallsMixin:
                 raise_if_execution_blocked(e)
                 if e.status_code == 401:
                     raise _NeedsAuth(str(e)) from e
-                if (e.status_code in {429, 500, 502, 503, 504} or e.status_code is None) and attempts < 4:
+                if _may_resend(e, attempts):
                     await _sleep_backoff(attempts)
                     attempts += 1
                     continue
@@ -129,6 +207,7 @@ class _LLMCallsMixin:
         require_semantic_scope()
         attempts = 0
         while True:
+            _charge_send()
             try:
                 text = await execution_llm(self._llm).chat_completions(
                     model_id=model_id,
@@ -147,12 +226,12 @@ class _LLMCallsMixin:
                 raise_if_execution_blocked(e)
                 if e.status_code == 401:
                     raise _NeedsAuth(str(e)) from e
-                if (e.status_code in {429, 500, 502, 503, 504} or e.status_code is None) and attempts < 4:
+                if _may_resend(e, attempts):
                     await _sleep_backoff(attempts)
                     attempts += 1
                     continue
                 # If multimodal fails, optionally fall back to text-only (NOT suitable for strict data capture).
-                if allow_text_fallback and attempts == 0:
+                if allow_text_fallback and attempts == 0 and not is_window_limit(e):
                     return await self._call_model_chat(
                         model_id=model_id,
                         prompt_text=prompt_text,

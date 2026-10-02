@@ -14,6 +14,7 @@ from ...storage import Report, get_report, get_run
 from ...storage import session_scope
 from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
 from ...paid_transport import DispatchGate, dispatch_gate
+from .llm_calls import is_window_limit, member_budget_spent, member_send_budget
 from ..execution import (
     execute_unit,
     gather_units,
@@ -947,62 +948,69 @@ class _StagesMixin:
                     "task": "stage1_model",
                     "model_id": model_id,
                 }
-                try:
-                    text = await self._await_with_heartbeat(
-                        execute_unit(
-                            f"s1/member/{member_index}/{model_id}/primary",
-                            self._call_longform_chat_with_repairs(
-                                model_id=model_id,
-                                prompt_text=final_prompt.strip(),
-                                temperature=0.2,
-                                max_tokens=stage1_max_tokens,
-                                end_sentinel=end_sentinel,
-                                required_headings=None,
+                # One send budget covers the primary unit, its retries and the
+                # reduced-budget pass (MEMBER_SEND_LIMIT).
+                with member_send_budget():
+                    try:
+                        text = await self._await_with_heartbeat(
+                            execute_unit(
+                                f"s1/member/{member_index}/{model_id}/primary",
+                                self._call_longform_chat_with_repairs(
+                                    model_id=model_id,
+                                    prompt_text=final_prompt.strip(),
+                                    temperature=0.2,
+                                    max_tokens=stage1_max_tokens,
+                                    end_sentinel=end_sentinel,
+                                    required_headings=None,
+                                ),
                             ),
-                        ),
-                        emit=emit,
-                        payload=stage1_payload,
-                    )
-                except Exception as primary_exc:
-                    raise_if_execution_blocked(primary_exc)
-                    if current_execution() is not None and not is_clinical_failure(
-                        primary_exc, key=f"s1/member/{member_index}/{model_id}/primary"
-                    ):
-                        raise
-                    if isinstance(model_id, str) and model_id.startswith("mock-"):
-                        raise
-                    await emit(
-                        {
-                            **stage1_payload,
-                            "status": "retry",
-                            "error": str(primary_exc)
-                            or primary_exc.__class__.__name__,
-                            "max_tokens": stage1_retry_max_tokens,
-                            "operatorHint": "Stage 1 upstream failed after heartbeat; retrying the same model with a smaller complete-output budget.",
-                        }
-                    )
-                    retry_prompt = (
-                        f"{final_prompt.strip()}\n\n---\n\n"
-                        "RETRY CONSTRAINT:\n"
-                        "The previous upstream call failed before returning usable text. "
-                        "Return a concise but complete Stage 1 analysis, preserve all critical numeric findings, "
-                        "do not invent missing values, and still end with the required sentinel line.\n"
-                    )
-                    text = await self._await_with_heartbeat(
-                        execute_unit(
-                            f"s1/member/{member_index}/{model_id}/reduced-budget",
-                            self._call_longform_chat_with_repairs(
-                                model_id=model_id,
-                                prompt_text=retry_prompt,
-                                temperature=0.2,
-                                max_tokens=stage1_retry_max_tokens,
-                                end_sentinel=end_sentinel,
-                                required_headings=None,
+                            emit=emit,
+                            payload=stage1_payload,
+                        )
+                    except Exception as primary_exc:
+                        raise_if_execution_blocked(primary_exc)
+                        if current_execution() is not None and not is_clinical_failure(
+                            primary_exc, key=f"s1/member/{member_index}/{model_id}/primary"
+                        ):
+                            raise
+                        if isinstance(model_id, str) and model_id.startswith("mock-"):
+                            raise
+                        # A spent usage window will refuse the reduced pass too, and
+                        # the member's six sends may already be spent (EN-H12).
+                        if is_window_limit(primary_exc) or member_budget_spent():
+                            raise
+                        await emit(
+                            {
+                                **stage1_payload,
+                                "status": "retry",
+                                "error": str(primary_exc)
+                                or primary_exc.__class__.__name__,
+                                "max_tokens": stage1_retry_max_tokens,
+                                "operatorHint": "Stage 1 upstream failed after heartbeat; retrying the same model with a smaller complete-output budget.",
+                            }
+                        )
+                        retry_prompt = (
+                            f"{final_prompt.strip()}\n\n---\n\n"
+                            "RETRY CONSTRAINT:\n"
+                            "The previous upstream call failed before returning usable text. "
+                            "Return a concise but complete Stage 1 analysis, preserve all critical numeric findings, "
+                            "do not invent missing values, and still end with the required sentinel line.\n"
+                        )
+                        text = await self._await_with_heartbeat(
+                            execute_unit(
+                                f"s1/member/{member_index}/{model_id}/reduced-budget",
+                                self._call_longform_chat_with_repairs(
+                                    model_id=model_id,
+                                    prompt_text=retry_prompt,
+                                    temperature=0.2,
+                                    max_tokens=stage1_retry_max_tokens,
+                                    end_sentinel=end_sentinel,
+                                    required_headings=None,
+                                ),
                             ),
-                        ),
-                        emit=emit,
-                        payload={**stage1_payload, "attempt": "retry"},
-                    )
+                            emit=emit,
+                            payload={**stage1_payload, "attempt": "retry"},
+                        )
                 enforce_complete = stage1_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
                 )

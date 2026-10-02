@@ -25,10 +25,16 @@ class UpstreamError(RuntimeError):
         *,
         status_code: int | None = None,
         operator_hint: str | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.operator_hint = operator_hint
+        # The provider's own error type/code (e.g. usage_limit_reached), kept
+        # so callers can tell a spent quota window from a transient 429.
+        self.error_type = error_type
+        self.error_code = error_code
 
 
 def _operator_hint(endpoint: str, issue: str, *, upstream: str = "CLIProxyAPI") -> str:
@@ -114,6 +120,8 @@ def _format_http_error(
             msg,
             status_code=response.status_code,
             operator_hint=_operator_hint(endpoint, "http_error", upstream=upstream),
+            error_type=parsed.type,
+            error_code=parsed.code,
         )
 
     body_preview: str | None = None

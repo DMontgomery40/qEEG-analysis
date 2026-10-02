@@ -1962,3 +1962,81 @@ async def test_owned_stage1_current_gpt56_members_receive_page_images(
         assert all(request["model"] == model for request in sent)
     finally:
         await context.aclose()
+
+
+# The exact acknowledged-500 shape the paid journal files as rejected.
+_ACK_500 = b'{"error":{"type":"server_error","code":"internal_server_error","message":"synthetic timeout"}}'
+_USAGE_WINDOW_429 = (
+    b'{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached",'
+    b'"resets_in_seconds":302400}}'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,body,expected_sends",
+    [
+        # Was 10: five sends in the primary unit, five in the reduced pass.
+        (500, _ACK_500, 6),
+        # A spent weekly window: no retry, no reduced pass.
+        (429, _USAGE_WINDOW_429, 1),
+    ],
+)
+async def test_stage1_member_sends_are_capped_and_a_spent_window_is_not_resent(
+    owner, tmp_path, monkeypatch, status, body, expected_sends
+):
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import llm_calls
+
+    e = execution()
+    report = seed_stages(owner, tmp_path, monkeypatch)
+
+    async def no_wait(_attempt):
+        return None
+
+    monkeypatch.setattr(llm_calls, "_sleep_backoff", no_wait)
+    sent = []
+
+    def send(req):
+        model = json.loads(req.content)["model"]
+        sent.append(model)
+        if model == "model-a":
+            return httpx.Response(status, content=body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+
+    llm = client(send)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+
+    async def emit(_):
+        pass
+
+    # The second pass replays the journal: the in-memory budget must make the
+    # same decisions from the saved receipts and send nothing new.
+    for _ in range(2):
+        with e.execution_context(ctx):
+            try:
+                await QEEGCouncilWorkflow(llm=llm)._stage1(
+                    "r", ["model-a", "model-b"], report, emit
+                )
+            except PaidOutcomeUnknown:
+                raise
+            except Exception:
+                pass
+    assert sent.count("model-a") == expected_sends
+    assert sent.count("model-b") == 1
+    with owner.transaction() as session:
+        rows = [
+            r
+            for r in session.scalars(select(storage.PaidRequest))
+            if "/model-a/" in r.scope_key
+        ]
+    assert len(rows) == expected_sends
+    assert {r.state for r in rows} == {"rejected"}
+    assert (sum("reduced-budget" in r.scope_key for r in rows) > 0) == (status == 500)
