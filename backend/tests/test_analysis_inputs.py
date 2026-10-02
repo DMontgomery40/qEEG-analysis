@@ -1009,6 +1009,32 @@ def test_legacy_reservation_remains_strict_without_invented_snapshot(admission, 
         assert reservation.model_fields_json is None
 
 
+def test_reservation_saved_before_force_new_existed_still_replays(admission):
+    # 1396b92 added force_new to every create_run request. A reservation saved
+    # before it has no such key, and its replay answered 409
+    # ANALYSIS_OPERATION_CONFLICT instead of the run it had admitted.
+    client, payload, tmp, _ = admission
+    report = source(tmp, payload["patient_id"])
+    request = {**payload, "report_id": report.id, "operation_id": "before-force-new"}
+    first = client.post("/api/runs", json=request)
+    assert first.status_code == 200, first.text
+    with storage.session_scope() as s:
+        reservation = s.get(storage.AnalysisInputReservation, request["operation_id"])
+        saved = json.loads(reservation.immutable_request_json)
+        assert saved.pop("force_new") is False
+        reservation.immutable_request_json = json.dumps(
+            saved, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        s.commit()
+    repeated = client.post("/api/runs", json=request)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["id"] == first.json()["id"]
+    # The operator's yes on a replayed operation is still a different request.
+    forced = client.post("/api/runs", json={**request, "force_new": True})
+    assert forced.status_code == 409
+    assert forced.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
+
+
 def test_reserved_recovery_keeps_saved_mapping_despite_policy_change(
     admission, monkeypatch
 ):

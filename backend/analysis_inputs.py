@@ -567,8 +567,11 @@ def lookup_admitted_operation(
         if prior is None:
             return None, None
         if prior.immutable_request_json is not None:
+            # A reservation saved before force_new existed has no such key; that
+            # is the same request with force_new false, not a different one.
+            saved = {"force_new": False, **json.loads(prior.immutable_request_json)}
             if (
-                prior.immutable_request_json != _canonical(immutable_request)
+                _canonical(saved) != _canonical({"force_new": False, **immutable_request})
                 or prior.model_fields_json is None
             ):
                 raise _operation_conflict()
