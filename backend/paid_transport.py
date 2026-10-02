@@ -25,7 +25,11 @@ import httpx
 from sqlalchemy import select
 
 from . import storage
+from .logging_utils import get_logger
 from .run_execution import ExecutionConflict, RunOwner
+
+
+LOGGER = get_logger(__name__)
 
 
 class PaidOutcomeUnknown(RuntimeError):
@@ -542,9 +546,22 @@ class _Receipt:
                 row.state = "rejected"
                 row.error_classification = "connect_refused"
 
-    def unknown(self, reason):
+    def unknown(self, reason, cause=None):
         unknown = PaidOutcomeUnknown(self.key, reason)
         self.scope.blocked = unknown
+        # Seven of the thirteen stuck unknown rows on 2026-10-02 had no traceable
+        # cause because nothing recorded the exception. Name it here, without
+        # the request or response body.
+        run_id, scope_key, ordinal = self.key
+        LOGGER.warning(
+            "paid_outcome_unknown",
+            run_id=str(run_id),
+            scope_key=str(scope_key),
+            dispatch_ordinal=int(ordinal),
+            reason=str(reason),
+            error_type=type(cause).__name__ if cause is not None else "",
+            error=(str(cause) or "")[:200] if cause is not None else "",
+        )
         try:
             with self.owner.transaction() as session:
                 row = session.get(storage.PaidRequest, self.key)
@@ -720,7 +737,8 @@ class PaidAsyncTransport(httpx.AsyncBaseTransport):
                 receipt.unknown(
                     "cancelled_after_dispatch"
                     if isinstance(exc, asyncio.CancelledError)
-                    else "transport_or_receipt_failure"
+                    else "transport_or_receipt_failure",
+                    cause=exc,
                 )
             except PaidOutcomeUnknown as unknown:
                 if isinstance(exc, asyncio.CancelledError):
@@ -782,7 +800,7 @@ class PaidSyncTransport(httpx.BaseTransport):
                 receipt.refused()
                 raise
             try:
-                receipt.unknown("transport_or_receipt_failure")
+                receipt.unknown("transport_or_receipt_failure", cause=exc)
             except PaidOutcomeUnknown as unknown:
                 raise unknown from exc
         finally:

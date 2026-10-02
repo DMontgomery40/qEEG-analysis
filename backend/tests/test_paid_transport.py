@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import httpx
+import structlog
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -1375,3 +1376,29 @@ async def test_refused_connection_is_provably_unsent_and_never_parks_the_run(own
     first, second = rows(owner)
     assert (first.state, first.error_classification) == ("rejected", "connect_refused")
     assert second.state == "response_saved"
+
+
+async def test_a_call_filed_unknown_records_what_the_error_was(owner):
+    """2026-10-02: seven stuck unknown rows had no traceable cause because the
+    engine never recorded the exception. A dropped read is still filed unknown
+    (money may have moved), and the log now names the error type and message,
+    with no request or response body."""
+    p = paid()
+
+    def send(request):
+        raise httpx.ReadTimeout("read timed out after 600 s", request=request)
+
+    with structlog.testing.capture_logs() as captured:
+        async with httpx.AsyncClient(
+            transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+        ) as client:
+            with scope(owner) as cursor:
+                with pytest.raises(p.PaidOutcomeUnknown):
+                    await client.post("http://test/v1/responses", content=b"original")
+    (row,) = rows(owner)
+    assert (row.state, row.error_classification) == ("unknown", "transport_or_receipt_failure")
+    events = [e for e in captured if e.get("event") == "paid_outcome_unknown"]
+    assert len(events) == 1, captured
+    assert events[0]["error_type"] == "ReadTimeout"
+    assert "read timed out" in events[0]["error"]
+    assert "original" not in str(events[0])
