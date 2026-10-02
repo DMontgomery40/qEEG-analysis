@@ -33,6 +33,23 @@ def current_policy_snapshot():
         settings, config.DISCOVERED_MODEL_IDS, base_url="", timeout_s=600.0
     )
     council = [m.id for m in config.COUNCIL_MODELS]
+    offered = [*council, config.DEFAULT_CONSOLIDATOR]
+    discovered = set(config.DISCOVERED_MODEL_IDS)
+    missing = [m for m in offered if m not in discovered]
+    if discovered and missing:
+        # The policy the hub shows is the policy a confirmed upload runs on,
+        # so only offer models this engine has. On 2026-09-29 the hub offered
+        # a council pinned to openai/gpt-5.6-terra, an id the engine never
+        # discovered; the confirmed intent could never be admitted and the
+        # clinic's "analyze" box did nothing.
+        from . import main
+        from .clinic_models import AnalysisPolicyUnavailable
+
+        main.LOGGER.warning("analysis_policy_unavailable", missing_models=missing)
+        raise AnalysisPolicyUnavailable(
+            "Analysis is not available right now. This is on David's end.",
+            models=missing,
+        )
     return dict(
         publicPolicy=dict(
             councilModelIds=council,
@@ -233,6 +250,35 @@ def admit_confirmed_upload(upload_id):
     return run
 
 
+# A confirmed upload whose admission raised, with when to try again. Before
+# this, the scan retried SC_12-20-1975's hub upload once a second for 72
+# minutes on 2026-09-29 (4,128 full tracebacks: "Original confirmed models
+# are unavailable") and the hub showed the clinic nothing.
+_ADMISSION_BACKOFF: dict[str, dict] = {}
+_BACKOFF_FIRST_S = 30.0
+_BACKOFF_MAX_S = 1800.0
+
+
+def admission_block(upload_id) -> str | None:
+    """The plain reason a confirmed upload is not running yet, if it is blocked."""
+    entry = _ADMISSION_BACKOFF.get(upload_id)
+    return entry["reason"] if entry else None
+
+
+def _note_admission_failure(upload_id, error, now) -> float:
+    entry = _ADMISSION_BACKOFF.get(upload_id) or {"attempts": 0}
+    attempts = int(entry["attempts"]) + 1
+    # One immediate retry covers a transient fault (a lock, a timeout); a
+    # second failure is a condition nobody fixes in a second, so back off.
+    delay = 0.0 if attempts == 1 else min(_BACKOFF_FIRST_S * (2 ** (attempts - 2)), _BACKOFF_MAX_S)
+    _ADMISSION_BACKOFF[upload_id] = {
+        "attempts": attempts,
+        "next_attempt": now + delay,
+        "reason": f"{type(error).__name__}: {error}"[:200],
+    }
+    return delay
+
+
 async def activate_confirmed_uploads(runtime):
     """Existing E6 consumer scans its original confirmed upload references."""
     import asyncio
@@ -271,7 +317,11 @@ async def activate_confirmed_uploads(runtime):
                 .order_by(ClinicUpload.id)
             )
         )
+    now = asyncio.get_running_loop().time()
     for upload_id, run in pending:
+        waiting = _ADMISSION_BACKOFF.get(upload_id)
+        if waiting and waiting["next_attempt"] > now:
+            continue
         try:
             if run is None:
                 run = await runtime.admission(admit_confirmed_upload, upload_id)
@@ -279,11 +329,19 @@ async def activate_confirmed_uploads(runtime):
                 # Admission is already durable. Preserve original upload ownership
                 # checks while recovering only its missing start intent.
                 await runtime.admission(run_policy_binding, run)
+            # A stage that succeeded clears the count; a later failure is new.
+            _ADMISSION_BACKOFF.pop(upload_id, None)
             if run is not None and run.start_requested_at is None:
                 await runtime.admission(main._new_start_intent, runtime.store, run.id)
+                _ADMISSION_BACKOFF.pop(upload_id, None)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            main.LOGGER.exception(
-                "confirmed_upload_admission_pending", upload_id=upload_id
+        except Exception as error:
+            delay = _note_admission_failure(upload_id, error, now)
+            main.LOGGER.warning(
+                "confirmed_upload_admission_blocked",
+                upload_id=upload_id,
+                reason=f"{type(error).__name__}: {error}"[:200],
+                retry_in_s=delay,
+                attempts=_ADMISSION_BACKOFF[upload_id]["attempts"],
             )

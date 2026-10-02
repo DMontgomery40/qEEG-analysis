@@ -604,3 +604,111 @@ def test_invalid_expected_policy_fingerprint_is_not_admitted(
             },
         )
     assert counts() == (0, 0, 0, 0, 0)
+
+
+def test_identical_report_bytes_file_once_on_the_same_chart(temp_data_dir):
+    # 2026-09-29: one Wellness Basic PDF became two engine reports (hub upload
+    # at 18:04, chat drop at 18:07) and five paid runs landed on the copy.
+    same = b"facts about the same session"
+    first = submit(
+        key="dup-1",
+        files=[("wellness.txt", same, "text/plain"), ("note.txt", b"second", "text/plain")],
+        file_meta=[{"documentKind": "report"}, {}],
+    )["upload"]
+    second = submit(
+        key="dup-2",
+        files=[("7a3d970d__wellness.txt", same, "text/plain"), ("note2.txt", b"third", "text/plain")],
+        file_meta=[{"documentKind": "report"}, {}],
+    )["upload"]
+    assert second["items"][0]["status"] == "registered"
+    assert second["items"][0]["sourceId"] == first["items"][0]["sourceId"]
+    assert counts()[2] == 1, "the same bytes on the same chart are one report"
+    assert counts()[3] == 2, "different patient files still file separately"
+    # a different patient with the same bytes is a different report
+    other = submit(
+        key="dup-3",
+        identity={"firstName": "Bea", "lastName": "Carter", "birthdate": "03-03-1901"},
+        files=[("wellness.txt", same, "text/plain"), ("note3.txt", b"fourth", "text/plain")],
+        file_meta=[{"documentKind": "report"}, {}],
+    )["upload"]
+    assert other["items"][0]["sourceId"] != first["items"][0]["sourceId"]
+    assert counts()[2] == 2
+
+
+def test_blocked_admission_backs_off_and_names_the_reason(temp_data_dir):
+    # 2026-09-29: the scan retried a confirmed hub upload once a second for
+    # 72 minutes with a full traceback each time, and the hub showed nothing.
+    import asyncio
+    from backend import clinic_analysis_intents as intents
+    from backend.clinic_models import CatalogueUnavailable
+
+    result = submit(
+        file_meta=[{"documentKind": "report"}, {}],
+        analysis_intent={
+            "operationId": "op-blocked",
+            "confirmed": True,
+            "reportItemIndexes": [0],
+            "specialInstructions": "",
+        },
+    )["upload"]
+    calls = []
+
+    class Store:
+        @property
+        def engine(self):
+            return storage.engine
+
+    class Runtime:
+        store = Store()
+
+        async def admission(self, fn, *args):
+            calls.append(fn.__name__)
+            raise CatalogueUnavailable("Original confirmed models are unavailable")
+
+    intents._ADMISSION_BACKOFF.clear()
+    for _ in range(4):
+        asyncio.run(intents.activate_confirmed_uploads(Runtime()))
+    assert calls == ["admit_confirmed_upload"] * 2, "one immediate retry, then the backoff holds"
+    assert intents._ADMISSION_BACKOFF[result["uploadId"]]["attempts"] == 2
+    assert intents.admission_block(result["uploadId"]).startswith("CatalogueUnavailable")
+    def record():
+        payload = intake().get_upload(result["uploadId"])
+        return (payload.get("upload") or payload)["analysis"]
+
+    shown = record()
+    assert shown["status"] == "blocked"
+    assert "models are unavailable" in shown["blockedReason"]
+    intents._ADMISSION_BACKOFF.clear()
+    assert record()["status"] == "ready"
+
+
+def test_policy_offers_only_models_the_engine_has(temp_data_dir, monkeypatch):
+    # 2026-09-29: the hub offered a council pinned to openai/gpt-5.6-terra, an
+    # id the engine never discovered, so the confirmed upload never ran.
+    from backend import config, clinic_analysis_intents as policy
+    from backend.clinic_models import CatalogueUnavailable
+
+    council = [m.id for m in config.COUNCIL_MODELS]
+    monkeypatch.setattr(
+        config, "DISCOVERED_MODEL_IDS", set(council + [config.DEFAULT_CONSOLIDATOR])
+    )
+    assert policy.public_current_policy()["policy"]["analysis"]["councilModelIds"] == council
+    monkeypatch.setattr(
+        config, "DISCOVERED_MODEL_IDS", set(council[1:] + [config.DEFAULT_CONSOLIDATOR])
+    )
+    with pytest.raises(CatalogueUnavailable, match="on David's end") as refused:
+        policy.public_current_policy()
+    assert refused.value.models == (council[0],)
+    with pytest.raises(CatalogueUnavailable):
+        submit(
+            file_meta=[{"documentKind": "report"}, {}],
+            analysis_intent={
+                "operationId": "op-unrunnable",
+                "confirmed": True,
+                "reportItemIndexes": [0],
+                "specialInstructions": "",
+            },
+        )
+    assert counts() == (0, 0, 0, 0, 0), "nothing is filed on a policy the engine cannot run"
+    monkeypatch.setattr(config, "DISCOVERED_MODEL_IDS", set())
+    assert policy.public_current_policy()["policy"]["analysis"]["councilModelIds"] == council

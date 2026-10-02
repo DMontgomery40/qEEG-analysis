@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from . import clinic_catalogue_reads as catalogue
 from .clinic_naming import POLICY_REVISION
+from .clinic_models import AnalysisPolicyUnavailable
 
 # Matches the existing shared clinic transport ceiling; applies to each batch.
 CLINIC_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
@@ -56,6 +57,8 @@ def _error(error):
         code, message = 404, str(error)
     elif isinstance(error, catalogue.CatalogueConflict):
         code, message = 409, str(error)
+    elif isinstance(error, AnalysisPolicyUnavailable):
+        code, message = 503, str(error)
     elif isinstance(error, (catalogue.CatalogueUnavailable, SQLAlchemyError, OSError)):
         code, message = 503, "Clinic authority or exact file bytes are unavailable"
     else:

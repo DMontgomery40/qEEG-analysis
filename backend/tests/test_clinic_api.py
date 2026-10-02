@@ -353,3 +353,25 @@ def test_http_upload_rejects_oversize_before_intake(live_api, monkeypatch, sizes
         ],
     )
     assert result.status_code == 413
+
+
+def test_policy_route_says_plainly_when_the_engine_cannot_run_it(live_api, monkeypatch):
+    # 2026-09-29: the hub offered a council pinned to a model id the engine never
+    # discovered; the confirmed upload could never run and the hub showed nothing.
+    from backend import config
+
+    client, chart, root = live_api
+    council = [m.id for m in config.COUNCIL_MODELS]
+    monkeypatch.setattr(
+        config, "DISCOVERED_MODEL_IDS", set(council[1:] + [config.DEFAULT_CONSOLIDATOR])
+    )
+    refused = client.get("/policy")
+    assert refused.status_code == 503
+    assert refused.json() == {
+        "ok": False,
+        "message": "Analysis is not available right now. This is on David's end.",
+    }
+    monkeypatch.setattr(
+        config, "DISCOVERED_MODEL_IDS", set(council + [config.DEFAULT_CONSOLIDATOR])
+    )
+    assert client.get("/policy").json()["policy"]["analysis"]["councilModelIds"] == council

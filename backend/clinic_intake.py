@@ -546,6 +546,35 @@ def _file_item(item_id, patient_uuid):
     if hashlib.sha256(data).hexdigest() != meta["sha256"] or len(data) != meta["size"]:
         raise CatalogueUnavailable("Staged upload byte binding changed")
     if kind == "report":
+        # The same bytes already on this chart are the same report. On
+        # 2026-09-29 one Wellness Basic PDF became two engine reports (hub
+        # upload, then a chat drop) and five paid runs landed on the copy.
+        with storage.session_scope() as s:
+            existing = s.scalar(
+                select(ClinicArtifact)
+                .where(
+                    ClinicArtifact.patient_uuid == patient_uuid,
+                    ClinicArtifact.source_kind == "report",
+                    ClinicArtifact.sha256 == meta["sha256"],
+                    ClinicArtifact.size == meta["size"],
+                    ClinicArtifact.archived.is_(False),
+                )
+                .order_by(ClinicArtifact.id)
+            )
+            existing_binding = (
+                (existing.id, existing.source_id)
+                if existing is not None
+                and s.get(storage.Report, existing.source_id) is not None
+                else None
+            )
+        if existing_binding is not None:
+            with _write() as s:
+                item = s.get(ClinicUploadItem, item_id)
+                item.source_id = existing_binding[1]
+                item.artifact_id = existing_binding[0]
+                item.status = "registered"
+                item.error = None
+            return
         path, extracted, mime, _ = reports.save_report_upload(
             patient_id=patient_uuid,
             report_id=source_id,
@@ -726,6 +755,13 @@ def _upload_json(s, u):
                 else "pending_registration"
             ),
         }
+        if not run:
+            from .clinic_analysis_intents import admission_block
+
+            blocked = admission_block(u.id)
+            if blocked:
+                analysis["status"] = "blocked"
+                analysis["blockedReason"] = blocked
     return dict(
         uploadId=u.id,
         status=u.status,
