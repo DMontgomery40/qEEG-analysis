@@ -30,6 +30,9 @@ from sqlalchemy.orm import Session
 from . import storage
 
 
+
+OUTSTANDING_OBLIGATIONS = "outstanding execution obligations"
+
 class StaleOwner(RuntimeError):
     """The local handle or its durable fence no longer authorizes a write."""
 
@@ -393,16 +396,16 @@ class RunOwner:
         with self._mutex:
             with self.transaction() as session:
                 if state == "done":
-                    unfinished = session.scalar(
-                        select(storage.PostObligation.run_id)
+                    unfinished = session.scalars(
+                        select(storage.PostObligation)
                         .where(
                             storage.PostObligation.run_id == self.run_id,
                             storage.PostObligation.state.not_in(["done", "skipped"]),
                         )
                         .limit(1)
-                    )
-                    uncertain = session.scalar(
-                        select(storage.PaidRequest.run_id)
+                    ).first()
+                    uncertain = session.scalars(
+                        select(storage.PaidRequest)
                         .where(
                             storage.PaidRequest.run_id == self.run_id,
                             storage.PaidRequest.state.in_(
@@ -410,9 +413,18 @@ class RunOwner:
                             ),
                         )
                         .limit(1)
-                    )
-                    if unfinished or uncertain:
-                        raise ExecutionConflict("outstanding execution obligations")
+                    ).first()
+                    if unfinished is not None or uncertain is not None:
+                        # Name the obligation so the run's blocked reason says
+                        # what is still open (EN-H14).
+                        what = (
+                            f"{unfinished.kind} document {unfinished.state}"
+                            if unfinished is not None
+                            else f"paid call {uncertain.scope_key} {uncertain.state}"
+                        )
+                        raise ExecutionConflict(
+                            OUTSTANDING_OBLIGATIONS + ": " + what
+                        )
                 run = session.get(storage.Run, self.run_id)
                 run.execution_state = state
                 run.next_check_at = next_check_at
