@@ -20,8 +20,13 @@ from sqlalchemy import select, update
 from . import config, storage, patient_facing_pdf
 from .council.execution import _hash, _json, _publish, _execution_client, drain_task
 from .execution_settings import settings
-from .paid_transport import PaidOutcomeUnknown, post_paid_scope
-from .run_execution import ExecutionConflict, ExecutionStore
+from .paid_transport import (
+    PaidOutcomeUnknown,
+    manifest_attempt,
+    patient_facing_scope,
+    post_paid_scope,
+)
+from .run_execution import ExecutionConflict, ExecutionStore, UNSETTLED_PAID_STATES
 from .portal_files import normalize_portal_patient_id
 from . import portal_sync
 from scripts import generate_patient_facing_writeups as writer
@@ -271,11 +276,15 @@ def register_completion_posts(session, owner, prepared):
         )
 
 
-def admit_patient_facing(store: ExecutionStore, run_id: str, *, config_snapshot):
+def admit_patient_facing(
+    store: ExecutionStore, run_id: str, *, config_snapshot, regenerate=False
+):
     """Explicit authorized historical action. Repeated/concurrent calls rejoin.
 
     Returns projection; never runs council or modifies its input/model attestation.
     Busy ownership returns an admitting projection for E6 to retry the same call.
+    With regenerate, a blocked post starts its next attempt (EN-H3); any other
+    existing post rejoins as before.
     """
     from .orchestration import run_downstream_delivery_gaps, summarize_run_progress
     from sqlalchemy.orm import Session
@@ -285,8 +294,14 @@ def admit_patient_facing(store: ExecutionStore, run_id: str, *, config_snapshot)
         if run is None:
             raise KeyError(run_id)
         prior = session.get(storage.PostObligation, (run_id, "patient_facing"))
-        if prior is not None:
+        reopen = prior is not None and regenerate and prior.state == "blocked"
+        if prior is not None and not reopen:
             return project_patient_facing(store, run_id)
+    if reopen:
+        # Outside the read session: the reopen claims and writes the run.
+        return _regenerate_patient_facing(store, run_id, config_snapshot)
+    with Session(store.engine) as session:
+        run = session.get(storage.Run, run_id)
         artifacts = list(
             session.scalars(
                 select(storage.Artifact).where(storage.Artifact.run_id == run_id)
@@ -336,6 +351,143 @@ def admit_patient_facing(store: ExecutionStore, run_id: str, *, config_snapshot)
     return project_patient_facing(store, run_id)
 
 
+def _regenerated_manifest(owner, prior_path, prior_hash, prior_reason, cfg):
+    """The next attempt of a blocked write-up: same paid prompt, new scope and files.
+
+    The clinical content of the paid request is copied from the blocked
+    attempt, never rebuilt, so the model is asked exactly what it was asked
+    before. The configuration is this request's own snapshot: an old one pins
+    the code recipe of its day, which every later deploy refuses. The new
+    attempt writes to its own folder and to filenames that do not exist yet,
+    so every record of the earlier attempt stays valid.
+    """
+    old = _load(prior_path, prior_hash)
+    if old.get("run_id") != owner.run_id or old.get("kind") != "patient_facing":
+        raise ExecutionConflict("post manifest identity changed")
+    if "prompt" not in old:
+        raise PostAdmissionUnavailable(
+            "this write-up was blocked before it had a prompt, so asking again "
+            "cannot help: "
+            + str(old.get("blocked_reason") or prior_reason or "reason not recorded")
+        )
+    attempt = manifest_attempt(old) + 1
+    path = _root(owner) / f"attempt-{attempt}" / "patient_facing.json"
+    if path.exists():
+        # An earlier request published this attempt and stopped before the
+        # obligation moved to it. The same blocked attempt rejoins that file.
+        saved = _load(path)
+        if (
+            saved.get("run_id"),
+            saved.get("kind"),
+            saved.get("attempt"),
+            saved.get("previous_manifest_hash"),
+        ) != (owner.run_id, "patient_facing", attempt, prior_hash):
+            raise ExecutionConflict("orphan post manifest identity changed")
+        return path, saved
+    with owner.transaction() as session:
+        run = session.get(storage.Run, owner.run_id)
+        patient = session.get(storage.Patient, old["patient_id"])
+        if patient is None or run.patient_id != old["patient_id"]:
+            raise ExecutionConflict("original patient identity changed")
+        label = patient.label
+    if normalize_portal_patient_id(label) != label:
+        raise PostAdmissionUnavailable(
+            "current patient label is not a canonical clinic id"
+        )
+    data = {
+        "schema_version": 1,
+        "run_id": owner.run_id,
+        "kind": "patient_facing",
+        "explicit": True,
+        "enabled": True,
+        "config": cfg,
+        "attempt": attempt,
+        "previous_manifest_hash": prior_hash,
+        **{
+            key: old[key]
+            for key in (
+                "patient_id",
+                "selected_artifact_id",
+                "sources",
+                "source_fingerprint",
+                "prompt",
+                "version",
+                "date",
+                "max_tokens",
+                "temperature",
+            )
+        },
+        "patient_label": label,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for number in range(attempt, attempt + 1000):
+        data["stem_suffix"] = f"-{number}"
+        data["destinations"] = _destinations(data, label)
+        if not any(Path(p).exists() for p in data["destinations"].values()):
+            break
+    else:
+        raise PostAdmissionUnavailable("no free filename for another write-up")
+    _publish(owner, path, _json(data))
+    return path, data
+
+
+def _regenerate_patient_facing(store, run_id, cfg):
+    """Explicit clinic request: one more try at a blocked write-up, no new council.
+
+    Only a blocked post whose run has no unsettled paid call is reopened; an
+    unknown outcome is reconciled first, never stepped over.
+    """
+    from sqlalchemy.orm import Session
+
+    with Session(store.engine) as session:
+        unsettled = session.scalar(
+            select(storage.PaidRequest)
+            .where(
+                storage.PaidRequest.run_id == run_id,
+                storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+            )
+            .limit(1)
+        )
+        if unsettled is not None:
+            raise ExecutionConflict(
+                "the write-up cannot be asked for again yet: paid call "
+                f"{unsettled.scope_key} is {unsettled.state}; reconcile it first"
+            )
+    owner = store.claim_run_owner(run_id, regenerate_post=True)
+    if owner is None:
+        projection = project_patient_facing(store, run_id)
+        if projection["state"] == "blocked":
+            return {"run_id": run_id, "state": "admitting", "verified": False}
+        return projection
+    run_reason = None
+    try:
+        with owner.transaction() as session:
+            run_reason = session.get(storage.Run, run_id).blocked_reason
+            prior = session.get(storage.PostObligation, (run_id, "patient_facing"))
+            prior_path, prior_hash, prior_reason = (
+                prior.manifest_path,
+                prior.manifest_hash,
+                prior.blocked_reason,
+            )
+        path, data = _regenerated_manifest(
+            owner, prior_path, prior_hash, prior_reason, cfg
+        )
+        owner.reopen_blocked_post(
+            "patient_facing",
+            expected_manifest_hash=prior_hash,
+            manifest_path=str(path),
+            manifest_hash=_hash(_json(data)),
+        )
+    except BaseException:
+        owner.release(
+            state="blocked",
+            blocked_reason=run_reason or "patient-facing document blocked",
+        )
+        raise
+    owner.release(state="pending")
+    return project_patient_facing(store, run_id)
+
+
 def _verify_manifest(owner, data):
     if data["run_id"] != owner.run_id or data["config"]["recipe"] != _recipe():
         raise ExecutionConflict("incompatible patient output recipe")
@@ -376,6 +528,19 @@ def _verify_manifest(owner, data):
 _OUTPUT_EXTENSIONS = (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json"))
 
 
+def _destinations(data, label):
+    """Output paths of one attempt; attempts after the first carry a suffix."""
+    stem = writer._output_stem(
+        patient_label=label, version=data["version"], date_str=data["date"]
+    ) + data.get("stem_suffix", "")
+    if Path(stem).name != stem:
+        raise PostAdmissionUnavailable(
+            "output version must be a single filename component"
+        )
+    folder = Path(data["config"]["portal_dir"]) / label
+    return {kind: str(folder / (stem + ext)) for kind, ext in _OUTPUT_EXTENSIONS}
+
+
 def _route_to_current_label(data, label):
     """File the document under the patient's id as it is now.
 
@@ -388,12 +553,7 @@ def _route_to_current_label(data, label):
         return data
     if normalize_portal_patient_id(label) != label:
         raise ExecutionConflict("current patient label is not a canonical clinic id")
-    stem = writer._output_stem(
-        patient_label=label, version=data["version"], date_str=data["date"]
-    )
-    folder = Path(data["config"]["portal_dir"]) / label
-    destinations = {kind: str(folder / (stem + ext)) for kind, ext in _OUTPUT_EXTENSIONS}
-    return {**data, "patient_label": label, "destinations": destinations}
+    return {**data, "patient_label": label, "destinations": _destinations(data, label)}
 
 
 def _accepted_output(owner, root, kind, destination, produce):
@@ -421,8 +581,8 @@ def _accepted_output(owner, root, kind, destination, produce):
     return {k: binding[k] for k in ("path", "size", "sha256")}
 
 
-def _publish_outputs(owner, data, md, meta):
-    root = _root(owner) / "outputs"
+def _publish_outputs(owner, base, data, md, meta):
+    root = base / "outputs"
     result = {}
     result["md"] = _accepted_output(
         owner, root, "md", data["destinations"]["md"], lambda: (md + "\n").encode()
@@ -506,8 +666,12 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
     )
     client = None
     setting_token = None
+    scope_key = None
+    # Each attempt keeps its outputs and receipts beside its own manifest.
+    base = Path(row.manifest_path).parent
     try:
         data = _load(row.manifest_path, row.manifest_hash)
+        scope_key = patient_facing_scope(manifest_attempt(data))
         data = _route_to_current_label(data, _verify_manifest(owner, data))
         cfg = data["config"]
         client = _execution_client(llm_client)
@@ -518,7 +682,7 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                 select(storage.PaidRequest)
                 .where(
                     storage.PaidRequest.run_id == owner.run_id,
-                    storage.PaidRequest.scope_key == "post/patient_facing/generation",
+                    storage.PaidRequest.scope_key == scope_key,
                 )
                 .order_by(storage.PaidRequest.dispatch_ordinal.desc())
                 .limit(1)
@@ -579,12 +743,12 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                     for kind in ("md", "pdf", "meta")
                 },
                 publisher=lambda md, meta: _owned_free_work(
-                    owner, _publish_outputs, owner, data, md, meta
+                    owner, _publish_outputs, owner, base, data, md, meta
                 ),
             )
             scope.raise_if_blocked()
         _verify_outputs(outputs)
-        sync_path = _root(owner) / "sync.json"
+        sync_path = base / "sync.json"
         if not sync_path.exists():
             if cfg["sync_enabled"]:
                 if sync is None:
@@ -615,11 +779,11 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
             "run_id": owner.run_id,
             "manifest_hash": row.manifest_hash,
             "outputs": outputs,
-            "paid": _paid_bindings(owner.store, owner.run_id),
+            "paid": _paid_bindings(owner.store, owner.run_id, scope_key),
             "sync": sync_receipt,
             "delivery_verified": False,
         }
-        receipt_path = _root(owner) / "complete.json"
+        receipt_path = base / "complete.json"
         _publish(owner, receipt_path, _json(receipt))
         _verify_outputs(outputs)
         owner.transition_post_obligation(
@@ -635,7 +799,7 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                 select(storage.PaidRequest)
                 .where(
                     storage.PaidRequest.run_id == owner.run_id,
-                    storage.PaidRequest.scope_key == "post/patient_facing/generation",
+                    storage.PaidRequest.scope_key == scope_key,
                     storage.PaidRequest.state.in_(["response_saved", "rejected"]),
                 )
                 .limit(1)
@@ -702,20 +866,21 @@ def project_patient_facing(store, run_id):
                     or receipt["manifest_hash"] != row.manifest_hash
                 ):
                     raise ExecutionConflict("completion binding changed")
-                if receipt["paid"] != _paid_bindings(store, run_id):
+                scope_key = patient_facing_scope(manifest_attempt(manifest))
+                if receipt["paid"] != _paid_bindings(store, run_id, scope_key):
                     raise ExecutionConflict("original generation binding changed")
                 _verify_outputs(receipt["outputs"])
                 result.update(
                     verified=True, outputs=receipt["outputs"], sync=receipt["sync"]
                 )
-        except (ExecutionConflict, KeyError, TypeError) as error:
+        except (ExecutionConflict, KeyError, TypeError, ValueError) as error:
             result.update(
                 verified=False, local_complete=False, integrity_error=str(error)
             )
         return result
 
 
-def _paid_bindings(store, run_id):
+def _paid_bindings(store, run_id, scope_key):
     """Verify complete original request/response files even after local completion."""
     from sqlalchemy.orm import Session
 
@@ -738,7 +903,7 @@ def _paid_bindings(store, run_id):
                 select(storage.PaidRequest)
                 .where(
                     storage.PaidRequest.run_id == run_id,
-                    storage.PaidRequest.scope_key == "post/patient_facing/generation",
+                    storage.PaidRequest.scope_key == scope_key,
                 )
                 .order_by(storage.PaidRequest.dispatch_ordinal)
             )

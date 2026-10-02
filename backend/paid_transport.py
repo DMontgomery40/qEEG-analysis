@@ -286,6 +286,45 @@ def _rejection(status, body):
     return None
 
 
+PATIENT_FACING_SCOPE = "post/patient_facing/generation"
+_PATIENT_FACING_PREFIX = "post/patient_facing/"
+
+
+def patient_facing_scope(attempt=1):
+    """The paid scope key of one patient-facing write-up attempt.
+
+    The journal binds a scope to one manifest, so a regeneration after a block
+    gets its own key. Attempt 1 keeps the original key, so every receipt
+    already saved under it stays valid.
+    """
+    if attempt == 1:
+        return PATIENT_FACING_SCOPE
+    if type(attempt) is not int or attempt < 2:
+        raise ValueError("patient-facing attempt must be a positive integer")
+    return f"{_PATIENT_FACING_PREFIX}{attempt}"
+
+
+def patient_facing_attempt(scope_key):
+    """The attempt a paid scope key belongs to; None if it is not a write-up."""
+    if scope_key == PATIENT_FACING_SCOPE:
+        return 1
+    if not (scope_key or "").startswith(_PATIENT_FACING_PREFIX):
+        return None
+    tail = scope_key[len(_PATIENT_FACING_PREFIX) :]
+    if tail.isascii() and tail.isdigit():
+        attempt = int(tail)
+        if attempt >= 2 and patient_facing_scope(attempt) == scope_key:
+            return attempt
+    return None
+
+
+def manifest_attempt(manifest):
+    """Attempt number recorded in a patient-facing manifest (absent means 1)."""
+    attempt = manifest.get("attempt", 1)
+    patient_facing_scope(attempt)
+    return attempt
+
+
 def reconcile_blocked_run(store, run_id):
     """Recheck complete saved responses without sending or replacing any request.
 
@@ -319,13 +358,46 @@ def reconcile_blocked_run(store, run_id):
             )
         if not requests:
             raise ExecutionConflict("blocked run has no dispatched paid receipts")
+        # A regenerated write-up re-validates only its current attempt. Earlier
+        # attempts were settled before the regeneration was admitted and are
+        # bound to their own manifests, so they are skipped, never re-checked
+        # against the current one.
+        current_attempt = None
+        if any(r.scope_key.startswith("post/") for r in requests):
+            with owner.transaction() as session:
+                post = session.get(storage.PostObligation, (run_id, "patient_facing"))
+            if post is None:
+                raise ExecutionConflict("original post obligation is missing")
+            with owner.file_guard():
+                try:
+                    raw = Path(post.manifest_path).read_bytes()
+                    if _hash(raw) != post.manifest_hash:
+                        raise ValueError("post manifest hash changed")
+                    current_attempt = manifest_attempt(json.loads(raw))
+                except (OSError, ValueError, AttributeError, TypeError) as error:
+                    raise ExecutionConflict("invalid post-only manifest") from error
+        earlier = set()
+        for r in requests:
+            attempt = patient_facing_attempt(r.scope_key)
+            if attempt is not None and attempt < current_attempt:
+                if r.state not in ("response_saved", "rejected"):
+                    raise ExecutionConflict(
+                        "an earlier patient-facing attempt is unresolved"
+                    )
+                earlier.add((r.scope_key, r.dispatch_ordinal))
+        requests = [r for r in requests if (r.scope_key, r.dispatch_ordinal) not in earlier]
+        if not requests:
+            raise ExecutionConflict("blocked run has no dispatched paid receipts")
+        current_scope = (
+            patient_facing_scope(current_attempt) if current_attempt else None
+        )
         # Receipt classification may already have committed before interruption.
         # The run's paid-outcome block remains the durable recovery checkpoint.
         # Re-validate those receipts too, preserving their original body/hash.
         paid_post_reasons = {
             str(PaidOutcomeUnknown((r.run_id, r.scope_key, r.dispatch_ordinal), reason))
             for r in requests
-            if r.scope_key == "post/patient_facing/generation"
+            if r.scope_key == current_scope
             for reason in (
                 "paid_outcome_unknown",
                 "unclassified_http_response",
@@ -346,7 +418,7 @@ def reconcile_blocked_run(store, run_id):
                 extensions={"timeout": route["timeout"]},
             )
             if row.scope_key.startswith("post/"):
-                if row.scope_key != "post/patient_facing/generation":
+                if row.scope_key != current_scope:
                     raise ExecutionConflict("unsupported post receipt scope")
                 with owner.transaction() as session:
                     post = session.get(
@@ -889,7 +961,8 @@ def post_paid_scope(
                 and saved["kind"] == kind == "patient_facing"
                 and saved["source_fingerprint"] == source_fingerprint
             )
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            semantic_key = patient_facing_scope(manifest_attempt(saved))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise ExecutionConflict("invalid post-only manifest") from error
         if not valid:
             raise ExecutionConflict("post-only scope differs from source manifest")
@@ -907,9 +980,7 @@ def post_paid_scope(
             != (str(manifest_path), manifest_hash)
         ):
             raise ExecutionConflict("post-only obligation differs from scope")
-    cursor = PaidScope(
-        owner, "post/patient_facing/generation", manifest_hash, source_fingerprint
-    )
+    cursor = PaidScope(owner, semantic_key, manifest_hash, source_fingerprint)
     token = _scope.set(cursor)
     try:
         yield cursor

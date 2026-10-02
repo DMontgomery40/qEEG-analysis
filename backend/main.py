@@ -1933,7 +1933,10 @@ async def run_patient_action(
             post = await runtime.admission(
                 project_patient_facing, runtime.store, patient_facing_run_id
             )
-            if post["state"] == "absent":
+            # A blocked write-up gets one more attempt on this explicit
+            # request, with the same paid prompt and no new council (EN-H3).
+            # Any other existing post rejoins unchanged.
+            if post["state"] in ("absent", "blocked"):
                 # Freeze once; every bounded contention retry uses this configuration.
                 snapshot = await asyncio.to_thread(
                     snapshot_post_config,
@@ -1943,7 +1946,9 @@ async def run_patient_action(
                     timeout_s=app.state.llm._timeout_s,
                 )
                 post = await runtime.admit_post(
-                    patient_facing_run_id, config_snapshot=snapshot
+                    patient_facing_run_id,
+                    config_snapshot=snapshot,
+                    regenerate=post["state"] == "blocked",
                 )
         except AdmissionUnavailable as error:
             raise HTTPException(
