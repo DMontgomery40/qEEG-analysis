@@ -853,9 +853,12 @@ def project_patient_facing(store, run_id):
             result["local_complete"] = False
             if local_path.exists():
                 local = _load(local_path)
+                # A relabel before generation files under the current id
+                # (EN-H7); every other part of each path stays as pinned.
+                filed_label = Path(local["md"]["path"]).parent.name
                 if {
                     kind: binding["path"] for kind, binding in local.items()
-                } != manifest["destinations"]:
+                } != _route_to_current_label(manifest, filed_label)["destinations"]:
                     raise ExecutionConflict("local output destinations changed")
                 _verify_outputs(local)
                 result.update(local_complete=True, outputs=local)

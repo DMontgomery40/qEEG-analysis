@@ -890,6 +890,20 @@ async def test_relabel_after_completion_files_the_document_under_the_new_id(
     assert synced == ["ZA_01-01-1900"]
     # One paid send, of the prompt as admitted: the relabel never rewrites it.
     assert len(sent) == 1 and b"ZA_01-01-1900" not in sent[0]
+    # The finished document verifies: the projection used to compare the
+    # outputs with the pinned old-id paths, so it read "local output
+    # destinations changed" and the runtime failed the done run.
+    assert result["verified"] and result["local_complete"], result
+    # Only the id may differ from what was pinned: an output filed under any
+    # other name still fails, even when its bytes check out.
+    local_path = Path(result["manifest_path"]).parent / "outputs" / "local.json"
+    local = json.loads(local_path.read_text())
+    moved = Path(local["md"]["path"]).with_name("ZA_01-01-1900-other.md")
+    moved.write_bytes(Path(local["md"]["path"]).read_bytes())
+    local["md"]["path"] = str(moved)
+    local_path.write_text(json.dumps(local))
+    tampered = post.project_patient_facing(owner.store, owner.run_id)
+    assert tampered["integrity_error"] == "local output destinations changed", tampered
 
 
 # EN-H3: a blocked write-up used to be final; the only way to get it was a whole
