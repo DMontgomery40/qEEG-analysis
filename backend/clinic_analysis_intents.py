@@ -259,23 +259,99 @@ _BACKOFF_FIRST_S = 30.0
 _BACKOFF_MAX_S = 1800.0
 
 
-def admission_block(upload_id) -> str | None:
+_DUPLICATE_CODES = ("ANALYSIS_ALREADY_RUNNING", "ANALYSIS_RECENTLY_COMPLETED")
+
+
+def _stored_block(upload_id, row=None):
+    if row is None:
+        with storage.session_scope() as s:
+            row = s.get(ClinicUpload, upload_id)
+    raw = getattr(row, "admission_block_json", None) if row is not None else None
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _store_block(upload_id, entry):
+    """The block lives on the upload row, so a restart does not show a stopped
+    upload as ready again (it read `ready` until the next failure before)."""
+    with storage.session_scope() as s:
+        row = s.get(ClinicUpload, upload_id)
+        if row is None:
+            return
+        value = (
+            json.dumps({k: entry[k] for k in ("attempts", "reason", "final")}, sort_keys=True)
+            if entry
+            else None
+        )
+        if row.admission_block_json != value:
+            row.admission_block_json = value
+            s.commit()
+
+
+def _clear_block(upload_id):
+    if _ADMISSION_BACKOFF.pop(upload_id, None) is not None or _stored_block(upload_id):
+        _store_block(upload_id, None)
+
+
+def admission_block(upload_id, row=None) -> str | None:
     """The plain reason a confirmed upload is not running yet, if it is blocked."""
-    entry = _ADMISSION_BACKOFF.get(upload_id)
+    entry = _ADMISSION_BACKOFF.get(upload_id) or _stored_block(upload_id, row)
     return entry["reason"] if entry else None
 
 
+def _plain_reason(error) -> str:
+    from starlette.exceptions import HTTPException
+
+    if isinstance(error, HTTPException):
+        detail = error.detail
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("code")
+        return str(detail or "")[:200] or type(error).__name__
+    return str(error)[:200] or type(error).__name__
+
+
+def _duplicate_refusal(error):
+    from starlette.exceptions import HTTPException
+
+    if not isinstance(error, HTTPException) or not isinstance(error.detail, dict):
+        return None
+    code = error.detail.get("code")
+    if code not in _DUPLICATE_CODES:
+        return None
+    # Retrying would wait out the 24-hour window and then start the paid
+    # council the refusal exists to prevent, so the refusal is final here.
+    if code == "ANALYSIS_ALREADY_RUNNING":
+        return (
+            "An analysis of these same reports is already running, so this upload "
+            "did not start a second one."
+        )
+    return (
+        "These same reports were analysed recently, so this upload did not start "
+        "a second analysis. Ask in chat for a fresh one if it is wanted."
+    )
+
+
 def _note_admission_failure(upload_id, error, now) -> float:
-    entry = _ADMISSION_BACKOFF.get(upload_id) or {"attempts": 0}
+    entry = _ADMISSION_BACKOFF.get(upload_id) or _stored_block(upload_id) or {"attempts": 0}
     attempts = int(entry["attempts"]) + 1
+    duplicate = _duplicate_refusal(error)
     # One immediate retry covers a transient fault (a lock, a timeout); a
     # second failure is a condition nobody fixes in a second, so back off.
-    delay = 0.0 if attempts == 1 else min(_BACKOFF_FIRST_S * (2 ** (attempts - 2)), _BACKOFF_MAX_S)
+    if duplicate:
+        delay = float("inf")
+    elif attempts == 1:
+        delay = 0.0
+    else:
+        delay = min(_BACKOFF_FIRST_S * (2 ** (attempts - 2)), _BACKOFF_MAX_S)
     _ADMISSION_BACKOFF[upload_id] = {
         "attempts": attempts,
         "next_attempt": now + delay,
-        "reason": str(error)[:200] or type(error).__name__,
+        "reason": duplicate or _plain_reason(error),
+        "final": bool(duplicate),
     }
+    _store_block(upload_id, _ADMISSION_BACKOFF[upload_id])
     return delay
 
 
@@ -320,6 +396,15 @@ async def activate_confirmed_uploads(runtime):
     now = asyncio.get_running_loop().time()
     for upload_id, run in pending:
         waiting = _ADMISSION_BACKOFF.get(upload_id)
+        if waiting is None:
+            stored = _stored_block(upload_id)
+            if stored:
+                # After a restart: a final refusal stays final; anything else
+                # gets one fresh try now and keeps its count.
+                waiting = _ADMISSION_BACKOFF[upload_id] = {
+                    **stored,
+                    "next_attempt": float("inf") if stored.get("final") else now,
+                }
         if waiting and waiting["next_attempt"] > now:
             continue
         try:
@@ -330,10 +415,10 @@ async def activate_confirmed_uploads(runtime):
                 # checks while recovering only its missing start intent.
                 await runtime.admission(run_policy_binding, run)
             # A stage that succeeded clears the count; a later failure is new.
-            _ADMISSION_BACKOFF.pop(upload_id, None)
+            _clear_block(upload_id)
             if run is not None and run.start_requested_at is None:
                 await runtime.admission(main._new_start_intent, runtime.store, run.id)
-                _ADMISSION_BACKOFF.pop(upload_id, None)
+                _clear_block(upload_id)
         except asyncio.CancelledError:
             raise
         except Exception as error:

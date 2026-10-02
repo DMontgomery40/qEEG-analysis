@@ -657,8 +657,20 @@ def test_blocked_admission_backs_off_and_names_the_reason(temp_data_dir):
     shown = record()
     assert shown["status"] == "blocked"
     assert "models are unavailable" in shown["blockedReason"]
+    # An engine restart empties memory; the block is on the upload row, so the
+    # hub still sees why it stopped (it read `ready` until the next failure).
     intents._ADMISSION_BACKOFF.clear()
-    assert record()["status"] == "ready"
+    assert record()["status"] == "blocked"
+    assert "models are unavailable" in record()["blockedReason"]
+
+    class Healthy(Runtime):
+        async def admission(self, fn, *args):
+            calls.append(fn.__name__)
+            return None
+
+    asyncio.run(intents.activate_confirmed_uploads(Healthy()))
+    assert calls[-1] == "admit_confirmed_upload", "a restart is one fresh try"
+    assert record()["status"] == "ready", "a stage that succeeds clears the stored block"
 
 
 def test_policy_offers_only_models_the_engine_has(temp_data_dir, monkeypatch):
@@ -759,3 +771,136 @@ def test_the_same_request_is_one_council_until_the_operator_asks_again(temp_data
         third_run.status = "failed"
         s.commit()
     assert admit("op-five").id not in (first.id, third.id), "an old council does not block a new one"
+
+
+def test_a_duplicate_council_refusal_is_final_for_a_hub_upload(temp_data_dir):
+    # The scan treated ANALYSIS_RECENTLY_COMPLETED like a transient fault and
+    # retried every 30 minutes, so the re-upload's paid council would start the
+    # moment the 24-hour window closed.
+    import asyncio
+    from fastapi import HTTPException
+    from backend import clinic_analysis_intents as intents
+
+    result = submit(
+        file_meta=[{"documentKind": "report"}, {}],
+        analysis_intent={
+            "operationId": "op-again",
+            "confirmed": True,
+            "reportItemIndexes": [0],
+            "specialInstructions": "",
+        },
+    )["upload"]
+    calls = []
+
+    class Store:
+        @property
+        def engine(self):
+            return storage.engine
+
+    class Runtime:
+        store = Store()
+
+        async def admission(self, fn, *args):
+            calls.append(fn.__name__)
+            raise HTTPException(
+                409,
+                {"code": "ANALYSIS_RECENTLY_COMPLETED", "message": "finished recently", "run_id": "r1"},
+            )
+
+    intents._ADMISSION_BACKOFF.clear()
+    for _ in range(3):
+        asyncio.run(intents.activate_confirmed_uploads(Runtime()))
+    intents._ADMISSION_BACKOFF.clear()  # an engine restart
+    asyncio.run(intents.activate_confirmed_uploads(Runtime()))
+    assert calls == ["admit_confirmed_upload"], "refused once, never retried"
+    shown = intake().get_upload(result["uploadId"])["upload"]["analysis"]
+    assert shown["status"] == "blocked"
+    assert shown["blockedReason"].startswith("These same reports were analysed recently")
+    assert "{" not in shown["blockedReason"]
+
+
+def test_hub_upload_is_answered_before_slow_filing(temp_data_dir, monkeypatch):
+    # Netlify ends a synchronous function at 60 s; filing took about 23 s per
+    # report on 2026-09-29, so three reports filed inline read as a failure.
+    import threading
+
+    module = intake()
+    gate = threading.Event()
+    real = module._file_item
+
+    def slow(item_id, patient_uuid):
+        assert gate.wait(20)
+        return real(item_id, patient_uuid)
+
+    monkeypatch.setattr(module, "_file_item", slow)
+    first = submit("hub-slow", principal="thrylen-service", acknowledge_first=True)["upload"]
+    assert first["status"] == "pending"
+    assert first["patientId"] == "AB_02-02-1900"
+    assert [i["status"] for i in first["items"]] == ["pending", "pending"]
+    again = submit("hub-slow", principal="thrylen-service", acknowledge_first=True)["upload"]
+    assert again["status"] == "pending", "a replay while filing answers at once"
+    gate.set()
+    with module._filing_lock(first["uploadId"]):
+        pass
+    done = module.get_upload(first["uploadId"])["upload"]
+    assert done["status"] == "registered"
+    assert counts() == (1, 1, 0, 2, 0), "filed once, not twice"
+    # the workbench's chat staging still files inside the request
+    assert submit("chat-inline", principal="workbench")["upload"]["status"] == "registered"
+
+
+def test_one_damaged_upload_row_does_not_hide_the_others(temp_data_dir):
+    from backend.clinic_records import ClinicUpload
+
+    good = submit("good-row")["upload"]
+    bad = submit("bad-row", identity={"firstName": "Bea", "lastName": "Carter", "birthdate": "03-03-1901"})["upload"]
+    with storage.session_scope() as s:
+        s.get(ClinicUpload, bad["uploadId"]).manifest_json = "{not json"
+        s.commit()
+    listed = {u["uploadId"]: u for u in intake().list_uploads()["uploads"]}
+    assert listed[good["uploadId"]]["status"] == "registered"
+    assert listed[bad["uploadId"]] == {
+        "uploadId": bad["uploadId"],
+        "status": "unreadable",
+        "error": "This upload's saved record could not be read.",
+    }
+
+
+def test_replay_after_the_analysis_request_was_cleared_is_a_plain_conflict(temp_data_dir):
+    from backend.clinic_records import ClinicUpload
+
+    intent = {
+        "operationId": "op-cleared",
+        "confirmed": True,
+        "reportItemIndexes": [0],
+        "specialInstructions": "",
+    }
+    first = submit("cleared", file_meta=[{"documentKind": "report"}, {}], analysis_intent=intent)["upload"]
+    with storage.session_scope() as s:
+        s.get(ClinicUpload, first["uploadId"]).analysis_json = None
+        s.commit()
+    with pytest.raises(CatalogueConflict) as refused:
+        submit("cleared", file_meta=[{"documentKind": "report"}, {}], analysis_intent=intent)
+    assert "analysis request was cleared" in str(refused.value)
+    assert "NoneType" not in str(refused.value)
+
+
+def test_a_dropdown_chart_conflict_says_which_birthday_differs(temp_data_dir):
+    # MF_09-05-1954's upload sat parked four days behind "The supplied identity
+    # differs from this chart" while the difference was the printed birthday.
+    with storage.session_scope() as s:
+        storage.create_patient(
+            s, label="MF_09-05-1954", first_initial="M", last_initial="F",
+            birthdate="09-05-1954", first_name="Mary", last_name="Fox",
+        )
+    parked = submit(
+        "dropdown-dob",
+        identity={},
+        patient_id="MF_09-05-1954",
+        file_meta=[{"documentKind": "report", "reportBirthdate": "03-05-2010"}, {}],
+    )["upload"]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["detail"] == (
+        "The report's printed birthday 03-05-2010 does not match this chart's "
+        "09-05-1954. Same person, or someone different?"
+    )

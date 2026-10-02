@@ -4,6 +4,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 import fcntl
+import logging
+import threading
 import hashlib
 import io
 import json
@@ -246,6 +248,7 @@ def submit_upload(
     uploaded_at=None,
     registered=None,
     principal=None,
+    acknowledge_first=False,
 ):
     key = require_key(key)
     if principal not in (None, "workbench", "thrylen-service"):
@@ -312,6 +315,15 @@ def submit_upload(
             )
 
             if existing:
+                if not existing.analysis_json:
+                    # The stored request was cleared after the original submission;
+                    # a replay carrying it cannot bring it back (a raw TypeError
+                    # reached the hub here before 2026-10-02).
+                    raise CatalogueConflict(
+                        "This upload's analysis request was cleared after it was sent, "
+                        "so this retry cannot bring it back. Ask in chat for an analysis "
+                        "of these reports."
+                    )
                 policy_binding = json.loads(existing.analysis_json)["policyBinding"]
                 snapshot, _ = read_policy_binding(policy_binding)
                 policy = snapshot["publicPolicy"]
@@ -428,7 +440,7 @@ def submit_upload(
                         )
                     )
                 _bump(s)
-        return _resume_locked(chosen)
+        return _resume_locked(chosen, background=acknowledge_first)
 
 
 def _bind_patient(upload_id):
@@ -478,6 +490,13 @@ def _bind_patient(upload_id):
                     s, identity, target_patient=target
                 )
                 if patient is None or patient.id != target.id:
+                    detail = _chart_difference(
+                        target,
+                        chart_birthdate=target.birthdate or parsed.birthdate,
+                        identity=identity,
+                        birthdate_from_report=bool(report_dobs)
+                        and "birthdate" not in m["identity"],
+                    )
                     raise IdentityNameConflict(
                         dict(
                             conflict="identity_name_mismatch",
@@ -490,7 +509,7 @@ def _bind_patient(upload_id):
                                     name=stored_full_name(target),
                                 )
                             ],
-                            detail="The supplied identity differs from this chart. Choose the same person or someone different.",
+                            detail=detail,
                         )
                     )
                 if not m["identity"]:
@@ -555,6 +574,41 @@ def _bind_patient(upload_id):
         u.status = "pending"
         _bump(s, patient.id)
         return patient.id
+
+
+def _chart_difference(target, *, chart_birthdate, identity, birthdate_from_report):
+    """Say in plain words what differs between an upload and the chart it was
+    filed to. MF's dropdown upload sat parked four days behind a sentence that
+    never said the report's printed birthday was the difference."""
+    from .patient_intake import stored_full_name
+
+    said = []
+    try:
+        chart_dob = normalize_birthdate(chart_birthdate) if chart_birthdate else None
+    except ValueError:
+        chart_dob = None
+    try:
+        given_dob = normalize_birthdate(identity.birthdate) if identity.birthdate else None
+    except ValueError:
+        given_dob = identity.birthdate
+    if given_dob and chart_dob and given_dob != chart_dob:
+        source = (
+            "The report's printed birthday"
+            if birthdate_from_report
+            else "The birthday given"
+        )
+        said.append(f"{source} {given_dob} does not match this chart's {chart_dob}.")
+    given_name = " ".join(filter(None, [identity.first_name, identity.last_name]))
+    chart_name = stored_full_name(target)
+    if (
+        given_name
+        and chart_name
+        and given_name.casefold() != str(chart_name).casefold()
+    ):
+        said.append(f"The name {given_name} does not match this chart's {chart_name}.")
+    if not said:
+        said.append("The details on this upload differ from this chart.")
+    return " ".join(said) + " Same person, or someone different?"
 
 
 def _file_item(item_id, patient_uuid):
@@ -671,41 +725,83 @@ def _file_item(item_id, patient_uuid):
         item.error = None
 
 
-def _resume_locked(upload_id):
+# One lock per upload so a filing in flight is never started twice in this
+# process: the hub's status loop replays a pending submission while it waits.
+_FILING_LOCKS: dict[str, threading.Lock] = {}
+_FILING_GUARD = threading.Lock()
+
+
+def _filing_lock(upload_id):
+    with _FILING_GUARD:
+        return _FILING_LOCKS.setdefault(upload_id, threading.Lock())
+
+
+def _file_items(upload_id, patient_uuid):
+    with storage.session_scope() as s:
+        ids = list(
+            s.scalars(
+                select(ClinicUploadItem.id)
+                .where(ClinicUploadItem.upload_id == upload_id)
+                .order_by(ClinicUploadItem.position)
+            )
+        )
+    for item_id in ids:
+        try:
+            _file_item(item_id, patient_uuid)
+        except Exception as error:
+            with _write() as s:
+                item = s.get(ClinicUploadItem, item_id)
+                item.status = "failed"
+                item.error = type(error).__name__ + ": Free filing needs retry"
+                _bump(s, patient_uuid)
+    with _write() as s:
+        u = s.get(ClinicUpload, upload_id)
+        statuses = list(
+            s.scalars(
+                select(ClinicUploadItem.status).where(
+                    ClinicUploadItem.upload_id == upload_id
+                )
+            )
+        )
+        status = "registered" if all(x == "registered" for x in statuses) else "failed"
+        if u.status != status:
+            u.status = status
+            _bump(s, patient_uuid)
+
+
+def _file_later(upload_id, patient_uuid):
+    """File after the answer has gone. Netlify ends a synchronous function at
+    60 s and filing takes about 23 s per report (09-29), so a hub request that
+    filed three reports inline read as a failure while the engine finished."""
+    lock = _filing_lock(upload_id)
+    if not lock.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            _file_items(upload_id, patient_uuid)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "clinic_background_filing_failed upload_id=%s", upload_id
+            )
+        finally:
+            lock.release()
+
+    try:
+        threading.Thread(target=run, name="clinic-filing", daemon=True).start()
+    except BaseException:
+        lock.release()
+        raise
+
+
+def _resume_locked(upload_id, background=False):
     patient_uuid = _bind_patient(upload_id)
     if patient_uuid:
-        with storage.session_scope() as s:
-            ids = list(
-                s.scalars(
-                    select(ClinicUploadItem.id)
-                    .where(ClinicUploadItem.upload_id == upload_id)
-                    .order_by(ClinicUploadItem.position)
-                )
-            )
-        for item_id in ids:
-            try:
-                _file_item(item_id, patient_uuid)
-            except Exception as error:
-                with _write() as s:
-                    item = s.get(ClinicUploadItem, item_id)
-                    item.status = "failed"
-                    item.error = type(error).__name__ + ": Free filing needs retry"
-                    _bump(s, patient_uuid)
-        with _write() as s:
-            u = s.get(ClinicUpload, upload_id)
-            statuses = list(
-                s.scalars(
-                    select(ClinicUploadItem.status).where(
-                        ClinicUploadItem.upload_id == upload_id
-                    )
-                )
-            )
-            status = (
-                "registered" if all(x == "registered" for x in statuses) else "failed"
-            )
-            if u.status != status:
-                u.status = status
-                _bump(s, patient_uuid)
+        if background:
+            _file_later(upload_id, patient_uuid)
+        else:
+            with _filing_lock(upload_id):
+                _file_items(upload_id, patient_uuid)
     return get_upload(upload_id)
 
 
@@ -771,7 +867,7 @@ def _upload_json(s, u):
         if not run:
             from .clinic_analysis_intents import admission_block
 
-            blocked = admission_block(u.id)
+            blocked = admission_block(u.id, u)
             if blocked:
                 analysis["status"] = "blocked"
                 analysis["blockedReason"] = blocked
@@ -816,16 +912,26 @@ def get_upload(upload_id):
         raise CatalogueNotFound("Upload not found")
 
 
+def _unreadable_reason(error):
+    if isinstance(error, (CatalogueConflict, CatalogueNotFound, CatalogueUnavailable)):
+        return str(error)[:160] or "This upload's saved record could not be read."
+    return "This upload's saved record could not be read."
+
+
 def list_uploads():
     with storage.session_scope() as s:
-        uploads = [
-            _upload_json(s, u)
-            for u in s.scalars(
-                select(ClinicUpload).order_by(
-                    ClinicUpload.uploaded_at.desc(), ClinicUpload.id
+        uploads = []
+        for u in s.scalars(
+            select(ClinicUpload).order_by(ClinicUpload.uploaded_at.desc(), ClinicUpload.id)
+        ):
+            # One damaged row is that row's problem, not the whole list's: the
+            # workbench read every pending upload as UPLOADS_UNAVAILABLE.
+            try:
+                uploads.append(_upload_json(s, u))
+            except Exception as error:
+                uploads.append(
+                    dict(uploadId=u.id, status="unreadable", error=_unreadable_reason(error))
                 )
-            )
-        ]
         admitted = {u["uploadId"] for u in uploads}
         uploads.extend(
             _legacy_json(u)
@@ -837,7 +943,7 @@ def list_uploads():
         return _envelope(s, uploads=uploads)
 
 
-def resolve_upload(upload_id, *, key, resolution, actor=None):
+def resolve_upload(upload_id, *, key, resolution, actor=None, acknowledge_first=False):
     key = require_key(key)
     resolution = _resolution(resolution)
     if not resolution:
@@ -896,4 +1002,4 @@ def resolve_upload(upload_id, *, key, resolution, actor=None):
                     )
                 )
                 _bump(s)
-        return _resume_locked(upload_id)
+        return _resume_locked(upload_id, background=acknowledge_first)
