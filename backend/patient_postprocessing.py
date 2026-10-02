@@ -532,7 +532,8 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                 from .run_runtime import ModelUnavailable
 
                 raise ModelUnavailable(
-                    "patient model catalogue unavailable; retrying"
+                    "patient model catalogue unavailable; retrying",
+                    model=cfg["model_id"],
                 ) from error
             if cfg["model_id"] not in available:
                 raise ExecutionConflict("pinned patient model unavailable")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,10 @@ LOGGER = get_logger(__name__)
 
 class ModelUnavailable(ExecutionConflict):
     """No dispatch occurred; retry the original model when discovery recovers."""
+
+    def __init__(self, message, *, model=None):
+        super().__init__(message)
+        self.model = model
 
 
 class AdmissionUnavailable(RuntimeError):
@@ -85,7 +90,9 @@ def _validate_dispatch(request):
     except (ValueError, KeyError, TypeError) as error:
         raise ExecutionConflict("paid request has no pinned model") from error
     if model not in DISCOVERED_MODEL_IDS:
-        raise ModelUnavailable(f"Pinned model is currently unavailable: {model}")
+        raise ModelUnavailable(
+            f"Pinned model is currently unavailable: {model}", model=model
+        )
 
 
 @contextmanager
@@ -141,9 +148,11 @@ async def continue_owned_run(owner, *, llm, workflow, publish=None, sync=None):
                     required = json.loads(run.council_model_ids_json) + [
                         run.consolidator_model_id
                     ]
-                    if any(model not in DISCOVERED_MODEL_IDS for model in required):
+                    missing = [m for m in required if m not in DISCOVERED_MODEL_IDS]
+                    if missing:
                         raise ModelUnavailable(
-                            "Pinned council catalogue is unavailable before first execution"
+                            "Pinned council catalogue is unavailable before first execution",
+                            model=", ".join(sorted(set(missing))),
                         )
                 async with owned_execution(owner, llm_client=llm):
                     if run.status != "complete":
@@ -224,6 +233,34 @@ def _is_availability_wait(error):
     return False
 
 
+# A wait has no attempt count, so a model that never comes back used to be
+# re-claimed every 5 s for ever. After this long waiting, the run is blocked
+# with a plain reason; an operator resumes it on purpose.
+MODEL_WAIT_LIMIT_S = float(os.getenv("QEEG_MODEL_WAIT_LIMIT_S", "86400"))
+
+
+def _unavailable_model(error):
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModelUnavailable):
+            return getattr(error, "model", None)
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def _waited_disposition(state, reason, model, waiting_since, now, limit=None):
+    """Block a run whose availability wait has outlived the limit."""
+    limit = MODEL_WAIT_LIMIT_S if limit is None else limit
+    if state != "pending" or waiting_since is None or now - waiting_since <= limit:
+        return state, reason
+    return (
+        "blocked",
+        f"the model {model or 'pinned for this run'} has not been available for a day; "
+        "nothing retries this by itself",
+    )
+
+
 def _capped_disposition(state, reason, consecutive_failures, generation):
     if state != "pending":
         return state, reason
@@ -282,6 +319,9 @@ class RunRuntime:
         page_size=100,
     ):
         self._pending_failures = {}
+        # run id -> clock reading at the first availability wait (in memory).
+        self._waiting_since = {}
+        self._clock = time.monotonic
         if not 1 <= concurrency <= 16 or not 1 <= page_size <= 1000:
             raise ValueError("invalid consumer bounds")
         if not 0 < poll_interval <= 60 or not 0 < retry_delay <= 300:
@@ -383,12 +423,22 @@ class RunRuntime:
             try:
                 state, reason = await self.continuation(owner)
                 self._pending_failures.pop(run_id, None)
+                self._waiting_since.pop(run_id, None)
             except Exception as error:
                 LOGGER.exception("run_continuation_interrupted", run_id=run_id)
                 state, reason = _failure_disposition(error)
                 if _is_availability_wait(error):
                     failures = self._pending_failures.get(run_id, 0)  # a wait, not an attempt
+                    now = self._clock()
+                    state, reason = _waited_disposition(
+                        state,
+                        reason,
+                        _unavailable_model(error),
+                        self._waiting_since.setdefault(run_id, now),
+                        now,
+                    )
                 else:
+                    self._waiting_since.pop(run_id, None)
                     failures = self._pending_failures[run_id] = self._pending_failures.get(run_id, 0) + 1
                     state, reason = _capped_disposition(
                         state, reason, failures, int(getattr(owner, "generation", 0) or 0)
@@ -406,6 +456,7 @@ class RunRuntime:
                         LOGGER.exception("run_strand_guard_failed", run_id=run_id)
                 if state == "blocked":
                     self._pending_failures.pop(run_id, None)
+                    self._waiting_since.pop(run_id, None)
             try:
                 await asyncio.to_thread(
                     owner.release,
@@ -424,6 +475,7 @@ class RunRuntime:
                     raise
                 LOGGER.warning("run_done_with_open_obligation", run_id=run_id, reason=str(error))
                 self._pending_failures.pop(run_id, None)
+                self._waiting_since.pop(run_id, None)
                 await asyncio.to_thread(
                     owner.release, state="blocked", blocked_reason=str(error)
                 )

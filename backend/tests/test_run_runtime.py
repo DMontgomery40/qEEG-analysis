@@ -968,3 +968,79 @@ async def test_done_with_an_open_document_parks_the_run_and_names_it(temp_data_d
     )
     assert run.owner_token is None
     assert calls == ["open-post"]
+
+
+def test_an_availability_wait_longer_than_a_day_blocks_with_the_model_named():
+    from backend import run_runtime as rr
+
+    reason = "Pinned model is currently unavailable: gone-model"
+    # Inside the limit it stays a wait.
+    assert rr._waited_disposition(
+        "pending", reason, "gone-model", 1000.0, 1000.0 + 86400, limit=86400
+    ) == ("pending", reason)
+    # Past it, blocked with a plain reason that names the model.
+    assert rr._waited_disposition(
+        "pending", reason, "gone-model", 1000.0, 1000.0 + 86401, limit=86400
+    ) == (
+        "blocked",
+        "the model gone-model has not been available for a day; "
+        "nothing retries this by itself",
+    )
+    # Other states are untouched.
+    assert rr._waited_disposition(
+        "blocked", "x", "gone-model", 0.0, 10**9, limit=1
+    ) == ("blocked", "x")
+    # The model id is read through the cause chain.
+    try:
+        try:
+            raise rr.ModelUnavailable(reason, model="gone-model")
+        except rr.ModelUnavailable as inner:
+            raise RuntimeError("wrapped") from inner
+    except RuntimeError as outer:
+        assert rr._unavailable_model(outer) == "gone-model"
+        assert rr._is_availability_wait(outer)
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_model_never_returns_is_blocked_after_the_wait_limit(
+    temp_data_dir, monkeypatch
+):
+    """A ModelUnavailable wait is exempt from the 20-attempt cap, so a model
+    that never came back meant a re-claim every 5 s for ever."""
+    from backend import run_runtime as rr
+
+    monkeypatch.setattr(rr, "MODEL_WAIT_LIMIT_S", 86400.0)
+    store = ExecutionStore(storage.engine)
+    calls = []
+
+    async def continuation(owner):
+        calls.append(owner.run_id)
+        raise rr.ModelUnavailable(
+            "Pinned model is currently unavailable: gone-model", model="gone-model"
+        )
+
+    add_run(store, "waiting")
+    runtime = runtime_type()(
+        store, continuation=continuation, poll_interval=0.02, retry_delay=0.05
+    )
+    clock = iter([0.0, 3600.0] + [90000.0] * 1000)
+    runtime._clock = lambda: next(clock)
+
+    def parked():
+        with Session(store.engine) as session:
+            run = session.get(storage.Run, "waiting")
+            return run.execution_state == "blocked" and run
+
+    await runtime.start()
+    try:
+        await until(lambda: bool(parked()))
+        await asyncio.sleep(0.3)  # several retry intervals: nothing re-claims it
+    finally:
+        await runtime.stop()
+    run = parked()
+    assert run.blocked_reason == (
+        "the model gone-model has not been available for a day; "
+        "nothing retries this by itself"
+    )
+    assert run.owner_token is None
+    assert len(calls) == 3
