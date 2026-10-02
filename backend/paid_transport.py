@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from . import storage
 from .logging_utils import get_logger
@@ -30,6 +30,31 @@ from .run_execution import ExecutionConflict, RunOwner
 
 
 LOGGER = get_logger(__name__)
+
+
+# httpx raises these only before a request byte is written, so nothing reached
+# the provider and no money moved (EN-H2). Checked against httpx 0.28.1 and
+# httpcore 1.0.9: ConnectError comes from opening the connection, including a
+# refused port, a failed DNS lookup (OSError) and a failed TLS handshake
+# (_backends/anyio.py connect_tcp, start_tls); ConnectTimeout from the same
+# steps running out of time; ProxyError from a proxy refusing the CONNECT or
+# SOCKS handshake before the tunnel exists (_async/http_proxy.py,
+# _async/socks_proxy.py); PoolTimeout from waiting for a pooled connection
+# (_synchronization.py). Read and write failures stay unknown.
+UNSENT_FAILURES = {
+    "connect_refused": httpx.ConnectError,
+    "connect_timeout": httpx.ConnectTimeout,
+    "proxy_refused": httpx.ProxyError,
+    "pool_timeout": httpx.PoolTimeout,
+}
+
+
+def unsent_classification(exc):
+    """The journal classification of a provably unsent failure, else None."""
+    for classification, kind in UNSENT_FAILURES.items():
+        if isinstance(exc, kind):
+            return classification
+    return None
 
 
 class PaidOutcomeUnknown(RuntimeError):
@@ -353,9 +378,12 @@ def reconcile_blocked_run(store, run_id):
                                 "response_saved",
                             ]
                         ),
-                        # A refused connection has no response file to check.
-                        storage.PaidRequest.error_classification.is_distinct_from(
-                            "connect_refused"
+                        # An unsent request has no response file to check.
+                        or_(
+                            storage.PaidRequest.error_classification.is_(None),
+                            storage.PaidRequest.error_classification.notin_(
+                                tuple(UNSENT_FAILURES)
+                            ),
                         ),
                     )
                 )
@@ -591,11 +619,11 @@ class _Receipt:
                     self.owner.generation,
                 )
         if state != "prepared":
-            if state == "rejected" and classification == "connect_refused":
-                # Replays the original refusal so the caller takes the same
+            if state == "rejected" and classification in UNSENT_FAILURES:
+                # Replays the original failure so the caller takes the same
                 # path it took then; nothing was sent, then or now.
-                raise httpx.ConnectError(
-                    "connection refused before any byte was sent (journaled)",
+                raise UNSENT_FAILURES[classification](
+                    f"{classification} before any byte was sent (journaled)",
                     request=self.request,
                 )
             if state in ("response_saved", "rejected"):
@@ -603,20 +631,19 @@ class _Receipt:
             self.unknown("paid_outcome_unknown")
         return None
 
-    def refused(self):
-        """The connection was refused before a request byte left this machine.
+    def refused(self, classification):
+        """The request failed before a byte of it left this machine.
 
-        httpx raises ConnectError only while opening the connection, before the
-        request is written, so nothing reached the provider and no money moved.
-        Filed rejected, not unknown, so it never parks the run (EN-H2, narrow
-        half). Timeouts and dropped reads stay unknown.
+        Filed rejected, not unknown, so it never parks the run (EN-H2). Only
+        the UNSENT_FAILURES classes come here; a read or write timeout, a
+        dropped connection or a protocol error stays unknown.
         """
         with self.owner.transaction() as session:
             row = session.get(storage.PaidRequest, self.key)
             self._verify_row(row)
             if row.state == "dispatched":
                 row.state = "rejected"
-                row.error_classification = "connect_refused"
+                row.error_classification = classification
 
     def unknown(self, reason, cause=None):
         unknown = PaidOutcomeUnknown(self.key, reason)
@@ -802,8 +829,9 @@ class PaidAsyncTransport(httpx.AsyncBaseTransport):
         except BaseException as exc:
             if receipt.acknowledged:
                 raise
-            if response is None and isinstance(exc, httpx.ConnectError):
-                receipt.refused()
+            unsent = None if response is not None else unsent_classification(exc)
+            if unsent is not None:
+                receipt.refused(unsent)
                 raise
             try:
                 receipt.unknown(
@@ -868,8 +896,9 @@ class PaidSyncTransport(httpx.BaseTransport):
         except BaseException as exc:
             if receipt.acknowledged:
                 raise
-            if response is None and isinstance(exc, httpx.ConnectError):
-                receipt.refused()
+            unsent = None if response is not None else unsent_classification(exc)
+            if unsent is not None:
+                receipt.refused(unsent)
                 raise
             try:
                 receipt.unknown("transport_or_receipt_failure", cause=exc)

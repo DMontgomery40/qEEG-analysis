@@ -165,6 +165,36 @@ async def test_each_output_boundary_replays_once(ready, monkeypatch, boundary):
 
 
 @pytest.mark.asyncio
+async def test_a_write_up_send_that_never_left_is_retried_not_blocked(ready):
+    """EN-H2 on the write-up: a connect timeout reaches no provider. The
+    write-up stays open, the next pass sends once more, and the finished
+    document verifies with the unsent row in its receipt."""
+    owner = admit(ready)
+    sent = []
+    try:
+        # The proxy is down for the whole pass: three tries, all unsent.
+        with pytest.raises(writer.UpstreamError):
+            await post.continue_patient_facing(
+                owner, llm_client=llm(sent, response=httpx.ConnectTimeout("timed out"))
+            )
+    finally:
+        owner.close()
+    assert len(sent) == 1 + post._UNSENT_RESENDS
+    assert _post_row(ready[1])[0] != "blocked"
+    # The next pass replays those three and sends once more, which lands.
+    owner = ready[0].claim_run_owner(ready[1])
+    try:
+        result = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 2 + post._UNSENT_RESENDS
+    states = [state for _, (state, _, _) in sorted(_paid_rows(ready[1]).items())]
+    assert states == ["rejected"] * (1 + post._UNSENT_RESENDS) + ["response_saved"]
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+
+
+@pytest.mark.asyncio
 async def test_pdf_failure_new_run_settings_catalogue_cannot_change_original(
     ready, monkeypatch
 ):

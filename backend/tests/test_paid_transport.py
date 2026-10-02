@@ -1346,19 +1346,36 @@ async def test_acknowledged_server_failure_retry_budget_survives_reconstruction(
     assert [(r.dispatch_ordinal, r.state) for r in rows(owner)] == [(n, "rejected") for n in range(5)]
 
 
+UNSENT = [
+    ("connect_refused", lambda: httpx.ConnectError("[Errno 61] Connection refused")),
+    (
+        "connect_refused",  # a failed DNS lookup is an OSError while connecting
+        lambda: httpx.ConnectError("[Errno 8] nodename nor servname provided"),
+    ),
+    ("connect_timeout", lambda: httpx.ConnectTimeout("timed out")),
+    ("proxy_refused", lambda: httpx.ProxyError("407 Proxy Authentication Required")),
+    ("pool_timeout", lambda: httpx.PoolTimeout("no pooled connection in time")),
+]
+
+
 @pytest.mark.asyncio
-async def test_refused_connection_is_provably_unsent_and_never_parks_the_run(owner):
-    """EN-H2 narrow half: nine live rows sit `unknown / transport_or_receipt_failure`
-    and park their runs for good. A connection refused before any byte left is
-    filed rejected / connect_refused, replays as the same refusal, and leaves the
-    run free to continue. The next ordinal is an ordinary new send."""
+@pytest.mark.parametrize("classification,failure", UNSENT, ids=lambda v: getattr(v, "__name__", v))
+async def test_a_provably_unsent_request_is_rejected_and_never_parks_the_run(
+    owner, classification, failure
+):
+    """EN-H2: nine live rows sat `unknown / transport_or_receipt_failure` and
+    parked their runs for good. A request that failed before any byte left
+    (refused, DNS, connect timeout, proxy handshake, pool wait) is filed
+    rejected, replays as the same failure, and leaves the run free to
+    continue. The next ordinal is an ordinary new send."""
     p = paid()
     calls = []
+    kind = type(failure())
 
     def send(request):
         calls.append(1)
         if len(calls) == 1:
-            raise httpx.ConnectError("Connection refused")
+            raise failure()
         return httpx.Response(200, json={"ok": True})
 
     async with httpx.AsyncClient(
@@ -1366,7 +1383,7 @@ async def test_refused_connection_is_provably_unsent_and_never_parks_the_run(own
     ) as client:
         for _ in range(2):  # first pass live, second pass a replay of the cycle
             with scope(owner) as cursor:
-                with pytest.raises(httpx.ConnectError):
+                with pytest.raises(kind):
                     await client.post("http://test/v1/responses", content=b"original")
                 response = await client.post("http://test/v1/responses", content=b"original")
                 assert response.json() == {"ok": True}
@@ -1374,8 +1391,56 @@ async def test_refused_connection_is_provably_unsent_and_never_parks_the_run(own
         p.raise_if_paid_blocked(owner)
     assert len(calls) == 2
     first, second = rows(owner)
-    assert (first.state, first.error_classification) == ("rejected", "connect_refused")
+    assert (first.state, first.error_classification) == ("rejected", classification)
     assert second.state == "response_saved"
+
+
+@pytest.mark.parametrize("classification,failure", UNSENT[2:], ids=lambda v: getattr(v, "__name__", v))
+def test_the_synchronous_transport_files_unsent_requests_the_same_way(
+    owner, classification, failure
+):
+    p = paid()
+    calls = []
+
+    def send(request):
+        calls.append(1)
+        raise failure()
+
+    with httpx.Client(transport=p.PaidSyncTransport(httpx.MockTransport(send))) as client:
+        with scope(owner) as cursor:
+            with pytest.raises(type(failure())):
+                client.post("http://test/v1/responses", content=b"original")
+            cursor.raise_if_blocked()
+    p.raise_if_paid_blocked(owner)
+    (row,) = rows(owner)
+    assert (row.state, row.error_classification) == ("rejected", classification)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.WriteTimeout("write timed out"),
+        httpx.WriteError("broken pipe"),
+        httpx.ReadError("connection reset"),
+        httpx.RemoteProtocolError("server disconnected without a response"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+async def test_a_failure_after_bytes_may_have_left_stays_unknown(owner, failure):
+    p = paid()
+
+    def send(request):
+        raise failure
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+        with scope(owner):
+            with pytest.raises(p.PaidOutcomeUnknown):
+                await client.post("http://test/v1/responses", content=b"original")
+    (row,) = rows(owner)
+    assert (row.state, row.error_classification) == ("unknown", "transport_or_receipt_failure")
 
 
 async def test_a_call_filed_unknown_records_what_the_error_was(owner):

@@ -15,17 +15,19 @@ from importlib.metadata import version
 from pathlib import Path
 from types import MappingProxyType
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 
 from . import config, storage, patient_facing_pdf
 from .council.execution import _hash, _json, _publish, _execution_client, drain_task
 from .execution_settings import settings
 from .logging_utils import get_logger
 from .paid_transport import (
+    UNSENT_FAILURES,
     PaidOutcomeUnknown,
     manifest_attempt,
     patient_facing_scope,
     post_paid_scope,
+    unsent_classification,
 )
 from .run_execution import ExecutionConflict, ExecutionStore, UNSETTLED_PAID_STATES
 from .portal_files import normalize_portal_patient_id
@@ -580,6 +582,9 @@ def _verify_manifest(owner, data):
     return current_label
 
 
+# New sends one write-up pass may make after a send that never left.
+_UNSENT_RESENDS = 2
+
 _OUTPUT_EXTENSIONS = (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json"))
 
 
@@ -801,22 +806,46 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                     for s in data["sources"]
                 ],
             }
-            outputs = await writer.generate_writeup(
-                client,
-                model_id=cfg["model_id"],
-                prompt=data["prompt"],
-                temperature=data["temperature"],
-                max_tokens=data["max_tokens"],
-                label=data["patient_label"],
-                meta=meta,
-                **{
-                    kind + "_path": Path(data["destinations"][kind])
-                    for kind in ("md", "pdf", "meta")
-                },
-                publisher=lambda md, meta: _owned_free_work(
-                    owner, _publish_outputs, owner, base, data, md, meta
-                ),
-            )
+            # A send that never left this machine is asked again in the same
+            # pass, at the next ordinal (EN-H2). The journal replays earlier
+            # unsent rows as the same failures, so each pass allows that many
+            # plus _UNSENT_RESENDS new tries.
+            with owner.transaction() as session:
+                tries = _UNSENT_RESENDS + session.scalar(
+                    select(func.count())
+                    .select_from(storage.PaidRequest)
+                    .where(
+                        storage.PaidRequest.run_id == owner.run_id,
+                        storage.PaidRequest.scope_key == scope_key,
+                        storage.PaidRequest.state == "rejected",
+                        storage.PaidRequest.error_classification.in_(
+                            tuple(UNSENT_FAILURES)
+                        ),
+                    )
+                )
+            while True:
+                try:
+                    outputs = await writer.generate_writeup(
+                        client,
+                        model_id=cfg["model_id"],
+                        prompt=data["prompt"],
+                        temperature=data["temperature"],
+                        max_tokens=data["max_tokens"],
+                        label=data["patient_label"],
+                        meta=meta,
+                        **{
+                            kind + "_path": Path(data["destinations"][kind])
+                            for kind in ("md", "pdf", "meta")
+                        },
+                        publisher=lambda md, meta: _owned_free_work(
+                            owner, _publish_outputs, owner, base, data, md, meta
+                        ),
+                    )
+                    break
+                except writer.UpstreamError as error:
+                    if not tries or unsent_classification(error.__cause__) is None:
+                        raise
+                    tries -= 1
             scope.raise_if_blocked()
         _verify_outputs(outputs)
         sync_path = base / "sync.json"
@@ -865,6 +894,8 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
             receipt_hash=_hash(_json(receipt)),
         )
     except writer.UpstreamError as error:
+        # A provider answer is final for this attempt; a request that never
+        # left this machine is a retry (EN-H2).
         with owner.transaction() as session:
             acknowledged = session.scalar(
                 select(storage.PaidRequest)
@@ -872,6 +903,12 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                     storage.PaidRequest.run_id == owner.run_id,
                     storage.PaidRequest.scope_key == scope_key,
                     storage.PaidRequest.state.in_(["response_saved", "rejected"]),
+                    or_(
+                        storage.PaidRequest.error_classification.is_(None),
+                        storage.PaidRequest.error_classification.notin_(
+                            tuple(UNSENT_FAILURES)
+                        ),
+                    ),
                 )
                 .limit(1)
             )
@@ -990,12 +1027,19 @@ def _paid_bindings(store, run_id, scope_key):
             )
         )
         bindings = [{key: getattr(row, key) for key in fields} for row in rows]
+        # Read beside the bindings, never into them: done receipts already
+        # bind exactly these fields.
+        unsent = [
+            row.state == "rejected" and row.error_classification in UNSENT_FAILURES
+            for row in rows
+        ]
     if not bindings:
         raise ExecutionConflict("original generation receipt missing")
-    for binding in bindings:
+    for binding, never_sent in zip(bindings, unsent):
         if binding["state"] not in ("response_saved", "rejected"):
             raise ExecutionConflict("original generation is unresolved")
-        for kind in ("request", "response"):
+        # A request that never left this machine has no response file.
+        for kind in ("request",) if never_sent else ("request", "response"):
             try:
                 raw = Path(binding[kind + "_path"]).read_bytes()
             except (OSError, TypeError) as error:
