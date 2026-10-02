@@ -333,8 +333,10 @@ def _summary_page_facts(
             rest = re.sub(r"^\s*\([^)\n]*\)", "", rest)
             # Allow up to two short OCR fragments before the first clean cell: the
             # low-yield marker is often read as "fl", "f=" or "m", and 1.1 as "i.1".
+            # The comparator is its own branch so "\s+" alone owns the blank run;
+            # "\s+" then an optional "\s*" made a long run quadratic.
             if re.match(
-                r"(?:\s+(?![:(])\S{1,3}){0,2}\s+(?:m?N/?A\b|[<>≤≥]?\s*-?\d)",
+                r"(?:\s+(?![:(])\S{1,3}){0,2}\s+(?:m?N/?A\b|[<>≤≥]\s*-?\d|-?\d)",
                 rest,
                 re.I,
             ):

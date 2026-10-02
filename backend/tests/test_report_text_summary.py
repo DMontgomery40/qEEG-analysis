@@ -296,6 +296,24 @@ def test_ocr_low_yield_marker_fragment_does_not_hide_the_row():
     assert _metric_values(facts, "audio_p300_delay") == {1: [(284, None)]}
 
 
+def test_a_long_blank_run_after_a_label_is_read_in_linear_time():
+    # The row check let "\s+" and "\s*" split one blank run every possible
+    # way, so a label followed by W spaces and no value cost O(W^2): 16k
+    # spaces took 1.3 s and 50k about 12 s, per label.
+    import time
+
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = "=== PAGE 1 / 1 ===\nPhysical Reaction Time" + " " * 50_000 + "x\n"
+    started = time.perf_counter()
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2])
+    assert time.perf_counter() - started < 1.0
+    assert _metric_values(facts, "physical_reaction_time") == {}
+    padded = "=== PAGE 1 / 1 ===\nPhysical Reaction Time" + " " * 50_000 + "282 ms 252-362 ms\n"
+    facts = _facts_from_report_text_summary(padded, expected_sessions=[1])
+    assert _metric_values(facts, "physical_reaction_time") == {1: [(282, None)]}
+
+
 def test_ocr_garbled_first_cell_keeps_the_rest_of_the_row():
     from backend.council.report_text import _facts_from_report_text_summary
 
