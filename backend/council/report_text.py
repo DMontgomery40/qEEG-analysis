@@ -450,14 +450,17 @@ def _summary_page_facts(
             continue
         value_part = tail_after(line, label)
         target = None
+        # A number starts only where a digit run starts, and the unit owns its
+        # trailing blanks: either gap let a long run of digits or spaces cost
+        # O(n^2). Matches, spans and groups are unchanged.
         reference = re.search(
-            r"(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)"
-            r"\s*(?:ms|[uµμ]V)?\s*$", value_part, re.I,
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)"
+            r"\s*(?:(?:ms|[uµμ]V)\s*)?$", value_part, re.I,
         )
         if reference:
             target = f"{reference.group(1)}-{reference.group(2)} {unit}"
             value_part = value_part[:reference.start()]
-        cells = re.findall(r"(?i)(?:[m■]?N/?A|\d+(?:\.\d+)?)\b", value_part)
+        cells = re.findall(r"(?i)(?:[m■]?N/?A|(?<!\d)\d+(?:\.\d+)?)\b", value_part)
         for sess, token in zip(expected_sessions, cells):
             missing = re.fullmatch(r"[m■]?N/?A", token, re.I) is not None
             value = None if missing else convert(token)

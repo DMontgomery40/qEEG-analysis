@@ -314,6 +314,23 @@ def test_a_long_blank_run_after_a_label_is_read_in_linear_time():
     assert _metric_values(facts, "physical_reaction_time") == {1: [(282, None)]}
 
 
+def test_a_long_digit_run_in_a_p300_row_is_read_in_linear_time():
+    # The reference-range search and the cell scan could start inside a digit
+    # run at every position, so a P300 row with a long run of digits cost
+    # O(n^2): 16k digits took about 5.5 s across the two patterns.
+    import time
+
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 1 ===\nAudio P300 Delay 300 ms " + "1" * 20_000 + "a\n"
+    )
+    started = time.perf_counter()
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1])
+    assert time.perf_counter() - started < 1.0
+    assert _metric_values(facts, "audio_p300_delay") == {1: [(300, None)]}
+
+
 def test_ocr_garbled_first_cell_keeps_the_rest_of_the_row():
     from backend.council.report_text import _facts_from_report_text_summary
 
