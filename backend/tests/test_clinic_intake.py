@@ -896,6 +896,56 @@ def test_hub_upload_is_answered_before_slow_filing(temp_data_dir, monkeypatch):
     assert submit("chat-inline", principal="workbench")["upload"]["status"] == "registered"
 
 
+def test_hub_filing_runs_two_at_a_time_and_still_answers_at_once(temp_data_dir, monkeypatch):
+    # Each hub upload started its own filing thread, so N uploads extracted and
+    # OCR'd N reports at once with nothing bounding it. Filing now waits its
+    # turn behind a fixed pair of workers; the hub still hears "pending" at once.
+    import threading
+    import time
+
+    module = intake()
+    gate = threading.Event()
+    guard = threading.Lock()
+    running, peak = [0], [0]
+    real = module._file_item
+
+    def slow(item_id, patient_uuid):
+        with guard:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        try:
+            assert gate.wait(20)
+            return real(item_id, patient_uuid)
+        finally:
+            with guard:
+                running[0] -= 1
+
+    monkeypatch.setattr(module, "_file_item", slow)
+    uploads = []
+    try:
+        for n in range(4):
+            upload = submit(
+                f"hub-many-{n}",
+                principal="thrylen-service",
+                acknowledge_first=True,
+                files=[(f"visit-{n}.txt", f"visit {n}".encode(), "text/plain")],
+                file_meta=[{}],
+            )["upload"]
+            assert upload["status"] == "pending"
+            uploads.append(upload["uploadId"])
+        deadline = time.monotonic() + 5
+        while peak[0] < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)  # room for any extra filing to start
+        assert peak[0] == 2, peak[0]
+    finally:
+        gate.set()  # never leave the shared workers parked for later tests
+    for upload_id in uploads:
+        with module._filing_lock(upload_id):
+            pass
+        assert module.get_upload(upload_id)["upload"]["status"] == "registered"
+
+
 def test_one_damaged_upload_row_does_not_hide_the_others(temp_data_dir):
     from backend.clinic_records import ClinicUpload
 

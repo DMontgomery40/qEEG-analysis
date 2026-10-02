@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 from pathlib import Path
 import re
 import tempfile
@@ -769,15 +770,18 @@ def _file_items(upload_id, patient_uuid):
             _bump(s, patient_uuid)
 
 
-def _file_later(upload_id, patient_uuid):
-    """File after the answer has gone. Netlify ends a synchronous function at
-    60 s and filing takes about 23 s per report (09-29), so a hub request that
-    filed three reports inline read as a failure while the engine finished."""
-    lock = _filing_lock(upload_id)
-    if not lock.acquire(blocking=False):
-        return
+# Filing extracts and OCRs every page, so at most this many run at once; more
+# hub uploads wait their turn in the queue and read "pending" meanwhile. The
+# workers are daemons like the per-upload threads they replace, so a restart
+# never waits on the queue: unfiled uploads are filed again on replay.
+_FILING_WORKERS = 2
+_FILING_QUEUE: queue.SimpleQueue = queue.SimpleQueue()
+_FILING_THREADS: list[threading.Thread] = []
 
-    def run():
+
+def _filing_worker():
+    while True:
+        upload_id, patient_uuid, lock = _FILING_QUEUE.get()
         try:
             _file_items(upload_id, patient_uuid)
         except Exception:
@@ -787,8 +791,26 @@ def _file_later(upload_id, patient_uuid):
         finally:
             lock.release()
 
+
+def _file_later(upload_id, patient_uuid):
+    """File after the answer has gone. Netlify ends a synchronous function at
+    60 s and filing takes about 23 s per report (09-29), so a hub request that
+    filed three reports inline read as a failure while the engine finished.
+    The upload's lock is held from queueing until its filing ends, so a replay
+    while it waits is not queued twice."""
+    lock = _filing_lock(upload_id)
+    if not lock.acquire(blocking=False):
+        return
     try:
-        threading.Thread(target=run, name="clinic-filing", daemon=True).start()
+        with _FILING_GUARD:
+            _FILING_THREADS[:] = [t for t in _FILING_THREADS if t.is_alive()]
+            while len(_FILING_THREADS) < _FILING_WORKERS:
+                worker = threading.Thread(
+                    target=_filing_worker, name="clinic-filing", daemon=True
+                )
+                worker.start()
+                _FILING_THREADS.append(worker)
+        _FILING_QUEUE.put((upload_id, patient_uuid, lock))
     except BaseException:
         lock.release()
         raise
