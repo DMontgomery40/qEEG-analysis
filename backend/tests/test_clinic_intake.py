@@ -670,7 +670,7 @@ def test_blocked_admission_backs_off_and_names_the_reason(temp_data_dir):
         asyncio.run(intents.activate_confirmed_uploads(Runtime()))
     assert calls == ["admit_confirmed_upload"] * 2, "one immediate retry, then the backoff holds"
     assert intents._ADMISSION_BACKOFF[result["uploadId"]]["attempts"] == 2
-    assert intents.admission_block(result["uploadId"]).startswith("CatalogueUnavailable")
+    assert intents.admission_block(result["uploadId"]) == "Original confirmed models are unavailable"
     def record():
         payload = intake().get_upload(result["uploadId"])
         return (payload.get("upload") or payload)["analysis"]
@@ -712,3 +712,27 @@ def test_policy_offers_only_models_the_engine_has(temp_data_dir, monkeypatch):
     assert counts() == (0, 0, 0, 0, 0), "nothing is filed on a policy the engine cannot run"
     monkeypatch.setattr(config, "DISCOVERED_MODEL_IDS", set())
     assert policy.public_current_policy()["policy"]["analysis"]["councilModelIds"] == council
+
+
+def test_two_matching_charts_park_the_upload_with_both_candidates(temp_data_dir):
+    # Before 2026-10-02 this was a 400 the hub could not answer; the clinic is
+    # asked one plain question with both charts offered, like a name mismatch.
+    with storage.session_scope() as s:
+        storage.create_patient(
+            s, label="AB_02-02-1900", first_initial="A", last_initial="B", birthdate="02-02-1900"
+        )
+        storage.create_patient(
+            s, label="AB_02-02-1900_2", first_initial="A", last_initial="B", birthdate="02-02-1900",
+            first_name="Ada", last_name="Baker",
+        )
+    parked = submit("two-fit")["upload"]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["conflict"] == "identity_ambiguous"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["AB_02-02-1900", "AB_02-02-1900_2"]
+    assert counts()[0] == 2, "no third chart was made"
+    resolved = intake().resolve_upload(
+        "two-fit", key="two-fit-answer", resolution={"attachTo": "AB_02-02-1900_2"}
+    )["upload"]
+    assert resolved["patientId"] == "AB_02-02-1900_2"
+    assert resolved["status"] == "registered"
+    assert counts()[0] == 2

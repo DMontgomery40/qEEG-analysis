@@ -1884,3 +1884,20 @@ def test_export_council_artifacts_action_falls_back_to_export_ready_run(
     assert "No export-ready complete run" in requested_response.text
     assert Path(payload["final_md"]).exists()
     assert Path(payload["final_pdf"]).exists()
+
+
+def test_a_blocked_run_reads_blocked_not_running_or_stale():
+    from types import SimpleNamespace
+    from datetime import datetime, timedelta, timezone
+    from backend.orchestration import derive_run_liveness
+
+    long_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    run = SimpleNamespace(
+        status="running", execution_state="blocked",
+        blocked_reason="incompatible execution recipe or SDK",
+        started_at=long_ago, created_at=long_ago, completed_at=None, id="run-blocked",
+    )
+    view = derive_run_liveness(run, progress={}, artifacts=[])
+    assert view["display_status"] == "blocked"
+    assert view["display_label"].startswith("Blocked - incompatible execution recipe")
+    assert view["blocks_duplicate_work"] is False

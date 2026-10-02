@@ -274,7 +274,7 @@ def _note_admission_failure(upload_id, error, now) -> float:
     _ADMISSION_BACKOFF[upload_id] = {
         "attempts": attempts,
         "next_attempt": now + delay,
-        "reason": f"{type(error).__name__}: {error}"[:200],
+        "reason": str(error)[:200] or type(error).__name__,
     }
     return delay
 
@@ -341,7 +341,8 @@ async def activate_confirmed_uploads(runtime):
             main.LOGGER.warning(
                 "confirmed_upload_admission_blocked",
                 upload_id=upload_id,
-                reason=f"{type(error).__name__}: {error}"[:200],
+                reason=str(error)[:200],
+                error_type=type(error).__name__,
                 retry_in_s=delay,
                 attempts=_ADMISSION_BACKOFF[upload_id]["attempts"],
             )

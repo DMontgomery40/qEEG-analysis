@@ -58,7 +58,11 @@ def _error(error):
     elif isinstance(error, catalogue.CatalogueConflict):
         code, message = 409, str(error)
     elif isinstance(error, AnalysisPolicyUnavailable):
-        code, message = 503, str(error)
+        # 409, not 503: the hub's Netlify transport replaces every 5xx with its
+        # own "Patient records are unavailable" text, which would tell the
+        # clinic the records are down when only analysis is. A 4xx message
+        # passes through unchanged (thrylen _shared/clinic-api.js).
+        code, message = 409, str(error)
     elif isinstance(error, (catalogue.CatalogueUnavailable, SQLAlchemyError, OSError)):
         code, message = 503, "Clinic authority or exact file bytes are unavailable"
     else:

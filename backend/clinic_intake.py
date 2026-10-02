@@ -29,6 +29,7 @@ from .clinic_records import (
     ClinicLegacyUpload,
 )
 from .patient_intake import (
+    IdentityMatchesAmbiguous,
     IdentityInput,
     find_patient_by_identity,
     identity_key,
@@ -499,6 +500,28 @@ def _bind_patient(upload_id):
         except IdentityNameConflict as error:
             u.status = "needs_operator_answer"
             u.conflict_json = _json(error.payload)
+            _bump(s)
+            return None
+        except IdentityMatchesAmbiguous as error:
+            # Two charts fit this name and birthday. That is a question for the
+            # clinic, asked the same way a name mismatch is, with both charts
+            # offered; before 2026-10-02 it was a 400 the hub could not answer.
+            from .patient_intake import stored_full_name
+
+            u.status = "needs_operator_answer"
+            u.conflict_json = _json(
+                dict(
+                    conflict="identity_ambiguous",
+                    incoming_name=" ".join(
+                        filter(None, [identity.first_name, identity.last_name])
+                    ),
+                    candidates=[
+                        dict(patient_id=p.label, name=stored_full_name(p))
+                        for p in error.candidates
+                    ],
+                    detail=str(error),
+                )
+            )
             _bump(s)
             return None
         if patient:

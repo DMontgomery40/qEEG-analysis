@@ -1233,10 +1233,10 @@ async def _startup() -> None:
     if not app.state.mock_mode:
         try:
             interval_s = float(
-                os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0"
+                os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(10 * 60)) or "0"
             )
         except Exception:
-            interval_s = 7 * 24 * 60 * 60
+            interval_s = 10 * 60
         if interval_s < 0:
             interval_s = 0
         app.state.model_refresh_task = loop.create_task(

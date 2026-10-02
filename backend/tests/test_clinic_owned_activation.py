@@ -245,3 +245,17 @@ async def test_consumer_retries_admission_and_missing_start_separately(
 
     runtime.admission = forbidden
     await intents.activate_confirmed_uploads(runtime)
+
+
+def test_pending_retries_end_in_a_blocked_run_with_a_plain_reason(monkeypatch):
+    # 2026-10-02: one run was claimed 30,561 times over three days.
+    from backend import run_runtime
+
+    monkeypatch.setattr(run_runtime, "PENDING_RETRY_LIMIT", 3)
+    monkeypatch.setattr(run_runtime, "GENERATION_BACKSTOP", 500)
+    assert run_runtime._capped_disposition("pending", "All models failed during Stage 1", 1, 5) == (
+        "pending", "All models failed during Stage 1")
+    assert run_runtime._capped_disposition("pending", "All models failed during Stage 1", 3, 7) == (
+        "blocked", "gave up after 3 failed attempts: All models failed during Stage 1")
+    assert run_runtime._capped_disposition("blocked", "paid_outcome_unknown", 9, 9) == ("blocked", "paid_outcome_unknown")
+    assert run_runtime._capped_disposition("pending", "x", 1, 500)[0] == "blocked", "the generation backstop survives restarts"

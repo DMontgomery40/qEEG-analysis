@@ -669,7 +669,16 @@ def derive_run_liveness(
         artifacts=artifacts,
     )
 
-    if is_stale:
+    blocked_reason = str(getattr(run, "blocked_reason", "") or "").strip()
+    if getattr(run, "execution_state", None) == "blocked" and raw_status != "complete":
+        # A parked run is parked, not running and not stale. 12 of 13 blocked
+        # rows read "running" / "Stale" until 2026-10-02.
+        display_status = "blocked"
+        display_label = "Blocked - " + (blocked_reason[:100] if blocked_reason else "needs a check")
+        reason = blocked_reason or "Run is parked and nothing will continue it without an operator."
+        is_stale = False
+        blocks_duplicate_work = False
+    elif is_stale:
         display_status = "stale"
         display_label = f"Stale - last update {_format_age_label(age_seconds)} ago"
         reason = "Run is still marked active in SQLite but has not emitted progress within the stale threshold."

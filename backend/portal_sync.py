@@ -7,6 +7,8 @@ import json
 import os
 import shutil
 import subprocess
+
+from .clinic_execution_cutover import shared_execution_enabled
 import sys
 import tempfile
 import time
@@ -743,7 +745,11 @@ async def watch_portal_patients_forever() -> None:
                             missing_reports=missing_complete,
                             active_reports=active_runs,
                         )
-                        if spawn_portal_pipeline(patient_id):
+                        # Under shared execution nothing is spawned here (the
+                        # clinic pipeline owns runs), so the fingerprint is
+                        # recorded as seen; before 2026-10-02 this logged again
+                        # every 5 s per patient, about 100 MB per 4 h.
+                        if spawn_portal_pipeline(patient_id) or shared_execution_enabled():
                             last_pipeline_snapshots[patient_id] = fingerprint
                             pipeline_state_dirty = True
                     elif not active_runs:

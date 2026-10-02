@@ -517,7 +517,17 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                 .limit(1)
             )
         if prior is None or prior.state in ("prepared", "rejected"):
-            if cfg["model_id"] not in await client.list_models():
+            try:
+                available = await client.list_models()
+            except Exception as error:
+                # The proxy blinked. That is a retry in a few seconds, not a
+                # blocked patient document (2026-10-02 engine map, H6).
+                from .run_runtime import ModelUnavailable
+
+                raise ModelUnavailable(
+                    "patient model catalogue unavailable; retrying"
+                ) from error
+            if cfg["model_id"] not in available:
                 raise ExecutionConflict("pinned patient model unavailable")
         with post_paid_scope(
             owner,

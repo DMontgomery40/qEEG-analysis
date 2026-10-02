@@ -7,6 +7,7 @@ through cleanup; stop drains work naturally, including SDK worker threads.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -199,6 +200,25 @@ async def continue_owned_run(owner, *, llm, workflow, publish=None, sync=None):
             return "done", None
 
 
+# A run that keeps failing non-clinically (a stage with no survivor, a unit
+# timeout, a local error) went back to "pending" every 5 s with no end: one
+# run was claimed 30,561 times over three days, the workbench had told the
+# clinic FAILED after the first, and the engine could have spent days later
+# with nobody watching (2026-10-02 engine map, H1). After this many
+# consecutive pending releases the run is blocked with a plain reason; an
+# operator resumes it on purpose. The generation backstop survives restarts.
+PENDING_RETRY_LIMIT = int(os.getenv("QEEG_RUN_PENDING_RETRY_LIMIT", "20"))
+GENERATION_BACKSTOP = int(os.getenv("QEEG_RUN_GENERATION_BACKSTOP", "500"))
+
+
+def _capped_disposition(state, reason, consecutive_failures, generation):
+    if state != "pending":
+        return state, reason
+    if consecutive_failures >= PENDING_RETRY_LIMIT or generation >= GENERATION_BACKSTOP:
+        return "blocked", f"gave up after {max(consecutive_failures, 1)} failed attempts: {reason}"
+    return state, reason
+
+
 def _failure_disposition(error):
     from .council.completion import is_clinical_failure
 
@@ -244,6 +264,7 @@ class RunRuntime:
         retry_delay=5.0,
         page_size=100,
     ):
+        self._pending_failures = {}
         if not 1 <= concurrency <= 16 or not 1 <= page_size <= 1000:
             raise ValueError("invalid consumer bounds")
         if not 0 < poll_interval <= 60 or not 0 < retry_delay <= 300:
@@ -344,9 +365,16 @@ class RunRuntime:
                 return
             try:
                 state, reason = await self.continuation(owner)
+                self._pending_failures.pop(run_id, None)
             except Exception as error:
                 LOGGER.exception("run_continuation_interrupted", run_id=run_id)
                 state, reason = _failure_disposition(error)
+                failures = self._pending_failures[run_id] = self._pending_failures.get(run_id, 0) + 1
+                state, reason = _capped_disposition(
+                    state, reason, failures, int(getattr(owner, "generation", 0) or 0)
+                )
+                if state == "blocked":
+                    self._pending_failures.pop(run_id, None)
             await asyncio.to_thread(
                 owner.release,
                 state=state,
