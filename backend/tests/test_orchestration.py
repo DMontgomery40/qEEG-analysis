@@ -713,7 +713,6 @@ def test_patient_facing_regeneration_uses_latest_delivery_ready_run(
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr(RunRuntime, "start", AsyncMock())
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     scheduled = {}
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:

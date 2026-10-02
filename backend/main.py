@@ -81,10 +81,7 @@ from .portal_export_manifest import (
 from .clinic_api import router as clinic_router
 from .clinic_internal_api import router as clinic_internal_router
 from .portal_files import normalize_portal_patient_id
-from .portal_sync import (
-    spawn_portal_sync,
-    watch_portal_patients_forever,
-)
+from .portal_sync import spawn_portal_sync
 from .reports import (
     extract_pdf_full,
     extract_text_from_pdf,
@@ -1073,7 +1070,6 @@ async def _startup() -> None:
     app.state.broker = _EventBroker()
     app.state.cliproxy_pid = None
     app.state.model_refresh_task = None
-    app.state.portal_raw_sync_task = None
 
     loop = asyncio.get_running_loop()
     if not app.state.mock_mode:
@@ -1098,7 +1094,6 @@ async def _startup() -> None:
         publish=app.state.broker.publish,
     )
     await app.state.run_runtime.start()
-    app.state.portal_raw_sync_task = loop.create_task(watch_portal_patients_forever())
     LOGGER.info(
         "backend_startup_complete",
         mock_mode=bool(app.state.mock_mode),
@@ -1113,8 +1108,6 @@ async def _shutdown() -> None:
         await runtime.stop()
     task = getattr(app.state, "model_refresh_task", None)
     await _cancel_task_if_possible(task)
-    raw_sync_task = getattr(app.state, "portal_raw_sync_task", None)
-    await _cancel_task_if_possible(raw_sync_task)
     llm: AsyncOpenAICompatClient | None = getattr(app.state, "llm", None)
     if llm is not None:
         await llm.aclose()

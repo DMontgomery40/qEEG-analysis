@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 
 def _test_app(temp_data_dir, monkeypatch):
     monkeypatch.setenv("QEEG_MOCK_LLM", "1")
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     from backend import main
 
     monkeypatch.setattr(

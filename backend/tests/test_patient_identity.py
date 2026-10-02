@@ -602,7 +602,6 @@ def test_init_db_is_idempotent_on_an_already_upgraded_database(tmp_path: Path):
 
 def _test_app(temp_data_dir, monkeypatch):
     monkeypatch.setenv("QEEG_MOCK_LLM", "1")
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     from backend import main
 
     monkeypatch.setattr(

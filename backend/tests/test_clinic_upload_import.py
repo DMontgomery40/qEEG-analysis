@@ -172,7 +172,6 @@ def test_resolving_an_unknown_upload_is_a_404(temp_data_dir, monkeypatch):
     from backend import main
 
     monkeypatch.setenv("QEEG_MOCK_LLM", "1")
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     monkeypatch.setattr(
         main, "_ensure_project_clipr_config", lambda: Path(temp_data_dir) / "c.conf"
     )

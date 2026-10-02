@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import fcntl
 import json
 import os
@@ -18,8 +17,7 @@ from typing import Any, Iterator
 from . import storage
 from . import config as cfg
 from .logging_utils import get_logger
-from .orchestration import derive_run_liveness, summarize_run_progress
-from .portal_files import is_source_report_pdf, normalize_portal_patient_id
+from .portal_files import normalize_portal_patient_id
 
 LOGGER = get_logger(__name__)
 
@@ -60,10 +58,6 @@ def portal_sync_repo() -> Path:
 
 def _sync_state_path(root_dir: Path) -> Path:
     return root_dir / ".qeeg_portal_sync_state.json"
-
-
-def _pipeline_watch_state_path(root_dir: Path) -> Path:
-    return root_dir / ".qeeg_portal_local_pipeline_state.json"
 
 
 def _sync_watch_state_path(root_dir: Path) -> Path:
@@ -473,257 +467,6 @@ def spawn_portal_sync(patient_label: str) -> bool:
 
     LOGGER.info("portal_sync_spawned", patient_label=patient_id)
     return True
-
-
-def _is_source_pdf(patient_id: str, path: Path) -> bool:
-    return is_source_report_pdf(patient_id, path)
-
-
-def _report_run_statuses_by_filename(patient_label: str) -> dict[str, set[str]]:
-    statuses_by_filename: dict[str, set[str]] = {}
-    with storage.session_scope() as session:
-        patients = storage.find_patients_by_label(session, patient_label)
-        for patient in patients:
-            for report in storage.list_reports(session, patient.id):
-                filename = (report.filename or "").strip()
-                if not filename:
-                    continue
-                statuses = statuses_by_filename.setdefault(filename, set())
-                runs = (
-                    session.query(storage.Run)
-                    .filter(storage.Run.report_id == report.id)
-                    .all()
-                )
-                for run in runs:
-                    liveness = derive_run_liveness(
-                        run, progress=summarize_run_progress(run)
-                    )
-                    status = (run.status or "").strip()
-                    if status in {"created", "running"} and not liveness["blocks_duplicate_work"]:
-                        continue
-                    if status:
-                        statuses.add(status)
-    return statuses_by_filename
-
-
-def _source_pdfs_missing_complete_runs(
-    patient_dir: Path, patient_id: str
-) -> tuple[list[str], list[str]]:
-    statuses_by_filename = _report_run_statuses_by_filename(patient_id)
-    missing_complete: list[str] = []
-    active_runs: list[str] = []
-
-    for path in sorted(patient_dir.glob("*.pdf")):
-        if not _is_source_pdf(patient_id, path):
-            continue
-        filename = path.name
-        statuses = statuses_by_filename.get(filename, set())
-        if {"created", "running"} & statuses:
-            active_runs.append(filename)
-            continue
-        if "complete" not in statuses:
-            missing_complete.append(filename)
-
-    return missing_complete, active_runs
-
-
-def _portal_patient_tree_fingerprint(patient_dir: Path) -> tuple[int, int, int]:
-    latest_mtime_ns = 0
-    file_count = 0
-    total_size = 0
-
-    try:
-        latest_mtime_ns = max(latest_mtime_ns, patient_dir.stat().st_mtime_ns)
-    except Exception:
-        return (0, 0, 0)
-
-    for path in patient_dir.rglob("*"):
-        try:
-            rel_parts = path.relative_to(patient_dir).parts
-        except Exception:
-            continue
-        if any(part.startswith(".") for part in rel_parts):
-            continue
-        if path.name == "_README.txt":
-            continue
-        try:
-            stat = path.stat()
-        except Exception:
-            continue
-        latest_mtime_ns = max(latest_mtime_ns, int(stat.st_mtime_ns or 0))
-        if path.is_file():
-            file_count += 1
-            total_size += int(stat.st_size or 0)
-
-    return (file_count, total_size, latest_mtime_ns)
-
-
-def _snapshot_portal_patient_fingerprints(
-    root_dir: Path,
-) -> dict[str, tuple[int, int, int]]:
-    snapshots: dict[str, tuple[int, int, int]] = {}
-    if not root_dir.exists():
-        return snapshots
-
-    for entry in root_dir.iterdir():
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        patient_id = _normalize_portal_patient_id(entry.name)
-        if patient_id is None:
-            continue
-        snapshots[patient_id] = _portal_patient_tree_fingerprint(entry)
-
-    return snapshots
-
-
-async def watch_portal_patients_forever() -> None:
-    if not _truthy_env("QEEG_PORTAL_RAW_SYNC_WATCHER", True):
-        return
-
-    local_pipeline_watcher = _truthy_env(
-        "QEEG_PORTAL_LOCAL_PIPELINE_WATCHER", True
-    )
-    netlify_sync_watcher = _truthy_env(
-        "QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", False
-    )
-
-    try:
-        poll_interval_s = float(os.getenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "5") or "5")
-    except Exception:
-        poll_interval_s = 5.0
-    if poll_interval_s <= 0:
-        poll_interval_s = 5.0
-
-    try:
-        stable_polls = int(os.getenv("QEEG_PORTAL_RAW_SYNC_STABLE_POLLS", "2") or "2")
-    except Exception:
-        stable_polls = 2
-    if stable_polls < 1:
-        stable_polls = 1
-
-    root_dir = portal_patients_dir()
-    pipeline_state_path = _pipeline_watch_state_path(root_dir)
-    sync_state_path = _sync_watch_state_path(root_dir)
-    LOGGER.info(
-        "portal_raw_sync_watcher_started",
-        root_dir=str(root_dir),
-        poll_interval_s=poll_interval_s,
-        stable_polls=stable_polls,
-        local_pipeline_watcher=local_pipeline_watcher,
-        netlify_sync_watcher=netlify_sync_watcher,
-    )
-
-    previous_snapshots: dict[str, tuple[int, int, int]] | None = None
-    stable_counts: dict[str, int] = {}
-    last_synced_snapshots: dict[str, tuple[int, int, int]] = _load_pipeline_watch_state(
-        sync_state_path
-    )
-    last_pipeline_snapshots: dict[str, tuple[int, int, int]] = (
-        _load_pipeline_watch_state(pipeline_state_path)
-        if local_pipeline_watcher
-        else {}
-    )
-    seed_sync_snapshots = not sync_state_path.exists()
-    seed_pipeline_snapshots = local_pipeline_watcher and not pipeline_state_path.exists()
-
-    try:
-        while True:
-            current_snapshots = await asyncio.to_thread(
-                _snapshot_portal_patient_fingerprints, root_dir
-            )
-            if sync_state_path.exists():
-                last_synced_snapshots = _load_pipeline_watch_state(
-                    sync_state_path
-                )
-
-            if previous_snapshots is None:
-                previous_snapshots = current_snapshots
-                stable_counts = {patient_id: 1 for patient_id in current_snapshots}
-                if seed_sync_snapshots:
-                    last_synced_snapshots = dict(current_snapshots)
-                    _write_pipeline_watch_state(
-                        sync_state_path, last_synced_snapshots
-                    )
-                    seed_sync_snapshots = False
-                if seed_pipeline_snapshots:
-                    last_pipeline_snapshots = dict(current_snapshots)
-                    _write_pipeline_watch_state(
-                        pipeline_state_path, last_pipeline_snapshots
-                    )
-                    seed_pipeline_snapshots = False
-                await asyncio.sleep(poll_interval_s)
-                continue
-
-            removed_patient_ids = set(previous_snapshots) - set(current_snapshots)
-            pipeline_state_dirty = False
-            sync_state_dirty = False
-            for patient_id in removed_patient_ids:
-                stable_counts.pop(patient_id, None)
-                if patient_id in last_synced_snapshots:
-                    last_synced_snapshots.pop(patient_id, None)
-                    sync_state_dirty = True
-                if patient_id in last_pipeline_snapshots:
-                    last_pipeline_snapshots.pop(patient_id, None)
-                    pipeline_state_dirty = True
-
-            for patient_id, fingerprint in current_snapshots.items():
-                if previous_snapshots.get(patient_id) == fingerprint:
-                    stable_counts[patient_id] = stable_counts.get(patient_id, 1) + 1
-                else:
-                    stable_counts[patient_id] = 1
-
-                if (
-                    netlify_sync_watcher
-                    and fingerprint != last_synced_snapshots.get(patient_id)
-                    and stable_counts[patient_id] >= stable_polls
-                ):
-                    LOGGER.info(
-                        "portal_raw_sync_change_detected",
-                        patient_label=patient_id,
-                        fingerprint=fingerprint,
-                    )
-                    if spawn_portal_sync(patient_id):
-                        last_synced_snapshots[patient_id] = fingerprint
-                        sync_state_dirty = True
-
-                if (
-                    local_pipeline_watcher
-                    and fingerprint != last_pipeline_snapshots.get(patient_id)
-                    and stable_counts[patient_id] >= stable_polls
-                ):
-                    patient_dir = root_dir / patient_id
-                    missing_complete, active_runs = _source_pdfs_missing_complete_runs(
-                        patient_dir, patient_id
-                    )
-                    if missing_complete:
-                        LOGGER.info(
-                            "portal_local_pipeline_change_detected",
-                            patient_label=patient_id,
-                            fingerprint=fingerprint,
-                            missing_reports=missing_complete,
-                            active_reports=active_runs,
-                        )
-                        # Nothing is spawned here (the clinic pipeline owns
-                        # runs), so the fingerprint is recorded as seen; before
-                        # 2026-10-02 this logged again every 5 s per patient,
-                        # about 100 MB per 4 h.
-                        last_pipeline_snapshots[patient_id] = fingerprint
-                        pipeline_state_dirty = True
-                    elif not active_runs:
-                        last_pipeline_snapshots[patient_id] = fingerprint
-                        pipeline_state_dirty = True
-
-            previous_snapshots = current_snapshots
-            if sync_state_dirty:
-                _write_pipeline_watch_state(sync_state_path, last_synced_snapshots)
-            if local_pipeline_watcher and pipeline_state_dirty:
-                _write_pipeline_watch_state(
-                    pipeline_state_path, last_pipeline_snapshots
-                )
-            await asyncio.sleep(poll_interval_s)
-    except asyncio.CancelledError:
-        LOGGER.info("portal_raw_sync_watcher_stopped", root_dir=str(root_dir))
-        raise
 
 
 def _main() -> int:

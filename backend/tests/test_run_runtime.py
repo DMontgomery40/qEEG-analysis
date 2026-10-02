@@ -742,7 +742,6 @@ async def test_startup_accepts_recovery_while_initial_catalogue_is_unavailable(
     monkeypatch.setattr(main, "AsyncOpenAICompatClient", lambda **kwargs: llm)
     monkeypatch.setattr(main, "_ensure_project_clipr_config", lambda: None)
     monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: None)
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     monkeypatch.setattr(main.app.state, "run_runtime", None, raising=False)
     try:
         await asyncio.wait_for(main._startup(), 0.5)
