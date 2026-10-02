@@ -571,6 +571,56 @@ async def test_runtime_post_only_recovers_free_work_without_council(
         assert session.query(storage.StageReceipt).count() == 0
 
 
+@pytest.mark.asyncio
+async def test_a_relabel_before_the_write_up_still_ends_the_run_done(
+    temp_data_dir, monkeypatch
+):
+    # 4765812 filed the write-up under the corrected id, but the projection
+    # compared it with the old id's pinned paths, so the runtime raised
+    # "completed patient outputs failed verification" and parked a finished
+    # run as blocked while its clinical status read complete.
+    from backend import patient_postprocessing as post
+    from backend.tests.test_patient_postprocessing import ready as ready_fixture, llm
+
+    store, run_id, cfg = ready_fixture.__wrapped__(temp_data_dir, monkeypatch)
+    post.admit_patient_facing(store, run_id, config_snapshot=cfg)
+    with Session(store.engine) as session:
+        run = session.get(storage.Run, run_id)
+        session.get(storage.Patient, run.patient_id).label = "ZA_01-01-1900"
+        session.commit()
+    monkeypatch.setattr(
+        post.writer,
+        "render_patient_facing_markdown_to_pdf",
+        lambda *args, **kwargs: args[1].write_bytes(b"%PDF synthetic original"),
+    )
+
+    class NoCouncil:
+        async def run_pipeline(self, *args, **kwargs):
+            raise AssertionError("post-only request entered council")
+
+    calls = []
+    client = llm(calls)
+    runtime = runtime_type()(
+        store,
+        llm=client,
+        workflow=NoCouncil(),
+        sync=lambda *args: True,
+        poll_interval=0.01,
+        retry_delay=0.02,
+    )
+    await runtime.start()
+    try:
+        await until(lambda: saved_run(store, run_id)[0] in ("done", "blocked"))
+    finally:
+        await runtime.stop()
+        await client.aclose()
+    assert saved_run(store, run_id) == ("done", "complete", None), saved_run(store, run_id)
+    result = post.project_patient_facing(store, run_id)
+    assert result["verified"], result
+    assert all("/ZA_01-01-1900/" in o["path"] for o in result["outputs"].values())
+    assert len(calls) == 1
+
+
 _THREAD_CONSUMER = r"""
 import asyncio,json,os,sys,time
 from pathlib import Path
