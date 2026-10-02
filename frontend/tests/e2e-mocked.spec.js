@@ -108,16 +108,10 @@ const MOCK_ORCHESTRATION = {
     task: 'Watching portal upload queue',
     updated_at: '2024-01-01T00:05:00Z',
   },
-  cathode: {
-    status: 'ready',
-    message: 'Stage 4 consolidation is ready for Cathode handoff',
-    prepared_at: '2024-01-01T00:03:00Z',
-  },
   actions: {
     refresh: { enabled: true },
     sync_portal: { enabled: true },
     regenerate_patient_facing: { enabled: true },
-    prepare_cathode_handoff: { enabled: true },
   },
 };
 
@@ -587,9 +581,7 @@ test.describe('Patient orchestration', () => {
     await expect(page.getByText('Portal sync')).toBeVisible();
     await expect(page.getByText('Patient-facing', { exact: true })).toBeVisible();
     await expect(page.getByText('Worker / pipeline')).toBeVisible();
-    await expect(page.getByText('Cathode', { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Sync portal' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Prepare Cathode handoff' })).toBeVisible();
   });
 
   test('runs patient actions against the orchestration endpoint', async ({ page }) => {

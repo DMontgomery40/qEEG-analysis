@@ -18,12 +18,6 @@ const ACTION_DEFINITIONS = [
     successMessage: 'Patient-facing regeneration requested.',
   },
   {
-    id: 'prepare_cathode_handoff',
-    label: 'Prepare Cathode handoff',
-    requestLabel: 'Cathode handoff preparation',
-    successMessage: 'Cathode handoff preparation requested.',
-  },
-  {
     id: 'export_council_artifacts',
     label: 'Export council artifacts',
     requestLabel: 'council export',
@@ -44,7 +38,6 @@ const SECTION_DEFINITIONS = [
     title: 'Worker / pipeline',
     aliases: ['worker', 'pipeline', 'pipeline_worker', 'job', 'pipeline_job', 'pipeline_state'],
   },
-  { id: 'cathode', title: 'Cathode', aliases: ['cathode', 'cathode_handoff', 'handoff'] },
 ];
 
 function isRecord(value) {
