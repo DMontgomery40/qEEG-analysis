@@ -177,7 +177,7 @@ def _manifest(owner, cfg, *, explicit=False):
         )
         destinations = {
             kind: str(Path(cfg["portal_dir"]) / patient.label / (stem + ext))
-            for kind, ext in (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json"))
+            for kind, ext in _OUTPUT_EXTENSIONS
         }
         if Path(stem).name != stem:
             raise PostAdmissionUnavailable(
@@ -342,12 +342,11 @@ def _verify_manifest(owner, data):
     with owner.transaction() as session:
         run = session.get(storage.Run, owner.run_id)
         patient = session.get(storage.Patient, data["patient_id"])
-        if (
-            run.patient_id != data["patient_id"]
-            or patient is None
-            or patient.label != data["patient_label"]
-        ):
+        # The patient is the UUID. A relabel since the manifest was pinned is
+        # the same patient under a corrected id, not a different one (EN-H7).
+        if run.patient_id != data["patient_id"] or patient is None:
             raise ExecutionConflict("original patient identity changed")
+        current_label = patient.label
         rows = {
             s["artifact_id"]: session.get(storage.Artifact, s["artifact_id"])
             for s in data["sources"]
@@ -371,6 +370,30 @@ def _verify_manifest(owner, data):
             raise ExecutionConflict("original source bytes changed")
     if _hash(_json(data["sources"])) != data["source_fingerprint"]:
         raise ExecutionConflict("original source fingerprint changed")
+    return current_label
+
+
+_OUTPUT_EXTENSIONS = (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json"))
+
+
+def _route_to_current_label(data, label):
+    """File the document under the patient's id as it is now.
+
+    A relabel between council completion and generation used to block the
+    document because the manifest pinned the old label (EN-H7). Identity
+    changes rename files and routing only: the pinned prompt is paid request
+    bytes and stays exactly as admitted.
+    """
+    if label == data["patient_label"]:
+        return data
+    if normalize_portal_patient_id(label) != label:
+        raise ExecutionConflict("current patient label is not a canonical clinic id")
+    stem = writer._output_stem(
+        patient_label=label, version=data["version"], date_str=data["date"]
+    )
+    folder = Path(data["config"]["portal_dir"]) / label
+    destinations = {kind: str(folder / (stem + ext)) for kind, ext in _OUTPUT_EXTENSIONS}
+    return {**data, "patient_label": label, "destinations": destinations}
 
 
 def _accepted_output(owner, root, kind, destination, produce):
@@ -485,7 +508,7 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
     setting_token = None
     try:
         data = _load(row.manifest_path, row.manifest_hash)
-        _verify_manifest(owner, data)
+        data = _route_to_current_label(data, _verify_manifest(owner, data))
         cfg = data["config"]
         client = _execution_client(llm_client)
         client._base_url, client._timeout_s = cfg["base_url"], cfg["timeout_s"]
@@ -522,7 +545,9 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
         ) as scope:
             meta = {
                 "patient_label": data["patient_label"],
-                "patient_id": data["patient_id"],
+                # The clinic id, as everywhere else; the engine's UUID never
+                # leaves the engine (EN-H15; nothing read it here).
+                "patient_id": data["patient_label"],
                 "run_id": owner.run_id,
                 "llm_model_id": cfg["model_id"],
                 "generated_at": data["generated_at"],
