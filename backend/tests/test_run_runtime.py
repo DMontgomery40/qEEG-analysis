@@ -1043,3 +1043,37 @@ async def test_a_run_whose_model_never_returns_is_blocked_after_the_wait_limit(
     )
     assert run.owner_token is None
     assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_failing_upload_activation_does_not_stop_the_scan(
+    temp_data_dir, monkeypatch
+):
+    # The confirmed-upload activation ran unguarded inside the scan, so one
+    # exception there (a backoff overflow, a locked database) ended the scan
+    # task and no run was claimed again until a restart.
+    from backend import clinic_analysis_intents, clinic_execution_cutover
+
+    store = ExecutionStore(storage.engine)
+    activations = []
+
+    async def activate(runtime):
+        activations.append(1)
+        raise OverflowError("int too large to convert to float")
+
+    monkeypatch.setattr(clinic_execution_cutover, "shared_execution_enabled", lambda: True)
+    monkeypatch.setattr(clinic_analysis_intents, "activate_confirmed_uploads", activate)
+    calls = []
+
+    async def continuation(owner):
+        calls.append(owner.run_id)
+        return "done", None
+
+    runtime = runtime_type()(store, continuation=continuation, poll_interval=0.01)
+    await runtime.start()
+    try:
+        add_run(store, "r")
+        await until(lambda: calls == ["r"])
+        await until(lambda: len(activations) > 2)
+    finally:
+        await runtime.stop()

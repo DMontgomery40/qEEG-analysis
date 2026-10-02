@@ -344,7 +344,9 @@ def _note_admission_failure(upload_id, error, now) -> float:
     elif attempts == 1:
         delay = 0.0
     else:
-        delay = min(_BACKOFF_FIRST_S * (2 ** (attempts - 2)), _BACKOFF_MAX_S)
+        # Cap the exponent, not just the product: 30.0 * 2 ** 1024 is an
+        # OverflowError, and the count survives restarts.
+        delay = min(_BACKOFF_FIRST_S * 2 ** min(attempts - 2, 16), _BACKOFF_MAX_S)
     _ADMISSION_BACKOFF[upload_id] = {
         "attempts": attempts,
         "next_attempt": now + delay,

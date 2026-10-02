@@ -367,7 +367,12 @@ class RunRuntime:
             if shared_execution_enabled():
                 from .clinic_analysis_intents import activate_confirmed_uploads
 
-                await activate_confirmed_uploads(self)
+                # One bad confirmed upload must not end the scan: unguarded,
+                # an exception here stopped every run until a restart.
+                try:
+                    await activate_confirmed_uploads(self)
+                except Exception:
+                    LOGGER.exception("confirmed_upload_activation_failed")
             now = asyncio.get_running_loop().time()
             self._retry_after = {
                 key: due for key, due in self._retry_after.items() if due > now

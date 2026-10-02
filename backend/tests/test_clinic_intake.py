@@ -673,6 +673,52 @@ def test_blocked_admission_backs_off_and_names_the_reason(temp_data_dir):
     assert record()["status"] == "ready", "a stage that succeeds clears the stored block"
 
 
+def test_a_long_blocked_upload_keeps_its_capped_backoff(temp_data_dir):
+    # 30.0 * 2 ** (attempts - 2) stops fitting in a float at attempt 1026,
+    # about three weeks of failures at the 30-minute cap. The OverflowError
+    # escaped the scan and stopped every run; the count survives a restart,
+    # so the next start stopped again on its first scan.
+    import asyncio
+    import time
+    from backend import clinic_analysis_intents as intents
+    from backend.clinic_models import CatalogueUnavailable
+
+    result = submit(
+        file_meta=[{"documentKind": "report"}, {}],
+        analysis_intent={
+            "operationId": "op-weeks",
+            "confirmed": True,
+            "reportItemIndexes": [0],
+            "specialInstructions": "",
+        },
+    )["upload"]
+    intents._ADMISSION_BACKOFF.clear()
+    intents._store_block(
+        result["uploadId"],
+        {"attempts": 1100, "reason": "Original confirmed models are unavailable", "final": False},
+    )
+
+    class Store:
+        @property
+        def engine(self):
+            return storage.engine
+
+    class Runtime:
+        store = Store()
+
+        async def admission(self, fn, *args):
+            raise CatalogueUnavailable("Original confirmed models are unavailable")
+
+    try:
+        asyncio.run(intents.activate_confirmed_uploads(Runtime()))
+        entry = intents._ADMISSION_BACKOFF[result["uploadId"]]
+        assert entry["attempts"] == 1101
+        # The scan's clock is the loop's, which is time.monotonic().
+        assert entry["next_attempt"] - time.monotonic() > intents._BACKOFF_MAX_S - 60
+    finally:
+        intents._ADMISSION_BACKOFF.clear()  # module state outlives this test database
+
+
 def test_policy_offers_only_models_the_engine_has(temp_data_dir, monkeypatch):
     # 2026-09-29: the hub offered a council pinned to openai/gpt-5.6-terra, an
     # id the engine never discovered, so the confirmed upload never ran.
