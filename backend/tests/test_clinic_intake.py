@@ -817,6 +817,7 @@ def test_a_duplicate_council_refusal_is_final_for_a_hub_upload(temp_data_dir):
     assert shown["status"] == "blocked"
     assert shown["blockedReason"].startswith("These same reports were analysed recently")
     assert "{" not in shown["blockedReason"]
+    intents._ADMISSION_BACKOFF.clear()  # module state outlives this test database
 
 
 def test_hub_upload_is_answered_before_slow_filing(temp_data_dir, monkeypatch):
