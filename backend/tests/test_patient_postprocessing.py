@@ -890,3 +890,270 @@ async def test_relabel_after_completion_files_the_document_under_the_new_id(
     assert synced == ["ZA_01-01-1900"]
     # One paid send, of the prompt as admitted: the relabel never rewrites it.
     assert len(sent) == 1 and b"ZA_01-01-1900" not in sent[0]
+
+
+# EN-H3: a blocked write-up used to be final; the only way to get it was a whole
+# new paid council run. An explicit request now starts its next attempt.
+INVALID = {"choices": [{"message": {"content": "incomplete"}}]}
+
+
+async def _block_attempt(owner, sent, response=INVALID):
+    """Drive one attempt to a blocked write-up and park the run as the runtime does."""
+    with pytest.raises(Exception):
+        await post.continue_patient_facing(
+            owner, llm_client=llm(sent, response=response)
+        )
+    with owner.transaction() as session:
+        row = session.get(storage.PostObligation, (owner.run_id, "patient_facing"))
+        assert row.state == "blocked"
+        reason = row.blocked_reason
+    owner.release(
+        state="blocked", blocked_reason="patient-facing document blocked: " + reason
+    )
+
+
+def _post_row(run_id):
+    with storage.session_scope() as session:
+        row = session.get(storage.PostObligation, (run_id, "patient_facing"))
+        return row.state, row.manifest_path, row.manifest_hash, row.blocked_reason
+
+
+def _paid_rows(run_id):
+    with storage.session_scope() as session:
+        return {
+            (r.scope_key, r.dispatch_ordinal): (r.state, r.request_hash, r.response_hash)
+            for r in session.scalars(
+                select(storage.PaidRequest).where(storage.PaidRequest.run_id == run_id)
+            )
+        }
+
+
+@pytest.mark.asyncio
+async def test_regenerate_blocked_write_up_asks_again_without_a_new_council(ready):
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(admit(ready), sent)
+    _, first_path, first_hash, _ = _post_row(run_id)
+    first = post._load(first_path, first_hash)
+    first_bytes = Path(first_path).read_bytes()
+
+    result = post.admit_patient_facing(
+        store, run_id, config_snapshot=cfg, regenerate=True
+    )
+
+    assert result["state"] == "pending" and result["blocked_reason"] is None
+    second = post._load(result["manifest_path"], result["manifest_hash"])
+    assert second["attempt"] == 2 and second["prompt"] == first["prompt"]
+    assert Path(result["manifest_path"]).parent.name == "attempt-2"
+    assert Path(first_path).read_bytes() == first_bytes
+    for kind, ext in (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json")):
+        old_name = first["destinations"][kind]
+        assert second["destinations"][kind] == old_name.removesuffix(ext) + "-2" + ext
+        assert not Path(second["destinations"][kind]).exists()
+    with storage.session_scope() as session:
+        run = session.get(storage.Run, run_id)
+        assert (run.execution_state, run.blocked_reason) == ("pending", None)
+
+    # The ordinary consumer picks it up: one more paid send, byte-identical.
+    owner = store.claim_run_owner(run_id)
+    assert owner is not None
+    try:
+        done = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release(state="done")
+    assert done["state"] == "done" and done["verified"] is True, done
+    assert len(sent) == 2 and sent[1] == sent[0]
+    paid = _paid_rows(run_id)
+    assert set(paid) == {
+        ("post/patient_facing/generation", 0),
+        ("post/patient_facing/2", 0),
+    }
+    assert (
+        paid[("post/patient_facing/2", 0)][1]
+        == paid[("post/patient_facing/generation", 0)][1]
+    )
+    assert {k: b["path"] for k, b in done["outputs"].items()} == second["destinations"]
+    # A finished write-up rejoins; asking again never spends again.
+    again = post.admit_patient_facing(
+        store, run_id, config_snapshot=cfg, regenerate=True
+    )
+    assert again["state"] == "done" and len(sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsettled", ["unknown_send", "prepared", "dispatched"])
+async def test_regenerate_never_steps_over_an_unsettled_paid_call(ready, unsettled):
+    from types import SimpleNamespace
+
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(
+        admit(ready),
+        sent,
+        response=httpx.ReadError("lost") if unsettled == "unknown_send" else INVALID,
+    )
+    if unsettled != "unknown_send":
+        with storage.session_scope() as session:
+            session.scalar(select(storage.PaidRequest)).state = unsettled
+            session.commit()
+    assert _paid_rows(run_id)[("post/patient_facing/generation", 0)][0] == (
+        "unknown" if unsettled == "unknown_send" else unsettled
+    )
+    before = _post_row(run_id)
+    assert before[0] == "blocked"
+
+    with pytest.raises(ExecutionConflict, match="reconcile it first"):
+        post.admit_patient_facing(store, run_id, config_snapshot=cfg, regenerate=True)
+
+    assert _post_row(run_id) == before
+    root = post._root(SimpleNamespace(store=store, run_id=run_id))
+    assert not (root / "attempt-2").exists()
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_regeneration_takes_attempt_three(ready):
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(admit(ready), sent)
+    post.admit_patient_facing(store, run_id, config_snapshot=cfg, regenerate=True)
+    await _block_attempt(store.claim_run_owner(run_id), sent)
+
+    result = post.admit_patient_facing(
+        store, run_id, config_snapshot=cfg, regenerate=True
+    )
+
+    third = post._load(result["manifest_path"], result["manifest_hash"])
+    assert result["state"] == "pending" and third["attempt"] == 3
+    assert Path(result["manifest_path"]).parent.name == "attempt-3"
+    for kind, ending in (("md", "-3.md"), ("pdf", "-3.pdf"), ("meta", "-3__meta.json")):
+        assert third["destinations"][kind].endswith(ending), third["destinations"]
+    owner = store.claim_run_owner(run_id)
+    try:
+        done = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release(state="done")
+    assert done["verified"] is True
+    assert {key[0] for key in _paid_rows(run_id)} == {
+        "post/patient_facing/generation",
+        "post/patient_facing/2",
+        "post/patient_facing/3",
+    }
+    assert len(sent) == 3 and sent[0] == sent[1] == sent[2]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_script_skips_settled_rows_of_earlier_attempts(
+    ready, monkeypatch
+):
+    """The paid-run reconcile script re-checked every post row against the
+    current manifest, so a regenerated write-up whose new attempt ended unknown
+    could never be reconciled: the first attempt's row failed that check."""
+    import subprocess
+    import sys
+
+    from backend import paid_transport as paid
+
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(admit(ready), sent)
+    post.admit_patient_facing(store, run_id, config_snapshot=cfg, regenerate=True)
+    first_row = _paid_rows(run_id)[("post/patient_facing/generation", 0)]
+
+    def billing(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "writer"}]})
+        sent.append(request.content)
+        return httpx.Response(402, json={"error": {"message": "Insufficient Balance"}})
+
+    client = llm(sent)
+    client._transport = httpx.MockTransport(billing)
+    original = paid._rejection
+    owner = store.claim_run_owner(run_id)
+    with monkeypatch.context() as old:
+        old.setattr(
+            paid,
+            "_rejection",
+            lambda status, body: None if status == 402 else original(status, body),
+        )
+        with pytest.raises(paid.PaidOutcomeUnknown):
+            await post.continue_patient_facing(owner, llm_client=client)
+    owner.release(state="blocked", blocked_reason="paid_outcome_unknown")
+    await client.aclose()
+    assert _paid_rows(run_id)[("post/patient_facing/2", 0)][0] == "unknown"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "backend.scripts.reconcile_paid_run",
+            "--data-dir",
+            str(Path(store.engine.url.database).parent),
+            run_id,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Saved receipts reconciled" in result.stdout
+    rows = _paid_rows(run_id)
+    assert rows[("post/patient_facing/generation", 0)] == first_row
+    assert rows[("post/patient_facing/2", 0)][0] == "rejected"
+    assert _post_row(run_id)[0] == "pending"
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["asked", "unknown", "not_asked"])
+async def test_regenerate_action_reopens_a_blocked_write_up(
+    ready, temp_data_dir, monkeypatch, case
+):
+    """The action used to answer a blocked write-up with scheduled: false and
+    nothing else; it only admitted a post not yet made. Another attempt spends,
+    so it happens only when the request carries the clinic's explicit yes."""
+    unknown = case == "unknown"
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from backend import main
+    from backend.run_runtime import RunRuntime
+
+    store, run_id, _ = ready
+    sent = []
+    await _block_attempt(
+        admit(ready),
+        sent,
+        response=httpx.ReadError("lost") if unknown else INVALID,
+    )
+    with storage.session_scope() as session:
+        patient_id = session.get(storage.Run, run_id).patient_id
+    monkeypatch.setenv("QEEG_MOCK_LLM", "1")
+    monkeypatch.setattr(
+        main, "_ensure_project_clipr_config", lambda: temp_data_dir / "clipr.conf"
+    )
+    monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    monkeypatch.setattr(RunRuntime, "start", AsyncMock())
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/patients/{patient_id}/actions/regenerate_patient_facing",
+            json={"run_id": run_id, "regenerate_blocked": case != "not_asked"},
+        )
+    if case == "not_asked":
+        assert response.status_code == 200, response.text
+        assert response.json()["scheduled"] is False
+        assert response.json()["postprocessing"]["state"] == "blocked"
+        assert _post_row(run_id)[0] == "blocked"
+    elif unknown:
+        assert response.status_code == 409, response.text
+        assert "reconcile it first" in response.text
+        assert _post_row(run_id)[0] == "blocked"
+    else:
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["scheduled"] is True
+        assert body["postprocessing"]["state"] == "pending"
+        assert Path(body["postprocessing"]["manifest_path"]).parent.name == "attempt-2"
+    assert len(sent) == 1

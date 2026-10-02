@@ -528,7 +528,9 @@ class RunRuntime:
         finally:
             self.admissions.discard(task)
 
-    async def admit_post(self, run_id, *, config_snapshot, budget=1.0):
+    async def admit_post(
+        self, run_id, *, config_snapshot, budget=1.0, regenerate=False
+    ):
         from .patient_postprocessing import admit_patient_facing
 
         deadline = asyncio.get_running_loop().time() + budget
@@ -538,6 +540,7 @@ class RunRuntime:
                 self.store,
                 run_id,
                 config_snapshot=config_snapshot,
+                regenerate=regenerate,
             )
             if result["state"] != "admitting":
                 return result

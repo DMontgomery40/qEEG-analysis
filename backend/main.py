@@ -244,6 +244,10 @@ class SelectRequest(BaseModel):
 
 class PatientActionRequest(BaseModel):
     run_id: str | None = None
+    # One more paid attempt at a blocked patient write-up (EN-H3). Spending
+    # beyond the standard job needs the clinic's explicit yes, so a caller
+    # sends this only after asking; without it a blocked post rejoins, free.
+    regenerate_blocked: bool = False
 
 
 class _EventBroker:
@@ -1933,7 +1937,11 @@ async def run_patient_action(
             post = await runtime.admission(
                 project_patient_facing, runtime.store, patient_facing_run_id
             )
-            if post["state"] == "absent":
+            # A blocked write-up gets one more attempt when the request says
+            # so, with the same paid prompt and no new council (EN-H3). Any
+            # other existing post rejoins unchanged.
+            reopen = post["state"] == "blocked" and req.regenerate_blocked
+            if post["state"] == "absent" or reopen:
                 # Freeze once; every bounded contention retry uses this configuration.
                 snapshot = await asyncio.to_thread(
                     snapshot_post_config,
@@ -1943,7 +1951,9 @@ async def run_patient_action(
                     timeout_s=app.state.llm._timeout_s,
                 )
                 post = await runtime.admit_post(
-                    patient_facing_run_id, config_snapshot=snapshot
+                    patient_facing_run_id,
+                    config_snapshot=snapshot,
+                    regenerate=reopen,
                 )
         except AdmissionUnavailable as error:
             raise HTTPException(
