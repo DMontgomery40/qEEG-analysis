@@ -800,6 +800,66 @@ def test_two_matching_charts_park_the_upload_with_both_candidates(temp_data_dir)
     assert counts()[0] == 2
 
 
+def _placeholder_chart(label, **names):
+    from backend.patient_identity import parse_canonical_patient_id
+
+    parsed = parse_canonical_patient_id(label)
+    with storage.session_scope() as s:
+        storage.create_patient(
+            s, label=label, first_initial=parsed.first_initial,
+            last_initial=parsed.last_initial, birthdate=parsed.birthdate, **names,
+        )
+
+
+def test_an_unknown_initial_chart_is_offered_not_silently_doubled(temp_data_dir):
+    # HUB-H5: a typed upload for the person on XS_04-08-1986 started a second
+    # chart beside it, because an X initial never matches a real one.
+    _placeholder_chart("XS_04-08-1986", last_name="Smith")
+    identity = {"firstName": "Jane", "lastName": "Smith", "birthdate": "04-08-1986"}
+    parked = submit("x-chart", identity=identity)["upload"]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["conflict"] == "placeholder_chart"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["XS_04-08-1986"]
+    assert parked["conflict"]["detail"].startswith(
+        "Is this the chart on file as XS_04-08-1986?"
+    )
+    assert counts()[0] == 1, "no second chart before the clinic answers"
+    resolved = intake().resolve_upload(
+        "x-chart", key="x-chart-yes", resolution={"attachTo": "XS_04-08-1986"}
+    )["upload"]
+    assert resolved["status"] == "registered"
+    assert resolved["patientId"] == "XS_04-08-1986"
+    assert counts()[0] == 1
+
+
+def test_a_placeholder_birthday_chart_is_offered_by_its_initials(temp_data_dir):
+    _placeholder_chart("ML_01-01-1989")
+    identity = {"firstName": "Mary", "lastName": "Lane", "birthdate": "05-12-1989"}
+    parked = submit("jan-first", identity=identity)["upload"]
+    assert parked["conflict"]["conflict"] == "placeholder_chart"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["ML_01-01-1989"]
+    different = intake().resolve_upload(
+        "jan-first", key="jan-first-no", resolution={"forceNew": True}
+    )["upload"]
+    assert different["status"] == "registered"
+    assert different["patientId"] == "ML_05-12-1989", "someone different gets their own chart"
+
+
+def test_an_identity_that_shares_nothing_known_still_files_a_new_chart(temp_data_dir):
+    _placeholder_chart("XS_04-08-1986")
+    _placeholder_chart("XX_01-01-1991")
+    _placeholder_chart("ML_01-01-1989")
+    other_initial = submit(
+        "jt", identity={"firstName": "Jane", "lastName": "Taylor", "birthdate": "04-08-1986"}
+    )["upload"]
+    assert other_initial["status"] == "registered"
+    assert other_initial["patientId"] == "JT_04-08-1986"
+    unrelated = submit("ab")["upload"]
+    assert unrelated["status"] == "registered"
+    assert unrelated["patientId"] == "AB_02-02-1900"
+    assert counts()[0] == 5
+
+
 def test_the_same_request_is_one_council_until_the_operator_asks_again(temp_data_dir, monkeypatch):
     # 2026-09-29: one PDF, five paid runs in 82 minutes under five operation ids.
     from datetime import datetime, timedelta, timezone

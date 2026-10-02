@@ -517,6 +517,8 @@ def _bind_patient(upload_id):
                     keep = True
             else:
                 patient, keep = find_patient_by_identity(s, identity)
+                if patient is None and not identity.force_new:
+                    _offer_placeholder_charts(s, identity)
         except IdentityNameConflict as error:
             u.status = "needs_operator_answer"
             u.conflict_json = _json(error.payload)
@@ -575,6 +577,41 @@ def _bind_patient(upload_id):
         u.status = "pending"
         _bump(s, patient.id)
         return patient.id
+
+
+def _offer_placeholder_charts(s, identity):
+    """Ask before starting a chart beside one with an unknown initial or a
+    placeholder birthday that this upload may be (HUB-H5). A yes is the
+    ordinary attachTo answer; a relabel then fills in what was unknown."""
+    from .patient_intake import placeholder_candidates, stored_full_name
+
+    offered = placeholder_candidates(s, identity)
+    if not offered:
+        return
+    labels = [p.label for p in offered]
+    if len(labels) == 1:
+        detail = (
+            f"Is this the chart on file as {labels[0]}? That chart was started "
+            "without the full initials or birthday. Same person, or someone different?"
+        )
+    else:
+        detail = (
+            f"Is this one of the charts on file as {', '.join(labels)}? Those charts "
+            "were started without the full initials or birthday. Say which one, "
+            "or someone different."
+        )
+    raise IdentityNameConflict(
+        dict(
+            conflict="placeholder_chart",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[
+                dict(patient_id=p.label, name=stored_full_name(p)) for p in offered
+            ],
+            detail=detail,
+        )
+    )
 
 
 def _chart_difference(target, *, chart_birthdate, identity, birthdate_from_report):
