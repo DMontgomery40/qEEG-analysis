@@ -225,12 +225,26 @@ def test_manifest_freezes_settings_prompts_roles_and_original_admission(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ending", ["cancel", "emit", "deadline"])
+@pytest.mark.parametrize(
+    "ending,late_dispatch",
+    [("cancel", False), ("emit", False), ("deadline", False), ("deadline", True)],
+)
 async def test_heartbeat_scopes_actual_child_and_drains_before_owner_exit(
-    owner, monkeypatch, ending
+    owner, monkeypatch, ending, late_dispatch
 ):
     from backend.council.workflow.stages import _StagesMixin
+    from backend.paid_transport import PaidAsyncTransport
 
+    if late_dispatch:
+        # Full-suite load (2026-10-02): the request reached the transport after
+        # a 20 ms deadline had already passed, so it was never sent.
+        real_handle = PaidAsyncTransport.handle_async_request
+
+        async def late(self, request):
+            await asyncio.sleep(0.05)
+            return await real_handle(self, request)
+
+        monkeypatch.setattr(PaidAsyncTransport, "handle_async_request", late)
     e = execution()
     entered = asyncio.Event()
     released = asyncio.Event()
@@ -267,18 +281,24 @@ async def test_heartbeat_scopes_actual_child_and_drains_before_owner_exit(
                 ),
                 emit=emit,
                 payload={"task": "test"},
-                timeout_s=0.02 if ending == "deadline" else None,
+                timeout_s=60 if ending == "deadline" else None,
             )
 
     task = asyncio.create_task(run())
     await asyncio.wait_for(entered.wait(), 2)
     if ending == "cancel":
         task.cancel()
+    if ending == "deadline":
+        # Pass the deadline only once the request is on the wire, however slow
+        # the machine: move this loop's clock a minute ahead.
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        monkeypatch.setattr(loop, "time", lambda: real_time() + 61)
     await asyncio.sleep(1.1 if ending == "emit" else 0.06)
     assert not task.done()
     assert owner.store.claim_run_owner("r") is None
     released.set()
-    with pytest.raises(BaseException):
+    with pytest.raises(TimeoutError if ending == "deadline" else BaseException):
         await task
     assert drained.is_set()
 
