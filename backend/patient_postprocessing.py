@@ -20,6 +20,7 @@ from sqlalchemy import select, update
 from . import config, storage, patient_facing_pdf
 from .council.execution import _hash, _json, _publish, _execution_client, drain_task
 from .execution_settings import settings
+from .logging_utils import get_logger
 from .paid_transport import (
     PaidOutcomeUnknown,
     manifest_attempt,
@@ -31,6 +32,8 @@ from .portal_files import normalize_portal_patient_id
 from .patient_rekey import rename_in_name
 from . import portal_sync
 from scripts import generate_patient_facing_writeups as writer
+
+LOGGER = get_logger(__name__)
 
 
 def _recipe():
@@ -489,9 +492,60 @@ def _regenerate_patient_facing(store, run_id, cfg):
     return project_patient_facing(store, run_id)
 
 
+def _adopt_current_recipe(owner, base, manifest_hash, data):
+    """Let a write-up with no paid call in flight continue on the code on disk.
+
+    The manifest pins the code recipe of its admission, so every deploy that
+    touched a recipe file used to block every pending write-up, and only a paid
+    regeneration recovered it (EN-H8). The manifest is never rewritten: its
+    hash binds the paid rows and the completion receipt. With nothing
+    unsettled, nothing is lost by moving on. A saved answer is replayed only
+    when the request this code builds is byte-identical to the one paid for
+    (the journal refuses anything else without sending), and outputs already
+    bound keep their bytes. An unsettled call still blocks.
+    """
+    current = _recipe()
+    pinned = data["config"]["recipe"]
+    if pinned == current:
+        return
+    with owner.transaction() as session:
+        unsettled = session.scalar(
+            select(storage.PaidRequest)
+            .where(
+                storage.PaidRequest.run_id == owner.run_id,
+                storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+            )
+            .limit(1)
+        )
+        if unsettled is not None:
+            raise ExecutionConflict(
+                "incompatible patient output recipe: paid call "
+                f"{unsettled.scope_key} is {unsettled.state}"
+            )
+    adopted = _hash(_json(current))
+    _publish(
+        owner,
+        base / f"recipe-adopted-{adopted[:16]}.json",
+        _json(
+            {
+                "run_id": owner.run_id,
+                "manifest_hash": manifest_hash,
+                "pinned": pinned,
+                "adopted": current,
+            }
+        ),
+    )
+    LOGGER.warning(
+        "patient_output_recipe_adopted",
+        run_id=owner.run_id,
+        pinned=_hash(_json(pinned))[:16],
+        adopted=adopted[:16],
+    )
+
+
 def _verify_manifest(owner, data):
-    if data["run_id"] != owner.run_id or data["config"]["recipe"] != _recipe():
-        raise ExecutionConflict("incompatible patient output recipe")
+    if data["run_id"] != owner.run_id:
+        raise ExecutionConflict("post manifest identity changed")
     with owner.transaction() as session:
         run = session.get(storage.Run, owner.run_id)
         patient = session.get(storage.Patient, data["patient_id"])
@@ -592,13 +646,20 @@ def _publish_outputs(owner, base, data, md, meta):
     from .clinic_producers import register_patient_output
 
     register_patient_output(owner, data, "md", result["md"])
+    # The PDF is the bound markdown, which can predate this process's writer
+    # code when a write-up adopted a newer recipe (EN-H8).
+    bound_md = (
+        bytes.fromhex(_load(root / "md.json")["bytes_hex"])
+        .decode("utf-8")
+        .removesuffix("\n")
+    )
 
     def pdf():
         with owner.file_guard(), tempfile.TemporaryDirectory(dir=root) as directory:
             path = Path(directory) / "report.pdf"
             with patient_facing_pdf.patient_pdf_assets(data["config"]["logo_uri"]):
                 writer.render_patient_facing_markdown_to_pdf(
-                    md, path, patient_label=data["patient_label"]
+                    bound_md, path, patient_label=data["patient_label"]
                 )
             return path.read_bytes()
 
@@ -681,6 +742,7 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
     try:
         data = _load(row.manifest_path, row.manifest_hash)
         scope_key = patient_facing_scope(manifest_attempt(data))
+        _adopt_current_recipe(owner, base, row.manifest_hash, data)
         data = _route_to_current_label(data, _verify_manifest(owner, data))
         cfg = data["config"]
         client = _execution_client(llm_client)

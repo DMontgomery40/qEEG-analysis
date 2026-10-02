@@ -608,24 +608,127 @@ async def test_acknowledged_endpoint_fallback_recovers_without_catalogue(
         owner.close()
 
 
+def _deploy_edits_a_recipe_file(monkeypatch):
+    """A deploy between admission and generation changes a post recipe file."""
+    real = post._recipe
+
+    def edited():
+        recipe = real()
+        files = {**recipe["files"], "backend/patient_facing_pdf.py": "edited-on-disk"}
+        return {**recipe, "files": files}
+
+    monkeypatch.setattr(post, "_recipe", edited)
+
+
+def _die_after_markdown_is_bound(monkeypatch):
+    original = post._publish
+
+    def publish(owner, path, data):
+        original(owner, path, data)
+        if path.name == "md.json":
+            raise OSError("death after the markdown was bound")
+
+    monkeypatch.setattr(post, "_publish", publish)
+    return original
+
+
 @pytest.mark.asyncio
-async def test_changed_render_dependency_parks_without_new_generation(
+async def test_a_deploy_before_the_write_up_is_paid_adopts_the_new_code(
     ready, monkeypatch
+):
+    """EN-H8: three live write-ups sat blocked because a deploy changed a
+    recipe file after admission, and only a paid regeneration recovered them.
+    Nothing was paid yet, so the write-up runs on the code now on disk and makes
+    its one authorized generation."""
+    owner = admit(ready)
+    _deploy_edits_a_recipe_file(monkeypatch)
+    sent = []
+    try:
+        result = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 1
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+    (record,) = Path(result["manifest_path"]).parent.glob("recipe-adopted-*.json")
+    assert json.loads(record.read_text())["adopted"] == post._recipe()
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_after_the_paid_answer_finishes_from_the_saved_answer(
+    ready, monkeypatch
+):
+    """The answer was paid for and its markdown bound before the process died;
+    then a deploy changed the writer. The saved answer finishes the write-up
+    with no new send, and the PDF is made from the markdown that was bound, not
+    from what the new writer code would make of the answer."""
+    owner = admit(ready)
+    sent = []
+    original = _die_after_markdown_is_bound(monkeypatch)
+    try:
+        with pytest.raises(OSError):
+            await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.close()
+    monkeypatch.setattr(post, "_publish", original)
+    _deploy_edits_a_recipe_file(monkeypatch)
+    real_chat = writer._chat_with_retries
+
+    async def new_writer_code(*args, **kwargs):
+        return (await real_chat(*args, **kwargs)) + "\n\nAdded by the new writer."
+
+    rendered = []
+    real_render = writer.render_patient_facing_markdown_to_pdf
+
+    def render(md, path, **kwargs):
+        rendered.append(md)
+        return real_render(md, path, **kwargs)
+
+    monkeypatch.setattr(writer, "_chat_with_retries", new_writer_code)
+    monkeypatch.setattr(writer, "render_patient_facing_markdown_to_pdf", render)
+    owner = ready[0].claim_run_owner(ready[1])
+    try:
+        result = await post.continue_patient_facing(
+            owner, llm_client=llm(sent, catalogue=False)
+        )
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 1
+    bound = Path(result["outputs"]["md"]["path"]).read_text()
+    assert "new writer" not in bound
+    assert rendered == [bound.removesuffix("\n")]
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsettled", ["prepared", "dispatched", "unknown"])
+async def test_a_deploy_never_steps_over_an_unsettled_write_up_call(
+    ready, monkeypatch, unsettled
 ):
     owner = admit(ready)
     sent = []
-    real_version = post.version
-    monkeypatch.setattr(
-        post,
-        "version",
-        lambda name: "incompatible" if name == "weasyprint" else real_version(name),
-    )
+    original = _die_after_markdown_is_bound(monkeypatch)
+    try:
+        with pytest.raises(OSError):
+            await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.close()
+    monkeypatch.setattr(post, "_publish", original)
+    with storage.session_scope() as session:
+        session.scalar(select(storage.PaidRequest)).state = unsettled
+        session.commit()
+    _deploy_edits_a_recipe_file(monkeypatch)
+    owner = ready[0].claim_run_owner(ready[1])
     try:
         with pytest.raises(ExecutionConflict, match="recipe"):
             await post.continue_patient_facing(owner, llm_client=llm(sent))
-        assert sent == []
     finally:
         owner.close()
+    assert len(sent) == 1
+    assert _post_row(ready[1])[0] == "blocked"
+    root = post._root(owner)
+    assert not list(root.glob("recipe-adopted-*.json"))
 
 
 @pytest.mark.asyncio
