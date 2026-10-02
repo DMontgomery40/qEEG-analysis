@@ -348,7 +348,7 @@ class RunOwner:
 
     def ensure_post_obligation(self, kind: str, manifest_path: str, manifest_hash: str):
         """Create/rejoin one pinned post obligation; never reopen its saved state."""
-        if kind not in ["patient_facing", "cathode"]:
+        if kind != "patient_facing":
             raise ValueError("unsupported postprocessing kind")
         if (
             not manifest_path

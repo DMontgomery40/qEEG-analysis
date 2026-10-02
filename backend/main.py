@@ -11,7 +11,6 @@ import subprocess
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -44,11 +43,6 @@ from . import runtime_identity
 from .orchestration import (
     build_patient_orchestration_detail,
     build_patient_orchestration_summary,
-    cathode_handoff_meta_path,
-    cathode_handoff_payload_path,
-    cathode_handoff_source_path,
-    cathode_project_dir,
-    choose_cathode_source_artifact,
     choose_final_export_ready_run,
     choose_patient_facing_ready_run,
     derive_run_liveness,
@@ -440,13 +434,6 @@ async def _cancel_task_if_possible(task: object | None) -> None:
             await task
 
 
-def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.partial")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
-
-
 def _latest_complete_run_for_patient(
     session, patient_id: str, *, preferred_run_id: str | None = None
 ) -> storage.Run | None:
@@ -455,71 +442,6 @@ def _latest_complete_run_for_patient(
     if preferred_run_id:
         complete_runs = [run for run in complete_runs if run.id == preferred_run_id]
     return complete_runs[0] if complete_runs else None
-
-
-def _prepare_cathode_handoff_for_patient(
-    *, patient_label: str, source_run: storage.Run, source_artifact: storage.Artifact
-) -> dict[str, Any]:
-    project_dir = cathode_project_dir(patient_label)
-    project_dir.mkdir(parents=True, exist_ok=True)
-
-    source_text = Path(source_artifact.content_path).read_text(
-        encoding="utf-8", errors="replace"
-    )
-    source_path = cathode_handoff_source_path(patient_label)
-    source_path.write_text(source_text, encoding="utf-8")
-
-    handoff_payload = {
-        "intent": "patient-friendly qEEG explainer video",
-        "workspace_path": str(_repo_root()),
-        "source_paths": [str(source_path.resolve())],
-        "audience": "the patient and their family",
-        "target_length_minutes": 6.5,
-        "tone": "clear, warm, grounded, scientifically honest",
-        "visual_style": "patient-friendly clinical explainer",
-        "must_include": (
-            "verified progress over time, practical caveats, and a clear explanation "
-            "of what improved, what remains uncertain, and what deserves follow-up"
-        ),
-        "must_avoid": (
-            "invented certainty, hallucinated diagnoses, and filler about sync blinks, "
-            "bad nodes, or spacing/session artifacts unless they materially affect an empirical conclusion"
-        ),
-        "run_until": "render",
-        "ready_for_handoff": True,
-        "review_decision": "accept",
-        "qeeg_source": {
-            "patient_label": patient_label,
-            "run_id": source_run.id,
-            "artifact_id": source_artifact.id,
-            "artifact_kind": source_artifact.kind,
-            "artifact_stage_num": source_artifact.stage_num,
-            "artifact_model_id": source_artifact.model_id,
-            "artifact_path": source_artifact.content_path,
-        },
-    }
-    _write_json_atomically(cathode_handoff_payload_path(patient_label), handoff_payload)
-
-    handoff_meta = {
-        "patient_label": patient_label,
-        "project_dir": str(project_dir),
-        "prepared_at": datetime.now(timezone.utc).isoformat(),
-        "source_run_id": source_run.id,
-        "source_artifact_id": source_artifact.id,
-        "source_artifact_kind": source_artifact.kind,
-        "source_artifact_stage_num": source_artifact.stage_num,
-        "source_artifact_model_id": source_artifact.model_id,
-        "source_markdown_path": str(source_path),
-        "payload_path": str(cathode_handoff_payload_path(patient_label)),
-        "status": "handoff_prepared",
-    }
-    _write_json_atomically(cathode_handoff_meta_path(patient_label), handoff_meta)
-    return {
-        "project_dir": str(project_dir),
-        "source_markdown_path": str(source_path),
-        "payload_path": str(cathode_handoff_payload_path(patient_label)),
-        "meta_path": str(cathode_handoff_meta_path(patient_label)),
-    }
 
 
 async def _auto_generate_patient_facing_for_run(
@@ -1970,40 +1892,6 @@ async def run_patient_action(
             "patient_label": patient_label,
             "scheduled": post["state"] in ("pending", "owned"),
             "postprocessing": post,
-        }
-
-    if action == "prepare_cathode_handoff":
-        if normalized_patient_label is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Patient label is not a canonical portal patient id",
-            )
-        with storage.session_scope() as session:
-            choice = choose_cathode_source_artifact(
-                session,
-                patient_id=patient_id,
-                preferred_run_id=req.run_id,
-                require_peer_reviewed=True,
-            )
-            if choice is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="No peer-reviewed council markdown artifact is available for Cathode handoff",
-                )
-            source_run, _source_artifact = choice
-            source_artifact = _source_artifact
-        handoff_paths = _prepare_cathode_handoff_for_patient(
-            patient_label=normalized_patient_label,
-            source_run=source_run,
-            source_artifact=source_artifact,
-        )
-        return {
-            "ok": True,
-            "action": action,
-            "patient_label": normalized_patient_label,
-            "run_id": source_run.id,
-            "artifact_id": source_artifact.id,
-            **handoff_paths,
         }
 
     if action == "export_council_artifacts":

@@ -48,29 +48,6 @@ def pipeline_job_status_dir() -> Path:
     return cfg.DATA_DIR / "pipeline_jobs"
 
 
-def cathode_projects_dir() -> Path:
-    configured = (os.getenv("QEEG_CATHODE_PROJECTS_DIR") or "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return Path(__file__).resolve().parents[2] / "cathode" / "projects"
-
-
-def cathode_project_dir(patient_label: str) -> Path:
-    return cathode_projects_dir() / patient_label
-
-
-def cathode_handoff_payload_path(patient_label: str) -> Path:
-    return cathode_project_dir(patient_label) / "qeeg_handoff_payload.json"
-
-
-def cathode_handoff_source_path(patient_label: str) -> Path:
-    return cathode_project_dir(patient_label) / "qeeg_council_source.md"
-
-
-def cathode_handoff_meta_path(patient_label: str) -> Path:
-    return cathode_project_dir(patient_label) / "qeeg_handoff.json"
-
-
 def progress_jsonl_path(run_id: str) -> Path:
     return cfg.ARTIFACTS_DIR / run_id / "progress.jsonl"
 
@@ -792,20 +769,6 @@ def load_pipeline_job_status(patient_label: str) -> dict[str, Any] | None:
     return payload
 
 
-def _artifact_out(artifact: storage.Artifact) -> dict[str, Any]:
-    return {
-        "id": artifact.id,
-        "run_id": artifact.run_id,
-        "stage_num": artifact.stage_num,
-        "stage_name": artifact.stage_name,
-        "model_id": artifact.model_id,
-        "kind": artifact.kind,
-        "content_path": artifact.content_path,
-        "content_type": artifact.content_type,
-        "created_at": artifact.created_at.isoformat(),
-    }
-
-
 def _run_out(run: storage.Run, artifacts: list[storage.Artifact] | None = None) -> dict[str, Any]:
     progress = summarize_run_progress(run)
     liveness = derive_run_liveness(run, progress=progress, artifacts=artifacts)
@@ -839,111 +802,6 @@ def _run_out(run: storage.Run, artifacts: list[storage.Artifact] | None = None) 
     }
 
 
-def choose_cathode_source_artifact(
-    session: storage.Session,
-    *,
-    patient_id: str,
-    preferred_run_id: str | None = None,
-    require_peer_reviewed: bool = False,
-    run_progress_by_id: dict[str, dict[str, Any]] | None = None,
-) -> tuple[storage.Run, storage.Artifact] | None:
-    runs = _prefer_run_id(storage.list_runs(session, patient_id), preferred_run_id)
-    for run in runs:
-        artifacts = storage.list_artifacts(session, run.id)
-        if require_peer_reviewed and not run_is_peer_reviewed_for_downstream(
-            run,
-            progress=(run_progress_by_id or {}).get(run.id),
-            artifacts=artifacts,
-        ):
-            continue
-        for stage_num, kind in ((4, "consolidation"), (3, "revision")):
-            candidates = [
-                artifact
-                for artifact in artifacts
-                if artifact.stage_num == stage_num
-                and artifact.kind == kind
-                and artifact.content_type.startswith("text/")
-            ]
-            if candidates:
-                candidates.sort(key=lambda artifact: artifact.created_at, reverse=True)
-                return run, candidates[0]
-    return None
-
-
-def cathode_status(
-    *,
-    patient_label: str,
-    source_artifact: tuple[storage.Run, storage.Artifact] | None = None,
-) -> dict[str, Any]:
-    project_dir = cathode_project_dir(patient_label)
-    plan_path = project_dir / "plan.json"
-    payload_path = cathode_handoff_payload_path(patient_label)
-    handoff_meta_path = cathode_handoff_meta_path(patient_label)
-    source_path = cathode_handoff_source_path(patient_label)
-    payload = _read_json(payload_path)
-    handoff_meta = _read_json(handoff_meta_path)
-
-    video_path: str | None = None
-    video_exists = False
-    if plan_path.exists():
-        plan = _read_json(plan_path) or {}
-        meta = plan.get("meta") if isinstance(plan.get("meta"), dict) else {}
-        candidate = meta.get("video_path")
-        if isinstance(candidate, str) and candidate.strip():
-            resolved = Path(candidate).expanduser()
-            if not resolved.is_absolute():
-                resolved = (project_dir / resolved).resolve()
-            video_path = str(resolved)
-            video_exists = resolved.exists()
-
-    status = "missing"
-    if payload_path.exists() or source_path.exists():
-        status = "handoff_prepared"
-    if plan_path.exists():
-        status = "project_ready"
-    if video_exists:
-        status = "video_ready"
-
-    recommended = None
-    if source_artifact:
-        run, artifact = source_artifact
-        recommended = {
-            "run_id": run.id,
-            "artifact": _artifact_out(artifact),
-        }
-
-    return {
-        "status": status,
-        "project_dir": str(project_dir),
-        "project_exists": project_dir.exists(),
-        "plan_path": str(plan_path),
-        "plan_exists": plan_path.exists(),
-        "video_path": video_path,
-        "video_exists": video_exists,
-        "handoff_payload_path": str(payload_path),
-        "handoff_payload_exists": payload_path.exists(),
-        "handoff_payload": payload,
-        "handoff_meta_path": str(handoff_meta_path),
-        "handoff_meta_exists": handoff_meta_path.exists(),
-        "handoff_meta": handoff_meta,
-        "handoff_source_path": str(source_path),
-        "handoff_source_exists": source_path.exists(),
-        "updated_at": max(
-            [
-                value
-                for value in (
-                    _path_iso(plan_path),
-                    _path_iso(payload_path),
-                    _path_iso(source_path),
-                )
-                if value
-            ],
-            default=None,
-        ),
-        "recommended_source": recommended,
-    }
-
-
 def build_patient_orchestration_summary(
     session: storage.Session, patient: storage.Patient
 ) -> dict[str, Any]:
@@ -965,15 +823,6 @@ def build_patient_orchestration_summary(
     pipeline_status = load_pipeline_job_status(patient.label)
     portal = classify_portal_files(patient.label)
     sync_entry = _read_sync_state(patient.label)
-    source_artifact = choose_cathode_source_artifact(
-        session,
-        patient_id=patient.id,
-        require_peer_reviewed=True,
-        run_progress_by_id=run_progress_by_id,
-    )
-    cathode = cathode_status(
-        patient_label=patient.label, source_artifact=source_artifact
-    )
 
     state = "idle"
     status = "idle"
@@ -1003,8 +852,6 @@ def build_patient_orchestration_summary(
         delivery_gaps = list(completion_gaps)
         if not portal["patient_facing_pdfs"]:
             delivery_gaps.append("patient-facing PDF missing")
-        if cathode["status"] == "missing":
-            delivery_gaps.append("Cathode handoff missing")
         if delivery_gaps:
             state = "attention"
             status = "incomplete"
@@ -1065,12 +912,6 @@ def build_patient_orchestration_summary(
             "last_modified": portal.get("last_modified"),
             "sync_known": sync_entry is not None,
         },
-        "cathode": {
-            "status": cathode["status"],
-            "project_exists": cathode["project_exists"],
-            "video_exists": cathode["video_exists"],
-            "updated_at": cathode["updated_at"],
-        },
     }
 
 
@@ -1091,15 +932,6 @@ def build_patient_orchestration_detail(
     portal = classify_portal_files(patient.label)
     sync_entry = _read_sync_state(patient.label)
     portal_patient_id = normalize_portal_patient_id(patient.label)
-    source_artifact = choose_cathode_source_artifact(
-        session,
-        patient_id=patient.id,
-        require_peer_reviewed=True,
-        run_progress_by_id=run_progress_by_id,
-    )
-    cathode = cathode_status(
-        patient_label=patient.label, source_artifact=source_artifact
-    )
     latest_complete_run = next((run for run in runs if run.status == "complete"), None)
     latest_peer_reviewed_run = next(
         (
@@ -1156,15 +988,6 @@ def build_patient_orchestration_detail(
             and latest_peer_reviewed_run is not None
             and latest_peer_reviewed_run.report_id == report.id
         )
-        cathode_for_report = bool(
-            source_artifact
-            and source_artifact[0].report_id == report.id
-            and run_is_peer_reviewed_for_downstream(
-                source_artifact[0],
-                progress=run_progress_by_id.get(source_artifact[0].id),
-                artifacts=storage.list_artifacts(session, source_artifact[0].id),
-            )
-        )
         report_rows.append(
             {
                 "report_id": report.id,
@@ -1188,9 +1011,6 @@ def build_patient_orchestration_detail(
                         if isinstance(sync_entry, dict)
                         else "unknown"
                     ),
-                    "cathode_status": cathode.get("status")
-                    if cathode_for_report
-                    else "pending",
                 },
             }
         )
@@ -1233,13 +1053,6 @@ def build_patient_orchestration_detail(
             **portal,
             "sync_entry": sync_entry,
         },
-        "cathode": cathode,
-        "recommended_cathode_source": {
-            "run_id": source_artifact[0].id,
-            "artifact": _artifact_out(source_artifact[1]),
-        }
-        if source_artifact
-        else None,
         "actions": {
             "refresh": {"enabled": True},
             "sync_portal": {
@@ -1254,28 +1067,6 @@ def build_patient_orchestration_detail(
                 if latest_patient_facing_ready_run is not None
                 else "No delivery-ready complete run with a Stage 6 final draft is available yet.",
             },
-            "prepare_cathode_handoff": {
-                "enabled": portal_patient_id is not None
-                and source_artifact is not None
-                and run_is_peer_reviewed_for_downstream(
-                    source_artifact[0],
-                    progress=run_progress_by_id.get(source_artifact[0].id),
-                    artifacts=storage.list_artifacts(session, source_artifact[0].id),
-                ),
-                "reason": ""
-                if portal_patient_id is not None
-                and source_artifact is not None
-                and run_is_peer_reviewed_for_downstream(
-                    source_artifact[0],
-                    progress=run_progress_by_id.get(source_artifact[0].id),
-                    artifacts=storage.list_artifacts(session, source_artifact[0].id),
-                )
-                else (
-                    "No peer-reviewed council markdown artifact is available yet."
-                    if portal_patient_id is not None
-                    else "Patient label is not a canonical portal patient id."
-                ),
-            },
             "export_council_artifacts": {
                 "enabled": latest_export_ready_run is not None,
                 "reason": ""
@@ -1289,7 +1080,6 @@ def build_patient_orchestration_detail(
                 for value in (
                     portal.get("last_modified"),
                     pipeline_status.get("updated_at") if pipeline_status else None,
-                    cathode.get("updated_at"),
                     latest_run.get("created_at") if latest_run else None,
                 )
                 if value

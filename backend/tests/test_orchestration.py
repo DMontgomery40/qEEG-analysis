@@ -930,13 +930,10 @@ def test_derive_run_liveness_keeps_fresh_created_runs_blocking_duplicate_work(
     assert stale["blocks_duplicate_work"] is False
 
 
-def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
+def test_patient_orchestration_endpoint_reports_pipeline_state(
     temp_data_dir, monkeypatch
 ):
     from backend import storage
-
-    cathode_root = Path(temp_data_dir) / "cathode_projects"
-    monkeypatch.setenv("QEEG_CATHODE_PROJECTS_DIR", str(cathode_root))
 
     with storage.session_scope() as session:
         patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
@@ -1030,12 +1027,6 @@ def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
         ),
         encoding="utf-8",
     )
-    cathode_project = cathode_root / "AB_03-05-2010"
-    cathode_project.mkdir(parents=True, exist_ok=True)
-    (cathode_project / "qeeg_handoff_payload.json").write_text(
-        json.dumps({"ready_for_handoff": True}),
-        encoding="utf-8",
-    )
 
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -1045,8 +1036,6 @@ def test_patient_orchestration_endpoint_reports_pipeline_and_cathode_state(
     payload = response.json()
     assert payload["summary"]["portal"]["patient_facing_count"] == 1
     assert payload["pipeline_job"]["status"] == "complete"
-    assert payload["cathode"]["handoff_payload_exists"] is True
-    assert payload["recommended_cathode_source"]["artifact"]["stage_num"] == 4
 
 
 def test_patient_orchestration_endpoint_surfaces_stale_running_rows(
@@ -1289,13 +1278,6 @@ def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
     (
         portal_dir / "LW_02-28-1978__patient-facing__auto-test__2026-05-09.pdf"
     ).write_bytes(b"%PDF-1.4\n")
-    cathode_dir = Path(temp_data_dir) / "cathode_projects" / "LW_02-28-1978"
-    cathode_dir.mkdir(parents=True, exist_ok=True)
-    (cathode_dir / "qeeg_handoff_payload.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv(
-        "QEEG_CATHODE_PROJECTS_DIR", str(Path(temp_data_dir) / "cathode_projects")
-    )
-
     status_dir = Path(temp_data_dir) / "pipeline_jobs"
     status_dir.mkdir(parents=True, exist_ok=True)
     (status_dir / "LW_02-28-1978.json").write_text(
@@ -1321,17 +1303,17 @@ def test_patient_orchestration_summary_prefers_complete_over_pipeline_failure(
     assert summary["status"] == "complete"
 
 
-def test_prepare_cathode_handoff_action_writes_payload_and_source(
+def test_retired_cathode_obligation_still_reads_and_its_action_is_gone(
     temp_data_dir, monkeypatch
 ):
+    # Runs finished before Cathode was retired keep a skipped kind="cathode"
+    # obligation. Every normal read of those runs keeps working.
     from backend import storage
-
-    cathode_root = Path(temp_data_dir) / "cathode_projects"
-    monkeypatch.setenv("QEEG_CATHODE_PROJECTS_DIR", str(cathode_root))
+    from backend.clinic_jobs import patient_jobs
 
     with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
-        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-3"
+        patient = storage.create_patient(session, label="CT_01-02-1960", notes="")
+        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-legacy"
         report_dir.mkdir(parents=True, exist_ok=True)
         stored_path = report_dir / "original.txt"
         extracted_path = report_dir / "extracted.txt"
@@ -1339,7 +1321,7 @@ def test_prepare_cathode_handoff_action_writes_payload_and_source(
         extracted_path.write_text("dummy", encoding="utf-8")
         report = storage.create_report(
             session,
-            report_id="report-3",
+            report_id="report-legacy",
             patient_id=patient.id,
             filename="source.pdf",
             mime_type="application/pdf",
@@ -1354,291 +1336,55 @@ def test_prepare_cathode_handoff_action_writes_payload_and_source(
             consolidator_model_id="claude-sonnet-4-6",
         )
         storage.update_run_status(session, run.id, status="complete")
-        peer_path = (
-            Path(temp_data_dir)
-            / "artifacts"
-            / run.id
-            / "stage-2"
-            / "claude-sonnet-4-6.json"
-        )
-        peer_path.parent.mkdir(parents=True, exist_ok=True)
-        peer_path.write_text("{}", encoding="utf-8")
-        storage.create_artifact(
-            session,
-            run_id=run.id,
-            stage_num=2,
-            stage_name="peer_review",
-            model_id="claude-sonnet-4-6",
-            kind="peer_review",
-            content_path=peer_path,
-            content_type="application/json",
-        )
-        revision_path = (
-            Path(temp_data_dir)
-            / "artifacts"
-            / run.id
-            / "stage-3"
-            / "claude-sonnet-4-6.md"
-        )
-        revision_path.parent.mkdir(parents=True, exist_ok=True)
-        revision_path.write_text("# Revision", encoding="utf-8")
-        storage.create_artifact(
-            session,
-            run_id=run.id,
-            stage_num=3,
-            stage_name="revision",
-            model_id="claude-sonnet-4-6",
-            kind="revision",
-            content_path=revision_path,
-            content_type="text/markdown",
-        )
-        artifact_dir = Path(temp_data_dir) / "artifacts" / run.id / "stage-4"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifact_dir / "claude-sonnet-4-6.md"
-        artifact_path.write_text(
-            "# Consolidation\nusable for cathode", encoding="utf-8"
-        )
-        artifact = storage.create_artifact(
-            session,
-            run_id=run.id,
-            stage_num=4,
-            stage_name="consolidation",
-            model_id="claude-sonnet-4-6",
-            kind="consolidation",
-            content_path=artifact_path,
-            content_type="text/markdown",
-        )
-        storage.select_artifact(session, run.id, artifact.id)
-
-    app = _test_app(temp_data_dir, monkeypatch)
-    with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(
-            f"/api/patients/{patient.id}/actions/prepare_cathode_handoff",
-            json={},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    source_path = Path(payload["source_markdown_path"])
-    handoff_payload_path = Path(payload["payload_path"])
-    assert source_path.exists()
-    assert handoff_payload_path.exists()
-    assert "usable for cathode" in source_path.read_text(encoding="utf-8")
-    handoff_payload = json.loads(handoff_payload_path.read_text(encoding="utf-8"))
-    assert handoff_payload["ready_for_handoff"] is True
-    assert handoff_payload["qeeg_source"]["run_id"] == payload["run_id"]
-
-
-def test_prepare_cathode_handoff_action_falls_back_to_peer_reviewed_source(
-    temp_data_dir, monkeypatch
-):
-    from backend import storage
-
-    cathode_root = Path(temp_data_dir) / "cathode_projects"
-    monkeypatch.setenv("QEEG_CATHODE_PROJECTS_DIR", str(cathode_root))
-
-    with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
-        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-cathode"
-        report_dir.mkdir(parents=True, exist_ok=True)
-        stored_path = report_dir / "original.txt"
-        extracted_path = report_dir / "extracted.txt"
-        stored_path.write_text("dummy", encoding="utf-8")
-        extracted_path.write_text("dummy", encoding="utf-8")
-        report = storage.create_report(
-            session,
-            report_id="report-cathode",
-            patient_id=patient.id,
-            filename="source.pdf",
-            mime_type="application/pdf",
-            stored_path=stored_path,
-            extracted_text_path=extracted_path,
-        )
-
-        older_run = storage.create_run(
-            session,
-            patient_id=patient.id,
-            report_id=report.id,
-            council_model_ids=["mock-council-a"],
-            consolidator_model_id="mock-consolidator",
-        )
-        storage.update_run_status(session, older_run.id, status="complete")
-        older_root = Path(temp_data_dir) / "artifacts" / older_run.id
-        for stage_num, stage_name, kind, suffix, text, content_type in (
-            (
-                2,
-                "peer_review",
-                "peer_review",
-                "peer-review.json",
-                "{}",
-                "application/json",
-            ),
-            (
-                3,
-                "revision",
-                "revision",
-                "revision.md",
-                "# Revision",
-                "text/markdown",
-            ),
-            (
-                4,
-                "consolidation",
-                "consolidation",
-                "consolidation.md",
-                "# Consolidation\nolder valid source",
-                "text/markdown",
-            ),
-        ):
-            artifact_path = older_root / f"stage-{stage_num}" / suffix
-            artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            artifact_path.write_text(text, encoding="utf-8")
-            storage.create_artifact(
-                session,
-                run_id=older_run.id,
-                stage_num=stage_num,
-                stage_name=stage_name,
-                model_id="mock-council-a",
-                kind=kind,
-                content_path=artifact_path,
-                content_type=content_type,
+        session.add(
+            storage.PostObligation(
+                run_id=run.id,
+                kind="cathode",
+                manifest_path="post/cathode.json",
+                manifest_hash="a" * 64,
+                owner_token="legacy",
+                owner_generation=1,
+                state="skipped",
             )
-
-        newer_run = storage.create_run(
-            session,
-            patient_id=patient.id,
-            report_id=report.id,
-            council_model_ids=["mock-council-a"],
-            consolidator_model_id="mock-consolidator",
         )
-        storage.update_run_status(session, newer_run.id, status="complete")
-        newer_path = (
-            Path(temp_data_dir)
-            / "artifacts"
-            / newer_run.id
-            / "stage-4"
-            / "consolidation.md"
-        )
-        newer_path.parent.mkdir(parents=True, exist_ok=True)
-        newer_path.write_text(
-            "# Consolidation\nnewer unreviewed source", encoding="utf-8"
-        )
-        storage.create_artifact(
-            session,
-            run_id=newer_run.id,
-            stage_num=4,
-            stage_name="consolidation",
-            model_id="mock-council-a",
-            kind="consolidation",
-            content_path=newer_path,
-            content_type="text/markdown",
-        )
-        patient_id = patient.id
-        older_run_id = older_run.id
-        newer_run_id = newer_run.id
+        session.commit()
+        patient_id, run_id = patient.id, run.id
 
     app = _test_app(temp_data_dir, monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(
-            f"/api/patients/{patient_id}/actions/prepare_cathode_handoff",
-            json={},
-        )
-        requested_response = client.post(
-            f"/api/patients/{patient_id}/actions/prepare_cathode_handoff",
-            json={"run_id": newer_run_id},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["run_id"] == older_run_id
-    assert payload["run_id"] != newer_run_id
-    assert requested_response.status_code == 409
-    assert "No peer-reviewed council markdown artifact" in requested_response.text
-    source_text = Path(payload["source_markdown_path"]).read_text(encoding="utf-8")
-    assert "older valid source" in source_text
-    assert "newer unreviewed source" not in source_text
-
-
-def test_choose_cathode_source_artifact_prefers_stage4_then_stage3(
-    temp_data_dir, monkeypatch
-):
-    from backend import storage
-    from backend.orchestration import choose_cathode_source_artifact
-
-    with storage.session_scope() as session:
-        patient = storage.create_patient(session, label="AB_03-05-2010", notes="")
-        report_dir = Path(temp_data_dir) / "reports" / patient.id / "report-4"
-        report_dir.mkdir(parents=True, exist_ok=True)
-        stored_path = report_dir / "original.txt"
-        extracted_path = report_dir / "extracted.txt"
-        stored_path.write_text("dummy", encoding="utf-8")
-        extracted_path.write_text("dummy", encoding="utf-8")
-        report = storage.create_report(
-            session,
-            report_id="report-4",
-            patient_id=patient.id,
-            filename="source.pdf",
-            mime_type="application/pdf",
-            stored_path=stored_path,
-            extracted_text_path=extracted_path,
+        run_view = client.get(f"/api/runs/{run_id}")
+        patient_runs = client.get(f"/api/patients/{patient_id}/runs")
+        orchestration = client.get(f"/api/patients/{patient_id}/orchestration")
+        patients = client.get("/api/patients")
+        retired_action = client.post(
+            f"/api/patients/{patient_id}/actions/prepare_cathode_handoff", json={}
         )
 
-        newer_run = storage.create_run(
-            session,
-            patient_id=patient.id,
-            report_id=report.id,
-            council_model_ids=["claude-sonnet-4-6"],
-            consolidator_model_id="claude-sonnet-4-6",
-        )
-        storage.update_run_status(session, newer_run.id, status="failed")
-        newer_artifact_dir = (
-            Path(temp_data_dir) / "artifacts" / newer_run.id / "stage-3"
-        )
-        newer_artifact_dir.mkdir(parents=True, exist_ok=True)
-        newer_artifact_path = newer_artifact_dir / "revision.md"
-        newer_artifact_path.write_text("# Revision\nusable fallback", encoding="utf-8")
-        storage.create_artifact(
-            session,
-            run_id=newer_run.id,
-            stage_num=3,
-            stage_name="revision",
-            model_id="claude-sonnet-4-6",
-            kind="revision",
-            content_path=newer_artifact_path,
-            content_type="text/markdown",
-        )
+    legacy = {
+        "kind": "cathode",
+        "state": "skipped",
+        "blocked_reason": None,
+        "next_check_at": None,
+    }
+    assert run_view.status_code == 200
+    assert run_view.json()["postprocessing"] == [legacy]
+    assert patient_runs.status_code == 200
+    assert [r["postprocessing"] for r in patient_runs.json()] == [[legacy]]
+    assert orchestration.status_code == 200
+    assert orchestration.json()["latest_run"]["id"] == run_id
+    assert patients.status_code == 200
+    assert any(item["id"] == patient_id for item in patients.json())
+    assert retired_action.status_code == 404
 
-        older_run = storage.create_run(
-            session,
-            patient_id=patient.id,
-            report_id=report.id,
-            council_model_ids=["claude-sonnet-4-6"],
-            consolidator_model_id="claude-sonnet-4-6",
-        )
-        storage.update_run_status(session, older_run.id, status="complete")
-        older_artifact_dir = (
-            Path(temp_data_dir) / "artifacts" / older_run.id / "stage-4"
-        )
-        older_artifact_dir.mkdir(parents=True, exist_ok=True)
-        older_artifact_path = older_artifact_dir / "consolidation.md"
-        older_artifact_path.write_text("# Consolidation\npreferred", encoding="utf-8")
-        storage.create_artifact(
-            session,
-            run_id=older_run.id,
-            stage_num=4,
-            stage_name="consolidation",
-            model_id="claude-sonnet-4-6",
-            kind="consolidation",
-            content_path=older_artifact_path,
-            content_type="text/markdown",
-        )
-
-        chosen = choose_cathode_source_artifact(session, patient_id=patient.id)
-
-    assert chosen is not None
-    chosen_run, chosen_artifact = chosen
-    assert chosen_run.id == older_run.id
-    assert chosen_artifact.stage_num == 4
+    jobs = patient_jobs("CT_01-02-1960")["jobs"]
+    assert jobs[0]["post"] == [
+        {
+            "kind": "cathode",
+            "state": "skipped",
+            "receiptHash": None,
+            "blockedReason": None,
+        }
+    ]
 
 
 def test_export_council_artifacts_action_exports_selected_final_draft(

@@ -196,7 +196,7 @@ def test_context_error_rolls_back_owned_transaction_and_keeps_recoverable_intent
                 session.add(
                     storage.PostObligation(
                         run_id="run",
-                        kind="cathode",
+                        kind="patient_facing",
                         manifest_path="post",
                         manifest_hash="a" * 64,
                         owner_token=owner.token,
@@ -520,7 +520,7 @@ def test_closing_handle_inside_transaction_prevents_commit(db):
             session.add(
                 storage.PostObligation(
                     run_id="run",
-                    kind="cathode",
+                    kind="patient_facing",
                     manifest_path="post",
                     manifest_hash="a" * 64,
                     owner_token=owner.token,
@@ -529,7 +529,7 @@ def test_closing_handle_inside_transaction_prevents_commit(db):
             )
             owner.close()
     with storage.session_scope() as session:
-        assert session.get(storage.PostObligation, ("run", "cathode")) is None
+        assert session.get(storage.PostObligation, ("run", "patient_facing")) is None
     with store.claim_run_owner("run") as replacement:
         assert replacement.generation == 2
 
@@ -578,9 +578,9 @@ def test_post_terminal_state_and_identity_are_never_reopened_by_rejoin(db, termi
     store = ex.ExecutionStore(storage.engine)
     store.request_run_start("run")
     with store.claim_run_owner("run") as owner:
-        owner.ensure_post_obligation("cathode", "manifest", "a" * 64)
+        owner.ensure_post_obligation("patient_facing", "manifest", "a" * 64)
         owner.transition_post_obligation(
-            "cathode",
+            "patient_facing",
             expected_state="pending",
             state=terminal,
             receipt_path="receipt" if terminal == "done" else None,
@@ -588,13 +588,25 @@ def test_post_terminal_state_and_identity_are_never_reopened_by_rejoin(db, termi
             blocked_reason="unknown" if terminal == "blocked" else None,
         )
         assert (
-            owner.ensure_post_obligation("cathode", "manifest", "a" * 64).state
+            owner.ensure_post_obligation("patient_facing", "manifest", "a" * 64).state
             == terminal
         )
         with pytest.raises(ex.ExecutionConflict):
             owner.transition_post_obligation(
-                "cathode", expected_state=terminal, state="pending"
+                "patient_facing", expected_state=terminal, state="pending"
             )
+
+
+def test_retired_cathode_obligation_is_never_created(db):
+    ex = execution()
+    add_run("run")
+    store = ex.ExecutionStore(storage.engine)
+    store.request_run_start("run")
+    with store.claim_run_owner("run") as owner:
+        with pytest.raises(ValueError):
+            owner.ensure_post_obligation("cathode", "manifest", "a" * 64)
+    with storage.session_scope() as session:
+        assert session.scalar(select(storage.PostObligation)) is None
 
 
 @pytest.mark.parametrize(
