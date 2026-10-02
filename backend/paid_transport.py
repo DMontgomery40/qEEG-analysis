@@ -310,6 +310,10 @@ def reconcile_blocked_run(store, run_id):
                                 "response_saved",
                             ]
                         ),
+                        # A refused connection has no response file to check.
+                        storage.PaidRequest.error_classification.is_distinct_from(
+                            "connect_refused"
+                        ),
                     )
                 )
             )
@@ -488,7 +492,7 @@ class _Receipt:
         with self.owner.transaction() as session:
             row = session.get(storage.PaidRequest, self.key)
             self._verify_row(row)
-            state = row.state
+            state, classification = row.state, row.error_classification
             if state == "prepared":
                 # A prior explicit unknown elsewhere cannot become a new request.
                 blocked = session.scalar(
@@ -511,10 +515,32 @@ class _Receipt:
                     self.owner.generation,
                 )
         if state != "prepared":
+            if state == "rejected" and classification == "connect_refused":
+                # Replays the original refusal so the caller takes the same
+                # path it took then; nothing was sent, then or now.
+                raise httpx.ConnectError(
+                    "connection refused before any byte was sent (journaled)",
+                    request=self.request,
+                )
             if state in ("response_saved", "rejected"):
                 raise ExecutionConflict("acknowledged response file missing")
             self.unknown("paid_outcome_unknown")
         return None
+
+    def refused(self):
+        """The connection was refused before a request byte left this machine.
+
+        httpx raises ConnectError only while opening the connection, before the
+        request is written, so nothing reached the provider and no money moved.
+        Filed rejected, not unknown, so it never parks the run (EN-H2, narrow
+        half). Timeouts and dropped reads stay unknown.
+        """
+        with self.owner.transaction() as session:
+            row = session.get(storage.PaidRequest, self.key)
+            self._verify_row(row)
+            if row.state == "dispatched":
+                row.state = "rejected"
+                row.error_classification = "connect_refused"
 
     def unknown(self, reason):
         unknown = PaidOutcomeUnknown(self.key, reason)
@@ -687,6 +713,9 @@ class PaidAsyncTransport(httpx.AsyncBaseTransport):
         except BaseException as exc:
             if receipt.acknowledged:
                 raise
+            if response is None and isinstance(exc, httpx.ConnectError):
+                receipt.refused()
+                raise
             try:
                 receipt.unknown(
                     "cancelled_after_dispatch"
@@ -748,6 +777,9 @@ class PaidSyncTransport(httpx.BaseTransport):
             raise
         except BaseException as exc:
             if receipt.acknowledged:
+                raise
+            if response is None and isinstance(exc, httpx.ConnectError):
+                receipt.refused()
                 raise
             try:
                 receipt.unknown("transport_or_receipt_failure")

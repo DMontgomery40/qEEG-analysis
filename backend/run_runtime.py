@@ -21,7 +21,7 @@ from . import storage
 from .council.execution import drain_task, owned_execution
 from .logging_utils import get_logger, log_context
 from .paid_transport import PaidOutcomeUnknown, dispatch_validation
-from .run_execution import ExecutionConflict
+from .run_execution import OUTSTANDING_OBLIGATIONS, ExecutionConflict
 
 LOGGER = get_logger(__name__)
 
@@ -406,15 +406,27 @@ class RunRuntime:
                         LOGGER.exception("run_strand_guard_failed", run_id=run_id)
                 if state == "blocked":
                     self._pending_failures.pop(run_id, None)
-            await asyncio.to_thread(
-                owner.release,
-                state=state,
-                next_check_at=datetime.now(timezone.utc)
-                + timedelta(seconds=self.retry_delay)
-                if state == "pending"
-                else None,
-                blocked_reason=reason,
-            )
+            try:
+                await asyncio.to_thread(
+                    owner.release,
+                    state=state,
+                    next_check_at=datetime.now(timezone.utc)
+                    + timedelta(seconds=self.retry_delay)
+                    if state == "pending"
+                    else None,
+                    blocked_reason=reason,
+                )
+            except ExecutionConflict as error:
+                # "done" with a post or paid call still open used to escape
+                # here, leave the row owned and be re-claimed every 5 s with
+                # nothing said (EN-H14). Park it and name what is open.
+                if state != "done" or not str(error).startswith(OUTSTANDING_OBLIGATIONS):
+                    raise
+                LOGGER.warning("run_done_with_open_obligation", run_id=run_id, reason=str(error))
+                self._pending_failures.pop(run_id, None)
+                await asyncio.to_thread(
+                    owner.release, state="blocked", blocked_reason=str(error)
+                )
             if self.publish is not None:
                 from .patient_postprocessing import project_patient_facing
 

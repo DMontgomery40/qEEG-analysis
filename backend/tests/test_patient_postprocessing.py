@@ -850,3 +850,43 @@ async def test_reconcile_saved_post_billing_rejection_uses_post_admission(
     finally:
         owner.close()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_relabel_after_completion_files_the_document_under_the_new_id(
+    ready, temp_data_dir
+):
+    """EN-H7 + EN-H15: the clinic corrected the id between council completion
+    and generation. The document used to block on "original patient identity
+    changed". It is the same patient (same UUID), so the files land under the
+    current id, the meta names the clinic id, and the paid prompt is unchanged."""
+    ready[2]["sync_enabled"] = True
+    owner = admit(ready)
+    from sqlalchemy.orm import Session
+
+    with Session(storage.engine) as session:
+        patient = session.get(storage.Patient, session.get(storage.Run, owner.run_id).patient_id)
+        uuid = patient.id
+        patient.label = "ZA_01-01-1900"
+        session.commit()
+    sent, synced = [], []
+    try:
+        result = await post.continue_patient_facing(
+            owner,
+            llm_client=llm(sent),
+            sync=lambda label: synced.append(label) or True,
+        )
+    finally:
+        owner.release()
+    assert result["state"] == "done", result
+    folder = temp_data_dir / "portal_patients"
+    old = folder / "ZZ_01-01-1900"
+    assert not old.exists() or not list(old.glob("*__meta.json")), list(old.iterdir())
+    written = sorted(p.name for p in (folder / "ZA_01-01-1900").iterdir())
+    assert len(written) == 3 and all(n.startswith("ZA_01-01-1900") for n in written), written
+    meta = json.loads(next((folder / "ZA_01-01-1900").glob("*__meta.json")).read_text())
+    assert meta["patient_id"] == meta["patient_label"] == "ZA_01-01-1900"
+    assert uuid not in json.dumps(meta)
+    assert synced == ["ZA_01-01-1900"]
+    # One paid send, of the prompt as admitted: the relabel never rewrites it.
+    assert len(sent) == 1 and b"ZA_01-01-1900" not in sent[0]

@@ -1343,3 +1343,35 @@ async def test_acknowledged_server_failure_retry_budget_survives_reconstruction(
         await client.aclose()
     assert len(calls) == 5 and len(set(calls)) == 1
     assert [(r.dispatch_ordinal, r.state) for r in rows(owner)] == [(n, "rejected") for n in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_refused_connection_is_provably_unsent_and_never_parks_the_run(owner):
+    """EN-H2 narrow half: nine live rows sit `unknown / transport_or_receipt_failure`
+    and park their runs for good. A connection refused before any byte left is
+    filed rejected / connect_refused, replays as the same refusal, and leaves the
+    run free to continue. The next ordinal is an ordinary new send."""
+    p = paid()
+    calls = []
+
+    def send(request):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("Connection refused")
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+        for _ in range(2):  # first pass live, second pass a replay of the cycle
+            with scope(owner) as cursor:
+                with pytest.raises(httpx.ConnectError):
+                    await client.post("http://test/v1/responses", content=b"original")
+                response = await client.post("http://test/v1/responses", content=b"original")
+                assert response.json() == {"ok": True}
+                cursor.raise_if_blocked()
+        p.raise_if_paid_blocked(owner)
+    assert len(calls) == 2
+    first, second = rows(owner)
+    assert (first.state, first.error_classification) == ("rejected", "connect_refused")
+    assert second.state == "response_saved"

@@ -919,3 +919,52 @@ async def test_billing_reconciliation_continues_original_six_stage_run(
     finally:
         await first.stop()
         await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_done_with_an_open_document_parks_the_run_and_names_it(temp_data_dir):
+    """EN-H14: release("done") refused for an open obligation used to escape
+    _run_owned, leave the row owned and be re-claimed every few seconds with
+    nothing said. It now parks the run once, naming what is still open."""
+    store = ExecutionStore(storage.engine)
+    calls = []
+
+    async def continuation(owner):
+        calls.append(owner.run_id)
+        return "done", None
+
+    add_run(store, "open-post")
+    with Session(store.engine) as session:
+        session.add(
+            storage.PostObligation(
+                run_id="open-post",
+                kind="patient_facing",
+                manifest_path="/nowhere/patient_facing.json",
+                manifest_hash="0" * 64,
+                owner_token="admission",
+                owner_generation=0,
+                state="pending",
+            )
+        )
+        session.commit()
+
+    def parked():
+        with Session(store.engine) as session:
+            run = session.get(storage.Run, "open-post")
+            return run.execution_state == "blocked" and run
+
+    runtime = runtime_type()(
+        store, continuation=continuation, poll_interval=0.02, retry_delay=0.05
+    )
+    await runtime.start()
+    try:
+        await until(lambda: bool(parked()))
+        await asyncio.sleep(0.3)  # several retry intervals: nothing re-claims it
+    finally:
+        await runtime.stop()
+    run = parked()
+    assert run.blocked_reason == (
+        "outstanding execution obligations: patient_facing document pending"
+    )
+    assert run.owner_token is None
+    assert calls == ["open-post"]
