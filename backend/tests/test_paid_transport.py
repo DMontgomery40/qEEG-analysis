@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 
 import httpx
-import structlog
 import pytest
+from unittest.mock import patch
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -1388,7 +1388,15 @@ async def test_a_call_filed_unknown_records_what_the_error_was(owner):
     def send(request):
         raise httpx.ReadTimeout("read timed out after 600 s", request=request)
 
-    with structlog.testing.capture_logs() as captured:
+    logged = []
+
+    class _Logger:
+        def warning(self, event, **fields):
+            logged.append({"event": event, **fields})
+
+    # The real structlog logger is configured and cached by the app at import;
+    # the module's LOGGER is what the filing calls, so it is what is observed.
+    with patch.object(p, "LOGGER", _Logger()):
         async with httpx.AsyncClient(
             transport=p.PaidAsyncTransport(httpx.MockTransport(send))
         ) as client:
@@ -1397,8 +1405,8 @@ async def test_a_call_filed_unknown_records_what_the_error_was(owner):
                     await client.post("http://test/v1/responses", content=b"original")
     (row,) = rows(owner)
     assert (row.state, row.error_classification) == ("unknown", "transport_or_receipt_failure")
-    events = [e for e in captured if e.get("event") == "paid_outcome_unknown"]
-    assert len(events) == 1, captured
+    events = [e for e in logged if e.get("event") == "paid_outcome_unknown"]
+    assert len(events) == 1, logged
     assert events[0]["error_type"] == "ReadTimeout"
     assert "read timed out" in events[0]["error"]
     assert "original" not in str(events[0])
