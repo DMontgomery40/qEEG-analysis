@@ -660,6 +660,48 @@ def test_identical_report_bytes_file_once_on_the_same_chart(temp_data_dir):
     assert counts()[2] == 2
 
 
+def test_the_same_report_bytes_filed_twice_at_once_are_one_report(temp_data_dir, monkeypatch):
+    # HUB-H12: the same-bytes check ran in a read of its own, before the
+    # unlocked save and the separate write, so two filings that both passed it
+    # (a hub upload and a chat drop of one PDF) both filed a report.
+    import threading
+    from backend import reports
+
+    chart = submit("race-chart")["upload"]["patientId"]
+    reports_before = counts()[2]
+    real_save = reports.save_report_upload
+    both_checked = threading.Barrier(2, timeout=30)
+
+    def save_once_both_have_checked(**kwargs):
+        both_checked.wait()
+        return real_save(**kwargs)
+
+    monkeypatch.setattr(reports, "save_report_upload", save_once_both_have_checked)
+    same = b"one Wellness Basic report, sent twice at once"
+
+    def file(key):
+        return submit(
+            key,
+            patient_id=chart,
+            identity={},
+            files=[("wellness.txt", same, "text/plain")],
+            file_meta=[{"documentKind": "report"}],
+        )["upload"]
+
+    with ThreadPoolExecutor(2) as pool:
+        first, second = pool.map(file, ["race-hub", "race-chat"])
+    assert first["items"][0]["status"] == second["items"][0]["status"] == "registered"
+    assert first["items"][0]["sourceId"] == second["items"][0]["sourceId"]
+    assert first["items"][0]["fileId"] == second["items"][0]["fileId"]
+    assert counts()[2] == reports_before + 1, "the same bytes on the same chart are one report"
+    # The copy the second filing saved before it lost is not left on disk.
+    with storage.session_scope() as s:
+        patient = s.scalar(select(storage.Patient).where(storage.Patient.label == chart))
+        kept = {r.id for r in s.scalars(select(storage.Report).where(storage.Report.patient_id == patient.id))}
+    on_disk = {d.name for d in (reports.REPORTS_DIR / patient.id).iterdir()}
+    assert on_disk == kept
+
+
 def test_blocked_admission_backs_off_and_names_the_reason(temp_data_dir):
     # 2026-09-29: the scan retried a confirmed hub upload once a second for
     # 72 minutes with a full traceback each time, and the hub showed nothing.
