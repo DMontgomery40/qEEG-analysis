@@ -1073,6 +1073,73 @@ def test_hub_filing_runs_two_at_a_time_and_still_answers_at_once(temp_data_dir, 
         assert module.get_upload(upload_id)["upload"]["status"] == "registered"
 
 
+def test_a_hung_filing_gets_a_replacement_worker_and_is_never_killed(
+    temp_data_dir, monkeypatch, caplog
+):
+    # c3c8875 put hub filing behind two workers; a filing that never returns
+    # held one until a restart, and two such filings stopped the queue.
+    import logging
+    import threading
+    import time
+
+    module = intake()
+    gate = threading.Event()
+    real = module._file_item
+
+    def hangs(item_id, patient_uuid):
+        if item_id.startswith("stuck-"):
+            assert gate.wait(20)
+        return real(item_id, patient_uuid)
+
+    def wait_for(condition):
+        deadline = time.monotonic() + 5
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return condition()
+
+    def live():
+        with module._FILING_GUARD:
+            return [t for t in module._FILING_THREADS if t.is_alive()]
+
+    def hub(key):
+        return submit(
+            key,
+            principal="thrylen-service",
+            acknowledge_first=True,
+            files=[(f"{key}.txt", key.encode(), "text/plain")],
+            file_meta=[{}],
+        )["upload"]["uploadId"]
+
+    monkeypatch.setattr(module, "_file_item", hangs)
+    monkeypatch.setattr(module, "_FILING_WORKERS_MAX", 3)
+    caplog.set_level(logging.WARNING, logger=module.__name__)
+    try:
+        stuck = [hub("stuck-1"), hub("stuck-2")]
+        assert wait_for(lambda: len(module._FILING_BUSY) == 2)
+        waiting = hub("waiting")
+        time.sleep(0.2)
+        assert module.get_upload(waiting)["upload"]["status"] == "pending", "both workers hung"
+        later = time.monotonic() + module._FILING_STALL_S + 1
+        module._check_filing_stalls(now=later)
+        module._check_filing_stalls(now=later)
+        assert wait_for(
+            lambda: module.get_upload(waiting)["upload"]["status"] == "registered"
+        ), "a replacement worker kept the queue moving"
+        assert len(live()) == 3, "two stalls, but never past the ceiling"
+        stalled = [r for r in caplog.records if "clinic_filing_stalled" in r.getMessage()]
+        assert len(stalled) == 2, "each stalled filing is named once"
+        assert all(t.is_alive() for t in live()), "a hung thread is never killed"
+    finally:
+        gate.set()
+    for upload_id in stuck:
+        with module._filing_lock(upload_id):
+            pass
+        assert module.get_upload(upload_id)["upload"]["status"] == "registered"
+    assert wait_for(lambda: len(live()) == module._FILING_WORKERS), (
+        "the extra worker retires once the stalled filings end"
+    )
+
+
 def test_one_damaged_upload_row_does_not_hide_the_others(temp_data_dir):
     from backend.clinic_records import ClinicUpload
 
