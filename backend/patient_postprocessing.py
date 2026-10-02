@@ -28,6 +28,7 @@ from .paid_transport import (
 )
 from .run_execution import ExecutionConflict, ExecutionStore, UNSETTLED_PAID_STATES
 from .portal_files import normalize_portal_patient_id
+from .patient_rekey import rename_in_name
 from . import portal_sync
 from scripts import generate_patient_facing_writeups as writer
 
@@ -617,10 +618,18 @@ def _publish_outputs(owner, base, data, md, meta):
     return result
 
 
-def _verify_outputs(outputs):
+def _verify_outputs(outputs, current_label=None):
     for binding in outputs.values():
+        path = Path(binding["path"])
+        if current_label and not path.exists():
+            # A rekey after the document was written renames its files under
+            # the patient's current id (patient_rekey); the receipts keep the
+            # old paths. The bytes must still be exactly the bound ones.
+            path = path.parent.parent / current_label / rename_in_name(
+                path.name, path.parent.name, current_label
+            )
         try:
-            raw = Path(binding["path"]).read_bytes()
+            raw = path.read_bytes()
         except OSError as error:
             raise ExecutionConflict("required output unavailable") from error
         if len(raw) != binding["size"] or _hash(raw) != binding["sha256"]:
@@ -838,6 +847,8 @@ def project_patient_facing(store, run_id):
         row = session.get(storage.PostObligation, (run_id, "patient_facing"))
         if row is None:
             return {"run_id": run_id, "state": "absent", "verified": False}
+        run = session.get(storage.Run, run_id)
+        patient = session.get(storage.Patient, run.patient_id) if run else None
         result = {
             "run_id": run_id,
             "state": row.state,
@@ -849,6 +860,11 @@ def project_patient_facing(store, run_id):
         }
         try:
             manifest = _load(row.manifest_path, row.manifest_hash)
+            current_label = (
+                patient.label
+                if patient is not None and patient.id == manifest["patient_id"]
+                else None
+            )
             local_path = Path(row.manifest_path).parent / "outputs" / "local.json"
             result["local_complete"] = False
             if local_path.exists():
@@ -860,7 +876,7 @@ def project_patient_facing(store, run_id):
                     kind: binding["path"] for kind, binding in local.items()
                 } != _route_to_current_label(manifest, filed_label)["destinations"]:
                     raise ExecutionConflict("local output destinations changed")
-                _verify_outputs(local)
+                _verify_outputs(local, current_label)
                 result.update(local_complete=True, outputs=local)
             if row.state == "done":
                 receipt = _load(row.receipt_path, row.receipt_hash)
@@ -872,7 +888,7 @@ def project_patient_facing(store, run_id):
                 scope_key = patient_facing_scope(manifest_attempt(manifest))
                 if receipt["paid"] != _paid_bindings(store, run_id, scope_key):
                     raise ExecutionConflict("original generation binding changed")
-                _verify_outputs(receipt["outputs"])
+                _verify_outputs(receipt["outputs"], current_label)
                 result.update(
                     verified=True, outputs=receipt["outputs"], sync=receipt["sync"]
                 )

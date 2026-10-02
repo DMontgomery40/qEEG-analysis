@@ -906,6 +906,42 @@ async def test_relabel_after_completion_files_the_document_under_the_new_id(
     assert tampered["integrity_error"] == "local output destinations changed", tampered
 
 
+@pytest.mark.asyncio
+async def test_a_rekey_after_the_write_up_keeps_it_verified_under_the_new_id(
+    ready, temp_data_dir
+):
+    """The rekey renames a finished write-up's files under the patient's new id
+    and leaves their bytes alone, but the receipts keep the old paths, so the
+    projection read "required output unavailable" for finished work."""
+    from sqlalchemy.orm import Session
+    from backend import patient_rekey
+
+    ready[2]["sync_enabled"] = True
+    owner = admit(ready)
+    try:
+        result = await post.continue_patient_facing(
+            owner, llm_client=llm([]), sync=lambda label: True
+        )
+    finally:
+        owner.release()
+    assert result["verified"], result
+    folder = temp_data_dir / "portal_patients"
+    with Session(storage.engine) as session:
+        uuid = session.get(storage.Run, owner.run_id).patient_id
+        plan = patient_rekey.plan_patient_rekey(
+            "ZZ_01-01-1900", "ZA_01-01-1900", portal_root=folder
+        )
+        patient_rekey.apply_patient_rekey(plan, session=session, patient_uuid=uuid)
+    assert not (folder / "ZZ_01-01-1900").exists()
+    moved = post.project_patient_facing(owner.store, owner.run_id)
+    assert moved["verified"] and moved["local_complete"], moved
+    # Renamed is fine; changed bytes are not.
+    pdf = next((folder / "ZA_01-01-1900").glob("*.pdf"))
+    pdf.write_bytes(pdf.read_bytes() + b"%")
+    changed = post.project_patient_facing(owner.store, owner.run_id)
+    assert changed["integrity_error"] == "required output binding changed", changed
+
+
 # EN-H3: a blocked write-up used to be final; the only way to get it was a whole
 # new paid council run. An explicit request now starts its next attempt.
 INVALID = {"choices": [{"message": {"content": "incomplete"}}]}
