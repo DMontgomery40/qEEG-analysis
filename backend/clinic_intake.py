@@ -1089,6 +1089,8 @@ def _upload_json(s, u):
         items=items,
         uploadedAt=u.uploaded_at,
         uploadedBy=u.uploaded_by,
+        # Who sent it: "thrylen-service" is the hub, "workbench" the clinic chat.
+        uploadedPrincipal=u.uploaded_principal,
         analysis=analysis,
     )
 
