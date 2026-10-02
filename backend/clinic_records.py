@@ -18,6 +18,8 @@ class ClinicUpload(Base):
     uploaded_by: Mapped[str | None]
     uploaded_principal: Mapped[str | None]
     analysis_json: Mapped[str | None] = mapped_column(Text)
+    # Why a confirmed analysis has not started, kept across engine restarts.
+    admission_block_json: Mapped[str | None] = mapped_column(Text)
 
 
 class ClinicUploadItem(Base):

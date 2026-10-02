@@ -375,3 +375,21 @@ def test_policy_route_says_plainly_when_the_engine_cannot_run_it(live_api, monke
         config, "DISCOVERED_MODEL_IDS", set(council + [config.DEFAULT_CONSOLIDATOR])
     )
     assert client.get("/policy").json()["policy"]["analysis"]["councilModelIds"] == council
+
+
+def test_an_oversize_upload_is_refused_in_plain_words(live_api, monkeypatch):
+    # The 413 carried only {"error": ...}; the hub prints `message`, so the
+    # clinic read "Request failed: 413".
+    from backend import clinic_api
+
+    client, _, _ = live_api
+    monkeypatch.setattr(clinic_api, "CLINIC_UPLOAD_MAX_BYTES", 8)
+    result = client.post(
+        "/uploads",
+        headers={"Idempotency-Key": "http-too-large"},
+        files=[("files", ("f.txt", b"x" * 9, "text/plain")), ("fileMeta", (None, "{}"))],
+    )
+    assert result.status_code == 413
+    body = result.json()
+    assert body["ok"] is False
+    assert "too large to send together" in body["message"]

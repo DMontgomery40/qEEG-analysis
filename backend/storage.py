@@ -448,6 +448,14 @@ def _ensure_clinic_location_lookup_index() -> None:
         )
 
 
+def _ensure_clinic_upload_columns() -> None:
+    """`create_all` never adds a column to the live `clinic_uploads` table."""
+    with engine.begin() as conn:
+        present = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(clinic_uploads)")}
+        if present and "admission_block_json" not in present:
+            conn.exec_driver_sql("ALTER TABLE clinic_uploads ADD COLUMN admission_block_json TEXT")
+
+
 def init_db() -> None:
     from . import clinic_records  # noqa: F401 - additive tables in the original Base
     from .clinic_catalogue import initialize_catalogue
@@ -460,6 +468,7 @@ def init_db() -> None:
     _ensure_run_execution_columns()
     _ensure_artifact_operation_key()
     _ensure_clinic_location_lookup_index()
+    _ensure_clinic_upload_columns()
     initialize_catalogue()
 
 
