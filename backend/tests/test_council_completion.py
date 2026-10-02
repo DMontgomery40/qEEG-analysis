@@ -1152,6 +1152,45 @@ async def test_definite_auth_rejection_survives_replay_at_terminal_policy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage_num", [1, 4])
+async def test_an_unsent_send_does_not_break_the_unit_record(
+    owner, tmp_path, monkeypatch, stage_num
+):
+    """EN-H2 in the council: a refused connection is filed rejected with no
+    response file (nothing came back), the call is retried at the next
+    ordinal, and the unit's record binds both rows instead of calling the
+    first one damaged."""
+    from backend.council.workflow.exceptions import _NeedsAuth
+
+    report = seed_stages(owner, tmp_path, monkeypatch, models=("model-a",))
+    sent = []
+
+    def send(req):
+        sent.append(req.content)
+        if len(sent) == 1:
+            raise httpx.ConnectError("[Errno 61] Connection refused")
+        return httpx.Response(
+            401,
+            json={"error": {"type": "authentication_error", "message": "invalid API key"}},
+        )
+
+    llm = client(send)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    args = ("r", silent) if stage_num == 4 else ("r", ["model-a"], report, silent)
+    with e.execution_context(ctx):
+        with pytest.raises(_NeedsAuth if stage_num == 4 else RuntimeError):
+            await getattr(QEEGCouncilWorkflow(llm=llm), f"_stage{stage_num}")(*args)
+        record = completion()._read(
+            "member/" + completion().member_key(stage_num, 0, "model-a")
+        )
+    assert record["error_type"] == "needs_auth"
+    assert [(row["state"], row["error_classification"]) for row in record["paid"]][:2] == [
+        ("rejected", "connect_refused"),
+        ("rejected", "authentication_rejected"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_failed_progress_after_clinical_exhaustion_preserves_terminal_evidence(
     owner, tmp_path, monkeypatch
 ):

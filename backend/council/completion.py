@@ -159,12 +159,18 @@ def _paid(prefix, *, exact=False):
             if row.scope_key == prefix
             or (not exact and row.scope_key.startswith(prefix + "/"))
         ]
+    from ..paid_transport import UNSENT_FAILURES
+
     for row in result:
         if row["state"] not in {"response_saved", "rejected"}:
             raise ExecutionConflict(
                 "unfinished paid work cannot acknowledge a semantic unit"
             )
-        for stem in ("request", "response"):
+        # A request that never left this machine has no response file (EN-H2).
+        unsent = (
+            row["state"] == "rejected" and row["error_classification"] in UNSENT_FAILURES
+        )
+        for stem in ("request",) if unsent else ("request", "response"):
             if (
                 not row[stem + "_path"]
                 or _file_hash(row[stem + "_path"]) != row[stem + "_hash"]
