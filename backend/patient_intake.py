@@ -199,3 +199,55 @@ def find_patient_by_identity(
             }
         )
     return None, False
+
+
+def _is_placeholder(first: str, last: str, birthdate: str) -> bool:
+    return "X" in (first, last) or birthdate.startswith("01-01-")
+
+
+def placeholder_candidates(session: Any, identity: IdentityInput) -> list[Any]:
+    """Charts started before everything was known that this identity may be.
+
+    An ``X`` initial is one nobody knew yet and a ``01-01`` birthday is often a
+    placeholder from the blacked-out-birthday era, so such a chart never
+    matches automatically. It is offered when the incoming identity shares
+    what the chart does know: the same birthday as an ``X`` chart, or the same
+    known initials as a ``01-01`` chart. Before 2026-10-02 a typed upload for
+    the person on ``XS_04-08-1986`` silently started a second chart beside it.
+    """
+    from .patient_identity import parse_canonical_patient_id
+    from .storage import Patient
+
+    first, last, birthdate = identity_key(identity)
+    offered = []
+    for patient in session.scalars(
+        select(Patient)
+        .where(
+            Patient.label.like("X%")
+            | Patient.label.like("_X%")
+            | Patient.label.like("___01-01-%")
+        )
+        .order_by(Patient.label)
+    ):
+        parsed = parse_canonical_patient_id(patient.label)
+        if parsed is None or not _is_placeholder(
+            parsed.first_initial, parsed.last_initial, parsed.birthdate
+        ):
+            continue
+        chart = (parsed.first_initial, parsed.last_initial, parsed.birthdate)
+        if chart == (first, last, birthdate):
+            continue  # the ordinary matcher already answered for this exact key
+        known = [
+            (on_chart, given)
+            for on_chart, given in zip(chart[:2], (first, last))
+            if on_chart != "X"
+        ]
+        if not all(on_chart == given for on_chart, given in known):
+            continue
+        same_birthday = chart[2] == birthdate
+        unknown_initial = len(known) < 2
+        placeholder_birthday = chart[2].startswith("01-01-")
+        if (unknown_initial and same_birthday) or (placeholder_birthday and known):
+            offered.append(patient)
+    return offered
+

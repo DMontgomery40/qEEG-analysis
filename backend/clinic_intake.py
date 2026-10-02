@@ -14,6 +14,7 @@ import queue
 from pathlib import Path
 import re
 import tempfile
+import time
 import uuid
 from sqlalchemy import select
 from . import storage, reports, patient_files
@@ -454,6 +455,7 @@ def _bind_patient(upload_id):
         m = json.loads(u.manifest_json)
         answer = json.loads(u.resolution_json) if u.resolution_json else m["resolution"]
         identity = _identity(m["identity"], answer)
+        note = None
         try:
             if answer.get("attachTo"):
                 exact = _patient(s, answer["attachTo"])
@@ -480,7 +482,21 @@ def _bind_patient(upload_id):
                 if len(report_dobs) > 1:
                     raise ValueError("Report items have different dates of birth")
                 if report_dobs and "birthdate" not in m["identity"]:
-                    merged["birthdate"] = next(iter(report_dobs))
+                    # Staff picked this chart, and the clinic is the authority on
+                    # who is who. A printed birthday a typo or a placeholder can
+                    # explain is noted; only one that differs in both month and
+                    # year is asked about (HUB-H8).
+                    printed = next(iter(report_dobs))
+                    on_chart = merged["birthdate"]
+                    if printed != on_chart:
+                        if _typo_or_placeholder(printed, on_chart):
+                            note = (
+                                f"The report's printed birthday {printed} differs "
+                                f"from this chart's {on_chart}; filed to the chart "
+                                "staff picked."
+                            )
+                        else:
+                            merged["birthdate"] = printed
                 merged.update(m["identity"])
                 if "firstName" in m["identity"] and "firstInitial" not in m["identity"]:
                     merged.pop("firstInitial", None)
@@ -517,6 +533,8 @@ def _bind_patient(upload_id):
                     keep = True
             else:
                 patient, keep = find_patient_by_identity(s, identity)
+                if patient is None and not identity.force_new:
+                    _offer_placeholder_charts(s, identity)
         except IdentityNameConflict as error:
             u.status = "needs_operator_answer"
             u.conflict_json = _json(error.payload)
@@ -572,9 +590,58 @@ def _bind_patient(upload_id):
             )
         u.patient_uuid = patient.id
         u.conflict_json = None
+        u.identity_note = note
         u.status = "pending"
         _bump(s, patient.id)
         return patient.id
+
+
+def _typo_or_placeholder(printed, on_chart):
+    """Whether a printed birthday differs from the chart's in a way a typo
+    (the same month or the same year) or the chart's 01-01 placeholder can
+    explain."""
+    try:
+        on_chart = normalize_birthdate(on_chart)
+    except ValueError:
+        return False
+    if on_chart.startswith("01-01-"):
+        return True
+    return printed[:2] == on_chart[:2] or printed[-4:] == on_chart[-4:]
+
+
+def _offer_placeholder_charts(s, identity):
+    """Ask before starting a chart beside one with an unknown initial or a
+    placeholder birthday that this upload may be (HUB-H5). A yes is the
+    ordinary attachTo answer; a relabel then fills in what was unknown."""
+    from .patient_intake import placeholder_candidates, stored_full_name
+
+    offered = placeholder_candidates(s, identity)
+    if not offered:
+        return
+    labels = [p.label for p in offered]
+    if len(labels) == 1:
+        detail = (
+            f"Is this the chart on file as {labels[0]}? That chart was started "
+            "without the full initials or birthday. Same person, or someone different?"
+        )
+    else:
+        detail = (
+            f"Is this one of the charts on file as {', '.join(labels)}? Those charts "
+            "were started without the full initials or birthday. Say which one, "
+            "or someone different."
+        )
+    raise IdentityNameConflict(
+        dict(
+            conflict="placeholder_chart",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[
+                dict(patient_id=p.label, name=stored_full_name(p)) for p in offered
+            ],
+            detail=detail,
+        )
+    )
 
 
 def _chart_difference(target, *, chart_birthdate, identity, birthdate_from_report):
@@ -778,10 +845,52 @@ _FILING_WORKERS = 2
 _FILING_QUEUE: queue.SimpleQueue = queue.SimpleQueue()
 _FILING_THREADS: list[threading.Thread] = []
 
+# A hung filing must not hold a worker until the next restart. One report
+# files in about 23 s (09-29) and a long scanned PDF can OCR for a few
+# minutes, so a filing still running after ten minutes is stalled: one more
+# worker starts for each stalled one, up to a hard ceiling, so the queue keeps
+# moving. A stalled thread is never killed; when it ends, the extra worker
+# retires. The stalled upload still reads "pending", which the workbench
+# health check reports to David once it has waited two hours.
+_FILING_STALL_S = 600.0
+_FILING_WORKERS_MAX = 4
+_FILING_WATCH_S = 30.0
+_FILING_BUSY: dict[threading.Thread, tuple[str, float]] = {}
+# Filings the watchdog has found stalled, as (worker, start); the one record
+# of what is stalled, so a worker never re-judges it against its own clock.
+_FILING_STALLED: set[tuple[threading.Thread, float]] = set()
+_FILING_WATCHDOG: list[threading.Thread] = []
+
+
+def _filing_target_locked():
+    stalled = sum(
+        1
+        for worker, (_, started) in _FILING_BUSY.items()
+        if (worker, started) in _FILING_STALLED
+    )
+    return min(_FILING_WORKERS_MAX, _FILING_WORKERS + stalled)
+
+
+def _start_filing_workers_locked():
+    _FILING_THREADS[:] = [t for t in _FILING_THREADS if t.is_alive()]
+    while len(_FILING_THREADS) < _filing_target_locked():
+        worker = threading.Thread(target=_filing_worker, name="clinic-filing", daemon=True)
+        worker.start()
+        _FILING_THREADS.append(worker)
+    if not any(t.is_alive() for t in _FILING_WATCHDOG):
+        watchdog = threading.Thread(
+            target=_filing_watchdog, name="clinic-filing-watchdog", daemon=True
+        )
+        watchdog.start()
+        _FILING_WATCHDOG[:] = [watchdog]
+
 
 def _filing_worker():
+    me = threading.current_thread()
     while True:
         upload_id, patient_uuid, lock = _FILING_QUEUE.get()
+        with _FILING_GUARD:
+            _FILING_BUSY[me] = (upload_id, time.monotonic())
         try:
             _file_items(upload_id, patient_uuid)
         except Exception:
@@ -789,7 +898,42 @@ def _filing_worker():
                 "clinic_background_filing_failed upload_id=%s", upload_id
             )
         finally:
+            with _FILING_GUARD:
+                _FILING_BUSY.pop(me, None)
             lock.release()
+        with _FILING_GUARD:
+            live = [t for t in _FILING_THREADS if t.is_alive()]
+            if len(live) > _filing_target_locked():
+                if me in _FILING_THREADS:
+                    _FILING_THREADS.remove(me)
+                return
+
+
+def _check_filing_stalls(now=None):
+    """Name each filing that has run past the bound once, and start the
+    replacement workers the stalls call for."""
+    now = time.monotonic() if now is None else now
+    with _FILING_GUARD:
+        running = {(worker, started) for worker, (_, started) in _FILING_BUSY.items()}
+        _FILING_STALLED.intersection_update(running)
+        for worker, (upload_id, started) in _FILING_BUSY.items():
+            if now - started > _FILING_STALL_S and (worker, started) not in _FILING_STALLED:
+                _FILING_STALLED.add((worker, started))
+                logging.getLogger(__name__).warning(
+                    "clinic_filing_stalled upload_id=%s running_s=%d",
+                    upload_id,
+                    now - started,
+                )
+        _start_filing_workers_locked()
+
+
+def _filing_watchdog():
+    while True:
+        time.sleep(_FILING_WATCH_S)
+        try:
+            _check_filing_stalls()
+        except Exception:
+            logging.getLogger(__name__).exception("clinic_filing_watchdog_failed")
 
 
 def _file_later(upload_id, patient_uuid):
@@ -803,13 +947,7 @@ def _file_later(upload_id, patient_uuid):
         return
     try:
         with _FILING_GUARD:
-            _FILING_THREADS[:] = [t for t in _FILING_THREADS if t.is_alive()]
-            while len(_FILING_THREADS) < _FILING_WORKERS:
-                worker = threading.Thread(
-                    target=_filing_worker, name="clinic-filing", daemon=True
-                )
-                worker.start()
-                _FILING_THREADS.append(worker)
+            _start_filing_workers_locked()
         _FILING_QUEUE.put((upload_id, patient_uuid, lock))
     except BaseException:
         lock.release()
@@ -893,12 +1031,28 @@ def _upload_json(s, u):
             if blocked:
                 analysis["status"] = "blocked"
                 analysis["blockedReason"] = blocked
+    elif m.get("analysisIntent"):
+        # The upload was sent with "analyze" ticked and the stored request has
+        # since been cleared. SC's confirmed request was cleared by hand after
+        # 09-29 and her receipt then read as done (HUB-H2); say it was withdrawn.
+        intent = m["analysisIntent"]
+        run = s.scalar(
+            select(storage.Run).where(storage.Run.operation_id == intent["operationId"])
+        )
+        analysis = dict(
+            operationId=intent["operationId"],
+            reportItemIndexes=intent["reportItemIndexes"],
+            reportIds=[],
+            runId=run.id if run else None,
+            status=run.status if run else "withdrawn",
+        )
     return dict(
         uploadId=u.id,
         status=u.status,
         patientId=patient.label if patient else None,
         identity=m["identity"],
         conflict=json.loads(u.conflict_json) if u.conflict_json else None,
+        identityNote=u.identity_note,
         items=items,
         uploadedAt=u.uploaded_at,
         uploadedBy=u.uploaded_by,

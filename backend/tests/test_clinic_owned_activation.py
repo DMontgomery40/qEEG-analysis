@@ -5,7 +5,10 @@ import pytest
 from sqlalchemy import select
 from backend import storage, patient_postprocessing as post
 from backend.tests.test_patient_postprocessing import ready  # noqa: F401
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 
 
 @pytest.mark.asyncio

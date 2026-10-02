@@ -1,6 +1,9 @@
 """Durable filing uses ordered source identity, never a filename or retry count."""
 
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib
@@ -443,16 +446,58 @@ def test_known_chart_birthdate_mismatch_is_resolved_without_renaming(temp_data_d
         assert storage.list_patients(s)[0].birthdate == "02-02-1900"
 
 
-def test_known_chart_report_birthdate_is_checked_before_filing(temp_data_dir):
+@pytest.mark.parametrize(
+    ("printed", "why"), [("03-03-1900", "same year"), ("02-14-1901", "same month")]
+)
+def test_a_picked_chart_files_with_a_typo_birthday_noted(temp_data_dir, printed, why):
+    # HUB-H8: the dropdown pick is the clinic's answer. A printed birthday a
+    # typo can explain is recorded on the upload instead of parking it.
     p = submit()["upload"]["patientId"]
     u = submit(
         "report-dob",
         patient_id=p,
         identity={},
-        file_meta=[{"documentKind": "report", "reportBirthdate": "03-03-1900"}, {}],
+        file_meta=[{"documentKind": "report", "reportBirthdate": printed}, {}],
     )["upload"]
-    assert u["status"] == "needs_operator_answer"
-    assert counts() == (1, 1, 0, 2, 0)
+    assert u["status"] == "registered", why
+    assert u["patientId"] == p
+    assert u["identityNote"] == (
+        f"The report's printed birthday {printed} differs from this chart's "
+        "02-02-1900; filed to the chart staff picked."
+    )
+    assert counts() == (1, 1, 1, 3, 0)
+    with storage.session_scope() as s:
+        assert storage.list_patients(s)[0].birthdate == "02-02-1900", "the chart is not rewritten"
+
+
+def test_a_picked_placeholder_birthday_chart_files_with_the_printed_birthday_noted(
+    temp_data_dir,
+):
+    with storage.session_scope() as s:
+        storage.create_patient(
+            s, label="ML_01-01-1989", first_initial="M", last_initial="L", birthdate="01-01-1989"
+        )
+    u = submit(
+        "placeholder-pick",
+        patient_id="ML_01-01-1989",
+        identity={},
+        file_meta=[{"documentKind": "report", "reportBirthdate": "05-12-1988"}, {}],
+    )["upload"]
+    assert u["status"] == "registered"
+    assert u["patientId"] == "ML_01-01-1989"
+    assert "05-12-1988" in u["identityNote"]
+
+
+def test_a_picked_chart_with_the_same_birthday_has_no_note(temp_data_dir):
+    p = submit()["upload"]["patientId"]
+    u = submit(
+        "report-dob-same",
+        patient_id=p,
+        identity={},
+        file_meta=[{"documentKind": "report", "reportBirthdate": "2/2/1900"}, {}],
+    )["upload"]
+    assert u["status"] == "registered"
+    assert u["identityNote"] is None
 
 
 @pytest.mark.parametrize("dates", [("2/2/1900", "02/02/1900"), ("02-02-1900", "2/2/1900")])
@@ -536,6 +581,7 @@ def test_confirmed_policy_fingerprint_rejects_new_drift_but_replays_original(
         monkeypatch.setattr(policy, "_snapshot_prompts", lambda: {"new": "changed"})
     elif drift == "models":
         monkeypatch.setattr(config, "COUNCIL_MODELS", [SimpleNamespace(id="new-model")])
+        config.DISCOVERED_MODEL_IDS.add("new-model")  # drift, not an unrunnable policy
     else:
         monkeypatch.setitem(clinic_naming.POLICY, "tts", {"voice": "changed"})
     assert (
@@ -747,8 +793,29 @@ def test_policy_offers_only_models_the_engine_has(temp_data_dir, monkeypatch):
             },
         )
     assert counts() == (0, 0, 0, 0, 0), "nothing is filed on a policy the engine cannot run"
+
+
+def test_no_discovered_models_reads_as_analysis_unavailable(temp_data_dir, monkeypatch):
+    # HUB-H6: before the first model refresh, or with the proxy down since
+    # boot, the discovered set is empty. The guard used to skip itself then,
+    # so the hub offered analysis that admission could only block.
+    from backend import config, clinic_analysis_intents as policy
+    from backend.clinic_models import AnalysisPolicyUnavailable
+
     monkeypatch.setattr(config, "DISCOVERED_MODEL_IDS", set())
-    assert policy.public_current_policy()["policy"]["analysis"]["councilModelIds"] == council
+    with pytest.raises(AnalysisPolicyUnavailable, match="on David's end"):
+        policy.public_current_policy()
+    with pytest.raises(AnalysisPolicyUnavailable):
+        submit(
+            file_meta=[{"documentKind": "report"}, {}],
+            analysis_intent={
+                "operationId": "op-before-discovery",
+                "confirmed": True,
+                "reportItemIndexes": [0],
+                "specialInstructions": "",
+            },
+        )
+    assert counts() == (0, 0, 0, 0, 0), "nothing is filed while no model is known"
 
 
 def test_two_matching_charts_park_the_upload_with_both_candidates(temp_data_dir):
@@ -773,6 +840,66 @@ def test_two_matching_charts_park_the_upload_with_both_candidates(temp_data_dir)
     assert resolved["patientId"] == "AB_02-02-1900_2"
     assert resolved["status"] == "registered"
     assert counts()[0] == 2
+
+
+def _placeholder_chart(label, **names):
+    from backend.patient_identity import parse_canonical_patient_id
+
+    parsed = parse_canonical_patient_id(label)
+    with storage.session_scope() as s:
+        storage.create_patient(
+            s, label=label, first_initial=parsed.first_initial,
+            last_initial=parsed.last_initial, birthdate=parsed.birthdate, **names,
+        )
+
+
+def test_an_unknown_initial_chart_is_offered_not_silently_doubled(temp_data_dir):
+    # HUB-H5: a typed upload for the person on XS_04-08-1986 started a second
+    # chart beside it, because an X initial never matches a real one.
+    _placeholder_chart("XS_04-08-1986", last_name="Smith")
+    identity = {"firstName": "Jane", "lastName": "Smith", "birthdate": "04-08-1986"}
+    parked = submit("x-chart", identity=identity)["upload"]
+    assert parked["status"] == "needs_operator_answer"
+    assert parked["conflict"]["conflict"] == "placeholder_chart"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["XS_04-08-1986"]
+    assert parked["conflict"]["detail"].startswith(
+        "Is this the chart on file as XS_04-08-1986?"
+    )
+    assert counts()[0] == 1, "no second chart before the clinic answers"
+    resolved = intake().resolve_upload(
+        "x-chart", key="x-chart-yes", resolution={"attachTo": "XS_04-08-1986"}
+    )["upload"]
+    assert resolved["status"] == "registered"
+    assert resolved["patientId"] == "XS_04-08-1986"
+    assert counts()[0] == 1
+
+
+def test_a_placeholder_birthday_chart_is_offered_by_its_initials(temp_data_dir):
+    _placeholder_chart("ML_01-01-1989")
+    identity = {"firstName": "Mary", "lastName": "Lane", "birthdate": "05-12-1989"}
+    parked = submit("jan-first", identity=identity)["upload"]
+    assert parked["conflict"]["conflict"] == "placeholder_chart"
+    assert [c["patient_id"] for c in parked["conflict"]["candidates"]] == ["ML_01-01-1989"]
+    different = intake().resolve_upload(
+        "jan-first", key="jan-first-no", resolution={"forceNew": True}
+    )["upload"]
+    assert different["status"] == "registered"
+    assert different["patientId"] == "ML_05-12-1989", "someone different gets their own chart"
+
+
+def test_an_identity_that_shares_nothing_known_still_files_a_new_chart(temp_data_dir):
+    _placeholder_chart("XS_04-08-1986")
+    _placeholder_chart("XX_01-01-1991")
+    _placeholder_chart("ML_01-01-1989")
+    other_initial = submit(
+        "jt", identity={"firstName": "Jane", "lastName": "Taylor", "birthdate": "04-08-1986"}
+    )["upload"]
+    assert other_initial["status"] == "registered"
+    assert other_initial["patientId"] == "JT_04-08-1986"
+    unrelated = submit("ab")["upload"]
+    assert unrelated["status"] == "registered"
+    assert unrelated["patientId"] == "AB_02-02-1900"
+    assert counts()[0] == 5
 
 
 def test_the_same_request_is_one_council_until_the_operator_asks_again(temp_data_dir, monkeypatch):
@@ -946,6 +1073,73 @@ def test_hub_filing_runs_two_at_a_time_and_still_answers_at_once(temp_data_dir, 
         assert module.get_upload(upload_id)["upload"]["status"] == "registered"
 
 
+def test_a_hung_filing_gets_a_replacement_worker_and_is_never_killed(
+    temp_data_dir, monkeypatch, caplog
+):
+    # c3c8875 put hub filing behind two workers; a filing that never returns
+    # held one until a restart, and two such filings stopped the queue.
+    import logging
+    import threading
+    import time
+
+    module = intake()
+    gate = threading.Event()
+    real = module._file_item
+
+    def hangs(item_id, patient_uuid):
+        if item_id.startswith("stuck-"):
+            assert gate.wait(20)
+        return real(item_id, patient_uuid)
+
+    def wait_for(condition):
+        deadline = time.monotonic() + 5
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return condition()
+
+    def live():
+        with module._FILING_GUARD:
+            return [t for t in module._FILING_THREADS if t.is_alive()]
+
+    def hub(key):
+        return submit(
+            key,
+            principal="thrylen-service",
+            acknowledge_first=True,
+            files=[(f"{key}.txt", key.encode(), "text/plain")],
+            file_meta=[{}],
+        )["upload"]["uploadId"]
+
+    monkeypatch.setattr(module, "_file_item", hangs)
+    monkeypatch.setattr(module, "_FILING_WORKERS_MAX", 3)
+    caplog.set_level(logging.WARNING, logger=module.__name__)
+    try:
+        stuck = [hub("stuck-1"), hub("stuck-2")]
+        assert wait_for(lambda: len(module._FILING_BUSY) == 2)
+        waiting = hub("waiting")
+        time.sleep(0.2)
+        assert module.get_upload(waiting)["upload"]["status"] == "pending", "both workers hung"
+        later = time.monotonic() + module._FILING_STALL_S + 1
+        module._check_filing_stalls(now=later)
+        module._check_filing_stalls(now=later)
+        assert wait_for(
+            lambda: module.get_upload(waiting)["upload"]["status"] == "registered"
+        ), "a replacement worker kept the queue moving"
+        assert len(live()) == 3, "two stalls, but never past the ceiling"
+        stalled = [r for r in caplog.records if "clinic_filing_stalled" in r.getMessage()]
+        assert len(stalled) == 2, "each stalled filing is named once"
+        assert all(t.is_alive() for t in live()), "a hung thread is never killed"
+    finally:
+        gate.set()
+    for upload_id in stuck:
+        with module._filing_lock(upload_id):
+            pass
+        assert module.get_upload(upload_id)["upload"]["status"] == "registered"
+    assert wait_for(lambda: len(live()) == module._FILING_WORKERS), (
+        "the extra worker retires once the stalled filings end"
+    )
+
+
 def test_one_damaged_upload_row_does_not_hide_the_others(temp_data_dir):
     from backend.clinic_records import ClinicUpload
 
@@ -982,6 +1176,32 @@ def test_replay_after_the_analysis_request_was_cleared_is_a_plain_conflict(temp_
     assert "NoneType" not in str(refused.value)
 
 
+def test_a_cleared_analysis_request_reads_as_withdrawn_not_done(temp_data_dir):
+    # HUB-H2: SC's confirmed request was cleared by hand; her upload then read
+    # with no analysis at all, which the hub shows as finished.
+    from backend.clinic_records import ClinicUpload
+
+    intent = {
+        "operationId": "op-withdrawn",
+        "confirmed": True,
+        "reportItemIndexes": [0],
+        "specialInstructions": "",
+    }
+    first = submit("withdrawn", file_meta=[{"documentKind": "report"}, {}], analysis_intent=intent)["upload"]
+    assert first["analysis"]["status"] == "ready"
+    with storage.session_scope() as s:
+        s.get(ClinicUpload, first["uploadId"]).analysis_json = None
+        s.commit()
+    read = intake().get_upload(first["uploadId"])["upload"]
+    assert read["analysis"]["status"] == "withdrawn"
+    assert read["analysis"]["operationId"] == "op-withdrawn"
+    assert read["analysis"]["runId"] is None
+    listed = {u["uploadId"]: u for u in intake().list_uploads()["uploads"]}
+    assert listed[first["uploadId"]]["analysis"]["status"] == "withdrawn"
+    plain = submit("plain")["upload"]
+    assert plain["analysis"] is None, "an upload sent without 'analyze' still has none"
+
+
 def test_a_dropdown_chart_conflict_says_which_birthday_differs(temp_data_dir):
     # MF_09-05-1954's upload sat parked four days behind "The supplied identity
     # differs from this chart" while the difference was the printed birthday.
@@ -996,8 +1216,22 @@ def test_a_dropdown_chart_conflict_says_which_birthday_differs(temp_data_dir):
         patient_id="MF_09-05-1954",
         file_meta=[{"documentKind": "report", "reportBirthdate": "03-05-2010"}, {}],
     )["upload"]
-    assert parked["status"] == "needs_operator_answer"
+    assert parked["status"] == "needs_operator_answer", "month and year differ: no typo explains it"
+    assert parked["identityNote"] is None
     assert parked["conflict"]["detail"] == (
         "The report's printed birthday 03-05-2010 does not match this chart's "
         "09-05-1954. Same person, or someone different?"
     )
+
+
+def test_a_live_uploads_table_gains_the_identity_note_column(temp_data_dir):
+    # create_all never adds a column to an existing table; the live
+    # clinic_uploads table predates identity_note.
+    first = submit()["upload"]
+    with storage.engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE clinic_uploads DROP COLUMN identity_note")
+    storage._ensure_clinic_upload_columns()
+    with storage.engine.begin() as conn:
+        columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(clinic_uploads)")}
+    assert "identity_note" in columns
+    assert intake().get_upload(first["uploadId"])["upload"]["identityNote"] is None

@@ -8,7 +8,10 @@ from backend import storage, clinic_producers as producers
 from backend.clinic_catalogue_reads import open_local_file
 from backend.clinic_models import ClinicArtifact, CatalogueConflict
 from backend.tests.test_patient_postprocessing import ready  # noqa: F401
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 
 
 def test_mutable_source_preserves_distinct_original_producer_bytes(temp_data_dir):

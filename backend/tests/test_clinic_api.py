@@ -10,6 +10,7 @@ import pytest
 import uvicorn
 
 from backend import storage, clinic_catalogue as catalogue
+from backend.tests.clinic_test_helpers import configured_models_discovered  # noqa: F401
 from backend import clinic_catalogue_reads as reads
 
 
@@ -375,6 +376,12 @@ def test_policy_route_says_plainly_when_the_engine_cannot_run_it(live_api, monke
         config, "DISCOVERED_MODEL_IDS", set(council + [config.DEFAULT_CONSOLIDATOR])
     )
     assert client.get("/policy").json()["policy"]["analysis"]["councilModelIds"] == council
+    monkeypatch.setattr(config, "DISCOVERED_MODEL_IDS", set())
+    empty = client.get("/policy")
+    assert empty.status_code == 503, "no discovered models is the same plain refusal (HUB-H6)"
+    assert empty.json()["message"] == (
+        "Analysis is not available right now. This is on David's end."
+    )
 
 
 def test_an_oversize_upload_is_refused_in_plain_words(live_api, monkeypatch):

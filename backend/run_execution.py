@@ -533,3 +533,52 @@ class RunOwner:
                 self.release()
         finally:
             self.close()
+
+    def close_superseded_post(
+        self,
+        kind: str,
+        *,
+        expected_manifest_hash: str,
+        reason: str,
+        receipt_path: str,
+        receipt_hash: str,
+    ):
+        """Fenced explicit close: a blocked post another run already delivered.
+
+        Only backend/scripts/close_superseded_post.py calls this, after writing
+        the immutable audit record it binds as the receipt. Nothing is sent and
+        the blocked attempt's manifest and files stay where they are; the post
+        becomes skipped, which every reader already treats as finished.
+        """
+        if (
+            not reason.strip()
+            or not receipt_path
+            or len(receipt_hash) != 64
+            or any(c not in "0123456789abcdef" for c in receipt_hash)
+        ):
+            raise ValueError("a superseded post needs a reason and its audit receipt")
+        with self.transaction() as session:
+            row = session.get(storage.PostObligation, (self.run_id, kind))
+            if row is None:
+                raise KeyError((self.run_id, kind))
+            if (row.state, row.manifest_hash) != ("blocked", expected_manifest_hash):
+                raise ExecutionConflict("postprocessing state changed")
+            unsettled = session.scalar(
+                select(storage.PaidRequest)
+                .where(
+                    storage.PaidRequest.run_id == self.run_id,
+                    storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+                )
+                .limit(1)
+            )
+            if unsettled is not None:
+                raise ExecutionConflict(
+                    f"paid call {unsettled.scope_key} is {unsettled.state}"
+                )
+            row.state, row.next_check_at = "skipped", None
+            row.blocked_reason = "superseded: " + reason.strip()
+            row.receipt_path, row.receipt_hash = receipt_path, receipt_hash
+            row.owner_token, row.owner_generation = self.token, self.generation
+            row.updated_at = _now()
+            session.flush()
+            return row
