@@ -709,16 +709,6 @@ def _resume_locked(upload_id):
     return get_upload(upload_id)
 
 
-def resume_upload(upload_id):
-    with storage.session_scope() as s:
-        u = s.get(ClinicUpload, upload_id)
-        if not u:
-            raise CatalogueNotFound("Upload not found")
-        key = u.admission_key
-    with upload_lock(key):
-        return _resume_locked(upload_id)
-
-
 def _upload_json(s, u):
     m = json.loads(u.manifest_json)
     items = [
@@ -907,61 +897,3 @@ def resolve_upload(upload_id, *, key, resolution, actor=None):
                 )
                 _bump(s)
         return _resume_locked(upload_id)
-
-
-def promote_upload(upload_id, portal_dir):
-    """Retryable exact byte projection; persist chosen path before any copy."""
-    with storage.session_scope() as s:
-        u = s.get(ClinicUpload, upload_id)
-        if not u:
-            raise CatalogueNotFound("Upload not found")
-        key = u.admission_key
-    with upload_lock(key):
-        with storage.session_scope() as s:
-            u = s.get(ClinicUpload, upload_id)
-            if u.status != "registered":
-                raise CatalogueConflict("Upload items remain unfinished")
-            label = s.get(storage.Patient, u.patient_uuid).label
-            ids = list(
-                s.scalars(
-                    select(ClinicUploadItem.id)
-                    .where(ClinicUploadItem.upload_id == upload_id)
-                    .order_by(ClinicUploadItem.position)
-                )
-            )
-        outputs = []
-        for item_id in ids:
-            with _write() as s:
-                item = s.get(ClinicUploadItem, item_id)
-                m = json.loads(item.metadata_json)
-                data = Path(item.staging_path).read_bytes()
-                if hashlib.sha256(data).hexdigest() != m["sha256"]:
-                    raise CatalogueUnavailable("Staging bytes changed")
-                if item.projection_path:
-                    path = Path(item.projection_path)
-                    if path.parent != Path(portal_dir) / label:
-                        raise CatalogueConflict(
-                            "Projection target differs from original binding"
-                        )
-                else:
-                    name = Path(m["originalName"].replace("\\", "/")).name
-                    path = Path(portal_dir) / label / name
-                    if path.exists() and path.read_bytes() != data:
-                        path = path.with_name(
-                            path.stem + "__" + item.source_id + path.suffix
-                        )
-                    # Every item in a same-name submission reserves its own path before copying.
-                    occupied = s.scalar(
-                        select(ClinicUploadItem.id).where(
-                            ClinicUploadItem.projection_path == str(path),
-                            ClinicUploadItem.id != item.id,
-                        )
-                    )
-                    if occupied:
-                        path = path.with_name(
-                            path.stem + "__" + item.source_id + path.suffix
-                        )
-                    item.projection_path = str(path)
-            _immutable(path, data)
-            outputs.append(str(path))
-        return outputs

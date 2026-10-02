@@ -84,7 +84,7 @@ def test_legacy_json_is_read_once_and_registered_cannot_reset(
     )
     assert pipeline_uploads.read_upload("old")["status"] == "registered"
     path.write_text(json.dumps(dict(uploadId="old", status="pending")))
-    pipeline_uploads.record_seen(upload_id="old", identity={})
+    pipeline_uploads.write_upload(dict(uploadId="old", status="pending"))
     assert pipeline_uploads.read_upload("old")["status"] == "registered"
 
 
@@ -134,7 +134,7 @@ def test_legacy_conflict_can_be_answered_through_shared_api_domain(temp_data_dir
         "old", key="answer", resolution={"forceNew": True}, actor="Doctor"
     )
     assert result["upload"]["status"] == "pending"
-    assert pipeline_uploads.pending_resolution("old") == {"forceNew": True}
+    assert pipeline_uploads.read_upload("old")["resolution"] == {"forceNew": True}
     assert (
         resolve_upload(
             "old", key="answer", resolution={"forceNew": True}, actor="Doctor"
@@ -166,73 +166,23 @@ def durable_legacy_snapshot():
     return dict(evidence=evidence, record=record, shared=get_upload("original-id"))
 
 
-@pytest.mark.parametrize("answer_kind", ["forceNew", "attachTo"])
-def test_independent_worker_uploads_share_answers_without_sharing_mutations(
-    temp_data_dir, tmp_path, monkeypatch, answer_kind
-):
-    from backend import clinic_intake, reports, storage
-    from backend.tests.test_portal_pipeline_worker import (
-        _UploadClient,
-        _upload_job,
-        _fake_save_report_upload,
-        _no_paid_work,
-    )
-    from scripts import portal_pipeline_worker as worker
+def test_resolving_an_unknown_upload_is_a_404(temp_data_dir, monkeypatch):
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from backend import main
 
-    _no_paid_work(monkeypatch, worker)
+    monkeypatch.setenv("QEEG_MOCK_LLM", "1")
+    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     monkeypatch.setattr(
-        reports, "save_report_upload", _fake_save_report_upload(temp_data_dir)
+        main, "_ensure_project_clipr_config", lambda: Path(temp_data_dir) / "c.conf"
     )
-    target = clinic_intake.submit_upload(
-        key="seed",
-        identity=_upload_job()["identity"],
-        files=[("seed.txt", b"seed", "text/plain")],
-        file_meta=[{}],
-    )["upload"]["patientId"]
-    answer = {"forceNew": True} if answer_kind == "forceNew" else {"attachTo": target}
-    result_ids = []
-    for index, name in enumerate(("Barry", "Beth")):
-        upload_id = f"independent-{index}"
-        payload = _upload_job()
-        payload.update(
-            uploadId=upload_id, fileKey=f"uploads/pending/{upload_id}/scan.pdf"
+    monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    with TestClient(main.app, raise_server_exceptions=False) as api:
+        response = api.post(
+            "/api/pipeline/uploads/nope/resolution", json={"force_new": True}
         )
-        payload["identity"]["firstName"] = name
-        job_key = f"pipeline/jobs/{upload_id}/upload.json"
-        client = _UploadClient(
-            {job_key: payload}, blobs={payload["fileKey"]: name.encode()}
-        )
-        args = dict(
-            client=client,
-            portal_dir=tmp_path / "portal",
-            status_dir=tmp_path / "status",
-            job_key=job_key,
-            payload=payload,
-        )
-        assert (
-            worker.process_new_patient_upload(**args).status == "needs_operator_answer"
-        )
-        record = pipeline_uploads.read_upload(upload_id)
-        pipeline_uploads.write_upload({**record, "resolution": answer})
-        accepted = worker.process_new_patient_upload(**args)
-        assert accepted.status == "registered", accepted.note
-        result_ids.append(accepted.patient_id)
-        original_upload = clinic_intake.get_upload(upload_id)
-        for _ in range(2):
-            client._jobs[job_key] = payload
-            replay = worker.process_new_patient_upload(**args)
-            assert replay.patient_id == accepted.patient_id
-            assert replay.status in ("registered", "already_registered")
-            assert clinic_intake.get_upload(upload_id) == original_upload
-    assert result_ids == (
-        [target + "_2", target + "_3"]
-        if answer_kind == "forceNew"
-        else [target, target]
-    )
-    with storage.session_scope() as session:
-        patients = storage.list_patients(session)
-        assert len(patients) == (3 if answer_kind == "forceNew" else 1)
-        assert sum(len(storage.list_reports(session, p.id)) for p in patients) == 2
+
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize(

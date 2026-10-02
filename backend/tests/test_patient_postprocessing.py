@@ -338,7 +338,6 @@ def test_clinical_complete_and_independent_post_dispositions_are_atomic(
 
     store, run_id, cfg = ready
     cfg["enabled"] = enabled
-    cfg["retired_cathode_flag"] = "1"
     store.request_run_start(run_id)
     owner = store.claim_run_owner(run_id)
     with owner.transaction() as session:
@@ -357,20 +356,17 @@ def test_clinical_complete_and_independent_post_dispositions_are_atomic(
         assert rows["patient_facing"].state == (
             "skipped" if not enabled else "blocked" if missing else "pending"
         )
-        assert rows["cathode"].state == "skipped"
-        assert rows["cathode"].blocked_reason == "manual_fallback"
-        assert (
-            post._load(rows["cathode"].manifest_path)["diagnostic"]
-            == "automatic_cathode_routing_retired"
-        )
+        # Retired Cathode routing leaves no obligation and no manifest behind.
+        assert set(rows) == {"patient_facing"}
+        assert not (post._root(owner) / "cathode.json").exists()
         completion.project_run_status(None, run_id, status="complete")
         with owner.transaction() as session:
-            assert len(list(session.scalars(select(storage.PostObligation)))) == 2
+            assert len(list(session.scalars(select(storage.PostObligation)))) == 1
     finally:
         owner.release()
 
 
-def test_complete_transaction_rolls_back_both_dispositions(ready, monkeypatch):
+def test_complete_transaction_rolls_back_status_and_post_together(ready, monkeypatch):
     from backend.council import completion
     from types import SimpleNamespace
 
@@ -401,7 +397,7 @@ def test_complete_transaction_rolls_back_both_dispositions(ready, monkeypatch):
         completion.project_run_status(None, run_id, status="complete")
         with owner.transaction() as session:
             assert session.get(storage.Run, run_id).status == "complete"
-            assert len(list(session.scalars(select(storage.PostObligation)))) == 2
+            assert len(list(session.scalars(select(storage.PostObligation)))) == 1
     finally:
         owner.release()
 

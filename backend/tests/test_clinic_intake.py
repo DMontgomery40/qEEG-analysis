@@ -273,27 +273,6 @@ def test_adopt_original_registered_sources_never_allocates_force_new_again(
     assert counts() == (1, 1, 0, 2, 0)
 
 
-def test_projection_equal_names_across_concurrent_submissions_preserves_every_byte(
-    temp_data_dir,
-):
-    a = submit("a", files=[("same.txt", b"A", "text/plain")], file_meta=[{}])["upload"]
-    b = submit("b", files=[("same.txt", b"B", "text/plain")], file_meta=[{}])["upload"]
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(
-            pool.map(
-                lambda u: intake().promote_upload(
-                    u["uploadId"], temp_data_dir / "portal"
-                ),
-                [a, b],
-            )
-        )
-    from pathlib import Path
-
-    assert {Path(paths[0]).read_bytes() for paths in results} == {b"A", b"B"}
-    for u, paths in zip([a, b], results):
-        assert intake().promote_upload(u["uploadId"], temp_data_dir / "portal") == paths
-
-
 def test_confirmed_upload_cannot_borrow_existing_operation_identity(temp_data_dir):
     from backend.clinic_jobs import register_operation
 

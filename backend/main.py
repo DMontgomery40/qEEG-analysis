@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -623,162 +622,6 @@ async def _auto_generate_patient_facing_for_run(
         },
     )
     return result["state"] == "done" and bool(result.get("verified"))
-
-
-async def _auto_generate_cathode_video_for_run(
-    run_id: str, broker: _EventBroker
-) -> None:
-    """Best-effort post-run Cathode video generation into ../cathode/projects."""
-    if not _truthy_env("QEEG_AUTO_CATHODE_VIDEO", True):
-        return
-
-    with storage.session_scope() as session:
-        run = storage.get_run(session, run_id)
-        if run is None or (run.status or "") != "complete":
-            return
-        completion_gaps = run_downstream_delivery_gaps(
-            run,
-            progress=summarize_run_progress(run),
-            artifacts=storage.list_artifacts(session, run_id),
-        )
-        if completion_gaps:
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "cathode_video",
-                    "status": "skipped",
-                    "reason": "Council run is not peer-reviewed enough for Cathode handoff.",
-                    "gaps": completion_gaps,
-                    "operatorHint": "Rerun the council until Stage 2 peer review completes before handing off to Cathode.",
-                },
-            )
-            return
-        patient = storage.get_patient(session, run.patient_id)
-        if patient is None:
-            return
-        patient_label = _normalize_portal_patient_id((patient.label or "").strip())
-        if patient_label is None:
-            return
-        source_choice = choose_cathode_source_artifact(
-            session,
-            patient_id=patient.id,
-            preferred_run_id=run_id,
-            require_peer_reviewed=True,
-        )
-        if source_choice is None:
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "cathode_video",
-                    "status": "failed",
-                    "patient_label": patient_label,
-                    "operatorHint": "No complete stage 4 or stage 3 council markdown artifact was available for Cathode video handoff after the run completed.",
-                },
-            )
-            return
-        source_run, source_artifact = source_choice
-        handoff_paths = _prepare_cathode_handoff_for_patient(
-            patient_label=patient_label,
-            source_run=source_run,
-            source_artifact=source_artifact,
-        )
-
-    cathode_root = _repo_root().parent / "cathode"
-    queue_script = cathode_root / "scripts" / "qeeg_patient_video_queue.py"
-    if not queue_script.exists():
-        await broker.publish(
-            run_id,
-            {
-                "run_id": run_id,
-                "stage_name": "cathode_video",
-                "status": "failed",
-                "patient_label": patient_label,
-                "project_dir": handoff_paths["project_dir"],
-                "operatorHint": f"Cathode queue script was not found at {queue_script}; verify ../cathode is checked out next to qEEG-analysis.",
-            },
-        )
-        return
-
-    cathode_python = Path(
-        os.getenv("QEEG_CATHODE_PYTHON")
-        or (
-            str(cathode_root / ".venv" / "bin" / "python")
-            if (cathode_root / ".venv" / "bin" / "python").exists()
-            else sys.executable
-        )
-    ).expanduser()
-    project_dir = Path(handoff_paths["project_dir"])
-    log_path = project_dir / "qeeg_video_queue.log"
-    status_path = project_dir / "qeeg_video_queue_status.json"
-    log_file = log_path.open("a", encoding="utf-8")
-    cmd = [
-        str(cathode_python),
-        str(queue_script),
-        "--patients",
-        patient_label,
-        "--target-minutes",
-        str(os.getenv("QEEG_CATHODE_TARGET_MINUTES", "6.5") or "6.5"),
-        "--status-path",
-        str(status_path),
-        "--rebuild-storyboard",
-        "--skip-scene-review",
-        "--continue-on-error",
-    ]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cathode_root),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        log_file.close()
-    except Exception as e:
-        log_file.close()
-        LOGGER.exception(
-            "cathode_video_generation_spawn_failed",
-            run_id=run_id,
-            patient_label=patient_label,
-            operatorHint="Cathode video queue spawn failed after handoff creation; inspect QEEG_CATHODE_PYTHON, ../cathode, and qeeg_patient_video_queue.py permissions.",
-        )
-        await broker.publish(
-            run_id,
-            {
-                "run_id": run_id,
-                "stage_name": "cathode_video",
-                "status": "failed",
-                "patient_label": patient_label,
-                "project_dir": str(project_dir),
-                "error": str(e),
-                "operatorHint": "Cathode video queue spawn failed after handoff creation; inspect QEEG_CATHODE_PYTHON, ../cathode, and qeeg_patient_video_queue.py permissions.",
-            },
-        )
-        return
-
-    LOGGER.info(
-        "cathode_video_generation_started",
-        run_id=run_id,
-        patient_label=patient_label,
-        project_dir=str(project_dir),
-        status_path=str(status_path),
-        pid=proc.pid,
-    )
-    await broker.publish(
-        run_id,
-        {
-            "run_id": run_id,
-            "stage_name": "cathode_video",
-            "status": "queued",
-            "patient_label": patient_label,
-            "project_dir": str(project_dir),
-            "payload_path": handoff_paths["payload_path"],
-            "status_path": str(status_path),
-            "log_path": str(log_path),
-            "pid": proc.pid,
-        },
-    )
 
 
 def _default_clipr_config_path() -> str:
@@ -2069,31 +1912,6 @@ async def run_patient_action(
             "action": action,
             "patient_label": normalized_patient_label,
             "scheduled": True,
-        }
-
-    if action == "rerun_pipeline":
-        if normalized_patient_label is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Patient label is not a canonical portal patient id",
-            )
-        log_path = (
-            cfg.DATA_DIR / "pipeline_jobs" / f"{normalized_patient_label}.manual.log"
-        )
-        cmd = [
-            sys.executable,
-            str(_repo_root() / "scripts" / "portal_pipeline_worker.py"),
-            "--once",
-            "--include-label",
-            normalized_patient_label,
-        ]
-        pid = _start_detached(cmd, log_path)
-        return {
-            "ok": True,
-            "action": action,
-            "patient_label": normalized_patient_label,
-            "pid": pid,
-            "log_path": str(log_path),
         }
 
     if action == "regenerate_patient_facing":

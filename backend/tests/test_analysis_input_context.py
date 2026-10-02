@@ -88,7 +88,6 @@ def test_normal_start_carries_instructions_through_all_stages_and_reviews(
         workflow=QEEGCouncilWorkflow(llm=llm),
         sync=lambda _: True,
     )
-    monkeypatch.setenv("QEEG_AUTO_CATHODE_VIDEO", "0")
     monkeypatch.setenv("QEEG_STAGE6_FINAL_DRAFT_MODEL", "mock-council-a")
     monkeypatch.setenv("QEEG_PATIENT_FACING_MODEL", "mock-council-a")
     monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "1")

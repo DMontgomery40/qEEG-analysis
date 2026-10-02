@@ -11,7 +11,6 @@ import pytest
     ("component", "expected_needle"),
     [
         ("portal_watcher", "qeeg_patients_watch.mjs --dir"),
-        ("pipeline_worker", "scripts/portal_pipeline_worker.py --poll-seconds"),
         ("backend", "-m backend.main"),
         ("frontend", "frontend/node_modules/.bin/vite"),
     ],
@@ -114,13 +113,12 @@ def test_start_preflight_uses_runtime_guard_without_starting_services(
         "Starting qEEG Council...",
         "",
         "portal_watcher=running",
-        "pipeline_worker=absent",
         "backend=absent",
         "frontend=absent",
     ]
 
 
-@pytest.mark.parametrize("component", ["backend", "pipeline_worker"])
+@pytest.mark.parametrize("component", ["backend"])
 @pytest.mark.parametrize("cwd_kind", ["same", "other", "missing", "symlink"])
 def test_runtime_guard_checks_process_checkout(tmp_path, component, cwd_kind):
     repo_root = Path(__file__).resolve().parents[2]

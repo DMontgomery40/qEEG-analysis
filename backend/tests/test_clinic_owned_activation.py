@@ -98,33 +98,6 @@ def test_confirmed_original_policy_survives_settings_drift_and_replay(
         owner.close()
 
 
-def test_shared_execution_retires_old_dispatch_before_remote_reads(
-    temp_data_dir, monkeypatch
-):
-    from backend.portal_sync import spawn_portal_pipeline
-    from scripts.portal_pipeline_worker import process_patient
-
-    monkeypatch.setenv("QEEG_CLINIC_SHARED_EXECUTION", "1")
-
-    class NoRemote:
-        def __getattr__(self, name):
-            pytest.fail(
-                "Old metadata/index/dispatch path must retire before remote reads"
-            )
-
-    assert spawn_portal_pipeline("ZZ_01-01-1900") is False
-    result = process_patient(
-        client=NoRemote(),
-        portal_dir=temp_data_dir,
-        status_dir=temp_data_dir / "status",
-        patient_id="ZZ_01-01-1900",
-        job_reports=[],
-        dry_run=False,
-        allow_paid_runs=True,
-    )
-    assert result.status == "retired" and not result.ran_batch
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("started", [False, True])
 async def test_consumer_admitted_upload_avoids_source_readmission(

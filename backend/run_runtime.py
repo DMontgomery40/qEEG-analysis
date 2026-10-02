@@ -145,17 +145,7 @@ async def continue_owned_run(owner, *, llm, workflow, publish=None, sync=None):
                         raise ModelUnavailable(
                             "Pinned council catalogue is unavailable before first execution"
                         )
-                async with owned_execution(owner, llm_client=llm) as execution:
-                    if execution.manifest["postprocessing"]["retired_cathode_flag"]:
-                        LOGGER.warning(
-                            "automatic_cathode_routing_retired", run_id=run.id
-                        )
-                        await observe(
-                            {
-                                "run_id": run.id,
-                                "diagnostic": "automatic_cathode_routing_retired",
-                            }
-                        )
+                async with owned_execution(owner, llm_client=llm):
                     if run.status != "complete":
                         await workflow.run_pipeline(
                             run.id, on_event=observe, propagate_owned_errors=True

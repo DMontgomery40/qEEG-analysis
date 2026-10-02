@@ -1248,12 +1248,6 @@ def build_patient_orchestration_detail(
                 if portal_patient_id is not None
                 else "Patient label is not a canonical portal patient id.",
             },
-            "rerun_pipeline": {
-                "enabled": portal_patient_id is not None,
-                "reason": ""
-                if portal_patient_id is not None
-                else "Patient label is not a canonical portal patient id.",
-            },
             "regenerate_patient_facing": {
                 "enabled": latest_patient_facing_ready_run is not None,
                 "reason": ""

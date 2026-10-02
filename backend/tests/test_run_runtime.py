@@ -197,7 +197,6 @@ def clinical(temp_data_dir, monkeypatch):
     config.DISCOVERED_MODEL_IDS.update(("mock-a", "mock-b"))
     monkeypatch.setattr(core, "ARTIFACTS_DIR", temp_data_dir / "artifacts")
     monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "0")
-    monkeypatch.setenv("QEEG_AUTO_CATHODE_VIDEO", "1")
     monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "0")
 
     async def review(**kwargs):
@@ -273,7 +272,6 @@ async def test_actual_six_stage_resume_preserves_policy_and_avoids_second_dispat
         raise AssertionError("legacy auto generator launched")
 
     monkeypatch.setattr(main, "_auto_generate_patient_facing_for_run", forbidden)
-    monkeypatch.setattr(main, "_auto_generate_cathode_video_for_run", forbidden)
     runtime = runtime_type()(
         clinical,
         llm=llm,
@@ -294,9 +292,9 @@ async def test_actual_six_stage_resume_preserves_policy_and_avoids_second_dispat
     with Session(clinical.engine) as session:
         assert session.query(storage.StageReceipt).count() == 6
         assert session.query(storage.PaidRequest).count() == 7
+        # A completed council owes one patient-facing post and nothing else.
         assert {p.kind: p.state for p in session.query(storage.PostObligation)} == {
             "patient_facing": "skipped",
-            "cathode": "skipped",
         }
 
 

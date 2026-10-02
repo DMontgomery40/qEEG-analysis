@@ -55,7 +55,6 @@ def snapshot_post_config(env, discovered, *, base_url, timeout_s):
     return {
         "enabled": env.get("QEEG_AUTO_PATIENT_FACING", "1").lower().strip()
         not in ("", "0", "false", "no", "off", "n"),
-        "retired_cathode_flag": env.get("QEEG_AUTO_CATHODE_VIDEO", ""),
         "model_preference": preferred,
         "model_id": resolved,
         "version_prefix": (
@@ -240,18 +239,7 @@ def prepare_completion_posts(owner, cfg):
             "blocked_reason": str(error),
         }
         _publish(owner, path, _json(data))
-    cathode = {
-        "schema_version": 1,
-        "run_id": owner.run_id,
-        "kind": "cathode",
-        "reason": "manual_fallback",
-        "diagnostic": "automatic_cathode_routing_retired"
-        if cfg["retired_cathode_flag"]
-        else None,
-    }
-    cp = _root(owner) / "cathode.json"
-    _publish(owner, cp, _json(cathode))
-    return [(path, data), (cp, cathode)]
+    return [(path, data)]
 
 
 def register_completion_posts(session, owner, prepared):
@@ -264,7 +252,7 @@ def register_completion_posts(session, owner, prepared):
             if (row.manifest_path, row.manifest_hash) != (str(path), digest):
                 raise ExecutionConflict("post obligation binding changed")
             continue
-        skip = data["kind"] == "cathode" or not data["enabled"]
+        skip = not data["enabled"]
         session.add(
             storage.PostObligation(
                 run_id=owner.run_id,
@@ -276,11 +264,7 @@ def register_completion_posts(session, owner, prepared):
                 else "blocked"
                 if data.get("blocked_reason")
                 else "pending",
-                blocked_reason=(
-                    "manual_fallback" if data["kind"] == "cathode" else "disabled"
-                )
-                if skip
-                else data.get("blocked_reason"),
+                blocked_reason="disabled" if skip else data.get("blocked_reason"),
                 owner_token=owner.token,
                 owner_generation=owner.generation,
             )

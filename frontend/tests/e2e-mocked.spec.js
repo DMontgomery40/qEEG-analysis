@@ -116,7 +116,6 @@ const MOCK_ORCHESTRATION = {
   actions: {
     refresh: { enabled: true },
     sync_portal: { enabled: true },
-    rerun_pipeline: { enabled: true },
     regenerate_patient_facing: { enabled: true },
     prepare_cathode_handoff: { enabled: true },
   },

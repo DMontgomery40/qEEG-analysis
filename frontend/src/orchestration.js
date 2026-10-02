@@ -12,12 +12,6 @@ const ACTION_DEFINITIONS = [
     successMessage: 'Portal sync requested.',
   },
   {
-    id: 'rerun_pipeline',
-    label: 'Rerun council batch',
-    requestLabel: 'council batch rerun',
-    successMessage: 'Council batch rerun requested.',
-  },
-  {
     id: 'regenerate_patient_facing',
     label: 'Regenerate patient-facing',
     requestLabel: 'patient-facing regeneration',

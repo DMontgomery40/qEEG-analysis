@@ -403,8 +403,7 @@ def test_source_pdfs_missing_complete_runs_flags_followups_not_generated_outputs
 
 def test_source_pdf_classifier_allows_clinic_analysis_report_names(tmp_path: Path):
     from backend import portal_sync
-    from scripts import portal_pipeline_worker
-    from scripts import run_portal_council_batch
+    from backend.portal_files import looks_generated_portal_pdf
 
     patient_id = "GH_08-10-1989"
     source_path = tmp_path / f"{patient_id}__analysis_report__v1__2026-02-09.pdf"
@@ -417,16 +416,11 @@ def test_source_pdf_classifier_allows_clinic_analysis_report_names(tmp_path: Pat
     generated_sync_echo.write_bytes(b"%PDF-1.4")
 
     assert portal_sync._is_source_pdf(patient_id, source_path)
-    assert run_portal_council_batch._is_source_pdf(patient_id, source_path)
-    assert not portal_pipeline_worker._looks_generated_pdf(patient_id, source_path.name)
+    assert not looks_generated_portal_pdf(patient_id, source_path.name)
 
     assert not portal_sync._is_source_pdf(patient_id, generated_path)
-    assert not run_portal_council_batch._is_source_pdf(patient_id, generated_path)
     assert not portal_sync._is_source_pdf(patient_id, generated_sync_echo)
-    assert not run_portal_council_batch._is_source_pdf(
-        patient_id, generated_sync_echo
-    )
-    assert portal_pipeline_worker._looks_generated_pdf(patient_id, generated_path.name)
+    assert looks_generated_portal_pdf(patient_id, generated_path.name)
 
 
 def test_source_pdfs_missing_complete_runs_keeps_fresh_created_rows_active(
@@ -673,66 +667,64 @@ async def test_watch_portal_patients_forever_seeds_sync_state_without_mass_resyn
 
 
 @pytest.mark.asyncio
-async def test_watch_portal_patients_forever_spawns_local_pipeline_for_missing_followup(
+async def test_watch_portal_patients_forever_records_missing_followup_once_and_spawns_nothing(
     tmp_path: Path, monkeypatch
 ):
+    """A report with no complete run is logged once, its fingerprint recorded.
+
+    Before 2026-10-02 the unrecorded fingerprint re-logged every poll per
+    patient (about 100 MB per 4 h), and with shared execution unset the
+    watcher shelled out to a council batch outside the receipt journal.
+    """
     from backend import portal_sync
 
     patient_id = "GH_08-10-1989"
-    snapshots = [
-        {patient_id: (2, 200, 2000)},
-        {patient_id: (2, 200, 2000)},
-    ]
-    pipeline_calls: list[str] = []
+    fingerprint = (2, 200, 2000)
+    missing_checks: list[str] = []
     sleep_calls = 0
 
-    def fake_snapshot(_root_dir):
-        if snapshots:
-            return snapshots.pop(0)
-        return {patient_id: (2, 200, 2000)}
-
-    def fake_spawn_sync(_label: str) -> bool:
-        return True
-
-    def fake_missing_complete(_patient_dir: Path, _patient_id: str):
+    def fake_missing_complete(_patient_dir: Path, label: str):
+        missing_checks.append(label)
         return (["DK_20Tx_toxic-brain-injury_Redacted.pdf"], [])
-
-    def fake_spawn_pipeline(label: str) -> bool:
-        pipeline_calls.append(label)
-        return True
 
     async def fake_sleep(_seconds: float):
         nonlocal sleep_calls
         sleep_calls += 1
-        if sleep_calls >= 2:
+        if sleep_calls >= 5:
             raise asyncio.CancelledError
 
+    monkeypatch.delenv("QEEG_CLINIC_SHARED_EXECUTION", raising=False)
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "1")
     monkeypatch.setenv("QEEG_PORTAL_LOCAL_PIPELINE_WATCHER", "1")
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "0")
     monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(tmp_path))
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_POLL_S", "0.01")
     monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_STABLE_POLLS", "2")
-    (tmp_path / ".qeeg_portal_local_pipeline_state.json").write_text(
+    state_path = tmp_path / ".qeeg_portal_local_pipeline_state.json"
+    state_path.write_text(
         json.dumps({"patients": {patient_id: [1, 100, 1000]}}), encoding="utf-8"
     )
     monkeypatch.setattr(
-        portal_sync, "_snapshot_portal_patient_fingerprints", fake_snapshot
-    )
-    monkeypatch.setattr(portal_sync, "spawn_portal_sync", fake_spawn_sync)
-    monkeypatch.setattr(
         portal_sync,
-        "_source_pdfs_missing_complete_runs",
-        fake_missing_complete,
+        "_snapshot_portal_patient_fingerprints",
+        lambda _root_dir: {patient_id: fingerprint},
     )
     monkeypatch.setattr(
-        portal_sync, "spawn_portal_pipeline", fake_spawn_pipeline
+        portal_sync, "_source_pdfs_missing_complete_runs", fake_missing_complete
+    )
+    monkeypatch.setattr(
+        portal_sync.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("the watcher must never spawn work"),
     )
     monkeypatch.setattr(portal_sync.asyncio, "sleep", fake_sleep)
 
     with pytest.raises(asyncio.CancelledError):
         await portal_sync.watch_portal_patients_forever()
 
-    assert pipeline_calls == [patient_id]
+    assert missing_checks == [patient_id]
+    recorded = json.loads(state_path.read_text(encoding="utf-8"))
+    assert recorded["patients"][patient_id] == list(fingerprint)
 
 
 def test_portal_sync_paths_route_only_on_canonical_ids(tmp_path: Path, monkeypatch):
@@ -763,7 +755,6 @@ def test_portal_sync_paths_route_only_on_canonical_ids(tmp_path: Path, monkeypat
 
     assert portal_sync.sync_patient_to_thrylen("09-05-1954-0") is False
     assert portal_sync.spawn_portal_sync("09-05-1954-0") is False
-    assert portal_sync.spawn_portal_pipeline("09-05-1954-0") is False
 
     snapshots = portal_sync._snapshot_portal_patient_fingerprints(portal_root)
     assert list(snapshots) == ["BT_12-11-1963"]

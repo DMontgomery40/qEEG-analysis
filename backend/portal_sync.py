@@ -8,7 +8,6 @@ import os
 import shutil
 import subprocess
 
-from .clinic_execution_cutover import shared_execution_enabled
 import sys
 import tempfile
 import time
@@ -528,47 +527,6 @@ def _source_pdfs_missing_complete_runs(
     return missing_complete, active_runs
 
 
-def spawn_portal_pipeline(patient_label: str) -> bool:
-    from .clinic_execution_cutover import shared_execution_enabled
-
-    if shared_execution_enabled():
-        return False
-    patient_id = _normalize_portal_patient_id(patient_label)
-    if patient_id is None:
-        return False
-
-    cmd = [
-        sys.executable,
-        str(_repo_root() / "scripts" / "run_portal_council_batch.py"),
-        "--include-label",
-        patient_id,
-    ]
-    log_path = Path("/tmp") / f"qeeg_local_portal_pipeline_{patient_id}.log"
-    try:
-        with log_path.open("ab") as log_file:
-            subprocess.Popen(
-                cmd,
-                cwd=str(_repo_root()),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-    except Exception:
-        LOGGER.exception(
-            "portal_pipeline_spawn_failed",
-            patient_label=patient_id,
-            operatorHint="Local follow-up pipeline spawn shells into scripts/run_portal_council_batch.py; verify sys.executable, repo cwd, and CLIProxy reachability.",
-        )
-        return False
-
-    LOGGER.info(
-        "portal_pipeline_spawned",
-        patient_label=patient_id,
-        log_path=str(log_path),
-    )
-    return True
-
-
 def _portal_patient_tree_fingerprint(patient_dir: Path) -> tuple[int, int, int]:
     latest_mtime_ns = 0
     file_count = 0
@@ -745,13 +703,12 @@ async def watch_portal_patients_forever() -> None:
                             missing_reports=missing_complete,
                             active_reports=active_runs,
                         )
-                        # Under shared execution nothing is spawned here (the
-                        # clinic pipeline owns runs), so the fingerprint is
-                        # recorded as seen; before 2026-10-02 this logged again
-                        # every 5 s per patient, about 100 MB per 4 h.
-                        if spawn_portal_pipeline(patient_id) or shared_execution_enabled():
-                            last_pipeline_snapshots[patient_id] = fingerprint
-                            pipeline_state_dirty = True
+                        # Nothing is spawned here (the clinic pipeline owns
+                        # runs), so the fingerprint is recorded as seen; before
+                        # 2026-10-02 this logged again every 5 s per patient,
+                        # about 100 MB per 4 h.
+                        last_pipeline_snapshots[patient_id] = fingerprint
+                        pipeline_state_dirty = True
                     elif not active_runs:
                         last_pipeline_snapshots[patient_id] = fingerprint
                         pipeline_state_dirty = True
