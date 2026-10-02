@@ -3098,7 +3098,14 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
     }
 
 
-if __name__ == "__main__":
+def serve() -> None:
+    # This machine only. The clinic routes carry no login of their own; every
+    # caller (the workbench, the admin surface, the health check) is local, and
+    # the clinic reaches the engine only through the workbench's doorway.
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+
+if __name__ == "__main__":
+    serve()

@@ -1605,3 +1605,27 @@ def test_bulk_failed_extraction_preserves_concurrent_patient_dependants(
     assert response.json()["counts"]["errors"] == 1
     with storage.session_scope() as s:
         assert storage.get_patient(s, saved[0]) is not None
+
+
+def test_the_engine_serves_only_this_machine(temp_data_dir, monkeypatch):
+    # 2026-10-02: the engine listened on every interface with the macOS firewall
+    # off, and its clinic routes carry no login, so anyone on the same network
+    # could read charts, file reports and start paid runs without the clinic
+    # doorway. Every real caller uses 127.0.0.1:8000.
+    import ipaddress
+    import sys
+    import types
+
+    _, main = _test_app(temp_data_dir, monkeypatch)
+    calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        types.SimpleNamespace(run=lambda app, **kwargs: calls.append(kwargs)),
+    )
+
+    main.serve()
+
+    assert len(calls) == 1
+    assert ipaddress.ip_address(calls[0]["host"]).is_loopback
+    assert calls[0]["port"] == 8000
