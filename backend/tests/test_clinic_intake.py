@@ -1007,6 +1007,32 @@ def test_replay_after_the_analysis_request_was_cleared_is_a_plain_conflict(temp_
     assert "NoneType" not in str(refused.value)
 
 
+def test_a_cleared_analysis_request_reads_as_withdrawn_not_done(temp_data_dir):
+    # HUB-H2: SC's confirmed request was cleared by hand; her upload then read
+    # with no analysis at all, which the hub shows as finished.
+    from backend.clinic_records import ClinicUpload
+
+    intent = {
+        "operationId": "op-withdrawn",
+        "confirmed": True,
+        "reportItemIndexes": [0],
+        "specialInstructions": "",
+    }
+    first = submit("withdrawn", file_meta=[{"documentKind": "report"}, {}], analysis_intent=intent)["upload"]
+    assert first["analysis"]["status"] == "ready"
+    with storage.session_scope() as s:
+        s.get(ClinicUpload, first["uploadId"]).analysis_json = None
+        s.commit()
+    read = intake().get_upload(first["uploadId"])["upload"]
+    assert read["analysis"]["status"] == "withdrawn"
+    assert read["analysis"]["operationId"] == "op-withdrawn"
+    assert read["analysis"]["runId"] is None
+    listed = {u["uploadId"]: u for u in intake().list_uploads()["uploads"]}
+    assert listed[first["uploadId"]]["analysis"]["status"] == "withdrawn"
+    plain = submit("plain")["upload"]
+    assert plain["analysis"] is None, "an upload sent without 'analyze' still has none"
+
+
 def test_a_dropdown_chart_conflict_says_which_birthday_differs(temp_data_dir):
     # MF_09-05-1954's upload sat parked four days behind "The supplied identity
     # differs from this chart" while the difference was the printed birthday.

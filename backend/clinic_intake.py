@@ -893,6 +893,21 @@ def _upload_json(s, u):
             if blocked:
                 analysis["status"] = "blocked"
                 analysis["blockedReason"] = blocked
+    elif m.get("analysisIntent"):
+        # The upload was sent with "analyze" ticked and the stored request has
+        # since been cleared. SC's confirmed request was cleared by hand after
+        # 09-29 and her receipt then read as done (HUB-H2); say it was withdrawn.
+        intent = m["analysisIntent"]
+        run = s.scalar(
+            select(storage.Run).where(storage.Run.operation_id == intent["operationId"])
+        )
+        analysis = dict(
+            operationId=intent["operationId"],
+            reportItemIndexes=intent["reportItemIndexes"],
+            reportIds=[],
+            runId=run.id if run else None,
+            status=run.status if run else "withdrawn",
+        )
     return dict(
         uploadId=u.id,
         status=u.status,
