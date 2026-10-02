@@ -454,6 +454,7 @@ def _bind_patient(upload_id):
         m = json.loads(u.manifest_json)
         answer = json.loads(u.resolution_json) if u.resolution_json else m["resolution"]
         identity = _identity(m["identity"], answer)
+        note = None
         try:
             if answer.get("attachTo"):
                 exact = _patient(s, answer["attachTo"])
@@ -480,7 +481,21 @@ def _bind_patient(upload_id):
                 if len(report_dobs) > 1:
                     raise ValueError("Report items have different dates of birth")
                 if report_dobs and "birthdate" not in m["identity"]:
-                    merged["birthdate"] = next(iter(report_dobs))
+                    # Staff picked this chart, and the clinic is the authority on
+                    # who is who. A printed birthday a typo or a placeholder can
+                    # explain is noted; only one that differs in both month and
+                    # year is asked about (HUB-H8).
+                    printed = next(iter(report_dobs))
+                    on_chart = merged["birthdate"]
+                    if printed != on_chart:
+                        if _typo_or_placeholder(printed, on_chart):
+                            note = (
+                                f"The report's printed birthday {printed} differs "
+                                f"from this chart's {on_chart}; filed to the chart "
+                                "staff picked."
+                            )
+                        else:
+                            merged["birthdate"] = printed
                 merged.update(m["identity"])
                 if "firstName" in m["identity"] and "firstInitial" not in m["identity"]:
                     merged.pop("firstInitial", None)
@@ -574,9 +589,23 @@ def _bind_patient(upload_id):
             )
         u.patient_uuid = patient.id
         u.conflict_json = None
+        u.identity_note = note
         u.status = "pending"
         _bump(s, patient.id)
         return patient.id
+
+
+def _typo_or_placeholder(printed, on_chart):
+    """Whether a printed birthday differs from the chart's in a way a typo
+    (the same month or the same year) or the chart's 01-01 placeholder can
+    explain."""
+    try:
+        on_chart = normalize_birthdate(on_chart)
+    except ValueError:
+        return False
+    if on_chart.startswith("01-01-"):
+        return True
+    return printed[:2] == on_chart[:2] or printed[-4:] == on_chart[-4:]
 
 
 def _offer_placeholder_charts(s, identity):
@@ -951,6 +980,7 @@ def _upload_json(s, u):
         patientId=patient.label if patient else None,
         identity=m["identity"],
         conflict=json.loads(u.conflict_json) if u.conflict_json else None,
+        identityNote=u.identity_note,
         items=items,
         uploadedAt=u.uploaded_at,
         uploadedBy=u.uploaded_by,

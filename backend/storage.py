@@ -454,6 +454,8 @@ def _ensure_clinic_upload_columns() -> None:
         present = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(clinic_uploads)")}
         if present and "admission_block_json" not in present:
             conn.exec_driver_sql("ALTER TABLE clinic_uploads ADD COLUMN admission_block_json TEXT")
+        if present and "identity_note" not in present:
+            conn.exec_driver_sql("ALTER TABLE clinic_uploads ADD COLUMN identity_note TEXT")
 
 
 def init_db() -> None:

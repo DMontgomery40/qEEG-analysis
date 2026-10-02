@@ -446,16 +446,58 @@ def test_known_chart_birthdate_mismatch_is_resolved_without_renaming(temp_data_d
         assert storage.list_patients(s)[0].birthdate == "02-02-1900"
 
 
-def test_known_chart_report_birthdate_is_checked_before_filing(temp_data_dir):
+@pytest.mark.parametrize(
+    ("printed", "why"), [("03-03-1900", "same year"), ("02-14-1901", "same month")]
+)
+def test_a_picked_chart_files_with_a_typo_birthday_noted(temp_data_dir, printed, why):
+    # HUB-H8: the dropdown pick is the clinic's answer. A printed birthday a
+    # typo can explain is recorded on the upload instead of parking it.
     p = submit()["upload"]["patientId"]
     u = submit(
         "report-dob",
         patient_id=p,
         identity={},
-        file_meta=[{"documentKind": "report", "reportBirthdate": "03-03-1900"}, {}],
+        file_meta=[{"documentKind": "report", "reportBirthdate": printed}, {}],
     )["upload"]
-    assert u["status"] == "needs_operator_answer"
-    assert counts() == (1, 1, 0, 2, 0)
+    assert u["status"] == "registered", why
+    assert u["patientId"] == p
+    assert u["identityNote"] == (
+        f"The report's printed birthday {printed} differs from this chart's "
+        "02-02-1900; filed to the chart staff picked."
+    )
+    assert counts() == (1, 1, 1, 3, 0)
+    with storage.session_scope() as s:
+        assert storage.list_patients(s)[0].birthdate == "02-02-1900", "the chart is not rewritten"
+
+
+def test_a_picked_placeholder_birthday_chart_files_with_the_printed_birthday_noted(
+    temp_data_dir,
+):
+    with storage.session_scope() as s:
+        storage.create_patient(
+            s, label="ML_01-01-1989", first_initial="M", last_initial="L", birthdate="01-01-1989"
+        )
+    u = submit(
+        "placeholder-pick",
+        patient_id="ML_01-01-1989",
+        identity={},
+        file_meta=[{"documentKind": "report", "reportBirthdate": "05-12-1988"}, {}],
+    )["upload"]
+    assert u["status"] == "registered"
+    assert u["patientId"] == "ML_01-01-1989"
+    assert "05-12-1988" in u["identityNote"]
+
+
+def test_a_picked_chart_with_the_same_birthday_has_no_note(temp_data_dir):
+    p = submit()["upload"]["patientId"]
+    u = submit(
+        "report-dob-same",
+        patient_id=p,
+        identity={},
+        file_meta=[{"documentKind": "report", "reportBirthdate": "2/2/1900"}, {}],
+    )["upload"]
+    assert u["status"] == "registered"
+    assert u["identityNote"] is None
 
 
 @pytest.mark.parametrize("dates", [("2/2/1900", "02/02/1900"), ("02-02-1900", "2/2/1900")])
@@ -1107,8 +1149,22 @@ def test_a_dropdown_chart_conflict_says_which_birthday_differs(temp_data_dir):
         patient_id="MF_09-05-1954",
         file_meta=[{"documentKind": "report", "reportBirthdate": "03-05-2010"}, {}],
     )["upload"]
-    assert parked["status"] == "needs_operator_answer"
+    assert parked["status"] == "needs_operator_answer", "month and year differ: no typo explains it"
+    assert parked["identityNote"] is None
     assert parked["conflict"]["detail"] == (
         "The report's printed birthday 03-05-2010 does not match this chart's "
         "09-05-1954. Same person, or someone different?"
     )
+
+
+def test_a_live_uploads_table_gains_the_identity_note_column(temp_data_dir):
+    # create_all never adds a column to an existing table; the live
+    # clinic_uploads table predates identity_note.
+    first = submit()["upload"]
+    with storage.engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE clinic_uploads DROP COLUMN identity_note")
+    storage._ensure_clinic_upload_columns()
+    with storage.engine.begin() as conn:
+        columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(clinic_uploads)")}
+    assert "identity_note" in columns
+    assert intake().get_upload(first["uploadId"])["upload"]["identityNote"] is None
