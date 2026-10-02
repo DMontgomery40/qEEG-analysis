@@ -25,8 +25,11 @@ import httpx
 
 from .. import storage
 from ..execution_settings import settings
+from ..logging_utils import get_logger
 from ..paid_transport import paid_scope, raise_if_paid_blocked, PaidOutcomeUnknown
-from ..run_execution import ExecutionConflict
+from ..run_execution import ExecutionConflict, UNSETTLED_PAID_STATES
+
+LOGGER = get_logger(__name__)
 
 _CURRENT = ContextVar("qeeg_council_execution", default=None)
 _CURSOR = ContextVar("qeeg_council_cursor", default=None)
@@ -117,12 +120,65 @@ def _publish(owner, path, data):
             os.unlink(tmp)
 
 
+def adopt_recipe(owner, directory, manifest_hash, pinned, current, what):
+    """Let work with no paid call in flight continue on the code on disk.
+
+    A manifest pins the code recipe of its admission, so every deploy that
+    touched a recipe file used to block the work in flight, and only a paid
+    re-run recovered it (EN-H8). The manifest is never rewritten: its hash
+    binds the paid rows and receipts. With nothing unsettled, nothing is lost
+    by moving on: a saved answer replays only when the request this code builds
+    is byte-identical to the one paid for (the journal refuses anything else
+    without sending). An unsettled call still blocks, since re-sending it could
+    pay twice. The adoption is recorded beside the manifest.
+    """
+    if pinned == current:
+        return
+    with owner.transaction() as session:
+        unsettled = session.scalar(
+            select(storage.PaidRequest)
+            .where(
+                storage.PaidRequest.run_id == owner.run_id,
+                storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+            )
+            .limit(1)
+        )
+        if unsettled is not None:
+            raise ExecutionConflict(
+                f"incompatible {what}: paid call "
+                f"{unsettled.scope_key} is {unsettled.state}"
+            )
+    adopted = _hash(_json(current))
+    _publish(
+        owner,
+        directory / f"recipe-adopted-{adopted[:16]}.json",
+        _json(
+            {
+                "run_id": owner.run_id,
+                "manifest_hash": manifest_hash,
+                "pinned": pinned,
+                "adopted": current,
+            }
+        ),
+    )
+    LOGGER.warning(
+        "recipe_adopted",
+        recipe=what,
+        run_id=owner.run_id,
+        pinned=_hash(_json(pinned))[:16],
+        adopted=adopted[:16],
+    )
+
+
 @dataclass(frozen=True)
 class CouncilExecution:
     owner: object
     manifest_path: Path
     manifest_bytes: bytes
     llm_client: object = field(default=None, compare=False, repr=False)
+    # The recipe this context runs on once it adopted the code on disk. Each new
+    # context starts from the pinned recipe, so a restart checks again.
+    adopted: dict = field(default_factory=dict, compare=False, repr=False)
 
     async def aclose(self):
         if self.llm_client is not None:
@@ -157,8 +213,17 @@ class CouncilExecution:
             ]:
                 raise ExecutionConflict("original admission changed")
         _verify_admitted_sources(saved["admission"])
-        if saved["recipe"] != _recipe():
-            raise ExecutionConflict("incompatible execution recipe or SDK")
+        current = _recipe()
+        if current != self.adopted.get("recipe", saved["recipe"]):
+            adopt_recipe(
+                self.owner,
+                self.manifest_path.parent,
+                self.manifest_hash,
+                saved["recipe"],
+                current,
+                "execution recipe or SDK",
+            )
+            self.adopted["recipe"] = current
 
 
 def prepare_execution(owner, *, llm_client=None):
