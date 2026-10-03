@@ -2154,13 +2154,53 @@ async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
             except (ValueError, TypeError, AttributeError, OSError):
                 page_count = 0
 
+    ownership = await asyncio.to_thread(
+        _report_ownership, file_bytes, text, filename
+    )
     return {
         "filename": filename,
         "mime_type": mime_type,
         "preview": preview,
         "text": text,
         "page_count": page_count,
+        **ownership,
     }
+
+
+def _report_ownership(file_bytes: bytes, text: str, filename: str) -> dict[str, Any]:
+    """Where a previewed report already is, and which charts it nearly matches.
+
+    ``onFile`` lists every chart already holding these exact bytes; when it is
+    empty, ``nearMatches`` lists charts with a report sharing a session date,
+    with the evidence computed here. A failed lookup is reported, never
+    guessed: the caller then asks the clinic as before.
+    """
+    import hashlib
+    import logging
+
+    from .report_ownership import near_matches, same_bytes_owners, session_dates
+
+    try:
+        dates = sorted(set(session_dates(text).values()))
+    except Exception:  # noqa: BLE001 - dates only phrase the tell
+        dates = []
+    try:
+        with storage.session_scope() as session:
+            owners = same_bytes_owners(
+                session, hashlib.sha256(file_bytes).hexdigest(), len(file_bytes)
+            )
+            near = [] if owners else near_matches(session, text, filename)
+    except Exception as exc:  # noqa: BLE001 - preview must still return its text
+        logging.getLogger(__name__).warning("Report ownership lookup failed: %s", exc)
+        return {
+            "onFile": [],
+            "nearMatches": [],
+            "sessionDates": dates,
+            "ownershipError": type(exc).__name__,
+        }
+    for owner in owners:
+        owner.pop("patientUuid", None)
+    return {"onFile": owners, "nearMatches": near, "sessionDates": dates}
 
 
 @app.get("/api/reports/{report_id}/extracted")

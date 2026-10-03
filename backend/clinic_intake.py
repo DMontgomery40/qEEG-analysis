@@ -532,8 +532,11 @@ def _bind_patient(upload_id):
                     )
                 if not m["identity"]:
                     keep = True
+                _same_report_elsewhere(s, m, patient, identity)
             else:
                 patient, keep = find_patient_by_identity(s, identity)
+                if not identity.force_new:
+                    _same_report_elsewhere(s, m, patient, identity)
                 if patient is None and not identity.force_new:
                     _offer_placeholder_charts(s, identity)
                 elif patient is not None and not identity.force_new:
@@ -711,6 +714,41 @@ def _chart_difference(target, *, chart_birthdate, identity, birthdate_from_repor
     if not said:
         said.append("The details on this upload differ from this chart.")
     return " ".join(said) + " Same person, or someone different?"
+
+
+def _same_report_elsewhere(s, m, patient, identity):
+    """Tell once when this upload's exact report bytes are on another chart.
+
+    The same bytes are the same report. On 2026-10-02 a blacked-out report
+    already filed and analyzed on DM_09-23-1982 was dropped again, a new staff
+    member supplied a different name and birthday, and a second chart was
+    opened for it. When the identity given would file these bytes anywhere but
+    a chart that already holds them, the clinic is told where they are and
+    asked once; an attachTo or forceNew answer then applies what they say.
+    """
+    from .report_ownership import owner_sentence, same_bytes_owners
+
+    owners = {}
+    for item in m["items"]:
+        if item["metadata"].get("documentKind") != "report":
+            continue
+        for owner in same_bytes_owners(s, item["sha256"], item["size"]):
+            owners.setdefault(owner["patientUuid"], owner)
+    if not owners or (patient is not None and patient.id in owners):
+        return
+    ordered = list(owners.values())
+    raise IdentityNameConflict(
+        dict(
+            conflict="same_report_on_file",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[
+                dict(patient_id=o["patientId"], name=o["name"]) for o in ordered
+            ],
+            detail=owner_sentence(ordered) + " Same person, or someone different?",
+        )
+    )
 
 
 def _same_report(s, patient_uuid, meta):
