@@ -841,6 +841,17 @@ def _file_item(item_id, patient_uuid):
     if duplicate is not None:
         # The copy this filing saved under its own fresh id is never referenced.
         shutil.rmtree(reports.report_dir(patient_uuid, source_id), ignore_errors=True)
+    elif kind == "report":
+        # Name, never block: a report whose printed birthday, ages or sex
+        # disagree with this chart, or whose bytes or visit already sit on
+        # another chart, becomes an engine event the health check emails to
+        # David the same day. Six wrong-chart filings were found by accident.
+        try:
+            from .chart_consistency import note_new_filing
+
+            note_new_filing(patient_uuid, source_id)
+        except Exception:  # the filing stands whatever the detector does
+            pass
 
 
 # One lock per upload so a filing in flight is never started twice in this
