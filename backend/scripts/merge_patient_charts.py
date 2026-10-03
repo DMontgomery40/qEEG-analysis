@@ -465,6 +465,8 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
     # an already-moved file.
     done: list[dict[str, Any]] = []
     created: list[Path] = []
+    # What the database step did; it reaches the audit only once committed.
+    attempt: dict[str, Any] = {"rows": {}, "renumbered": []}
     committed = False
     try:
         for move in plan["moves"]:
@@ -484,12 +486,14 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
                 raise MergeRefused(f"{target.name} changed bytes moving ({move['sha256'][:12]} -> {after[:12]}).")
             audit["moves"].append({k: move[k] for k in ("from", "to", "owner", "sha256", "size", "artifact_ids", "location_ids", "evidence")})
             _write_json_atomic(audit_path, audit)
-        _commit_rows(plan, audit)
+        _commit_rows(plan, attempt)
         committed = True
     except BaseException as error:
         if not committed:
-            _reverse_moves(done, created, error, audit, audit_path)
+            _reverse_moves(done, created, error, attempt, audit, audit_path)
         raise
+    audit.update(attempt)
+    _write_json_atomic(audit_path, audit)
 
     dup = plan["duplicate"]
     folder = portal_patients_dir().resolve() / dup["label"]
@@ -525,6 +529,7 @@ def _reverse_moves(
     done: list[dict[str, Any]],
     created: list[Path],
     error: BaseException,
+    attempt: dict[str, Any],
     audit: dict[str, Any],
     audit_path: Path,
 ) -> None:
@@ -554,6 +559,8 @@ def _reverse_moves(
         "at": datetime.now(timezone.utc).isoformat(),
         "error": f"{type(error).__name__}: {error}",
         "database": "nothing committed",
+        # What the database step had done before it was rolled back.
+        "attempted": attempt,
         "reversed": reversed_moves,
         "failed": failed,
     }
@@ -561,7 +568,10 @@ def _reverse_moves(
 
 
 def _commit_rows(plan: dict[str, Any], audit: dict[str, Any]) -> None:
-    """The database half of the merge, in one write transaction."""
+    """The database half of the merge, in one write transaction.
+
+    ``audit`` collects what this step does; the caller decides where it lands.
+    """
     from backend.clinic_catalogue import _bump
     from backend.clinic_catalogue_reads import _fingerprint
 

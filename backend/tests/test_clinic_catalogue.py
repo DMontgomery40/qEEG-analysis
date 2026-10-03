@@ -2335,9 +2335,16 @@ def test_a_failure_after_files_move_puts_every_file_back(
     assert _chart_rows(case["duplicate_id"]) == rows
     assert _location_keys() == locations
     assert reads.current_revision() == revision
-    rollback = json.loads(audit.read_text())["rollback"]
+    record = json.loads(audit.read_text())
+    rollback = record["rollback"]
     assert len(rollback["reversed"]) == reversed_count and not rollback["failed"]
     assert {r["sha256"] for r in rollback["reversed"]} <= {m["sha256"] for m in plan["moves"]}
+    # The audit's own account says nothing was committed; what the database
+    # step tried is kept apart, under the rollback.
+    assert record["rows"] == {} and record["renumbered"] == []
+    assert "retired" not in record and "catalog_revision" not in record
+    if stage == "database":
+        assert rollback["attempted"]["rows"]["reports.patient_id"] == 1
 
 
 def test_finder_and_meta_files_do_not_hold_a_merged_chart_open(temp_data_dir, tmp_path):
