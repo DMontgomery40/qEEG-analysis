@@ -42,6 +42,10 @@ from .report_composition import (
 )
 
 COMPOSITION_VERSION = 1
+# Per source, the local sessions whose shared visit rests on the operator's
+# explicit mapping over attributable source text that differs between reports.
+SHARED_SESSION_PROVENANCE = "shared_session_provenance"
+OPERATOR_OVER_DIFFERING_TEXT = "operator_asserted_over_differing_source_text"
 _ENGINES = {
     "pypdf": "pypdf_text",
     "pymupdf": "pymupdf_text",
@@ -282,6 +286,11 @@ def _observed_session_evidence(
     return complete and bool(observations), tuple(sorted(observations))
 
 
+def _saved_shared_provenance(saved: dict) -> dict:
+    """Only manifests that recorded an operator assertion carry the key."""
+    return {k: v for k, v in saved.items() if k == SHARED_SESSION_PROVENANCE}
+
+
 def _mapping_error(snapshots: list[dict], reason: str) -> None:
     raise HTTPException(
         409,
@@ -358,6 +367,7 @@ def resolve_aliases(
                 )
     # Parsed facts detect definite conflicts; their matching intersection alone
     # cannot establish that all the source's observed measurements agree.
+    asserted: dict[int, set[int]] = {}
     groups: dict[int, list[tuple[int, dict]]] = {}
     for i, row in rows:
         groups.setdefault(aliases[i, row["local_session_index"]], []).append((i, row))
@@ -400,10 +410,17 @@ def resolve_aliases(
                     and snapshots[i]["asset_digests"] == snapshots[j]["asset_digests"]
                 )
                 if left_observed and right_observed and left_observed != right_observed:
-                    _mapping_error(
-                        snapshots,
-                        "A shared global session has differing attributable source evidence; resolve the source observations before merging visits",
-                    )
+                    if not explicit:
+                        _mapping_error(
+                            snapshots,
+                            "A shared global session has differing attributable source evidence; resolve the source observations before merging visits",
+                        )
+                    # Two exports of one visit never share text: comparison tables
+                    # follow each report's own first session, targets are normed at
+                    # export, OCR noise differs. Dates and parsed values agreed
+                    # above, so the operator's mapping decides; record that it did.
+                    asserted.setdefault(i, set()).add(row["local_session_index"])
+                    asserted.setdefault(j, set()).add(other["local_session_index"])
                 if (
                     not explicit
                     and not identical_source_session
@@ -432,6 +449,10 @@ def resolve_aliases(
                 "source_dates_and_measurements" if multi else "original_local_sessions"
             )
         )
+        if asserted.get(i):
+            snap[SHARED_SESSION_PROVENANCE] = {
+                str(local): OPERATOR_OVER_DIFFERING_TEXT for local in sorted(asserted[i])
+            }
         dates = {
             r["local_session_index"]: r["dates"][0]
             for r in snap["session_evidence"]
@@ -493,6 +514,19 @@ def _compose(
     if not _ready(stage, fingerprint):
         if stage.exists():
             shutil.rmtree(stage)
+        # Fresh admission and repair both compose here from the saved manifest,
+        # so the page labels the council reads always carry the assertion.
+        extracted = [
+            replace(
+                src,
+                operator_asserted_sessions=frozenset(
+                    int(local) for local in saved.get(SHARED_SESSION_PROVENANCE, {})
+                ),
+            )
+            if src
+            else None
+            for src, saved in zip(extracted, manifest["sources"])
+        ]
         recipe = Manifest(
             "", "combined_council_report.pdf", "", [s.spec for s in extracted], [], None
         )
@@ -708,6 +742,7 @@ def admit_run(
                     **current,
                     "session_aliases": original["session_aliases"],
                     "mapping_provenance": original["mapping_provenance"],
+                    **_saved_shared_provenance(original),
                 }
                 for current, original in zip(snapshots, saved)
             ]
@@ -724,6 +759,7 @@ def admit_run(
                     **current,
                     "session_aliases": saved["session_aliases"],
                     "mapping_provenance": saved["mapping_provenance"],
+                    **_saved_shared_provenance(saved),
                 }
                 for current, saved in zip(snapshots, saved_sources)
             ]
