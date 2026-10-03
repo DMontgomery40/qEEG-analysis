@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy.orm import Session
@@ -1843,3 +1845,230 @@ def test_new_undated_video_lists_above_older_dated_video(chart, temp_data_dir):
     videos = [f for f in reads.patient_files(chart.label, mode="archive")["files"] if f["documentKind"] == "video"]
     assert [f["fileId"] for f in videos] == [newer["fileId"], older["fileId"]]
     assert videos[0]["generatedAt"] is not None
+
+
+def _merge_fixture(temp_data_dir, *, foreign_file):
+    """A duplicate chart, its survivor, and a third chart sharing the old folder."""
+    from backend.patient_identity import reserve_canonical_patient_id
+
+    portal = temp_data_dir / "portal_patients"
+    with storage.session_scope() as session:
+        for label in ("ZS_02-02-2002", "XX_01-01-2003", "ZT_03-03-2003"):
+            reserve_canonical_patient_id(session, label)
+        session.commit()
+        survivor = storage.create_patient(session, label="ZS_02-02-2002")
+        duplicate = storage.create_patient(session, label="XX_01-01-2003")
+        third = storage.create_patient(session, label="ZT_03-03-2003")
+        ids = survivor.id, duplicate.id, third.id
+    survivor_id, duplicate_id, third_id = ids
+
+    report_dir = temp_data_dir / "reports" / duplicate_id / "r1"
+    report_dir.mkdir(parents=True)
+    (report_dir / "original.pdf").write_bytes(b"duplicate report bytes")
+    with storage.session_scope() as session:
+        report = storage.create_report(
+            session,
+            patient_id=duplicate_id,
+            filename="combined_5sessions.pdf",
+            mime_type="application/pdf",
+            stored_path=report_dir / "original.pdf",
+            extracted_text_path=report_dir / "extracted.txt",
+        )
+        run = storage.create_run(
+            session,
+            patient_id=survivor_id,
+            report_id=report.id,
+            council_model_ids=["m"],
+            consolidator_model_id="m",
+        )
+        foreign_run = storage.create_run(
+            session,
+            patient_id=third_id,
+            report_id=report.id,
+            council_model_ids=["m"],
+            consolidator_model_id="m",
+        )
+        report_id, run_id, foreign_run_id = report.id, run.id, foreign_run.id
+    source = reads.patient_files("XX_01-01-2003")["files"][0]
+    key = f"patients/XX_01-01-2003/files/{source['fileId']}"
+    catalogue.add_remote_location(source["fileId"], key)
+    catalogue.verify_remote_location(
+        source["fileId"], key, lambda: iter([b"duplicate report bytes"])
+    )
+
+    folder = portal / "XX_01-01-2003"
+    (portal / "ZS_02-02-2002").mkdir(parents=True)
+    clash = f"__patient-facing__auto-{run_id[:8]}__2026-05-09.pdf"
+    (portal / "ZS_02-02-2002" / ("ZS_02-02-2002" + clash)).write_bytes(b"theirs")
+    owned = {
+        f"XX_01-01-2003__patient-facing__auto-{run_id[:8]}__2026-05-09.md": b"write-up",
+        "XX_01-01-2003" + clash: b"same name, other bytes",
+        f"council/{run_id}/stage-6/model.md": b"council draft",
+    }
+    for relative, data in owned.items():
+        path = folder / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        catalogue.register_artifact(
+            patient_uuid=survivor_id,
+            source_kind="original-local-history",
+            source_id=relative,
+            original_name=path.name,
+            logical_family=relative,
+            local_path=path,
+        )
+    stays = {"untracked.txt": b"nobody catalogued this"}
+    if foreign_file:
+        foreign = f"XX_01-01-2003__patient-facing__auto-{foreign_run_id[:8]}__2026-05-10.md"
+        stays[foreign] = b"another patient's write-up"
+        (folder / foreign).write_bytes(stays[foreign])
+        catalogue.register_artifact(
+            patient_uuid=third_id,
+            source_kind="original-local-history",
+            source_id=foreign,
+            original_name=foreign,
+            logical_family=foreign,
+            local_path=folder / foreign,
+        )
+    (folder / "untracked.txt").write_bytes(stays["untracked.txt"])
+    return dict(
+        portal=portal,
+        survivor_id=survivor_id,
+        duplicate_id=duplicate_id,
+        report_id=report_id,
+        run_id=run_id,
+        owned=owned,
+        stays=stays,
+        clash=clash,
+        remote_key=key,
+    )
+
+
+def _merge(*argv):
+    from backend.scripts import merge_patient_charts
+
+    return merge_patient_charts.main(
+        ["--duplicate", "XX_01-01-2003", "--survivor", "ZS_02-02-2002", *argv]
+    )
+
+
+def _chart_rows(patient_uuid):
+    from sqlalchemy import text
+
+    with storage.session_scope() as session:
+        return {
+            table: session.execute(
+                text(f"SELECT count(*) FROM {table} WHERE {column} = :id"),
+                {"id": patient_uuid},
+            ).scalar()
+            for table, column in (
+                ("reports", "patient_id"),
+                ("runs", "patient_id"),
+                ("clinic_artifacts", "patient_uuid"),
+                ("patients", "id"),
+                ("clinic_patient_catalog_state", "patient_uuid"),
+            )
+        }
+
+
+def test_merging_a_duplicate_chart_moves_its_rows_files_and_listing(
+    temp_data_dir, tmp_path
+):
+    from sqlalchemy import text
+
+    case = _merge_fixture(temp_data_dir, foreign_file=False)
+    portal, folder = case["portal"], case["portal"] / "XX_01-01-2003"
+    # Charts filed before the catalogue existed carry no alias row of their own.
+    with storage.session_scope() as session:
+        session.execute(text("DELETE FROM clinic_patient_aliases WHERE alias = 'XX_01-01-2003'"))
+        session.commit()
+    before_rows = _chart_rows(case["duplicate_id"])
+    before_bytes = {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+    revision = reads.current_revision()
+
+    plan_path = tmp_path / "plan.json"
+    assert _merge("--plan-out", str(plan_path)) == 0
+    assert _chart_rows(case["duplicate_id"]) == before_rows
+    assert {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()} == before_bytes
+    assert reads.current_revision() == revision
+    assert _merge("--apply") != 0
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002_9") != 0
+    assert reads.current_revision() == revision
+
+    audit = tmp_path / "audit.json"
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(audit)) == 0
+
+    # Every row keyed to the duplicate now belongs to the survivor.
+    assert _chart_rows(case["duplicate_id"]) == dict.fromkeys(before_rows, 0)
+    with storage.session_scope() as session:
+        assert storage.get_report(session, case["report_id"]).patient_id == case["survivor_id"]
+        reservation = session.get(storage.PatientIdReservation, "XX_01-01-2003")
+        assert reservation is not None
+
+    # The roster stops listing the duplicate; its old ID now finds the survivor.
+    roster = [p["patientId"] for p in reads.roster()["patients"]]
+    assert "XX_01-01-2003" not in roster and "ZS_02-02-2002" in roster
+    assert reads.roster("XX_01-01-2003")["patient"]["patientId"] == "ZS_02-02-2002"
+
+    # Files moved under the survivor's prefix byte-identical; the clash got its
+    # own name and the survivor's file is untouched.
+    survivor_dir = portal / "ZS_02-02-2002"
+    assert (survivor_dir / ("ZS_02-02-2002" + case["clash"])).read_bytes() == b"theirs"
+    moved = {
+        p.relative_to(survivor_dir).as_posix(): p.read_bytes()
+        for p in survivor_dir.rglob("*")
+        if p.is_file() and p.read_bytes() != b"theirs"
+    }
+    assert sorted(moved.values()) == sorted(case["owned"].values())
+    assert f"council/{case['run_id']}/stage-6/model.md" in moved
+    assert any(name.endswith("__merged-2.pdf") for name in moved)
+    assert sorted(p.name for p in folder.rglob("*") if p.is_file()) == ["untracked.txt"]
+
+    # The survivor's catalogue lists the moved files with live local bytes, and
+    # the report published under the old ID still serves from the hub key.
+    files = reads.patient_files("ZS_02-02-2002", mode="full")["files"]
+    by_name = {f["originalName"]: f for f in files}
+    for relative in case["owned"]:
+        assert by_name[Path(relative).name]["hashVerified"]
+    local = [
+        loc for f in files for loc in f["locations"] if loc["kind"] == "local"
+    ]
+    assert local and all(loc["verified"] for loc in local)
+    source = by_name["combined_5sessions.pdf"]
+    assert any(
+        loc["key"] == case["remote_key"] and loc["verified"]
+        for loc in source["locations"]
+    )
+
+    record = json.loads(audit.read_text())
+    assert {m["sha256"] for m in record["moves"]} == {
+        hashlib.sha256(data).hexdigest() for data in case["owned"].values()
+    }
+
+    # A second apply finds nothing left to do and changes nothing.
+    revision = reads.current_revision()
+    after = {p: p.read_bytes() for p in portal.rglob("*") if p.is_file()}
+    second = tmp_path / "second.json"
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(second)) == 0
+    assert reads.current_revision() == revision
+    assert {p: p.read_bytes() for p in portal.rglob("*") if p.is_file()} == after
+    assert json.loads(second.read_text())["moves"] == []
+
+
+def test_merge_leaves_other_charts_files_and_does_not_alias_a_shared_id(
+    temp_data_dir, tmp_path
+):
+    case = _merge_fixture(temp_data_dir, foreign_file=True)
+    folder = case["portal"] / "XX_01-01-2003"
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(tmp_path / "audit.json")) == 0
+
+    left = {p.name: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+    assert left == case["stays"]
+    # Two people were filed under the old ID, so it must not resolve to one.
+    with pytest.raises((reads.CatalogueNotFound, reads.CatalogueConflict)):
+        reads.roster("XX_01-01-2003")
+    third = reads.patient_files("ZT_03-03-2003", mode="full")["files"]
+    assert [f["hashVerified"] for f in third] == [True]
