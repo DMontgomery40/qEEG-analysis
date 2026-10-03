@@ -772,7 +772,7 @@ async def test_a_deploy_after_the_paid_answer_finishes_from_the_saved_answer(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unsettled", ["prepared", "dispatched", "unknown"])
+@pytest.mark.parametrize("unsettled", ["dispatched", "unknown"])
 async def test_a_deploy_never_steps_over_an_unsettled_write_up_call(
     ready, monkeypatch, unsettled
 ):
@@ -799,6 +799,52 @@ async def test_a_deploy_never_steps_over_an_unsettled_write_up_call(
     assert _post_row(ready[1])[0] == "blocked"
     root = post._root(owner)
     assert not list(root.glob("recipe-adopted-*.json"))
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_adopts_over_a_prepared_write_up_call_and_sends_it_once(
+    ready, monkeypatch
+):
+    """The process died after the write-up call was journaled prepared and
+    before it was sent. A recipe deploy then must not strand the write-up: it
+    adopts the new code, sends that call once through dispatched, and finishes."""
+    from backend import paid_transport
+
+    class Death(BaseException):
+        pass
+
+    owner = admit(ready)
+    sent = []
+    verify_files = paid_transport._Receipt._verify_files
+
+    def die_before_dispatch(receipt):
+        raise Death("process died before the call was dispatched")
+
+    monkeypatch.setattr(paid_transport._Receipt, "_verify_files", die_before_dispatch)
+    try:
+        with pytest.raises(Death):
+            await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.close()
+    monkeypatch.setattr(paid_transport._Receipt, "_verify_files", verify_files)
+    prepared = _paid_rows(ready[1])
+    assert [state for state, _, _ in prepared.values()] == ["prepared"]
+    assert sent == []
+    _deploy_edits_a_recipe_file(monkeypatch)
+    owner = ready[0].claim_run_owner(ready[1])
+    try:
+        result = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 1
+    finished = _paid_rows(ready[1])
+    assert finished.keys() == prepared.keys()
+    ((key, (state, request_hash, _)),) = finished.items()
+    assert (state, request_hash) == ("response_saved", prepared[key][1])
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+    (record,) = Path(result["manifest_path"]).parent.glob("recipe-adopted-*.json")
+    assert json.loads(record.read_text())["adopted"] == post._recipe()
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,10 @@ def _due_filters(now):
 
 
 UNSETTLED_PAID_STATES = ("prepared", "dispatched", "unknown")
+# A prepared row was journaled but never sent: its bytes leave only after the
+# row commits dispatched. Moving to new code over it cannot pay twice, so a
+# recipe adoption steps over it and the run finishes instead of stranding.
+ADOPTION_UNSETTLED_PAID_STATES = ("dispatched", "unknown")
 
 
 def _regeneration_filters(run_id):

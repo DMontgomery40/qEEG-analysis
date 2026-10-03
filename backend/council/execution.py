@@ -27,7 +27,7 @@ from .. import storage
 from ..execution_settings import settings
 from ..logging_utils import get_logger
 from ..paid_transport import paid_scope, raise_if_paid_blocked, PaidOutcomeUnknown
-from ..run_execution import ExecutionConflict, UNSETTLED_PAID_STATES
+from ..run_execution import ExecutionConflict, ADOPTION_UNSETTLED_PAID_STATES
 
 LOGGER = get_logger(__name__)
 
@@ -139,7 +139,7 @@ def adopt_recipe(owner, directory, manifest_hash, pinned, current, what):
             select(storage.PaidRequest)
             .where(
                 storage.PaidRequest.run_id == owner.run_id,
-                storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+                storage.PaidRequest.state.in_(ADOPTION_UNSETTLED_PAID_STATES),
             )
             .limit(1)
         )

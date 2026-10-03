@@ -1204,7 +1204,7 @@ async def test_an_adopted_council_runs_parallel_units_and_rechecks_on_restart(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unsettled", ["prepared", "dispatched", "unknown"])
+@pytest.mark.parametrize("unsettled", ["dispatched", "unknown"])
 async def test_a_deploy_never_steps_over_an_unsettled_council_call(
     owner, monkeypatch, unsettled
 ):
@@ -1227,6 +1227,54 @@ async def test_a_deploy_never_steps_over_an_unsettled_council_call(
             await _member(e, llm, 1)
     assert len(sent) == 1
     assert not list(ctx.manifest_path.parent.glob("recipe-adopted-*.json"))
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_adopts_over_a_prepared_council_call_and_sends_it_once(
+    owner, monkeypatch
+):
+    """A council call was journaled prepared, then its pinned model was not in
+    the catalogue, so nothing was sent. The next recipe deploy must not strand
+    the run on that row: the council adopts the new code and the call goes out
+    exactly once, through dispatched; a later restart replays its answer."""
+    from backend.paid_transport import dispatch_validation
+    from backend.run_runtime import ModelUnavailable
+
+    e = execution()
+    sent = []
+    llm = client(_answer(sent))
+
+    def unavailable(request):
+        raise ModelUnavailable("Pinned model is currently unavailable: model-a")
+
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    token = dispatch_validation.set(unavailable)
+    try:
+        with e.execution_context(ctx):
+            with pytest.raises(ModelUnavailable):
+                await _member(e, llm, 0)
+    finally:
+        dispatch_validation.reset(token)
+    with storage.session_scope() as session:
+        assert [row.state for row in session.scalars(select(storage.PaidRequest))] == [
+            "prepared"
+        ]
+    assert sent == []
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    adopted = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(adopted):
+        await _member(e, llm, 0)
+    restarted = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(restarted):
+        await _member(e, llm, 0)
+    assert len(sent) == 1
+    with storage.session_scope() as session:
+        rows = list(session.scalars(select(storage.PaidRequest)))
+    assert [(row.dispatch_ordinal, row.state) for row in rows] == [
+        (0, "response_saved")
+    ]
+    assert rows[0].dispatched_at is not None
+    assert list(ctx.manifest_path.parent.glob("recipe-adopted-*.json"))
 
 
 @pytest.mark.asyncio
