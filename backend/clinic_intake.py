@@ -844,8 +844,9 @@ def _file_item(item_id, patient_uuid):
     elif kind == "report":
         # Name, never block: a report whose printed birthday, ages or sex
         # disagree with this chart, or whose bytes or visit already sit on
-        # another chart, becomes an engine event the health check emails to
-        # David the same day. Six wrong-chart filings were found by accident.
+        # another chart, becomes an engine log event at once, and the health
+        # check's chart consistency lane emails David within the half hour.
+        # Six wrong-chart filings were found by accident, days to months later.
         try:
             from .chart_consistency import note_new_filing
 

@@ -450,9 +450,10 @@ def note_new_filing(patient_uuid: str, report_id: str, *, logger: Any = None) ->
 
     "New" is the chart's violation keys with this report minus its keys
     without it, so a clean report added to an already mixed chart says
-    nothing. Each new one is a ``chart_consistency_violation`` engine event,
-    which the workbench health check emails to David. Never raises, never
-    blocks the filing.
+    nothing. Each new one is a ``chart_consistency_violation`` engine log
+    event, the owner record of when it arrived; the workbench health check's
+    chart consistency lane emails David about the same key within the half
+    hour. Never raises, never blocks the filing.
     """
     from backend import config, storage
 
