@@ -289,9 +289,17 @@ def plan_merge(
             pass
 
     holder = existing_alias[0] if existing_alias else None
-    if holder not in (None, keep["uuid"], dup["uuid"]):
+    elsewhere = holder not in (None, keep["uuid"], dup["uuid"])
+    if elsewhere and not existing_alias[1]:
         raise MergeRefused(f"{duplicate} is already an alias of another chart.")
-    if others:
+    if elsewhere:
+        # Already the catalogue's answer for an ID more than one person wore.
+        alias = {
+            "register": False,
+            "ambiguous": False,
+            "reason": f"{duplicate} is already an ambiguous historical alias; it stays that way",
+        }
+    elif others:
         # The old ID named more than one person, so it must resolve to none. An
         # alias row the duplicate already had moves with its rows and is marked
         # ambiguous, which is the catalogue's own word for exactly this.

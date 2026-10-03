@@ -2072,3 +2072,29 @@ def test_merge_leaves_other_charts_files_and_does_not_alias_a_shared_id(
         reads.roster("XX_01-01-2003")
     third = reads.patient_files("ZT_03-03-2003", mode="full")["files"]
     assert [f["hashVerified"] for f in third] == [True]
+
+
+@pytest.mark.parametrize("ambiguous", [0, 1])
+def test_merge_respects_an_old_id_already_bound_to_another_chart(
+    temp_data_dir, tmp_path, ambiguous
+):
+    from sqlalchemy import text
+
+    case = _merge_fixture(temp_data_dir, foreign_file=True)
+    with storage.session_scope() as session:
+        third = storage.find_patients_by_label(session, "ZT_03-03-2003")[0].id
+        session.execute(
+            text("UPDATE clinic_patient_aliases SET patient_uuid = :p, ambiguous = :a "
+                 "WHERE alias = 'XX_01-01-2003'"),
+            {"p": third, "a": ambiguous},
+        )
+        session.commit()
+    code = _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(tmp_path / "audit.json"))
+    if not ambiguous:
+        # Bound to someone else outright: that is a question, not a merge.
+        assert code == 2 and _chart_rows(case["duplicate_id"])["patients"] == 1
+        return
+    assert code == 0 and _chart_rows(case["duplicate_id"])["patients"] == 0
+    with pytest.raises(reads.CatalogueConflict):
+        reads.roster("XX_01-01-2003")
