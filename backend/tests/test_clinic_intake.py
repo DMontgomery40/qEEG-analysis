@@ -836,6 +836,8 @@ def test_the_neutral_preview_says_where_the_exact_bytes_already_are(temp_data_di
     assert found["onFile"][0]["filedAt"]
     assert "patientUuid" not in found["onFile"][0], "the engine UUID stays plumbing"
     assert found["nearMatches"] == []
+    dated = main._report_ownership(b"other", _wavi("x", "8/11/2025", 42, 1, 2), "a.pdf")
+    assert dated["sessionDates"] == ["2025-08-11"]
 
     def broken(*args, **kwargs):
         raise RuntimeError("catalogue unavailable")
