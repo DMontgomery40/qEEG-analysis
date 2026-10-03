@@ -933,6 +933,47 @@ def test_operator_mapping_still_needs_agreeing_dates_and_values(
         assert not list(session.scalars(select(storage.Run)))
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize(
+    "left_n100,right_n100,expected",
+    [
+        ("45 -6.2 98", "45 -6.2 98", 200),
+        ("45 -6.2 98", "45 -9.8 98", 409),
+        ("45 -6.2 98", "45 -6.2 112", 409),
+    ],
+)
+def test_shared_visit_compares_the_n100_reading(
+    admission, explicit, left_n100, right_n100, expected
+):
+    # N100 facts carry uv/ms, not value. Admission compared value/sd only, so
+    # every N100 reading looked equal and an operator-mapped visit with two
+    # different N100 readings was admitted.
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    for original, reading in zip(originals, [left_n100, right_n100]):
+        block = (
+            "\nCentral-Frontal Average\nN100-UV MS\n"
+            f"{reading}\nMaximum N100 reported between 30-120 msec.\n"
+        )
+        directory = Path(original.stored_path).parent
+        for path in [
+            directory / "extracted_enhanced.txt",
+            *sorted((directory / "sources").glob("*.txt")),
+        ]:
+            path.write_text(path.read_text() + block)
+    request = {**payload, "report_ids": [r.id for r in originals]}
+    if explicit:
+        request["source_session_aliases"] = {r.id: {"1": 1} for r in originals}
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == expected, response.text
+    if expected == 409:
+        assert response.json()["detail"]["reason"] == (
+            "A shared global session has conflicting measured values"
+        )
+        with storage.session_scope() as session:
+            assert not list(session.scalars(select(storage.Run)))
+
+
 def test_stricter_admission_preserves_identical_banked_operation_receipt(
     admission, monkeypatch
 ):

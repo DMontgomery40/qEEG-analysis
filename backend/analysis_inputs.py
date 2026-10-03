@@ -227,8 +227,11 @@ def _measurements(source: ExtractedSource, local: int) -> dict[str, set[str]]:
                     for k in ("fact_type", "metric", "electrode", "condition", "unit")
                 ]
             )
+            # N100 facts carry their reading as uv/ms, not value.
             result.setdefault(key, set()).add(
-                _canonical([fact.get(k) for k in ("value", "sd_plus_minus")])
+                _canonical(
+                    [fact.get(k) for k in ("value", "sd_plus_minus", "uv", "ms")]
+                )
             )
     return result
 
