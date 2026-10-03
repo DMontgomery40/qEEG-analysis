@@ -700,6 +700,47 @@ def test_partial_multisession_evidence_needs_operator_mapping(admission, explici
     assert response.status_code == (200 if explicit else 409), response.text
 
 
+@pytest.mark.parametrize(
+    "later_first_cell,expected",
+    [("270 (+62) ms", 200), ("271 (+62) ms", 409)],
+)
+def test_ocr_plus_minus_lookalike_does_not_fake_a_shared_session_conflict(
+    admission, later_first_cell, expected
+):
+    # Two WAVi reports of one patient share the 1/14/2026 visit. The earlier
+    # report's OCR read that row's "±" as "£" in session 3, which shifted 54
+    # into session 4 and refused a merge whose values agreed.
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    bodies = [
+        "Session 1 (10/24/2025) Baseline\nSession 2 (11/14/2025) Followup\n"
+        "Session 3 (12/8/2025) Followup\nSession 4 (1/14/2026) Followup\n"
+        "Physical Reaction Time 247 (+45) ms 249 (+48) ms 273 (£54) ms "
+        "270 (+62) ms 281-405 ms\n",
+        "Session 1 (1/14/2026) Followup\nSession 2 (2/18/2026) Followup\n"
+        f"Physical Reaction Time {later_first_cell} 257 (+62) ms 279-402 ms\n",
+    ]
+    for report, body in zip(originals, bodies):
+        directory = Path(report.stored_path).parent
+        (directory / "extracted_enhanced.txt").write_text("=== PAGE 1 / 1 ===\n" + body)
+        for path in (directory / "sources").glob("*.txt"):
+            path.write_text(body)
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "source_session_aliases": {
+            originals[0].id: {"1": 1, "2": 2, "3": 3, "4": 4},
+            originals[1].id: {"1": 4, "2": 5},
+        },
+    }
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == expected, response.text
+    if expected == 409:
+        assert response.json()["detail"]["reason"] == (
+            "A shared global session has conflicting measured values"
+        )
+
+
 def test_stricter_admission_preserves_identical_banked_operation_receipt(
     admission, monkeypatch
 ):

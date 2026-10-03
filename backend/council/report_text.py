@@ -370,8 +370,12 @@ def _summary_page_facts(
             value_part = value_part[: m_range.start()]
         # OCR can omit units from some or all cells. Consume each value and
         # its parenthesized SD together before advancing to the next column.
+        # OCR reads the "±" as "+", "£", "t", "=" or drops it; any one glyph
+        # before the SD digits is that sign, never a session value of its own.
         cells = re.findall(
-            r"(\d+)\s*(?:\(\s*[+±]?\s*(\d+)\s*\))?(?:\s*ms)?", value_part, re.I
+            r"(\d+)\s*(?:\(\s*(?:[^\d\s()]\s*)?(\d+)\s*\))?(?:\s*ms)?",
+            value_part,
+            re.I,
         )
         for sess, (token, sd) in zip(expected_sessions, cells):
             val = _safe_int(token)

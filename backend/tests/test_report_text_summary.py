@@ -284,6 +284,48 @@ def test_plus_minus_sd_is_read_like_plus_sd():
     assert _metric_values(facts, "physical_reaction_time") == {1: [(282, 56)], 2: [(337, 109)]}
 
 
+# Tesseract's reading of a real four-session WAVi summary (1/14/2026 report):
+# the third cell's "±" came through as "£", the others as "+".
+_FOUR_SESSION_RT_ROW = (
+    "Physical Reaction Time 247 (+45) ms 249 (+48) ms 273 (£54) ms 270 (+62) ms 281-405 ms"
+)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _FOUR_SESSION_RT_ROW,
+        *(
+            _FOUR_SESSION_RT_ROW.replace("(+", f"({glyph}").replace("(£", f"({glyph}")
+            for glyph in ["+", "£", "t", "=", "±", ""]
+        ),
+    ],
+    ids=["ocr-row", "plus", "pound", "t", "equals", "plus-minus", "missing"],
+)
+def test_ocr_lookalike_plus_minus_keeps_each_sd_with_its_session(row):
+    # The "£" cell was read as 273 with no SD, then 54 took session 4's column,
+    # so a merge with a report printing session 4 as "270 (+62) ms" was refused.
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 17 ===\n"
+        "Assessment Scores Session 1 Session 2 Session 3 Session 4 Target\n"
+        "(10/24/2025) (11/14/2025) (12/8/2025) (1/14/2026) Range\n"
+        "Performance Assessments\n" + row + "\n"
+        "Trail Making Test A 63 sec 41 sec 50 sec 42 sec 43-74 sec\n"
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2, 3, 4])
+    rt = [f for f in facts if f.get("metric") == "physical_reaction_time"]
+
+    assert _metric_values(facts, "physical_reaction_time") == {
+        1: [(247, 45)],
+        2: [(249, 48)],
+        3: [(273, 54)],
+        4: [(270, 62)],
+    }
+    assert {f["target_range"] for f in rt} == {"281-405 ms"}
+
+
 def test_ocr_low_yield_marker_fragment_does_not_hide_the_row():
     from backend.council.report_text import _facts_from_report_text_summary
 
