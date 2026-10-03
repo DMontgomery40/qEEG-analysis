@@ -23,6 +23,14 @@ the ruling out and nothing else. Never run it on a guess.
 - The old ID becomes a historical alias of the survivor, so hub keys published
   under it stay bound — unless the old folder also holds another chart's files,
   in which case the ID named more than one person and resolves to none.
+- Where both charts hold the same catalogue version of a family, the
+  duplicate's versions in that family follow the survivor's highest, in their
+  own order. Row ids, file keys, bytes and provenance stay as they are. Two
+  charts sharing a file key is a question for the operator: the plan refuses.
+- File moves and the database step are one unit. If anything fails before the
+  commit, every file this run moved goes back to its old path, checked by hash.
+- Finder and folder bookkeeping files (``.DS_Store``, ``$meta.json``) never hold
+  a chart open. On retirement they are set aside beside the audit file.
 
 The hub reads this catalogue; nothing on the hub needs to run. The legacy
 portal sync state and workbench conversations are reported, never rewritten.
@@ -34,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,6 +146,57 @@ def _known_hashes(session, data_dir: Path, uuids: set[str]) -> dict[str, tuple[s
     return known
 
 
+def _artifact_versions(session, dup_uuid: str, keep_uuid: str) -> list[dict[str, Any]]:
+    """The version changes the duplicate's catalogue rows need to join the survivor.
+
+    In a family where any of the duplicate's versions is already the survivor's,
+    every duplicate version in that family follows the survivor's highest, in its
+    original order. Shifting the whole family keeps the order and keeps a shifted
+    version off one of the duplicate's own. A file key both charts use names a
+    file the catalogue cannot hold twice, so the merge stops there.
+    """
+    def rows(uuid):
+        return session.execute(
+            text(
+                "SELECT id, logical_family, version, file_key FROM clinic_artifacts "
+                "WHERE patient_uuid = :p"
+            ),
+            {"p": uuid},
+        ).all()
+
+    dup_rows, keep_rows = rows(dup_uuid), rows(keep_uuid)
+    shared = sorted({r[3] for r in dup_rows} & {r[3] for r in keep_rows})
+    if shared:
+        named = ", ".join(shared[:5]) + (", ..." if len(shared) > 5 else "")
+        raise MergeRefused(
+            f"Both charts have a catalogue file under the same file key ({named}). "
+            "One chart cannot hold two files with one key; decide which file keeps it first."
+        )
+    taken = {(family, version) for _, family, version, _ in keep_rows}
+    highest: dict[str, int] = {}
+    for family, version in taken:
+        highest[family] = max(highest.get(family, 0), version)
+    families: dict[str, list[tuple[int, str]]] = {}
+    for artifact_id, family, version, _ in dup_rows:
+        families.setdefault(family, []).append((version, artifact_id))
+    renumbered = []
+    for family, versions in sorted(families.items()):
+        if not any((family, version) in taken for version, _ in versions):
+            continue
+        top = highest[family]
+        for rank, (version, artifact_id) in enumerate(sorted(versions), 1):
+            if version != top + rank:
+                renumbered.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "logical_family": family,
+                        "from": version,
+                        "to": top + rank,
+                    }
+                )
+    return renumbered
+
+
 def _distinct_target(target: Path, taken: set[Path]) -> Path:
     if not target.exists() and target not in taken:
         return target
@@ -215,9 +275,10 @@ def plan_merge(
         ):
             located.setdefault(row[1], []).append(row)
 
+        renumbered = _artifact_versions(session, dup["uuid"], keep["uuid"]) if dup["uuid"] else []
         census = {e[2] for found in located.values() for e in found}
         known = _known_hashes(session, data_dir, person | census)
-        moves, stays, others = [], [], set()
+        moves, stays, others, bookkeeping = [], [], set(), []
         taken: set[Path] = set()
         paths = {Path(k) for k in located} | (
             {p for p in folder.rglob("*") if p.is_file()} if folder.is_dir() else set()
@@ -232,7 +293,9 @@ def plan_merge(
             owners = {e[2] for e in entries}
             labels = sorted({e[5] or e[2] for e in entries})
             if path.name in SKIPPED_NAMES:
-                stays.append({"path": relative, "reason": "folder bookkeeping"})
+                # Never holds the chart open. A catalogue row for it moves with
+                # the duplicate's other rows; the file is set aside on retirement.
+                bookkeeping.append({"path": relative, "catalogued": bool(entries)})
                 continue
             if not entries:
                 stays.append({"path": relative, "reason": "not in the catalogue"})
@@ -365,10 +428,12 @@ def plan_merge(
         "survivor": keep,
         "data_dir": str(data_dir),
         "rows": rows,
+        "renumbered": renumbered,
         "aliases_repointed": aliases,
         "alias": alias,
         "moves": moves,
         "stays": stays,
+        "bookkeeping": bookkeeping,
         "conversations": conversations,
         "legacy_sync_entries": legacy_entries,
         "retire": retire,
@@ -378,9 +443,6 @@ def plan_merge(
 
 def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
     """Carry the plan out, journalling every step to ``audit_path`` as it goes."""
-    from backend.clinic_catalogue import _bump
-    from backend.clinic_catalogue_reads import _fingerprint
-
     audit = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "duplicate": plan["duplicate"],
@@ -392,23 +454,116 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
         "aliases_repointed": plan["aliases_repointed"],
         "alias": plan["alias"],
         "stays": plan["stays"],
+        "renumbered": [],
+        "bookkeeping": [],
     }
     _write_json_atomic(audit_path, audit)
 
-    # Files first: a crash here leaves locations naming the old path, which the
-    # next plan finds and finishes as an already-moved file.
-    for move in plan["moves"]:
-        source, target = Path(move["from"]), Path(move["to"])
-        if source.exists():
-            if target.exists():
-                raise MergeRefused(f"{target} appeared after planning; nothing overwritten.")
+    # Files first, then the database, as one unit: a failure before the commit
+    # puts back every file this run moved. Only a hard crash can leave
+    # locations naming the old path, which the next plan finds and finishes as
+    # an already-moved file.
+    done: list[dict[str, Any]] = []
+    created: list[Path] = []
+    committed = False
+    try:
+        for move in plan["moves"]:
+            source, target = Path(move["from"]), Path(move["to"])
+            if source.exists():
+                if target.exists():
+                    raise MergeRefused(f"{target} appeared after planning; nothing overwritten.")
+                parent = target.parent
+                while not parent.exists():
+                    created.append(parent)
+                    parent = parent.parent
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+                done.append(move)
+            after = _sha256_file(target)
+            if after != move["sha256"]:
+                raise MergeRefused(f"{target.name} changed bytes moving ({move['sha256'][:12]} -> {after[:12]}).")
+            audit["moves"].append({k: move[k] for k in ("from", "to", "owner", "sha256", "size", "artifact_ids", "location_ids", "evidence")})
+            _write_json_atomic(audit_path, audit)
+        _commit_rows(plan, audit)
+        committed = True
+    except BaseException as error:
+        if not committed:
+            _reverse_moves(done, created, error, audit, audit_path)
+        raise
+
+    dup = plan["duplicate"]
+    folder = portal_patients_dir().resolve() / dup["label"]
+    if plan["retire"]:
+        # Finder and folder bookkeeping kept nothing of anyone's; set it aside
+        # beside the audit rather than delete it, so the empty folder can go.
+        aside = audit_path.with_name(audit_path.stem + "__bookkeeping")
+        for entry in plan["bookkeeping"]:
+            source = folder / entry["path"]
+            if not source.is_file():
+                continue
+            sha = _sha256_file(source)
+            target = _distinct_target(aside / entry["path"], set())
             target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(source, target)
-        after = _sha256_file(target)
-        if after != move["sha256"]:
-            raise MergeRefused(f"{target.name} changed bytes moving ({move['sha256'][:12]} -> {after[:12]}).")
-        audit["moves"].append({k: move[k] for k in ("from", "to", "owner", "sha256", "size", "artifact_ids", "location_ids", "evidence")})
-        _write_json_atomic(audit_path, audit)
+            shutil.move(source, target)
+            if _sha256_file(target) != sha:
+                raise MergeRefused(f"{target.name} changed bytes setting it aside.")
+            audit["bookkeeping"].append({"from": str(source), "to": str(target), "sha256": sha})
+            _write_json_atomic(audit_path, audit)
+    if folder.is_dir():
+        for directory in sorted((d for d in folder.rglob("*") if d.is_dir()), reverse=True):
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        if not any(folder.iterdir()):
+            folder.rmdir()
+            audit["duplicate_folder_removed"] = True
+    audit["finished_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json_atomic(audit_path, audit)
+    return audit
+
+
+def _reverse_moves(
+    done: list[dict[str, Any]],
+    created: list[Path],
+    error: BaseException,
+    audit: dict[str, Any],
+    audit_path: Path,
+) -> None:
+    """Put every file this run moved back at its old path, checked by hash."""
+    reversed_moves, failed = [], []
+    for move in reversed(done):
+        source, target = Path(move["from"]), Path(move["to"])
+        try:
+            if source.exists():
+                raise FileExistsError(f"{source} is occupied again")
+            source.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(target, source)
+            after = _sha256_file(source)
+            if after != move["sha256"]:
+                raise ValueError(f"bytes changed ({move['sha256'][:12]} -> {after[:12]})")
+        except Exception as problem:  # keep going; the original error still propagates
+            failed.append({"from": move["to"], "to": move["from"], "error": f"{type(problem).__name__}: {problem}"})
+            continue
+        reversed_moves.append({"from": move["to"], "to": move["from"], "sha256": after})
+    # Folders this run created for the moves go too, once nothing is in them.
+    for directory in sorted(created, key=lambda d: len(d.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    audit["rollback"] = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "error": f"{type(error).__name__}: {error}",
+        "database": "nothing committed",
+        "reversed": reversed_moves,
+        "failed": failed,
+    }
+    _write_json_atomic(audit_path, audit)
+
+
+def _commit_rows(plan: dict[str, Any], audit: dict[str, Any]) -> None:
+    """The database half of the merge, in one write transaction."""
+    from backend.clinic_catalogue import _bump
+    from backend.clinic_catalogue_reads import _fingerprint
 
     dup, keep = plan["duplicate"], plan["survivor"]
     with storage.session_scope() as session:
@@ -416,6 +571,18 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
         touched = False
         retire = plan["retire"]
         if dup["uuid"]:
+            # Read again under the write lock; the plan was computed without it.
+            renumbered = _artifact_versions(session, dup["uuid"], keep["uuid"])
+            for sign in (-1, 1):
+                # Through negative stand-ins first, so no step lands on a
+                # version one of the duplicate's own rows still holds.
+                for entry in renumbered:
+                    session.execute(
+                        text("UPDATE clinic_artifacts SET version = :v WHERE id = :id"),
+                        {"v": sign * entry["to"], "id": entry["artifact_id"]},
+                    )
+            audit["renumbered"] = renumbered
+            touched |= bool(renumbered)
             for table, column in _foreign_keys(session):
                 if table == "clinic_patient_catalog_state":
                     continue
@@ -486,18 +653,6 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
             audit["retired"] = retire
         session.commit()
 
-    folder = portal_patients_dir().resolve() / dup["label"]
-    if folder.is_dir():
-        for directory in sorted((d for d in folder.rglob("*") if d.is_dir()), reverse=True):
-            if not any(directory.iterdir()):
-                directory.rmdir()
-        if not any(folder.iterdir()):
-            folder.rmdir()
-            audit["duplicate_folder_removed"] = True
-    audit["finished_at"] = datetime.now(timezone.utc).isoformat()
-    _write_json_atomic(audit_path, audit)
-    return audit
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -553,7 +708,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"stopped: {error} (audit so far: {audit_path})", file=sys.stderr)
         return 1
     print(f"merged {args.duplicate} into {args.survivor}: {len(audit['moves'])} file(s) moved, "
-          f"rows {audit['rows']}, chart retired: {audit.get('retired', False)}; audit {audit_path}")
+          f"rows {audit['rows']}, {len(audit['renumbered'])} version(s) renumbered, "
+          f"{len(audit['bookkeeping'])} bookkeeping file(s) set aside, "
+          f"chart retired: {audit.get('retired', False)}; audit {audit_path}")
     return 0
 
 

@@ -2150,3 +2150,240 @@ def test_merge_respects_an_old_id_already_bound_to_another_chart(
     assert code == 0 and _chart_rows(case["duplicate_id"])["patients"] == 0
     with pytest.raises(reads.CatalogueConflict):
         reads.roster("XX_01-01-2003")
+
+
+def _portal_snapshot(portal):
+    files = {p.relative_to(portal): p.read_bytes() for p in portal.rglob("*") if p.is_file()}
+    dirs = {p.relative_to(portal) for p in portal.rglob("*") if p.is_dir()}
+    return files, dirs
+
+
+def _location_keys():
+    from sqlalchemy import text
+
+    with storage.session_scope() as session:
+        return dict(session.execute(text("SELECT id, key FROM clinic_locations")).all())
+
+
+def _artifact_rows(patient_uuid):
+    from sqlalchemy import text
+
+    with storage.session_scope() as session:
+        return {
+            row[0]: tuple(row[1:])
+            for row in session.execute(
+                text(
+                    "SELECT id, logical_family, version, file_key, sha256, provenance_json "
+                    "FROM clinic_artifacts WHERE patient_uuid = :p"
+                ),
+                {"p": patient_uuid},
+            ).all()
+        }
+
+
+def test_charts_with_their_own_council_versions_merge_and_the_duplicates_follow(
+    temp_data_dir, tmp_path
+):
+    # SF_12-03-1970 into SF_12-30-1970: both charts carried council artifacts in
+    # the same families and versions, and the merge died on the unique index.
+    case = _merge_fixture(temp_data_dir, foreign_file=False, untracked=False)
+    portal = case["portal"]
+    with storage.session_scope() as session:
+        dup_run = storage.create_run(
+            session,
+            patient_id=case["duplicate_id"],
+            report_id=case["report_id"],
+            council_model_ids=["m"],
+            consolidator_model_id="m",
+        ).id
+    # family -> (survivor's versions, duplicate's versions)
+    counts = {
+        "council-export:meta": (1, 1),
+        "council-stage:1:data_pack": (2, 3),
+        "council-stage:1:vision_transcript": (2, 2),
+        "council-stage:2:draft": (0, 1),
+    }
+    for label, uuid, run, column in (
+        ("ZS_02-02-2002", case["survivor_id"], case["run_id"], 0),
+        ("XX_01-01-2003", case["duplicate_id"], dup_run, 1),
+    ):
+        for family, per_chart in counts.items():
+            for n in range(1, per_chart[column] + 1):
+                name = f"{family.replace(':', '_')}_{n}.md"
+                path = portal / label / "council" / run / "stage-1" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"{label} {family} {n}".encode())
+                catalogue.register_artifact(
+                    patient_uuid=uuid,
+                    source_kind="council-stage",
+                    source_id=f"{run}:{family}:{n}",
+                    original_name=name,
+                    logical_family=family,
+                    local_path=path,
+                    provenance={"run_id": run, "n": n},
+                )
+    kept, dup = _artifact_rows(case["survivor_id"]), _artifact_rows(case["duplicate_id"])
+
+    audit = tmp_path / "audit.json"
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(audit)) == 0
+    left = _chart_rows(case["duplicate_id"])
+    assert left == dict.fromkeys(left, 0)
+    assert not (portal / "XX_01-01-2003").exists()
+
+    after = _artifact_rows(case["survivor_id"])
+    assert set(after) == set(kept) | set(dup)
+    # The survivor's own versions never move.
+    assert {i: after[i] for i in kept} == kept
+    # Row ids, file keys, hashes and provenance stay; only the version changes.
+    for artifact_id, (family, _version, *rest) in dup.items():
+        assert after[artifact_id][0] == family and list(after[artifact_id][2:]) == rest
+    renumbered = {}
+    for family, (theirs, ours) in counts.items():
+        mine = sorted((row[1], i) for i, row in dup.items() if row[0] == family)
+        landed = [after[i][1] for _, i in mine]
+        if theirs:
+            # Each duplicate version follows the survivor's highest, in order.
+            assert landed == list(range(theirs + 1, theirs + ours + 1))
+            renumbered.update({i: (v, theirs + k) for k, (v, i) in enumerate(mine, 1)})
+        else:
+            assert landed == [v for v, _ in mine]
+    record = json.loads(audit.read_text())
+    assert {r["artifact_id"]: (r["from"], r["to"]) for r in record["renumbered"]} == renumbered
+
+    files = reads.patient_files("ZS_02-02-2002", mode="full")["files"]
+    council = [f for f in files if f["originalName"].startswith("council-")]
+    assert len(council) == sum(a + b for a, b in counts.values())
+    assert all(f["hashVerified"] for f in council)
+
+
+def test_a_shared_file_key_refuses_the_merge_before_anything_moves(
+    temp_data_dir, tmp_path, capsys
+):
+    case = _merge_fixture(temp_data_dir, foreign_file=False, untracked=False)
+    for uuid, label in ((case["survivor_id"], "ZS"), (case["duplicate_id"], "XX")):
+        catalogue.register_artifact(
+            patient_uuid=uuid,
+            source_kind="hub-upload",
+            source_id=f"{label}-upload",
+            original_name="intake.pdf",
+            logical_family="hub-upload:intake.pdf",
+            sha256=hashlib.sha256(label.encode()).hexdigest(),
+            size=2,
+            file_key="intake-0001",
+        )
+    before = _portal_snapshot(case["portal"])
+    rows, revision = _chart_rows(case["duplicate_id"]), reads.current_revision()
+
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(tmp_path / "audit.json")) == 2
+    assert "intake-0001" in capsys.readouterr().err
+    assert _portal_snapshot(case["portal"]) == before
+    assert _chart_rows(case["duplicate_id"]) == rows
+    assert reads.current_revision() == revision
+    assert not (tmp_path / "audit.json").exists()
+
+
+class _InjectedFailure(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize("stage", ["database", "moves"])
+def test_a_failure_after_files_move_puts_every_file_back(
+    temp_data_dir, tmp_path, monkeypatch, stage
+):
+    # SF_12-03-1970 again: the database refused after 32 files had crossed, and
+    # they sat in the survivor's folder while the catalogue named the old paths.
+    from backend.scripts import merge_patient_charts
+
+    case = _merge_fixture(temp_data_dir, foreign_file=False, untracked=False)
+    portal = case["portal"]
+    files, dirs = _portal_snapshot(portal)
+    rows, locations = _chart_rows(case["duplicate_id"]), _location_keys()
+    revision = reads.current_revision()
+    audit = tmp_path / "audit.json"
+
+    plan = merge_patient_charts.plan_merge("XX_01-01-2003", "ZS_02-02-2002")
+    assert len(plan["moves"]) == 3 and plan["retire"]
+    blocker = None
+    if stage == "database":
+        def refuse(session, charts):
+            raise _InjectedFailure("UNIQUE constraint failed")
+
+        monkeypatch.setattr(catalogue, "_bump", refuse)
+        with pytest.raises(_InjectedFailure):
+            merge_patient_charts.apply_merge(plan, audit)
+        reversed_count = 3
+    else:
+        # Two files cross, then the third target turns up after planning.
+        blocker = Path(plan["moves"][-1]["to"])
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_bytes(b"arrived after planning")
+        with pytest.raises(merge_patient_charts.MergeRefused):
+            merge_patient_charts.apply_merge(plan, audit)
+        reversed_count = 2
+
+    after_files, after_dirs = _portal_snapshot(portal)
+    if blocker is not None:
+        assert after_files.pop(blocker.relative_to(portal)) == b"arrived after planning"
+        # Folders the test made for the blocker are not the merge's to remove.
+        after_dirs -= {
+            d.relative_to(portal) for d in blocker.parents if d.is_relative_to(portal)
+        } - dirs
+    assert after_files == files
+    assert after_dirs == dirs
+    assert _chart_rows(case["duplicate_id"]) == rows
+    assert _location_keys() == locations
+    assert reads.current_revision() == revision
+    rollback = json.loads(audit.read_text())["rollback"]
+    assert len(rollback["reversed"]) == reversed_count and not rollback["failed"]
+    assert {r["sha256"] for r in rollback["reversed"]} <= {m["sha256"] for m in plan["moves"]}
+
+
+def test_finder_and_meta_files_do_not_hold_a_merged_chart_open(temp_data_dir, tmp_path):
+    from sqlalchemy import text
+
+    case = _merge_fixture(temp_data_dir, foreign_file=False, untracked=False)
+    folder = case["portal"] / "XX_01-01-2003"
+    bookkeeping = {
+        ".DS_Store": b"finder root",
+        "$meta.json": b'{"folder": "XX_01-01-2003"}',
+        "council/.DS_Store": b"finder council",
+    }
+    for relative, data in bookkeeping.items():
+        (folder / relative).write_bytes(data)
+    catalogue.register_artifact(
+        patient_uuid=case["duplicate_id"],
+        source_kind="original-local-history",
+        source_id="XX_01-01-2003/.DS_Store",
+        original_name=".DS_Store",
+        logical_family=".DS_Store",
+        local_path=folder / ".DS_Store",
+    )
+
+    audit = tmp_path / "audits" / "audit.json"
+    audit.parent.mkdir()
+    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+                  "--audit", str(audit)) == 0
+
+    # The chart retires and its folder goes.
+    assert _chart_rows(case["duplicate_id"])["patients"] == 0
+    assert not folder.exists()
+    assert "XX_01-01-2003" not in [p["patientId"] for p in reads.roster()["patients"]]
+    # The catalogued Finder file moved to the survivor with every other row.
+    with storage.session_scope() as session:
+        owner = session.execute(
+            text("SELECT patient_uuid FROM clinic_artifacts WHERE source_id = :s"),
+            {"s": "XX_01-01-2003/.DS_Store"},
+        ).scalar()
+    assert owner == case["survivor_id"]
+    # The bookkeeping files were set aside beside the audit, bytes intact.
+    record = json.loads(audit.read_text())
+    aside = {
+        Path(entry["from"]).relative_to(folder).as_posix(): Path(entry["to"])
+        for entry in record["bookkeeping"]
+    }
+    assert set(aside) == set(bookkeeping)
+    for relative, path in aside.items():
+        assert path.is_relative_to(audit.parent)
+        assert path.read_bytes() == bookkeeping[relative]
