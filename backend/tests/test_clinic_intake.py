@@ -649,15 +649,200 @@ def test_identical_report_bytes_file_once_on_the_same_chart(temp_data_dir):
     assert second["items"][0]["sourceId"] == first["items"][0]["sourceId"]
     assert counts()[2] == 1, "the same bytes on the same chart are one report"
     assert counts()[3] == 2, "different patient files still file separately"
-    # a different patient with the same bytes is a different report
+    # Somebody else named for the same bytes is told where they are first; once
+    # the clinic says it is a different person, it is a different report.
     other = submit(
         key="dup-3",
         identity={"firstName": "Bea", "lastName": "Carter", "birthdate": "03-03-1901"},
         files=[("wellness.txt", same, "text/plain"), ("note3.txt", b"fourth", "text/plain")],
         file_meta=[{"documentKind": "report"}, {}],
     )["upload"]
+    assert other["status"] == "needs_operator_answer"
+    other = intake().resolve_upload(
+        other["uploadId"], key="dup-3-answer", resolution={"forceNew": True}
+    )["upload"]
     assert other["items"][0]["sourceId"] != first["items"][0]["sourceId"]
     assert counts()[2] == 2
+
+
+# 2026-10-02, conv_4455668b96bd: the owner's own report, name and birthday
+# blacked out, was dropped into a clinic chat. The exact bytes were already
+# filed and analyzed on DM_09-23-1982. A new staff member answered "Daniel
+# Mason, DOB 3/14/1981", and a second chart was opened for the duplicate.
+TONIGHT = b"blacked-out Wellness report, ages 42 on 8/11/2025 and 43 on 11/11/2025"
+OWNER = {"firstName": "Dmitri", "lastName": "Marsh", "birthdate": "09-23-1982"}
+STAFFER = {"firstName": "Daniel", "lastName": "Mason", "birthdate": "03-14-1981"}
+
+
+def file_tonight(key, identity, **kwargs):
+    return submit(
+        key,
+        identity=identity,
+        files=[("Wellness_Basic.txt", TONIGHT, "text/plain")],
+        file_meta=[{"documentKind": "report"}],
+        **kwargs,
+    )["upload"]
+
+
+def test_a_report_already_on_a_chart_is_told_not_filed_under_a_new_name(temp_data_dir):
+    owner = file_tonight("owner-first", OWNER)
+    assert owner["patientId"] == "DM_09-23-1982"
+    patients = counts()[0]
+    told = file_tonight("staffer-guess", STAFFER)
+    assert told["status"] == "needs_operator_answer"
+    assert told["patientId"] is None
+    assert counts()[0] == patients, "no chart is opened before the clinic hears"
+    assert told["conflict"]["conflict"] == "same_report_on_file"
+    assert [c["patient_id"] for c in told["conflict"]["candidates"]] == ["DM_09-23-1982"]
+    assert told["conflict"]["detail"].startswith(
+        "This exact report is already in DM_09-23-1982's chart (Dmitri Marsh), filed "
+    )
+    # Same person: the answer files to the chart that holds it, as one report.
+    same = intake().resolve_upload(
+        told["uploadId"], key="same", resolution={"attachTo": "DM_09-23-1982"}
+    )["upload"]
+    assert same["patientId"] == "DM_09-23-1982"
+    assert same["items"][0]["sourceId"] == owner["items"][0]["sourceId"]
+    assert counts()[0] == patients
+
+
+def test_after_being_told_once_the_clinic_answer_is_applied(temp_data_dir):
+    file_tonight("owner-first", OWNER)
+    told = file_tonight("staffer-guess", STAFFER)
+    applied = intake().resolve_upload(
+        told["uploadId"], key="different", resolution={"forceNew": True}
+    )["upload"]
+    assert applied["status"] == "registered"
+    assert applied["patientId"] == "DM_03-14-1981"
+
+
+def test_the_chart_that_holds_the_bytes_is_never_asked_about(temp_data_dir):
+    owner = file_tonight("owner-first", OWNER)
+    reports = counts()[2]
+    by_chart = file_tonight("picked", {}, patient_id="DM_09-23-1982")
+    by_name = file_tonight("named", OWNER)
+    for upload in (by_chart, by_name):
+        assert upload["status"] == "registered"
+        assert upload["patientId"] == "DM_09-23-1982"
+        assert upload["items"][0]["sourceId"] == owner["items"][0]["sourceId"]
+    assert counts()[2] == reports
+
+
+def test_a_staff_picked_chart_without_the_bytes_is_told_where_they_are(temp_data_dir):
+    file_tonight("owner-first", OWNER)
+    other = submit("other-chart")["upload"]["patientId"]
+    told = file_tonight("picked-wrong", {}, patient_id=other)
+    assert told["status"] == "needs_operator_answer"
+    assert told["conflict"]["conflict"] == "same_report_on_file"
+
+
+def test_bytes_on_two_charts_name_both_and_file_nowhere(temp_data_dir):
+    from backend.report_ownership import same_bytes_owners
+
+    file_tonight("owner-first", OWNER)
+    told = file_tonight("staffer-guess", STAFFER)
+    intake().resolve_upload(told["uploadId"], key="d", resolution={"forceNew": True})
+    with storage.session_scope() as s:
+        owners = same_bytes_owners(
+            s, hashlib.sha256(TONIGHT).hexdigest(), len(TONIGHT)
+        )
+    assert [o["patientId"] for o in owners] == ["DM_09-23-1982", "DM_03-14-1981"]
+    patients = counts()[0]
+    third = file_tonight(
+        "third", {"firstName": "Zed", "lastName": "Zane", "birthdate": "01-01-1990"}
+    )
+    assert third["status"] == "needs_operator_answer"
+    assert {c["patient_id"] for c in third["conflict"]["candidates"]} == {
+        "DM_09-23-1982",
+        "DM_03-14-1981",
+    }
+    assert counts()[0] == patients
+
+
+def _report_on(temp_data_dir, label, text, birthdate=None):
+    import uuid
+
+    with storage.session_scope() as s:
+        patient = s.scalar(select(storage.Patient).where(storage.Patient.label == label))
+        if patient is None:
+            patient = storage.create_patient(s, label=label, birthdate=birthdate)
+        folder = temp_data_dir / "near" / str(uuid.uuid4())
+        folder.mkdir(parents=True)
+        (folder / "extracted.txt").write_text(text)
+        s.add(
+            storage.Report(
+                patient_id=patient.id,
+                filename="report.pdf",
+                mime_type="application/pdf",
+                stored_path=str(folder / "original.pdf"),
+                extracted_text_path=str(folder / "extracted.txt"),
+            )
+        )
+        s.commit()
+
+
+def _wavi(header, date, age, reaction, p300):
+    return (
+        "=== PAGE 1 / 1 ===\n"
+        f"{header}\n"
+        f"Session 1 ({date}) Baseline N/A N/A {age} yrs\n"
+        f"Physical Reaction Time {reaction} ms 250-360 ms\n"
+        f"Audio P300 Delay {p300} ms 250-330 ms\n"
+    )
+
+
+def test_near_matches_carry_the_evidence_computed_in_code(temp_data_dir):
+    from backend.report_ownership import near_matches
+
+    _report_on(
+        temp_data_dir,
+        "DM_09-23-1982",
+        _wavi("Dmitri Marsh — Male, 9/23/1982 — ID: N/A", "8/11/2025", 42, 280, 300),
+        birthdate="09-23-1982",
+    )
+    _report_on(
+        temp_data_dir,
+        "ZZ_01-01-1900",
+        _wavi("Zelda Zane — Female, 1/1/1900 — ID: N/A", "8/11/2025", 125, 341, 322),
+    )
+    _report_on(
+        temp_data_dir,
+        "AB_02-02-1990",
+        _wavi("Ann Bee — Female, 2/2/1990 — ID: N/A", "3/3/2024", 34, 280, 300),
+    )
+    new = _wavi("— Male, ██████ — ID: N/A", "8/11/2025", 42, 280, 300)
+    with storage.session_scope() as s:
+        found = {c["patientId"]: c for c in near_matches(s, new, "DM scan.pdf")}
+    assert set(found) == {"DM_09-23-1982", "ZZ_01-01-1900"}, "only shared session dates"
+    mine, theirs = found["DM_09-23-1982"], found["ZZ_01-01-1900"]
+    assert mine["sharedSessions"][0]["date"] == "2025-08-11"
+    first = mine["sharedSessions"][0]
+    assert (first["valuesCompared"], first["valuesMatched"]) == (2, 2)
+    other = theirs["sharedSessions"][0]
+    assert (other["valuesMatched"], other["valuesDiffered"]) == (0, 2)
+    assert mine["ageFit"] == "fits" and theirs["ageFit"] == "does_not_fit"
+    assert mine["sexOnNewReport"] == "male" and theirs["sexOnChartReport"] == "female"
+    assert mine["filenameInitialsMatch"] is True
+    assert theirs["filenameInitialsMatch"] is False
+
+
+def test_the_neutral_preview_says_where_the_exact_bytes_already_are(temp_data_dir, monkeypatch):
+    from backend import main, report_ownership
+
+    file_tonight("owner-first", OWNER)
+    found = main._report_ownership(TONIGHT, "", "Wellness_Basic.pdf")
+    assert [o["patientId"] for o in found["onFile"]] == ["DM_09-23-1982"]
+    assert found["onFile"][0]["name"] == "Dmitri Marsh"
+    assert found["onFile"][0]["filedAt"]
+    assert "patientUuid" not in found["onFile"][0], "the engine UUID stays plumbing"
+    assert found["nearMatches"] == []
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("catalogue unavailable")
+
+    monkeypatch.setattr(report_ownership, "same_bytes_owners", broken)
+    failed = main._report_ownership(TONIGHT, "", "Wellness_Basic.pdf")
+    assert failed["onFile"] == [] and failed["ownershipError"] == "RuntimeError"
 
 
 def test_the_same_report_bytes_filed_twice_at_once_are_one_report(temp_data_dir, monkeypatch):
