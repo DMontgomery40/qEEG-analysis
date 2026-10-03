@@ -1847,7 +1847,7 @@ def test_new_undated_video_lists_above_older_dated_video(chart, temp_data_dir):
     assert videos[0]["generatedAt"] is not None
 
 
-def _merge_fixture(temp_data_dir, *, foreign_file):
+def _merge_fixture(temp_data_dir, *, foreign_file, untracked=True):
     """A duplicate chart, its survivor, and a third chart sharing the old folder."""
     from backend.patient_identity import reserve_canonical_patient_id
 
@@ -1917,7 +1917,7 @@ def _merge_fixture(temp_data_dir, *, foreign_file):
             logical_family=relative,
             local_path=path,
         )
-    stays = {"untracked.txt": b"nobody catalogued this"}
+    stays = {"untracked.txt": b"nobody catalogued this"} if untracked else {}
     if foreign_file:
         foreign = f"XX_01-01-2003__patient-facing__auto-{foreign_run_id[:8]}__2026-05-10.md"
         stays[foreign] = b"another patient's write-up"
@@ -1930,8 +1930,10 @@ def _merge_fixture(temp_data_dir, *, foreign_file):
             logical_family=foreign,
             local_path=folder / foreign,
         )
-    (folder / "untracked.txt").write_bytes(stays["untracked.txt"])
+    if untracked:
+        (folder / "untracked.txt").write_bytes(stays["untracked.txt"])
     return dict(
+        third_id=third_id,
         portal=portal,
         survivor_id=survivor_id,
         duplicate_id=duplicate_id,
@@ -1976,7 +1978,7 @@ def test_merging_a_duplicate_chart_moves_its_rows_files_and_listing(
 ):
     from sqlalchemy import text
 
-    case = _merge_fixture(temp_data_dir, foreign_file=False)
+    case = _merge_fixture(temp_data_dir, foreign_file=False, untracked=False)
     portal, folder = case["portal"], case["portal"] / "XX_01-01-2003"
     # Charts filed before the catalogue existed carry no alias row of their own.
     with storage.session_scope() as session:
@@ -2023,7 +2025,7 @@ def test_merging_a_duplicate_chart_moves_its_rows_files_and_listing(
     assert sorted(moved.values()) == sorted(case["owned"].values())
     assert f"council/{case['run_id']}/stage-6/model.md" in moved
     assert any(name.endswith("__merged-2.pdf") for name in moved)
-    assert sorted(p.name for p in folder.rglob("*") if p.is_file()) == ["untracked.txt"]
+    assert not folder.exists()
 
     # The survivor's catalogue lists the moved files with live local bytes, and
     # the report published under the old ID still serves from the hub key.
@@ -2057,21 +2059,71 @@ def test_merging_a_duplicate_chart_moves_its_rows_files_and_listing(
     assert json.loads(second.read_text())["moves"] == []
 
 
-def test_merge_leaves_other_charts_files_and_does_not_alias_a_shared_id(
+def test_a_shared_old_folder_goes_to_each_proven_owner_and_retires_only_when_empty(
     temp_data_dir, tmp_path
 ):
     case = _merge_fixture(temp_data_dir, foreign_file=True)
     folder = case["portal"] / "XX_01-01-2003"
-    assert _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
-                  "--audit", str(tmp_path / "audit.json")) == 0
+    yes = ("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002")
 
-    left = {p.name: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
-    assert left == case["stays"]
-    # Two people were filed under the old ID, so it must not resolve to one.
-    with pytest.raises((reads.CatalogueNotFound, reads.CatalogueConflict)):
-        reads.roster("XX_01-01-2003")
+    # Without the flag another chart's file stays, so the chart cannot go.
+    assert _merge(*yes, "--audit", str(tmp_path / "a.json")) == 0
+    assert {p.name: p.read_bytes() for p in folder.rglob("*") if p.is_file()} == case["stays"]
+    assert _chart_rows(case["duplicate_id"])["patients"] == 1
+    assert _chart_rows(case["duplicate_id"])["reports"] == 0
+
+    # With it, the third chart's file goes home under its own prefix; the file
+    # nobody catalogued still holds the chart open.
+    assert _merge(*yes, "--to-census-owners", "--audit", str(tmp_path / "b.json")) == 0
+    foreign = next(name for name in case["stays"] if name.endswith(".md"))
+    landed = case["portal"] / "ZT_03-03-2003" / foreign.replace("XX_01-01-2003", "ZT_03-03-2003")
+    assert landed.read_bytes() == case["stays"][foreign]
     third = reads.patient_files("ZT_03-03-2003", mode="full")["files"]
     assert [f["hashVerified"] for f in third] == [True]
+    assert [p.name for p in folder.rglob("*") if p.is_file()] == ["untracked.txt"]
+    assert _chart_rows(case["duplicate_id"])["patients"] == 1
+
+    # Once the folder is empty the chart retires, and an ID two people wore
+    # resolves to neither.
+    (folder / "untracked.txt").unlink()
+    assert _merge(*yes, "--to-census-owners", "--no-alias", "--audit", str(tmp_path / "c.json")) == 0
+    assert _chart_rows(case["duplicate_id"])["patients"] == 0 and not folder.exists()
+    assert "XX_01-01-2003" not in [p["patientId"] for p in reads.roster()["patients"]]
+    with pytest.raises((reads.CatalogueNotFound, reads.CatalogueConflict)):
+        reads.roster("XX_01-01-2003")
+    with storage.session_scope() as session:
+        assert session.get(storage.PatientIdReservation, "XX_01-01-2003") is not None
+
+
+def test_conflicting_evidence_holds_a_file_until_the_operator_confirms_its_owner(
+    temp_data_dir, tmp_path
+):
+    case = _merge_fixture(temp_data_dir, foreign_file=False, untracked=False)
+    folder = case["portal"] / "XX_01-01-2003"
+    # Catalogued to the third chart, but its name carries the survivor's run.
+    name = f"XX_01-01-2003__patient-facing__auto-{case['run_id'][:8]}__2026-05-11.md"
+    (folder / name).write_bytes(b"third chart's content under a misleading name")
+    catalogue.register_artifact(
+        patient_uuid=case["third_id"], source_kind="original-local-history",
+        source_id=name, original_name=name, logical_family=name, local_path=folder / name,
+    )
+    yes = ("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002", "--to-census-owners")
+    assert _merge(*yes, "--audit", str(tmp_path / "a.json")) == 0
+    assert [p.name for p in folder.rglob("*") if p.is_file()] == [name]
+    assert _chart_rows(case["duplicate_id"])["patients"] == 1
+
+    wrong = tmp_path / "wrong.json"
+    wrong.write_text(json.dumps({name: "ZS_02-02-2002"}))
+    assert _merge(*yes, "--confirm-owners", str(wrong), "--audit", str(tmp_path / "b.json")) == 0
+    assert (folder / name).exists()
+
+    ruling = tmp_path / "ruling.json"
+    ruling.write_text(json.dumps({name: "ZT_03-03-2003"}))
+    assert _merge(*yes, "--confirm-owners", str(ruling), "--no-alias",
+                  "--audit", str(tmp_path / "c.json")) == 0
+    landed = case["portal"] / "ZT_03-03-2003" / name.replace("XX_01-01-2003", "ZT_03-03-2003")
+    assert landed.exists() and not folder.exists()
+    assert _chart_rows(case["duplicate_id"])["patients"] == 0
 
 
 @pytest.mark.parametrize("ambiguous", [0, 1])
@@ -2080,7 +2132,7 @@ def test_merge_respects_an_old_id_already_bound_to_another_chart(
 ):
     from sqlalchemy import text
 
-    case = _merge_fixture(temp_data_dir, foreign_file=True)
+    case = _merge_fixture(temp_data_dir, foreign_file=True, untracked=False)
     with storage.session_scope() as session:
         third = storage.find_patients_by_label(session, "ZT_03-03-2003")[0].id
         session.execute(
@@ -2090,7 +2142,7 @@ def test_merge_respects_an_old_id_already_bound_to_another_chart(
         )
         session.commit()
     code = _merge("--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
-                  "--audit", str(tmp_path / "audit.json"))
+                  "--to-census-owners", "--audit", str(tmp_path / "audit.json"))
     if not ambiguous:
         # Bound to someone else outright: that is a question, not a merge.
         assert code == 2 and _chart_rows(case["duplicate_id"])["patients"] == 1

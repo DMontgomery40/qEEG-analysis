@@ -42,6 +42,7 @@ from typing import Any
 from sqlalchemy import text
 
 from backend import storage
+from backend.patient_identity import parse_canonical_patient_id
 from backend.patient_rekey import _sha256_file, _write_json_atomic, rename_in_name
 from backend.portal_sync import portal_patients_dir
 
@@ -82,46 +83,57 @@ def _chart(session, label: str) -> dict[str, Any] | None:
     return {"label": label, "uuid": rows[0] if rows else None, "reserved": bool(reserved)}
 
 
-def _run_owners(session, path: Path, relative: str) -> dict[str, str]:
-    """Run IDs this file names, each mapped to the chart that owns the run."""
-    tokens = set(FULL_UUID.findall(relative)) | set(RUN_TOKEN.findall(path.name))
-    if path.suffix == ".json":
+def _named_owners(session, path: Path, relative: str, provenance: list[str]) -> dict[str, str]:
+    """Runs and reports this file names, each mapped to the chart that owns it.
+
+    Read from its name and path, a meta file's ``run_id``, and the catalogue's own
+    provenance record for it.
+    """
+    runs = set(FULL_UUID.findall(relative)) | set(RUN_TOKEN.findall(path.name))
+    full = set(FULL_UUID.findall(relative))
+    for blob in provenance:
+        full |= set(FULL_UUID.findall(blob or ""))
+    if path.suffix == ".json" and path.is_file():
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(record, dict) and isinstance(record.get("run_id"), str):
-                tokens.add(record["run_id"])
+                runs.add(record["run_id"])
         except (OSError, ValueError):
             pass
     owners = {}
-    for token in sorted(tokens):
-        found = session.execute(
-            text("SELECT id, patient_id FROM runs WHERE id = :t OR id LIKE :p"),
-            {"t": token, "p": token + "%" if len(token) == 8 else token},
-        ).all()
-        if len(found) == 1:
-            owners[found[0][0]] = found[0][1]
+    for token in sorted(runs | full):
+        for table in ("runs", "reports"):
+            if table == "reports" and token not in full:
+                continue
+            found = session.execute(
+                text(f"SELECT id, patient_id FROM {table} WHERE id = :t OR id LIKE :p"),
+                {"t": token, "p": token + "%" if len(token) == 8 else token},
+            ).all()
+            if len(found) == 1:
+                owners[f"{table[:-1]} {found[0][0]}"] = found[0][1]
     return owners
 
 
-def _known_hashes(session, data_dir: Path, uuids: set[str]) -> dict[str, str]:
-    """sha256 -> what it is, for the merged person's report originals and exports."""
+def _known_hashes(session, data_dir: Path, uuids: set[str]) -> dict[str, tuple[str, str]]:
+    """sha256 -> (what it is, whose), for these charts' report originals and exports."""
     known = {}
     params = {f"u{i}": u for i, u in enumerate(sorted(uuids))}
-    marks = ", ".join(f":{k}" for k in params)
-    for report_id, stored in session.execute(
-        text(f"SELECT id, stored_path FROM reports WHERE patient_id IN ({marks})"), params
+    marks = ", ".join(f":{k}" for k in params) or "NULL"
+    for report_id, stored, owner in session.execute(
+        text(f"SELECT id, stored_path, patient_id FROM reports WHERE patient_id IN ({marks})"),
+        params,
     ):
         # Stored paths are relative to the checkout that owns DATA_DIR.
         path = Path(stored) if Path(stored).is_absolute() else data_dir.parent / stored
         if path.is_file():
-            known[_sha256_file(path)] = f"report {report_id} original"
-    for (run_id,) in session.execute(
-        text(f"SELECT id FROM runs WHERE patient_id IN ({marks})"), params
+            known[_sha256_file(path)] = (f"report {report_id} original", owner)
+    for run_id, owner in session.execute(
+        text(f"SELECT id, patient_id FROM runs WHERE patient_id IN ({marks})"), params
     ):
         for name in ("final.md", "final.pdf"):
             path = data_dir / "exports" / run_id / name
             if path.is_file():
-                known[_sha256_file(path)] = f"run {run_id} {name}"
+                known[_sha256_file(path)] = (f"run {run_id} {name}", owner)
     return known
 
 
@@ -142,8 +154,15 @@ def plan_merge(
     *,
     holds: tuple[str, ...] = (),
     conversations_dir: Path | None = None,
+    to_census_owners: bool = False,
+    no_alias: bool = False,
+    confirmed: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Everything the merge would do, computed without writing anything."""
+    """Everything the merge would do, computed without writing anything.
+
+    With ``to_census_owners`` a file the catalogue files under a third chart goes
+    to that chart's folder instead of staying, on the same two-source proof.
+    """
     if duplicate == survivor:
         raise MergeRefused("A chart cannot be merged into itself.")
     data_dir = Path(storage.DATA_DIR).resolve()
@@ -187,7 +206,7 @@ def plan_merge(
         located: dict[str, list[tuple]] = {}
         for row in session.execute(
             text(
-                "SELECT l.id, l.key, a.patient_uuid, a.id, a.sha256, p.label "
+                "SELECT l.id, l.key, a.patient_uuid, a.id, a.sha256, p.label, a.provenance_json "
                 "FROM clinic_locations l JOIN clinic_artifacts a ON a.id = l.artifact_id "
                 "LEFT JOIN patients p ON p.id = a.patient_uuid "
                 "WHERE l.kind = 'local' AND l.active = 1 AND substr(l.key, 1, :n) = :prefix"
@@ -196,12 +215,17 @@ def plan_merge(
         ):
             located.setdefault(row[1], []).append(row)
 
-        known = _known_hashes(session, data_dir, person)
+        census = {e[2] for found in located.values() for e in found}
+        known = _known_hashes(session, data_dir, person | census)
         moves, stays, others = [], [], set()
         taken: set[Path] = set()
         paths = {Path(k) for k in located} | (
             {p for p in folder.rglob("*") if p.is_file()} if folder.is_dir() else set()
         )
+
+        def same(uuid):
+            return keep["uuid"] if uuid in person else uuid
+
         for path in sorted(paths):
             relative = path.relative_to(folder).as_posix()
             entries = located.get(str(path), [])
@@ -216,17 +240,19 @@ def plan_merge(
             if len(owners) != 1:
                 stays.append({"path": relative, "reason": f"catalogued to {labels}"})
                 continue
-            owner = next(iter(owners))
-            if owner not in person:
-                others.add(labels[0])
-                stays.append({"path": relative, "reason": f"catalogued to {labels[0]}"})
-                continue
+            owner = same(next(iter(owners)))
+            home = survivor if owner == keep["uuid"] else labels[0]
+            if owner != keep["uuid"]:
+                others.add(home)
+                if not to_census_owners or not parse_canonical_patient_id(home):
+                    stays.append({"path": relative, "reason": f"catalogued to {home}"})
+                    continue
             if relative in holds:
                 stays.append({"path": relative, "reason": "held by the operator"})
                 continue
             exists = path.is_file()
-            target_dir = portal / survivor / Path(relative).parent
-            target = target_dir / rename_in_name(path.name, duplicate, survivor)
+            target_dir = portal / home / Path(relative).parent
+            target = target_dir / rename_in_name(path.name, duplicate, home)
             sha = _sha256_file(path) if exists else entries[0][4]
             if not exists:
                 # A resumed run: the file already crossed and only its catalogue
@@ -241,23 +267,40 @@ def plan_merge(
                 target = landed[0]
             else:
                 target = _distinct_target(target, taken)
-            run_owners = _run_owners(session, target if not exists else path, relative)
-            evidence = [f"run {run} belongs to {'survivor' if u == keep['uuid'] else 'duplicate' if u == dup['uuid'] else u}"
-                        for run, u in run_owners.items()]
+            named = _named_owners(
+                session, path if exists else target, relative, [e[6] for e in entries]
+            )
+            evidence = [f"{what} belongs to {home if same(u) == owner else u}"
+                        for what, u in named.items()]
+            proven = {same(u) for u in named.values()}
             if sha in known:
-                evidence.append(f"bytes equal {known[sha]}")
-            strangers = {u for u in run_owners.values() if u not in person}
-            if strangers:
-                stays.append({"path": relative, "reason": f"catalogue says this chart but run evidence says {sorted(strangers)}"})
+                evidence.append(f"bytes equal {known[sha][0]}")
+                proven.add(same(known[sha][1]))
+            ruling = (confirmed or {}).get(relative)
+            if ruling is not None and ruling != home:
+                stays.append({"path": relative, "reason": f"operator named {ruling}; catalogue says {home}"})
                 continue
-            if not evidence:
-                stays.append({"path": relative, "reason": "catalogued to this person but no run or hash confirms it"})
+            if ruling == home:
+                # The operator settled a conflict in the catalogue's favour after
+                # reading the evidence; it can confirm the census, never invent.
+                evidence.append(f"operator confirmed {home} over {sorted(proven - {owner})}")
+                proven = {owner}
+            if proven - {owner}:
+                stays.append({
+                    "path": relative,
+                    "reason": f"catalogued to {home} but evidence names {sorted(proven - {owner})}",
+                })
+                continue
+            if not proven:
+                stays.append({"path": relative, "reason": f"catalogued to {home}; no run, report or hash confirms it"})
                 continue
             taken.add(target)
             moves.append(
                 {
                     "from": str(path),
                     "to": str(target),
+                    "owner": home,
+                    "owner_uuid": owner,
                     "sha256": sha,
                     "size": path.stat().st_size if exists else None,
                     "already_moved": not exists,
@@ -299,14 +342,14 @@ def plan_merge(
             "ambiguous": False,
             "reason": f"{duplicate} is already an ambiguous historical alias; it stays that way",
         }
-    elif others:
+    elif others or no_alias:
         # The old ID named more than one person, so it must resolve to none. An
         # alias row the duplicate already had moves with its rows and is marked
         # ambiguous, which is the catalogue's own word for exactly this.
         alias = {
             "register": False,
             "ambiguous": holder is not None,
-            "reason": f"{duplicate} also filed {sorted(others)}; it names more than one person",
+            "reason": f"{duplicate} also filed {sorted(others) or 'other charts'}; it names more than one person",
         }
     else:
         alias = {
@@ -315,6 +358,8 @@ def plan_merge(
             "reason": "historical ID of the survivor",
         }
 
+    # The chart goes only once nothing of anyone's is left under its name.
+    retire = bool(dup["uuid"]) and not stays
     return {
         "duplicate": dup,
         "survivor": keep,
@@ -326,8 +371,8 @@ def plan_merge(
         "stays": stays,
         "conversations": conversations,
         "legacy_sync_entries": legacy_entries,
-        "nothing_to_do": not dup["uuid"] and not moves and not alias["register"]
-        and not (alias["ambiguous"] and holder == dup["uuid"]),
+        "retire": retire,
+        "nothing_to_do": not moves and not retire and not any(rows.values()),
     }
 
 
@@ -362,22 +407,27 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
         after = _sha256_file(target)
         if after != move["sha256"]:
             raise MergeRefused(f"{target.name} changed bytes moving ({move['sha256'][:12]} -> {after[:12]}).")
-        audit["moves"].append({k: move[k] for k in ("from", "to", "sha256", "size", "artifact_ids", "location_ids", "evidence")})
+        audit["moves"].append({k: move[k] for k in ("from", "to", "owner", "sha256", "size", "artifact_ids", "location_ids", "evidence")})
         _write_json_atomic(audit_path, audit)
 
     dup, keep = plan["duplicate"], plan["survivor"]
     with storage.session_scope() as session:
         session.execute(text("BEGIN IMMEDIATE"))
         touched = False
+        retire = plan["retire"]
         if dup["uuid"]:
             for table, column in _foreign_keys(session):
                 if table == "clinic_patient_catalog_state":
+                    continue
+                if table == "clinic_patient_aliases" and not retire:
                     continue
                 moved = session.execute(
                     text(f"UPDATE {table} SET {column} = :keep WHERE {column} = :dup"),
                     {"keep": keep["uuid"], "dup": dup["uuid"]},
                 ).rowcount
                 audit["rows"][f"{table}.{column}"] = moved
+                touched |= bool(moved)
+        if retire:
             for table, column in _foreign_keys(session):
                 if table == "clinic_patient_catalog_state":
                     continue
@@ -408,7 +458,7 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
                     },
                 )
             touched = True
-        if plan["alias"]["register"]:
+        if retire and plan["alias"]["register"]:
             session.execute(
                 text(
                     "INSERT INTO clinic_patient_aliases (alias, ambiguous, patient_uuid) "
@@ -417,7 +467,7 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
                 {"alias": dup["label"], "keep": keep["uuid"]},
             )
             touched = True
-        if plan["alias"]["ambiguous"]:
+        if retire and plan["alias"]["ambiguous"]:
             touched |= bool(session.execute(
                 text("UPDATE clinic_patient_aliases SET ambiguous = 1 "
                      "WHERE alias = :alias AND ambiguous = 0"),
@@ -429,7 +479,11 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
         ).first():
             raise MergeRefused(f"The reservation for {dup['label']} is missing; nothing committed.")
         if touched:
-            audit["catalog_revision"] = _bump(session, {keep["uuid"]})
+            charts = {keep["uuid"]} | {m["owner_uuid"] for m in plan["moves"]}
+            if dup["uuid"] and not retire:
+                charts.add(dup["uuid"])
+            audit["catalog_revision"] = _bump(session, charts)
+            audit["retired"] = retire
         session.commit()
 
     folder = portal_patients_dir().resolve() / dup["label"]
@@ -454,6 +508,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hold", action="append", default=[], help="portal path (relative to the duplicate's folder) to leave in place")
     parser.add_argument("--plan-out", type=Path, help="also write the plan JSON here")
     parser.add_argument("--audit", type=Path, help="audit JSON path for --apply")
+    parser.add_argument("--to-census-owners", action="store_true", help="move files the catalogue files under a third chart to that chart")
+    parser.add_argument("--no-alias", action="store_true", help="the old ID named more than one person: never resolve it to the survivor")
+    parser.add_argument("--confirm-owners", type=Path, help="JSON {path relative to the duplicate folder: clinic ID} confirming the catalogue owner where evidence conflicts")
     parser.add_argument("--conversations-dir", type=Path, help="workbench conversations, counted read-only")
     args = parser.parse_args(argv)
 
@@ -463,6 +520,11 @@ def main(argv: list[str] | None = None) -> int:
             args.survivor,
             holds=tuple(args.hold),
             conversations_dir=args.conversations_dir,
+            to_census_owners=args.to_census_owners,
+            no_alias=args.no_alias,
+            confirmed=json.loads(args.confirm_owners.read_text(encoding="utf-8"))
+            if args.confirm_owners
+            else None,
         )
     except MergeRefused as error:
         print(f"refused: {error}", file=sys.stderr)
@@ -491,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"stopped: {error} (audit so far: {audit_path})", file=sys.stderr)
         return 1
     print(f"merged {args.duplicate} into {args.survivor}: {len(audit['moves'])} file(s) moved, "
-          f"rows {audit['rows']}; audit {audit_path}")
+          f"rows {audit['rows']}, chart retired: {audit.get('retired', False)}; audit {audit_path}")
     return 0
 
 
