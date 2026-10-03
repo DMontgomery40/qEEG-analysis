@@ -342,6 +342,10 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
         "survivor": plan["survivor"],
         "moves": [],
         "rows": {},
+        # Exactly what a reversal needs: which rows moved, which alias changed.
+        "row_ids": plan["rows"],
+        "aliases_repointed": plan["aliases_repointed"],
+        "alias": plan["alias"],
         "stays": plan["stays"],
     }
     _write_json_atomic(audit_path, audit)
@@ -358,7 +362,7 @@ def apply_merge(plan: dict[str, Any], audit_path: Path) -> dict[str, Any]:
         after = _sha256_file(target)
         if after != move["sha256"]:
             raise MergeRefused(f"{target.name} changed bytes moving ({move['sha256'][:12]} -> {after[:12]}).")
-        audit["moves"].append({k: move[k] for k in ("from", "to", "sha256", "size", "artifact_ids", "evidence")})
+        audit["moves"].append({k: move[k] for k in ("from", "to", "sha256", "size", "artifact_ids", "location_ids", "evidence")})
         _write_json_atomic(audit_path, audit)
 
     dup, keep = plan["duplicate"], plan["survivor"]
