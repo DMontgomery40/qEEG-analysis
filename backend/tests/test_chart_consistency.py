@@ -223,3 +223,55 @@ def test_a_detector_failure_never_fails_the_filing(temp_data_dir, monkeypatch):
     filed = _file("g1", "Ada", "Baker", "02-02-1900", wavi("Female, 9/5/1954"), "a.txt")
     assert filed["items"][0]["status"] == "registered"
     assert [e["event"] for e in events] == ["chart_consistency_check_failed"]
+
+
+def filed(file_id, uuid, folder, *, kind="patient-summary", run=None, name=None):
+    return {"id": file_id, "patient_uuid": uuid, "filename": name or f"{file_id}.pdf",
+            "document_kind": kind, "folder": folder, "run": run}
+
+
+def test_a_chart_whose_files_sit_in_another_ids_folder_is_named_once():
+    # 2026-10-19: BT_12-11-1963 was relabelled in the catalogue (and so on the
+    # hub) but its files stayed in the folder CL_12-11-1963, unnoticed.
+    bt, bt_chart = chart("BT_12-11-1963")
+    jp, jp_chart = chart("JP_09-25-1977")
+    legacy, legacy_chart = chart("03-05-2010-0")
+    charts = {bt: bt_chart, jp: jp_chart, legacy: legacy_chart}
+    found = cc.find_filing_violations(charts, [
+        filed("a1", bt, "CL_12-11-1963"),
+        filed("a2", bt, "CL_12-11-1963", kind="video"),
+        filed("a3", jp, "JP_09-25-1977"),
+        filed("a4", jp, None),
+        filed("a5", legacy, "anything"),
+    ], {})
+    assert [v["kind"] for v in found] == ["folder_label"]
+    assert found[0]["patients"] == ["BT_12-11-1963"]
+    assert "CL_12-11-1963" in found[0]["evidence"]
+
+
+def test_a_write_up_listed_on_another_chart_than_its_run_is_named():
+    dk, dk_chart = chart("DK_08-10-1989")
+    pl, pl_chart = chart("PL_10-31-2008")
+    charts = {dk: dk_chart, pl: pl_chart}
+    runs = {"run-dk": dk, "run-pl": pl}
+    found = cc.find_filing_violations(charts, [
+        filed("b1", pl, "PL_10-31-2008", run="run-dk"),
+        filed("b2", pl, "PL_10-31-2008", run="run-pl"),
+    ], runs)
+    assert [v["kind"] for v in found] == ["output_owner"]
+    assert found[0]["patients"] == ["PL_10-31-2008", "DK_08-10-1989"]
+
+
+def test_the_producing_run_comes_from_the_record_never_the_name_tag(tmp_path):
+    # 2026-10-19: eight PL write-ups named "auto-0aa84f7c" etc. were read as DK
+    # and LC runs. The tag was a manual --version; the sidecar written with each
+    # one, and the migration's ownership record, both name PL's own run.
+    pdf = tmp_path / "PL_10-31-2008__patient-facing__auto-0aa84f7c__2026-05-09.pdf"
+    pdf.write_bytes(b"%PDF")
+    (tmp_path / "PL_10-31-2008__patient-facing__auto-0aa84f7c__2026-05-09__meta.json").write_text(
+        '{"run_id": "b1a86638-65db-4c7b-ae9a-9531ea144d5b"}', encoding="utf-8")
+    assert cc._producing_run({}, str(pdf)) == "b1a86638-65db-4c7b-ae9a-9531ea144d5b"
+    assert cc._producing_run({"runId": "own"}, str(pdf)) == "own"
+    migrated = {"ownershipCorrection": {"originalRunId": "orig", "originalProducerProofs": [{"runId": "proof"}]}}
+    assert cc._producing_run(migrated, None) == "orig"
+    assert cc._producing_run({}, str(tmp_path / "missing.pdf")) is None

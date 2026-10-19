@@ -16,7 +16,11 @@ and names every disagreement:
 - ``duplicate``: the same report bytes (sha256) on two charts;
 - ``same_visit``: two charts each hold a session on the same date with the
   same deterministic measured values (at least ``SAME_VISIT_MIN_MATCHES``
-  matching, none differing), parsed by the engine's own report parsers.
+  matching, none differing), parsed by the engine's own report parsers;
+- ``folder_label``: a chart's files sit in a patient folder named for another
+  id (a relabel or merge that reached the catalogue but not the folder);
+- ``output_owner``: a patient-facing write-up is listed on one chart while the
+  analysis run it was written from belongs to another.
 
 Each violation names the charts, the reports, one plain sentence of evidence,
 and a stable key built from content and chart, never from a label, so a
@@ -422,6 +426,109 @@ def find_violations(charts: dict[str, dict], reports: list[dict]) -> list[dict[s
     return sorted(out, key=lambda v: v["key"])
 
 
+def _producing_run(provenance: dict[str, Any], local_path: str | None) -> str | None:
+    """The analysis run a patient-facing file was written from: its own record
+    first, then the migration's ownership record, then the sidecar written with
+    it. Never the ``auto-<id>`` name tag, which a manual ``--version`` can set
+    to any other run's id."""
+    run = provenance.get("runId")
+    correction = provenance.get("ownershipCorrection") or {}
+    run = run or correction.get("originalRunId")
+    for proof in correction.get("originalProducerProofs") or []:
+        run = run or proof.get("runId")
+    if not run and local_path:
+        sidecar = Path(re.sub(r"\.(pdf|md)$", "__meta.json", local_path))
+        try:
+            run = json.loads(sidecar.read_text(encoding="utf-8")).get("run_id")
+        except (OSError, ValueError, AttributeError):
+            run = None
+    return run if isinstance(run, str) else None
+
+
+def load_filing_rows(db_path: Path, *, data_dir: Path) -> tuple[list[dict], dict[str, str]]:
+    """Every listed (not archived) catalogue file with its patient-folder copy,
+    and every run's chart, read-only."""
+    portal = str((data_dir / "portal_patients").resolve()) + os.sep
+    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as db:
+        runs = dict(db.execute("SELECT id, patient_id FROM runs"))
+        rows = db.execute(
+            """SELECT a.id, a.patient_uuid, a.original_name, a.document_kind, a.provenance_json,
+                      (SELECT l.key FROM clinic_locations l
+                        WHERE l.artifact_id = a.id AND l.kind = 'local' AND l.active = 1
+                          AND substr(l.key, 1, ?) = ? LIMIT 1)
+                 FROM clinic_artifacts a WHERE a.archived = 0""",
+            (len(portal), portal),
+        ).fetchall()
+    artifacts = []
+    for artifact_id, uuid, name, kind, provenance, local in rows:
+        try:
+            parsed = json.loads(provenance or "{}")
+        except ValueError:
+            parsed = {}
+        artifacts.append({
+            "id": artifact_id,
+            "patient_uuid": uuid,
+            "filename": name or "",
+            "document_kind": kind,
+            "folder": local[len(portal):].split(os.sep, 1)[0] if local else None,
+            "run": _producing_run(parsed if isinstance(parsed, dict) else {}, local)
+            if kind == "patient-summary" else None,
+        })
+    return artifacts, runs
+
+
+def _names(members: list[dict]) -> str:
+    """One file name and how many other files there are."""
+    names = sorted({m["filename"] for m in members}, key=lambda n: (n.startswith("."), len(n), n))
+    more = len(members) - 1
+    return names[0] + (f" (and {more} other file{'' if more == 1 else 's'})" if more else "")
+
+
+def find_filing_violations(
+    charts: dict[str, dict], artifacts: list[dict], runs: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Files that sit somewhere other than where the catalogue says they belong.
+
+    - ``folder_label``: a chart's files are in a patient folder named for
+      another id. A relabel or merge reached the catalogue (and the hub) but not
+      the folder, so anything reading the folder sees the old patient.
+    - ``output_owner``: a patient-facing write-up is listed on one chart while
+      the run it was written from belongs to another.
+    """
+    folders: dict[tuple[str, str], list[dict]] = {}
+    owners: dict[tuple[str, str], list[dict]] = {}
+    for artifact in artifacts:
+        chart = charts.get(artifact["patient_uuid"])
+        if not chart or not chart.get("clinic", True):
+            continue
+        folder = artifact.get("folder")
+        if folder and folder != chart["label"]:
+            folders.setdefault((artifact["patient_uuid"], folder), []).append(artifact)
+        owner = runs.get(artifact.get("run") or "")
+        if owner and owner != artifact["patient_uuid"] and owner in charts and charts[owner].get("clinic", True):
+            owners.setdefault((artifact["patient_uuid"], owner), []).append(artifact)
+    out = []
+    for (uuid, folder), members in folders.items():
+        label = charts[uuid]["label"]
+        out.append({
+            "kind": "folder_label",
+            "key": f"folder_label:{uuid[:8]}:{folder}",
+            "patients": [label],
+            "reports": [],
+            "evidence": f"{label}'s files are in the patient folder {folder}, not {label}: {_names(members)}.",
+        })
+    for (uuid, owner), members in owners.items():
+        listed, written = charts[uuid]["label"], charts[owner]["label"]
+        out.append({
+            "kind": "output_owner",
+            "key": f"output_owner:{uuid[:8]}+{owner[:8]}:{','.join(sorted(m['id'][:8] for m in members))}",
+            "patients": [listed, written],
+            "reports": [],
+            "evidence": f"{listed} lists write-ups made from {written}'s analysis run: {_names(members)}.",
+        })
+    return out
+
+
 def check(
     db_path: Path,
     *,
@@ -434,6 +541,8 @@ def check(
     unreadable = read_reports(reports, cache_path=cache_path)
     skip = set(exclude_reports)
     violations = find_violations(charts, [r for r in reports if r["id"] not in skip])
+    artifacts, runs = load_filing_rows(db_path, data_dir=data_dir)
+    violations = sorted(violations + find_filing_violations(charts, artifacts, runs), key=lambda v: v["key"])
     return {
         "charts": len(charts),
         "reports": len(reports),
