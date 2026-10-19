@@ -16,6 +16,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
+
 from backend.config import CLIPROXY_API_KEY, CLIPROXY_BASE_URL, ensure_data_dirs  # noqa: E402
 from backend.council.report_text import (  # noqa: E402
     _find_summary_pages,
@@ -938,6 +940,7 @@ async def main() -> int:
     output_dir = (
         Path(args.output_dir).expanduser() if args.output_dir else manifest_path.parent
     )
+    refuse_live_portal_write(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     extracted_path = report_dir / "extracted_enhanced.txt"
@@ -972,6 +975,8 @@ async def main() -> int:
     patient_md_path = output_dir / f"{patient_stem}.md"
     patient_pdf_path = output_dir / f"{patient_stem}.pdf"
     meta_path = output_dir / f"{patient_stem}__meta.json"
+
+    refuse_live_portal_write(analysis_path, patient_md_path, patient_pdf_path, meta_path)
 
     if not args.overwrite:
         existing = [

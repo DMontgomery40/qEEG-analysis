@@ -19,7 +19,15 @@ Usage:
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
+
 
 from backend.portal_files import normalize_portal_patient_id
 from backend.portal_sync import sync_patient_to_thrylen
@@ -60,6 +68,9 @@ def stage_artifacts(dry_run: bool = False) -> None:
     data_dir = Path(__file__).parent.parent / "data"
     artifacts_dir = data_dir / "artifacts"
     portal_dir = data_dir / "portal_patients"
+
+    if not dry_run:
+        refuse_live_portal_write(portal_dir)
 
     if not artifacts_dir.exists():
         print(f"Artifacts directory not found: {artifacts_dir}")
@@ -135,6 +146,7 @@ def stage_artifacts(dry_run: bool = False) -> None:
                 if dry_run:
                     print(f"  [dry-run] Copy {src.name} -> {rel_dst}")
                 else:
+                    refuse_live_portal_write(dst)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
                     print(f"  Copy {src.name} -> {rel_dst}")

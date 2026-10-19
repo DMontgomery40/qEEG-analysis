@@ -4,12 +4,20 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4"}
@@ -113,6 +121,7 @@ def _should_compress(stats: VideoStats, args: argparse.Namespace) -> bool:
 
 
 def _compress_video(path: Path, stats: VideoStats, args: argparse.Namespace) -> tuple[Path, VideoStats]:
+    refuse_live_portal_write(path)
     suffix = path.suffix or ".mp4"
     with tempfile.NamedTemporaryFile(
         prefix=f"{path.stem}.compressing.",
@@ -238,6 +247,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
+    if not args.dry_run:
+        refuse_live_portal_write(root)
+    if args.report_json:
+        refuse_live_portal_write(Path(args.report_json))
     if not root.exists():
         raise SystemExit(f"Missing root folder: {root}")
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
@@ -245,6 +258,7 @@ def main() -> int:
 
     backup_dir = Path(args.backup_dir).expanduser().resolve() if str(args.backup_dir).strip() else None
     if backup_dir is not None and not args.dry_run:
+        refuse_live_portal_write(backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
 
     report: list[dict[str, Any]] = []
@@ -258,6 +272,10 @@ def main() -> int:
         for path in root.rglob("*")
         if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
     )
+    if not args.dry_run:
+        refuse_live_portal_write(*files)
+        if backup_dir is not None:
+            refuse_live_portal_write(*(backup_dir / path.relative_to(root) for path in files))
     print(f"Scanning {len(files)} video(s) under {root}")
 
     for path in files:
@@ -312,6 +330,7 @@ def main() -> int:
 
             if backup_dir is not None:
                 backup_path = _unique_backup_path(backup_dir / path.relative_to(root))
+                refuse_live_portal_write(backup_path)
                 backup_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(path), str(backup_path))
                 item["backup_path"] = str(backup_path)

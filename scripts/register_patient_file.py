@@ -11,6 +11,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
+
 from backend import storage  # noqa: E402
 from backend.patient_files import patient_file_original_path  # noqa: E402
 
@@ -42,6 +44,8 @@ def register_patient_file(
         )
         file_id = existing.id if existing else str(uuid.uuid4())
         target_path = patient_file_original_path(patient_id, file_id, display_name)
+        if existing:
+            refuse_live_portal_write(target_path, Path(existing.stored_path))
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target_path)
         size_bytes = int(target_path.stat().st_size)
