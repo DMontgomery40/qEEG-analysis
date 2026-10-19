@@ -212,3 +212,31 @@ def test_engine_jobs_read_original_stage_and_post_receipts_without_file_inferenc
     assert job["runId"] == run.id and job["status"] == "created"
     assert job["stages"][0]["receiptHash"] == "a" * 64
     assert job["post"][0]["state"] == "pending"
+
+
+def test_an_archived_file_leaves_the_hub_lists_but_still_resolves(temp_data_dir):
+    # 2026-10-19: David asked for JP_09-25-1977's first orchestra cut, the one
+    # closing on "bring these findings to your clinician", to come out of the
+    # hub. Archiving it changed a flag the hub's lists never read, so both cuts
+    # stayed side by side. The chat card for the first cut must keep working.
+    m = importlib.import_module("backend.clinic_feedback")
+    first = artifact(temp_data_dir, "first-cut")
+    corrected = artifact(temp_data_dir, "corrected")
+    before = reads.patient_files(first["patientId"], mode="initial")
+    m.record_feedback(
+        key="withdraw-first-cut",
+        patient_id=first["patientId"],
+        file_id=first["fileId"],
+        version=first["version"],
+        action="archive",
+        actor="David",
+    )
+    for mode in ("initial", "archive"):
+        listed = {r["fileId"] for r in reads.patient_files(first["patientId"], mode=mode)["files"]}
+        assert first["fileId"] not in listed, mode
+        assert corrected["fileId"] in listed, mode
+    full = {r["fileId"]: r for r in reads.patient_files(first["patientId"], mode="full")["files"]}
+    assert full[first["fileId"]]["archived"] is True
+    after = reads.patient_files(first["patientId"], mode="initial")
+    assert after["indexVersion"] != before["indexVersion"]
+    assert (temp_data_dir / "first-cut").read_bytes() == b"first-cut"
