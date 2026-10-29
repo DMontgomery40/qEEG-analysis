@@ -200,6 +200,20 @@ def test_existing_output_replacement_preserves_retained_history(
     assert not list(target.parent.glob(".pending-*"))
 
 
+def test_new_output_keeps_ordinary_file_permissions(producer):
+    # Staging must not leave outputs owner-only: readers that ran under the
+    # previous direct writes saw the process umask's default file mode.
+    target, _, update = producer
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    umask = os.umask(0)
+    os.umask(umask)
+
+    update()
+
+    assert target.stat().st_mode & 0o777 == 0o666 & ~umask
+
+
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink", "regular"])
 @pytest.mark.parametrize("writer", ["api", "batch"])
 def test_export_replaces_both_outputs_without_changing_history(

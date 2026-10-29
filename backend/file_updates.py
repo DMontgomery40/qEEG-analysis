@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
-import tempfile
+import uuid
 from typing import Iterator
 
 
@@ -15,9 +15,11 @@ def atomic_destination(destination: Path) -> Iterator[Path]:
     immutable body shared by other registered files.
     """
     destination = Path(destination)
-    fd, name = tempfile.mkstemp(prefix=".pending-", dir=destination.parent)
-    os.close(fd)
-    pending = Path(name)
+    # mkstemp would create the output owner-only (0600); keep the umask default
+    # a direct write produced. Never copy the destination's mode: it may be a
+    # link to a read-only shared body.
+    pending = destination.parent / f".pending-{uuid.uuid4().hex}"
+    os.close(os.open(pending, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
     try:
         yield pending
         with pending.open("rb") as stream:
