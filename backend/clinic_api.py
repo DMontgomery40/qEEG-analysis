@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from . import clinic_catalogue_reads as catalogue
 from .clinic_naming import POLICY_REVISION
+from .clinic_models import AnalysisPolicyUnavailable
 
 # Matches the existing shared clinic transport ceiling; applies to each batch.
 CLINIC_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
@@ -56,6 +57,11 @@ def _error(error):
         code, message = 404, str(error)
     elif isinstance(error, catalogue.CatalogueConflict):
         code, message = 409, str(error)
+    elif isinstance(error, AnalysisPolicyUnavailable):
+        # A 503 with the plain sentence: since the hub deploy of 2026-10-02 the
+        # transport passes an {ok:false, message} 5xx through, and its
+        # self-healing loop retries a 5xx where it parks a 4xx.
+        code, message = 503, str(error)
     elif isinstance(error, (catalogue.CatalogueUnavailable, SQLAlchemyError, OSError)):
         code, message = 503, "Clinic authority or exact file bytes are unavailable"
     else:
@@ -283,6 +289,25 @@ def _object_json(raw):
     return value
 
 
+def _too_large():
+    # The hub prints `message`; with only `error` the clinic read "Request failed: 413".
+    return JSONResponse(
+        dict(
+            ok=False,
+            message="These files are too large to send together (the limit is 256 MB). "
+            "Send them in smaller groups.",
+        ),
+        status_code=413,
+    )
+
+
+def _from_hub(request):
+    """The hub's Netlify function is cut off at 60 s, so its submissions are
+    answered once the rows are saved and filed afterwards; the workbench's own
+    chat staging keeps filing inside the request."""
+    return request.headers.get("x-clinic-principal") == "thrylen-service"
+
+
 @router.post("/uploads")
 async def clinic_upload_submit(request: Request):
     from starlette.concurrency import run_in_threadpool
@@ -326,18 +351,14 @@ async def clinic_upload_submit(request: Request):
             any(f.size is None or f.size < 0 for f in uploads)
             or sum(f.size for f in uploads) > CLINIC_UPLOAD_MAX_BYTES
         ):
-            return JSONResponse(
-                {"error": "Upload batch exceeds 256 MiB"}, status_code=413
-            )
+            return _too_large()
         files = []
         total = 0
         for f in uploads:
             data = await f.read(CLINIC_UPLOAD_MAX_BYTES - total + 1)
             total += len(data)
             if total > CLINIC_UPLOAD_MAX_BYTES:
-                return JSONResponse(
-                    {"error": "Upload batch exceeds 256 MiB"}, status_code=413
-                )
+                return _too_large()
             files.append(
                 (f.filename, data, f.content_type or "application/octet-stream")
             )
@@ -358,6 +379,7 @@ async def clinic_upload_submit(request: Request):
             file_meta=[_object_json(m) for m in metas],
             actor=trusted_actor(request),
             principal=request.headers.get("x-clinic-principal"),
+            acknowledge_first=_from_hub(request),
             patient_id=form.get("patientId"),
             resolution=_object_json(form["resolution"])
             if "resolution" in form
@@ -390,6 +412,7 @@ async def clinic_upload_resolve(upload_id: str, request: Request):
         key=request.headers.get("idempotency-key"),
         resolution=body,
         actor=trusted_actor(request),
+        acknowledge_first=_from_hub(request),
     )
 
 

@@ -41,6 +41,7 @@ class ExtractedSource:
     metadata: dict[str, Any]
     session_dates: dict[int, str]
     repaired_assets: dict[str, bytes] | None = None
+    operator_asserted_sessions: frozenset[int] = frozenset()
 
 
 def _session_evidence(enhanced: str) -> list[dict[str, Any]]:
@@ -92,14 +93,20 @@ def _label_for_page(
     source_page: int,
     session_aliases: dict[int, int],
     session_dates: dict[int, str],
+    operator_asserted_sessions: frozenset[int] = frozenset(),
 ) -> str:
     alias_parts: list[str] = []
     for local_idx, global_idx in sorted(session_aliases.items()):
         date_part = (
             f" ({session_dates[local_idx]})" if local_idx in session_dates else ""
         )
+        asserted_part = (
+            ", operator-mapped as the same visit as another source whose text differs"
+            if local_idx in operator_asserted_sessions
+            else ""
+        )
         alias_parts.append(
-            f"local Session {local_idx}{date_part} => global Session {global_idx}"
+            f"local Session {local_idx}{date_part} => global Session {global_idx}{asserted_part}"
         )
     aliases = "; ".join(alias_parts) if alias_parts else "no aliases"
     return f"source PDF: {source_name}; source page: {source_page}; {aliases}"
@@ -208,6 +215,7 @@ def _write_combined_report(
                 source_page=idx,
                 session_aliases=source.spec.session_aliases,
                 session_dates=source.session_dates,
+                operator_asserted_sessions=source.operator_asserted_sessions,
             )
             page_labels[str(combined_page_num)] = page_label
             page_map.append(

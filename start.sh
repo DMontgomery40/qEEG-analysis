@@ -25,7 +25,7 @@ RUNTIME_GUARD="$PROJECT_ROOT/scripts/qeeg_runtime_guard.sh"
 source "$RUNTIME_GUARD"
 
 if [ "${QEEG_START_PREFLIGHT_ONLY:-0}" = "1" ]; then
-  for component in portal_watcher pipeline_worker backend frontend; do
+  for component in portal_watcher backend frontend; do
     if qeeg_component_is_running "$component" "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
       printf '%s=running\n' "$component"
     else
@@ -37,7 +37,6 @@ fi
 
 CLIPROXY_PID=""
 PORTAL_SYNC_PID=""
-PORTAL_PIPELINE_PID=""
 export PATH="$HOME/.local/bin:$PATH"
 
 find_cliproxy_bin() {
@@ -243,28 +242,6 @@ if [ "$QEEG_PORTAL_AUTO_SYNC" != "0" ]; then
   fi
 fi
 
-if [ "${QEEG_PORTAL_PIPELINE_WORKER:-1}" != "0" ]; then
-  if command -v netlify >/dev/null 2>&1; then
-    if qeeg_component_is_running pipeline_worker "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
-      echo "✓ Portal pipeline worker already running"
-    else
-      echo "Starting portal pipeline worker..."
-      (
-        uv run python scripts/portal_pipeline_worker.py --poll-seconds "${QEEG_PORTAL_PIPELINE_POLL_S:-60}"
-      ) >/tmp/qeeg_portal_pipeline_worker.log 2>&1 &
-      PORTAL_PIPELINE_PID=$!
-      sleep 1
-      if ps -p "$PORTAL_PIPELINE_PID" >/dev/null 2>&1; then
-        echo "✓ Portal pipeline worker started (pid $PORTAL_PIPELINE_PID)"
-      else
-        echo "⚠ Portal pipeline worker failed to start. See /tmp/qeeg_portal_pipeline_worker.log"
-      fi
-    fi
-  else
-    echo "⚠ netlify CLI not found; portal pipeline worker cannot watch clinic uploads."
-  fi
-fi
-
 # Start backend
 if qeeg_component_is_running backend "$PROJECT_ROOT" "$QEEG_PORTAL_SYNC_DIR"; then
   echo "✓ Backend already running on http://localhost:8000"
@@ -300,5 +277,5 @@ echo ""
 echo "Press Ctrl+C to stop both servers"
 
 # Wait for Ctrl+C
-trap "kill $BACKEND_PID $FRONTEND_PID $CLIPROXY_PID $PORTAL_SYNC_PID $PORTAL_PIPELINE_PID 2>/dev/null; exit" SIGINT SIGTERM
+trap "kill $BACKEND_PID $FRONTEND_PID $CLIPROXY_PID $PORTAL_SYNC_PID 2>/dev/null; exit" SIGINT SIGTERM
 wait

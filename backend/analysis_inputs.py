@@ -14,6 +14,7 @@ from dataclasses import replace
 import fcntl
 import hashlib
 import json
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -41,6 +42,10 @@ from .report_composition import (
 )
 
 COMPOSITION_VERSION = 1
+# Per source, the local sessions whose shared visit rests on the operator's
+# explicit mapping over attributable source text that differs between reports.
+SHARED_SESSION_PROVENANCE = "shared_session_provenance"
+OPERATOR_OVER_DIFFERING_TEXT = "operator_asserted_over_differing_source_text"
 _ENGINES = {
     "pypdf": "pypdf_text",
     "pymupdf": "pymupdf_text",
@@ -222,8 +227,11 @@ def _measurements(source: ExtractedSource, local: int) -> dict[str, set[str]]:
                     for k in ("fact_type", "metric", "electrode", "condition", "unit")
                 ]
             )
+            # N100 facts carry their reading as uv/ms, not value.
             result.setdefault(key, set()).add(
-                _canonical([fact.get(k) for k in ("value", "sd_plus_minus")])
+                _canonical(
+                    [fact.get(k) for k in ("value", "sd_plus_minus", "uv", "ms")]
+                )
             )
     return result
 
@@ -279,6 +287,11 @@ def _observed_session_evidence(
         if belongs:
             observations.append(tuple(normalized(text) for text in texts))
     return complete and bool(observations), tuple(sorted(observations))
+
+
+def _saved_shared_provenance(saved: dict) -> dict:
+    """Only manifests that recorded an operator assertion carry the key."""
+    return {k: v for k, v in saved.items() if k == SHARED_SESSION_PROVENANCE}
 
 
 def _mapping_error(snapshots: list[dict], reason: str) -> None:
@@ -357,6 +370,7 @@ def resolve_aliases(
                 )
     # Parsed facts detect definite conflicts; their matching intersection alone
     # cannot establish that all the source's observed measurements agree.
+    asserted: dict[int, set[int]] = {}
     groups: dict[int, list[tuple[int, dict]]] = {}
     for i, row in rows:
         groups.setdefault(aliases[i, row["local_session_index"]], []).append((i, row))
@@ -399,10 +413,17 @@ def resolve_aliases(
                     and snapshots[i]["asset_digests"] == snapshots[j]["asset_digests"]
                 )
                 if left_observed and right_observed and left_observed != right_observed:
-                    _mapping_error(
-                        snapshots,
-                        "A shared global session has differing attributable source evidence; resolve the source observations before merging visits",
-                    )
+                    if not explicit:
+                        _mapping_error(
+                            snapshots,
+                            "A shared global session has differing attributable source evidence; resolve the source observations before merging visits",
+                        )
+                    # Two exports of one visit never share text: comparison tables
+                    # follow each report's own first session, targets are normed at
+                    # export, OCR noise differs. Dates and parsed values agreed
+                    # above, so the operator's mapping decides; record that it did.
+                    asserted.setdefault(i, set()).add(row["local_session_index"])
+                    asserted.setdefault(j, set()).add(other["local_session_index"])
                 if (
                     not explicit
                     and not identical_source_session
@@ -431,6 +452,10 @@ def resolve_aliases(
                 "source_dates_and_measurements" if multi else "original_local_sessions"
             )
         )
+        if asserted.get(i):
+            snap[SHARED_SESSION_PROVENANCE] = {
+                str(local): OPERATOR_OVER_DIFFERING_TEXT for local in sorted(asserted[i])
+            }
         dates = {
             r["local_session_index"]: r["dates"][0]
             for r in snap["session_evidence"]
@@ -492,6 +517,19 @@ def _compose(
     if not _ready(stage, fingerprint):
         if stage.exists():
             shutil.rmtree(stage)
+        # Fresh admission and repair both compose here from the saved manifest,
+        # so the page labels the council reads always carry the assertion.
+        extracted = [
+            replace(
+                src,
+                operator_asserted_sessions=frozenset(
+                    int(local) for local in saved.get(SHARED_SESSION_PROVENANCE, {})
+                ),
+            )
+            if src
+            else None
+            for src, saved in zip(extracted, manifest["sources"])
+        ]
         recipe = Manifest(
             "", "combined_council_report.pdf", "", [s.spec for s in extracted], [], None
         )
@@ -566,14 +604,63 @@ def lookup_admitted_operation(
         if prior is None:
             return None, None
         if prior.immutable_request_json is not None:
+            # A reservation saved before force_new existed has no such key; that
+            # is the same request with force_new false, not a different one.
+            saved = {"force_new": False, **json.loads(prior.immutable_request_json)}
             if (
-                prior.immutable_request_json != _canonical(immutable_request)
+                _canonical(saved) != _canonical({"force_new": False, **immutable_request})
                 or prior.model_fields_json is None
             ):
                 raise _operation_conflict()
         elif immutable_request["allowed_model_fallbacks"]:
             raise _operation_conflict()
         return prior, storage.get_run(session, prior.run_id)
+
+
+RECENT_RUN_WINDOW_S = int(os.getenv("QEEG_RECENT_RUN_WINDOW_S", str(24 * 3600)))
+
+
+def _refuse_duplicate_council(session, envelope_fingerprint, immutable_request):
+    """The same patient, sources, instructions and models already have a
+    council in progress, or one that finished within the window. On
+    2026-09-29 one PDF drew five paid runs in 82 minutes under five
+    operation ids (engine map H11). A new operation id is not a new request;
+    the caller says force_new when the operator asked for a fresh run."""
+    if (immutable_request or {}).get("force_new"):
+        return
+    siblings = session.scalars(
+        select(storage.AnalysisInputReservation).where(
+            storage.AnalysisInputReservation.envelope_fingerprint == envelope_fingerprint
+        )
+    ).all()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for reservation in siblings:
+        run = storage.get_run(session, reservation.run_id)
+        if run is None:
+            continue
+        if run.status in ("created", "running", "queued") and (run.execution_state or "") != "blocked":
+            raise HTTPException(
+                409,
+                {
+                    "code": "ANALYSIS_ALREADY_RUNNING",
+                    "message": "A council for these same reports and models is already in progress",
+                    "run_id": run.id,
+                },
+            )
+        finished = run.completed_at
+        if run.status == "complete" and finished is not None:
+            if finished.tzinfo is not None:
+                finished = finished.astimezone(timezone.utc).replace(tzinfo=None)
+            if (now - finished).total_seconds() < RECENT_RUN_WINDOW_S:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "ANALYSIS_RECENTLY_COMPLETED",
+                        "message": "A council for these same reports and models finished recently",
+                        "run_id": run.id,
+                        "completed_at": run.completed_at.isoformat(),
+                    },
+                )
 
 
 def admit_run(
@@ -609,6 +696,8 @@ def admit_run(
         with storage.session_scope() as session:
             if prior and prior.envelope_fingerprint != envelope_fingerprint:
                 raise _operation_conflict()
+            if prior is None:
+                _refuse_duplicate_council(session, envelope_fingerprint, immutable_request)
             if storage.get_patient(session, patient_id) is None:
                 raise HTTPException(404, "Patient not found")
             originals = []
@@ -656,6 +745,7 @@ def admit_run(
                     **current,
                     "session_aliases": original["session_aliases"],
                     "mapping_provenance": original["mapping_provenance"],
+                    **_saved_shared_provenance(original),
                 }
                 for current, original in zip(snapshots, saved)
             ]
@@ -672,6 +762,7 @@ def admit_run(
                     **current,
                     "session_aliases": saved["session_aliases"],
                     "mapping_provenance": saved["mapping_provenance"],
+                    **_saved_shared_provenance(saved),
                 }
                 for current, saved in zip(snapshots, saved_sources)
             ]

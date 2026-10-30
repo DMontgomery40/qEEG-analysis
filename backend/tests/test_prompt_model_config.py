@@ -34,12 +34,12 @@ def test_model_role_defaults_are_quality_first_by_role(monkeypatch):
     assert [model.id for model in config.COUNCIL_MODELS] == [
         "deepseek-v4-flash",
         "z-ai/glm-5.3-flash",
-        "openai/gpt-5.6-terra",
+        "openai/gpt-6.1-sol",
     ]
     assert [model.endpoint_preference for model in config.COUNCIL_MODELS] == [
         "chat",
         "chat",
-        "responses",
+        "chat",
     ]
 
 

@@ -83,6 +83,18 @@ class CatalogueUnavailable(RuntimeError):
     pass
 
 
+class AnalysisPolicyUnavailable(CatalogueUnavailable):
+    """The engine cannot run the analysis policy it would otherwise offer.
+
+    The message is plain enough to show the clinic; ``models`` names the
+    configured model ids this engine has not discovered.
+    """
+
+    def __init__(self, message, *, models=()):
+        super().__init__(message)
+        self.models = tuple(models)
+
+
 class CatalogueConflict(ValueError):
     pass
 

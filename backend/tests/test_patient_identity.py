@@ -149,6 +149,39 @@ def test_parse_rejects_none():
     assert parse_canonical_patient_id(None) is None
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ZZ_０１-０１-１９００",  # fullwidth digits
+        "ZZ_٠١-٠١-١٩٠٠",  # Arabic-Indic
+        "ZZ_01-01-1900_２",  # fullwidth ordinal
+        "ZZ_01-01-1900\n",  # `$` alone would match before this newline
+        "ZZ_01-01-1900_2\n",
+    ],
+)
+def test_parse_and_portal_gate_reject_look_alike_ids(value):
+    from backend.portal_files import normalize_portal_patient_id
+
+    assert parse_canonical_patient_id(value) is None
+    assert pid.CANONICAL_PATIENT_ID_RE.match(value) is None
+    # Strips whitespace first, so only the non-ASCII digits are still refused.
+    if value.strip() == value:
+        assert normalize_portal_patient_id(value) is None
+
+
+def test_portal_gate_tolerates_a_trailing_newline_by_stripping_it():
+    from backend.portal_files import normalize_portal_patient_id
+
+    assert normalize_portal_patient_id("ZZ_01-01-1900\n") == "ZZ_01-01-1900"
+
+
+def test_canonical_patient_id_writes_non_ascii_birthdate_digits_as_ascii():
+    assert (
+        canonical_patient_id("Z", "Z", "０１-０１-１９００")
+        == "ZZ_01-01-1900"
+    )
+
+
 # ---------------------------------------------------------------- builder
 
 
@@ -602,7 +635,6 @@ def test_init_db_is_idempotent_on_an_already_upgraded_database(tmp_path: Path):
 
 def _test_app(temp_data_dir, monkeypatch):
     monkeypatch.setenv("QEEG_MOCK_LLM", "1")
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     from backend import main
 
     monkeypatch.setattr(

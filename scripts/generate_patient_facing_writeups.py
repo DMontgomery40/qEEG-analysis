@@ -16,6 +16,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
+
 from backend.config import (  # noqa: E402
     CLIPROXY_API_KEY,
     CLIPROXY_BASE_URL,
@@ -360,6 +362,8 @@ async def generate_writeup(
     publisher=None,
 ):
     """Existing generation/validation/render recipe, with an owned publication seam."""
+    if publisher is None:
+        refuse_live_portal_write(md_path, pdf_path, meta_path)
     md = await _chat_with_retries(
         llm,
         model_id=model_id,
@@ -477,10 +481,13 @@ async def main() -> int:
     )
     args = ap.parse_args()
 
+    portal_dir = Path(args.portal_dir)
+    if not args.dry_run:
+        refuse_live_portal_write(portal_dir)
+
     ensure_data_dirs()
     init_db()
 
-    portal_dir = Path(args.portal_dir)
     labels = args.patient_label or _discover_portal_patient_labels(portal_dir)
     if not labels:
         print(f"ERROR: no patients found in {portal_dir}", file=sys.stderr)
@@ -491,6 +498,9 @@ async def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if not args.dry_run:
+        refuse_live_portal_write(*(portal_dir / label for label in labels))
 
     example = _example_writeup_text()
     target_body_words = _count_words(example)
@@ -578,7 +588,8 @@ async def main() -> int:
         )
 
         out_dir = portal_dir / label
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if not args.dry_run:
+            out_dir.mkdir(parents=True, exist_ok=True)
         stem = _output_stem(
             patient_label=label, version=args.version, date_str=date_str
         )

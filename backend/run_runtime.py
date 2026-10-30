@@ -7,6 +7,8 @@ through cleanup; stop drains work naturally, including SDK worker threads.
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -20,13 +22,17 @@ from . import storage
 from .council.execution import drain_task, owned_execution
 from .logging_utils import get_logger, log_context
 from .paid_transport import PaidOutcomeUnknown, dispatch_validation
-from .run_execution import ExecutionConflict
+from .run_execution import OUTSTANDING_OBLIGATIONS, ExecutionConflict
 
 LOGGER = get_logger(__name__)
 
 
 class ModelUnavailable(ExecutionConflict):
     """No dispatch occurred; retry the original model when discovery recovers."""
+
+    def __init__(self, message, *, model=None):
+        super().__init__(message)
+        self.model = model
 
 
 class AdmissionUnavailable(RuntimeError):
@@ -84,7 +90,9 @@ def _validate_dispatch(request):
     except (ValueError, KeyError, TypeError) as error:
         raise ExecutionConflict("paid request has no pinned model") from error
     if model not in DISCOVERED_MODEL_IDS:
-        raise ModelUnavailable(f"Pinned model is currently unavailable: {model}")
+        raise ModelUnavailable(
+            f"Pinned model is currently unavailable: {model}", model=model
+        )
 
 
 @contextmanager
@@ -140,21 +148,13 @@ async def continue_owned_run(owner, *, llm, workflow, publish=None, sync=None):
                     required = json.loads(run.council_model_ids_json) + [
                         run.consolidator_model_id
                     ]
-                    if any(model not in DISCOVERED_MODEL_IDS for model in required):
+                    missing = [m for m in required if m not in DISCOVERED_MODEL_IDS]
+                    if missing:
                         raise ModelUnavailable(
-                            "Pinned council catalogue is unavailable before first execution"
+                            "Pinned council catalogue is unavailable before first execution",
+                            model=", ".join(sorted(set(missing))),
                         )
-                async with owned_execution(owner, llm_client=llm) as execution:
-                    if execution.manifest["postprocessing"]["retired_cathode_flag"]:
-                        LOGGER.warning(
-                            "automatic_cathode_routing_retired", run_id=run.id
-                        )
-                        await observe(
-                            {
-                                "run_id": run.id,
-                                "diagnostic": "automatic_cathode_routing_retired",
-                            }
-                        )
+                async with owned_execution(owner, llm_client=llm):
                     if run.status != "complete":
                         await workflow.run_pipeline(
                             run.id, on_event=observe, propagate_owned_errors=True
@@ -199,6 +199,80 @@ async def continue_owned_run(owner, *, llm, workflow, publish=None, sync=None):
             return "done", None
 
 
+# A run that keeps failing non-clinically (a stage with no survivor, a unit
+# timeout, a local error) went back to "pending" every 5 s with no end: one
+# run was claimed 30,561 times over three days, the workbench had told the
+# clinic FAILED after the first, and the engine could have spent days later
+# with nobody watching (2026-10-02 engine map, H1). After this many
+# consecutive pending releases the run is blocked with a plain reason; an
+# operator resumes it on purpose. The generation backstop survives restarts.
+PENDING_RETRY_LIMIT = int(os.getenv("QEEG_RUN_PENDING_RETRY_LIMIT", "20"))
+GENERATION_BACKSTOP = int(os.getenv("QEEG_RUN_GENERATION_BACKSTOP", "500"))
+
+
+def _strand_guard(state, reason, run_status, post_state, post_reason):
+    """A completed council whose patient-facing post is blocked is blocked,
+    not pending: the due filter never picks a complete run with no due post
+    again, so "pending" there means stranded for good (two live rows on
+    2026-10-02, engine map H5)."""
+    if state == "pending" and run_status == "complete" and post_state == "blocked":
+        return "blocked", "patient-facing document blocked: " + (str(post_reason or "").strip() or "reason not recorded")
+    return state, reason
+
+
+def _is_availability_wait(error):
+    """A pinned model missing from the catalogue, or the catalogue itself
+    unreachable, is a wait, not a failure: a two-minute cliproxy gap must
+    not block a run behind a paid re-council (Fable review, 2026-10-02)."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModelUnavailable):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
+# A wait has no attempt count, so a model that never comes back used to be
+# re-claimed every 5 s for ever. After this long waiting, the run is blocked
+# with a plain reason; an operator resumes it on purpose.
+MODEL_WAIT_LIMIT_S = float(os.getenv("QEEG_MODEL_WAIT_LIMIT_S", "86400"))
+
+
+def _unavailable_model(error):
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ModelUnavailable):
+            return getattr(error, "model", None)
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def _waited_disposition(state, reason, model, waiting_since, now, limit=None):
+    """Block a run whose availability wait has outlived the limit."""
+    limit = MODEL_WAIT_LIMIT_S if limit is None else limit
+    if state != "pending" or waiting_since is None or now - waiting_since <= limit:
+        return state, reason
+    return (
+        "blocked",
+        f"the model {model or 'pinned for this run'} has not been available for a day; "
+        "nothing retries this by itself",
+    )
+
+
+def _capped_disposition(state, reason, consecutive_failures, generation):
+    if state != "pending":
+        return state, reason
+    # The generation backstop needs a few real failures too, so a long
+    # healthy run is never blocked by its first transient one.
+    if consecutive_failures >= PENDING_RETRY_LIMIT or (
+        generation >= GENERATION_BACKSTOP and consecutive_failures >= 3
+    ):
+        return "blocked", f"gave up after {max(consecutive_failures, 1)} failed attempts: {reason}"
+    return state, reason
+
+
 def _failure_disposition(error):
     from .council.completion import is_clinical_failure
 
@@ -237,11 +311,17 @@ class RunRuntime:
         publish=None,
         sync=None,
         continuation=None,
-        concurrency=2,
+        # Several clinic patients are routinely analyzed at once; two left
+        # later uploads queued behind whole council runs.
+        concurrency=6,
         poll_interval=1.0,
         retry_delay=5.0,
         page_size=100,
     ):
+        self._pending_failures = {}
+        # run id -> clock reading at the first availability wait (in memory).
+        self._waiting_since = {}
+        self._clock = time.monotonic
         if not 1 <= concurrency <= 16 or not 1 <= page_size <= 1000:
             raise ValueError("invalid consumer bounds")
         if not 0 < poll_interval <= 60 or not 0 < retry_delay <= 300:
@@ -287,7 +367,12 @@ class RunRuntime:
             if shared_execution_enabled():
                 from .clinic_analysis_intents import activate_confirmed_uploads
 
-                await activate_confirmed_uploads(self)
+                # One bad confirmed upload must not end the scan: unguarded,
+                # an exception here stopped every run until a restart.
+                try:
+                    await activate_confirmed_uploads(self)
+                except Exception:
+                    LOGGER.exception("confirmed_upload_activation_failed")
             now = asyncio.get_running_loop().time()
             self._retry_after = {
                 key: due for key, due in self._retry_after.items() if due > now
@@ -342,18 +427,63 @@ class RunRuntime:
                 return
             try:
                 state, reason = await self.continuation(owner)
+                self._pending_failures.pop(run_id, None)
+                self._waiting_since.pop(run_id, None)
             except Exception as error:
                 LOGGER.exception("run_continuation_interrupted", run_id=run_id)
                 state, reason = _failure_disposition(error)
-            await asyncio.to_thread(
-                owner.release,
-                state=state,
-                next_check_at=datetime.now(timezone.utc)
-                + timedelta(seconds=self.retry_delay)
-                if state == "pending"
-                else None,
-                blocked_reason=reason,
-            )
+                if _is_availability_wait(error):
+                    failures = self._pending_failures.get(run_id, 0)  # a wait, not an attempt
+                    now = self._clock()
+                    state, reason = _waited_disposition(
+                        state,
+                        reason,
+                        _unavailable_model(error),
+                        self._waiting_since.setdefault(run_id, now),
+                        now,
+                    )
+                else:
+                    self._waiting_since.pop(run_id, None)
+                    failures = self._pending_failures[run_id] = self._pending_failures.get(run_id, 0) + 1
+                    state, reason = _capped_disposition(
+                        state, reason, failures, int(getattr(owner, "generation", 0) or 0)
+                    )
+                if state == "pending":
+                    from .patient_postprocessing import project_patient_facing
+
+                    try:
+                        run_now = await asyncio.to_thread(_read_run, self.store, run_id)
+                        post_now = await asyncio.to_thread(project_patient_facing, self.store, run_id)
+                        state, reason = _strand_guard(
+                            state, reason, run_now.status, post_now.get("state"), post_now.get("blocked_reason")
+                        )
+                    except Exception:
+                        LOGGER.exception("run_strand_guard_failed", run_id=run_id)
+                if state == "blocked":
+                    self._pending_failures.pop(run_id, None)
+                    self._waiting_since.pop(run_id, None)
+            try:
+                await asyncio.to_thread(
+                    owner.release,
+                    state=state,
+                    next_check_at=datetime.now(timezone.utc)
+                    + timedelta(seconds=self.retry_delay)
+                    if state == "pending"
+                    else None,
+                    blocked_reason=reason,
+                )
+            except ExecutionConflict as error:
+                # "done" with a post or paid call still open used to escape
+                # here, leave the row owned and be re-claimed every 5 s with
+                # nothing said (EN-H14). Park it and name what is open.
+                if state != "done" or not str(error).startswith(OUTSTANDING_OBLIGATIONS):
+                    raise
+                LOGGER.warning("run_done_with_open_obligation", run_id=run_id, reason=str(error))
+                self._pending_failures.pop(run_id, None)
+                self._waiting_since.pop(run_id, None)
+                await asyncio.to_thread(
+                    owner.release, state="blocked", blocked_reason=str(error)
+                )
             if self.publish is not None:
                 from .patient_postprocessing import project_patient_facing
 
@@ -403,7 +533,9 @@ class RunRuntime:
         finally:
             self.admissions.discard(task)
 
-    async def admit_post(self, run_id, *, config_snapshot, budget=1.0):
+    async def admit_post(
+        self, run_id, *, config_snapshot, budget=1.0, regenerate=False
+    ):
         from .patient_postprocessing import admit_patient_facing
 
         deadline = asyncio.get_running_loop().time() + budget
@@ -413,6 +545,7 @@ class RunRuntime:
                 self.store,
                 run_id,
                 config_snapshot=config_snapshot,
+                regenerate=regenerate,
             )
             if result["state"] != "admitting":
                 return result

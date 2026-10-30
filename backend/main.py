@@ -8,11 +8,9 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -45,11 +43,6 @@ from . import runtime_identity
 from .orchestration import (
     build_patient_orchestration_detail,
     build_patient_orchestration_summary,
-    cathode_handoff_meta_path,
-    cathode_handoff_payload_path,
-    cathode_handoff_source_path,
-    cathode_project_dir,
-    choose_cathode_source_artifact,
     choose_final_export_ready_run,
     choose_patient_facing_ready_run,
     derive_run_liveness,
@@ -83,10 +76,7 @@ from .portal_export_manifest import (
 from .clinic_api import router as clinic_router
 from .clinic_internal_api import router as clinic_internal_router
 from .portal_files import normalize_portal_patient_id
-from .portal_sync import (
-    spawn_portal_sync,
-    watch_portal_patients_forever,
-)
+from .portal_sync import spawn_portal_sync
 from .reports import (
     extract_pdf_full,
     extract_text_from_pdf,
@@ -235,6 +225,9 @@ class RunCreate(BaseModel):
     council_model_ids: list[str]
     consolidator_model_id: str
     allowed_model_fallbacks: dict[str, str] = Field(default_factory=dict)
+    # The operator asked for a fresh council although one for the same request
+    # runs or just finished (2026-10-02, engine map H11).
+    force_new: bool = False
 
 
 class SelectRequest(BaseModel):
@@ -246,6 +239,10 @@ class SelectRequest(BaseModel):
 
 class PatientActionRequest(BaseModel):
     run_id: str | None = None
+    # One more paid attempt at a blocked patient write-up (EN-H3). Spending
+    # beyond the standard job needs the clinic's explicit yes, so a caller
+    # sends this only after asking; without it a blocked post rejoins, free.
+    regenerate_blocked: bool = False
 
 
 class _EventBroker:
@@ -438,13 +435,6 @@ async def _cancel_task_if_possible(task: object | None) -> None:
             await task
 
 
-def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.partial")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
-
-
 def _latest_complete_run_for_patient(
     session, patient_id: str, *, preferred_run_id: str | None = None
 ) -> storage.Run | None:
@@ -453,71 +443,6 @@ def _latest_complete_run_for_patient(
     if preferred_run_id:
         complete_runs = [run for run in complete_runs if run.id == preferred_run_id]
     return complete_runs[0] if complete_runs else None
-
-
-def _prepare_cathode_handoff_for_patient(
-    *, patient_label: str, source_run: storage.Run, source_artifact: storage.Artifact
-) -> dict[str, Any]:
-    project_dir = cathode_project_dir(patient_label)
-    project_dir.mkdir(parents=True, exist_ok=True)
-
-    source_text = Path(source_artifact.content_path).read_text(
-        encoding="utf-8", errors="replace"
-    )
-    source_path = cathode_handoff_source_path(patient_label)
-    source_path.write_text(source_text, encoding="utf-8")
-
-    handoff_payload = {
-        "intent": "patient-friendly qEEG explainer video",
-        "workspace_path": str(_repo_root()),
-        "source_paths": [str(source_path.resolve())],
-        "audience": "the patient and their family",
-        "target_length_minutes": 6.5,
-        "tone": "clear, warm, grounded, scientifically honest",
-        "visual_style": "patient-friendly clinical explainer",
-        "must_include": (
-            "verified progress over time, practical caveats, and a clear explanation "
-            "of what improved, what remains uncertain, and what deserves follow-up"
-        ),
-        "must_avoid": (
-            "invented certainty, hallucinated diagnoses, and filler about sync blinks, "
-            "bad nodes, or spacing/session artifacts unless they materially affect an empirical conclusion"
-        ),
-        "run_until": "render",
-        "ready_for_handoff": True,
-        "review_decision": "accept",
-        "qeeg_source": {
-            "patient_label": patient_label,
-            "run_id": source_run.id,
-            "artifact_id": source_artifact.id,
-            "artifact_kind": source_artifact.kind,
-            "artifact_stage_num": source_artifact.stage_num,
-            "artifact_model_id": source_artifact.model_id,
-            "artifact_path": source_artifact.content_path,
-        },
-    }
-    _write_json_atomically(cathode_handoff_payload_path(patient_label), handoff_payload)
-
-    handoff_meta = {
-        "patient_label": patient_label,
-        "project_dir": str(project_dir),
-        "prepared_at": datetime.now(timezone.utc).isoformat(),
-        "source_run_id": source_run.id,
-        "source_artifact_id": source_artifact.id,
-        "source_artifact_kind": source_artifact.kind,
-        "source_artifact_stage_num": source_artifact.stage_num,
-        "source_artifact_model_id": source_artifact.model_id,
-        "source_markdown_path": str(source_path),
-        "payload_path": str(cathode_handoff_payload_path(patient_label)),
-        "status": "handoff_prepared",
-    }
-    _write_json_atomically(cathode_handoff_meta_path(patient_label), handoff_meta)
-    return {
-        "project_dir": str(project_dir),
-        "source_markdown_path": str(source_path),
-        "payload_path": str(cathode_handoff_payload_path(patient_label)),
-        "meta_path": str(cathode_handoff_meta_path(patient_label)),
-    }
 
 
 async def _auto_generate_patient_facing_for_run(
@@ -621,162 +546,6 @@ async def _auto_generate_patient_facing_for_run(
         },
     )
     return result["state"] == "done" and bool(result.get("verified"))
-
-
-async def _auto_generate_cathode_video_for_run(
-    run_id: str, broker: _EventBroker
-) -> None:
-    """Best-effort post-run Cathode video generation into ../cathode/projects."""
-    if not _truthy_env("QEEG_AUTO_CATHODE_VIDEO", True):
-        return
-
-    with storage.session_scope() as session:
-        run = storage.get_run(session, run_id)
-        if run is None or (run.status or "") != "complete":
-            return
-        completion_gaps = run_downstream_delivery_gaps(
-            run,
-            progress=summarize_run_progress(run),
-            artifacts=storage.list_artifacts(session, run_id),
-        )
-        if completion_gaps:
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "cathode_video",
-                    "status": "skipped",
-                    "reason": "Council run is not peer-reviewed enough for Cathode handoff.",
-                    "gaps": completion_gaps,
-                    "operatorHint": "Rerun the council until Stage 2 peer review completes before handing off to Cathode.",
-                },
-            )
-            return
-        patient = storage.get_patient(session, run.patient_id)
-        if patient is None:
-            return
-        patient_label = _normalize_portal_patient_id((patient.label or "").strip())
-        if patient_label is None:
-            return
-        source_choice = choose_cathode_source_artifact(
-            session,
-            patient_id=patient.id,
-            preferred_run_id=run_id,
-            require_peer_reviewed=True,
-        )
-        if source_choice is None:
-            await broker.publish(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "stage_name": "cathode_video",
-                    "status": "failed",
-                    "patient_label": patient_label,
-                    "operatorHint": "No complete stage 4 or stage 3 council markdown artifact was available for Cathode video handoff after the run completed.",
-                },
-            )
-            return
-        source_run, source_artifact = source_choice
-        handoff_paths = _prepare_cathode_handoff_for_patient(
-            patient_label=patient_label,
-            source_run=source_run,
-            source_artifact=source_artifact,
-        )
-
-    cathode_root = _repo_root().parent / "cathode"
-    queue_script = cathode_root / "scripts" / "qeeg_patient_video_queue.py"
-    if not queue_script.exists():
-        await broker.publish(
-            run_id,
-            {
-                "run_id": run_id,
-                "stage_name": "cathode_video",
-                "status": "failed",
-                "patient_label": patient_label,
-                "project_dir": handoff_paths["project_dir"],
-                "operatorHint": f"Cathode queue script was not found at {queue_script}; verify ../cathode is checked out next to qEEG-analysis.",
-            },
-        )
-        return
-
-    cathode_python = Path(
-        os.getenv("QEEG_CATHODE_PYTHON")
-        or (
-            str(cathode_root / ".venv" / "bin" / "python")
-            if (cathode_root / ".venv" / "bin" / "python").exists()
-            else sys.executable
-        )
-    ).expanduser()
-    project_dir = Path(handoff_paths["project_dir"])
-    log_path = project_dir / "qeeg_video_queue.log"
-    status_path = project_dir / "qeeg_video_queue_status.json"
-    log_file = log_path.open("a", encoding="utf-8")
-    cmd = [
-        str(cathode_python),
-        str(queue_script),
-        "--patients",
-        patient_label,
-        "--target-minutes",
-        str(os.getenv("QEEG_CATHODE_TARGET_MINUTES", "6.5") or "6.5"),
-        "--status-path",
-        str(status_path),
-        "--rebuild-storyboard",
-        "--skip-scene-review",
-        "--continue-on-error",
-    ]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cathode_root),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        log_file.close()
-    except Exception as e:
-        log_file.close()
-        LOGGER.exception(
-            "cathode_video_generation_spawn_failed",
-            run_id=run_id,
-            patient_label=patient_label,
-            operatorHint="Cathode video queue spawn failed after handoff creation; inspect QEEG_CATHODE_PYTHON, ../cathode, and qeeg_patient_video_queue.py permissions.",
-        )
-        await broker.publish(
-            run_id,
-            {
-                "run_id": run_id,
-                "stage_name": "cathode_video",
-                "status": "failed",
-                "patient_label": patient_label,
-                "project_dir": str(project_dir),
-                "error": str(e),
-                "operatorHint": "Cathode video queue spawn failed after handoff creation; inspect QEEG_CATHODE_PYTHON, ../cathode, and qeeg_patient_video_queue.py permissions.",
-            },
-        )
-        return
-
-    LOGGER.info(
-        "cathode_video_generation_started",
-        run_id=run_id,
-        patient_label=patient_label,
-        project_dir=str(project_dir),
-        status_path=str(status_path),
-        pid=proc.pid,
-    )
-    await broker.publish(
-        run_id,
-        {
-            "run_id": run_id,
-            "stage_name": "cathode_video",
-            "status": "queued",
-            "patient_label": patient_label,
-            "project_dir": str(project_dir),
-            "payload_path": handoff_paths["payload_path"],
-            "status_path": str(status_path),
-            "log_path": str(log_path),
-            "pid": proc.pid,
-        },
-    )
 
 
 def _default_clipr_config_path() -> str:
@@ -1228,16 +997,15 @@ async def _startup() -> None:
     app.state.broker = _EventBroker()
     app.state.cliproxy_pid = None
     app.state.model_refresh_task = None
-    app.state.portal_raw_sync_task = None
 
     loop = asyncio.get_running_loop()
     if not app.state.mock_mode:
         try:
             interval_s = float(
-                os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(7 * 24 * 60 * 60)) or "0"
+                os.getenv("QEEG_MODEL_REFRESH_INTERVAL_S", str(10 * 60)) or "0"
             )
         except Exception:
-            interval_s = 7 * 24 * 60 * 60
+            interval_s = 10 * 60
         if interval_s < 0:
             interval_s = 0
         app.state.model_refresh_task = loop.create_task(
@@ -1253,7 +1021,6 @@ async def _startup() -> None:
         publish=app.state.broker.publish,
     )
     await app.state.run_runtime.start()
-    app.state.portal_raw_sync_task = loop.create_task(watch_portal_patients_forever())
     LOGGER.info(
         "backend_startup_complete",
         mock_mode=bool(app.state.mock_mode),
@@ -1268,8 +1035,6 @@ async def _shutdown() -> None:
         await runtime.stop()
     task = getattr(app.state, "model_refresh_task", None)
     await _cancel_task_if_possible(task)
-    raw_sync_task = getattr(app.state, "portal_raw_sync_task", None)
-    await _cancel_task_if_possible(raw_sync_task)
     llm: AsyncOpenAICompatClient | None = getattr(app.state, "llm", None)
     if llm is not None:
         await llm.aclose()
@@ -2069,31 +1834,6 @@ async def run_patient_action(
             "scheduled": True,
         }
 
-    if action == "rerun_pipeline":
-        if normalized_patient_label is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Patient label is not a canonical portal patient id",
-            )
-        log_path = (
-            cfg.DATA_DIR / "pipeline_jobs" / f"{normalized_patient_label}.manual.log"
-        )
-        cmd = [
-            sys.executable,
-            str(_repo_root() / "scripts" / "portal_pipeline_worker.py"),
-            "--once",
-            "--include-label",
-            normalized_patient_label,
-        ]
-        pid = _start_detached(cmd, log_path)
-        return {
-            "ok": True,
-            "action": action,
-            "patient_label": normalized_patient_label,
-            "pid": pid,
-            "log_path": str(log_path),
-        }
-
     if action == "regenerate_patient_facing":
         if patient_facing_run_id is None:
             if preferred_run is not None:
@@ -2120,7 +1860,11 @@ async def run_patient_action(
             post = await runtime.admission(
                 project_patient_facing, runtime.store, patient_facing_run_id
             )
-            if post["state"] == "absent":
+            # A blocked write-up gets one more attempt when the request says
+            # so, with the same paid prompt and no new council (EN-H3). Any
+            # other existing post rejoins unchanged.
+            reopen = post["state"] == "blocked" and req.regenerate_blocked
+            if post["state"] == "absent" or reopen:
                 # Freeze once; every bounded contention retry uses this configuration.
                 snapshot = await asyncio.to_thread(
                     snapshot_post_config,
@@ -2130,7 +1874,9 @@ async def run_patient_action(
                     timeout_s=app.state.llm._timeout_s,
                 )
                 post = await runtime.admit_post(
-                    patient_facing_run_id, config_snapshot=snapshot
+                    patient_facing_run_id,
+                    config_snapshot=snapshot,
+                    regenerate=reopen,
                 )
         except AdmissionUnavailable as error:
             raise HTTPException(
@@ -2147,40 +1893,6 @@ async def run_patient_action(
             "patient_label": patient_label,
             "scheduled": post["state"] in ("pending", "owned"),
             "postprocessing": post,
-        }
-
-    if action == "prepare_cathode_handoff":
-        if normalized_patient_label is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Patient label is not a canonical portal patient id",
-            )
-        with storage.session_scope() as session:
-            choice = choose_cathode_source_artifact(
-                session,
-                patient_id=patient_id,
-                preferred_run_id=req.run_id,
-                require_peer_reviewed=True,
-            )
-            if choice is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="No peer-reviewed council markdown artifact is available for Cathode handoff",
-                )
-            source_run, _source_artifact = choice
-            source_artifact = _source_artifact
-        handoff_paths = _prepare_cathode_handoff_for_patient(
-            patient_label=normalized_patient_label,
-            source_run=source_run,
-            source_artifact=source_artifact,
-        )
-        return {
-            "ok": True,
-            "action": action,
-            "patient_label": normalized_patient_label,
-            "run_id": source_run.id,
-            "artifact_id": source_artifact.id,
-            **handoff_paths,
         }
 
     if action == "export_council_artifacts":
@@ -2443,13 +2155,53 @@ async def preview_report(file: UploadFile = File(...)) -> dict[str, Any]:
             except (ValueError, TypeError, AttributeError, OSError):
                 page_count = 0
 
+    ownership = await asyncio.to_thread(
+        _report_ownership, file_bytes, text, filename
+    )
     return {
         "filename": filename,
         "mime_type": mime_type,
         "preview": preview,
         "text": text,
         "page_count": page_count,
+        **ownership,
     }
+
+
+def _report_ownership(file_bytes: bytes, text: str, filename: str) -> dict[str, Any]:
+    """Where a previewed report already is, and which charts it nearly matches.
+
+    ``onFile`` lists every chart already holding these exact bytes; when it is
+    empty, ``nearMatches`` lists charts with a report sharing a session date,
+    with the evidence computed here. A failed lookup is reported, never
+    guessed: the caller then asks the clinic as before.
+    """
+    import hashlib
+    import logging
+
+    from .report_ownership import near_matches, same_bytes_owners, session_dates
+
+    try:
+        dates = sorted(set(session_dates(text).values()))
+    except Exception:  # noqa: BLE001 - dates only phrase the tell
+        dates = []
+    try:
+        with storage.session_scope() as session:
+            owners = same_bytes_owners(
+                session, hashlib.sha256(file_bytes).hexdigest(), len(file_bytes)
+            )
+            near = [] if owners else near_matches(session, text, filename)
+    except Exception as exc:  # noqa: BLE001 - preview must still return its text
+        logging.getLogger(__name__).warning("Report ownership lookup failed: %s", exc)
+        return {
+            "onFile": [],
+            "nearMatches": [],
+            "sessionDates": dates,
+            "ownershipError": type(exc).__name__,
+        }
+    for owner in owners:
+        owner.pop("patientUuid", None)
+    return {"onFile": owners, "nearMatches": near, "sessionDates": dates}
 
 
 @app.get("/api/reports/{report_id}/extracted")
@@ -2763,6 +2515,7 @@ async def create_run(req: RunCreate) -> dict[str, Any]:
         list_supplied="report_ids" in req.model_fields_set,
     )
     immutable_request = {
+        "force_new": bool(getattr(req, "force_new", False)),
         "patient_id": req.patient_id,
         "source_ids": source_ids,
         "special_instructions": req.special_instructions,
@@ -3276,7 +3029,14 @@ def _run_out(r: storage.Run) -> dict[str, Any]:
     }
 
 
-if __name__ == "__main__":
+def serve() -> None:
+    # This machine only. The clinic routes carry no login of their own; every
+    # caller (the workbench, the admin surface, the health check) is local, and
+    # the clinic reaches the engine only through the workbench's doorway.
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+
+if __name__ == "__main__":
+    serve()

@@ -20,3 +20,19 @@ def forbid_clinic_paid(monkeypatch):
     monkeypatch.setattr(PaidSyncTransport, "handle_request", forbidden)
     yield
     assert calls == []
+
+
+@pytest.fixture(autouse=True)
+def configured_models_discovered():
+    """A running engine has discovered its configured council and consolidator.
+
+    The shared conftest empties the discovered set for isolation; since HUB-H6
+    an empty set means analysis is unavailable, so a test that confirms an
+    analysis starts from an engine that has found its models. A test that sets
+    the set itself still wins."""
+    from backend import config
+
+    config.DISCOVERED_MODEL_IDS.update(
+        [m.id for m in config.COUNCIL_MODELS] + [config.DEFAULT_CONSOLIDATOR]
+    )
+    yield

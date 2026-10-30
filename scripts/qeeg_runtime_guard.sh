@@ -9,9 +9,6 @@ qeeg_component_pattern() {
     portal_watcher)
       printf '%s\n' "qeeg_patients_watch.mjs --dir $sync_dir"
       ;;
-    pipeline_worker)
-      printf '%s\n' "scripts/portal_pipeline_worker.py --poll-seconds"
-      ;;
     backend)
       printf '%s\n' "-m backend.main"
       ;;
@@ -28,7 +25,7 @@ qeeg_component_is_running() {
   local pattern
   pattern="$(qeeg_component_pattern "$1" "$2" "$3")" || return 2
   case "$1" in
-    backend|pipeline_worker)
+    backend)
       local project_root pid process_root
       project_root="$(cd "$2" && pwd -P)" || return 1
       for pid in $(pgrep -f -- "$pattern" 2>/dev/null); do

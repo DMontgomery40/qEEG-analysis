@@ -142,3 +142,17 @@ def test_cliproxy_openai_base_url_appends_v1_once():
         _cliproxy_openai_base_url("http://127.0.0.1:8317/v1")
         == "http://127.0.0.1:8317/v1"
     )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('model_id,expected_limit', [('z-ai/glm-5.3-flash',8192),('openai/gpt-6.1-sol',2500),('mock-council-a',2500)])
+async def test_stage5_keeps_room_for_glm_reasoning_and_valid_final_vote(model_id,expected_limit):
+    observed=[]
+    async def function(messages,info):
+        observed.append(info.model_settings['max_tokens'])
+        # Model refuses to provide a usable tool result if reasoning consumes
+        # the entire allowance; the live GLM receipt exhausted 2500 tokens.
+        assert info.model_settings['max_tokens']==expected_limit
+        return _tool_output_response(info,_fixture('stage5_approve_valid.json'),call_id='bounded-stage5')
+    payload=await run_stage5_final_review(llm_client=None,model_id=model_id,prompt_text='Synthetic final review.',model_override=FunctionModel(function=function))
+    assert payload.vote=='APPROVE'
+    assert observed==[expected_limit]

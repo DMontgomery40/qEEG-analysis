@@ -225,12 +225,26 @@ def test_manifest_freezes_settings_prompts_roles_and_original_admission(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ending", ["cancel", "emit", "deadline"])
+@pytest.mark.parametrize(
+    "ending,late_dispatch",
+    [("cancel", False), ("emit", False), ("deadline", False), ("deadline", True)],
+)
 async def test_heartbeat_scopes_actual_child_and_drains_before_owner_exit(
-    owner, monkeypatch, ending
+    owner, monkeypatch, ending, late_dispatch
 ):
     from backend.council.workflow.stages import _StagesMixin
+    from backend.paid_transport import PaidAsyncTransport
 
+    if late_dispatch:
+        # Full-suite load (2026-10-02): the request reached the transport after
+        # a 20 ms deadline had already passed, so it was never sent.
+        real_handle = PaidAsyncTransport.handle_async_request
+
+        async def late(self, request):
+            await asyncio.sleep(0.05)
+            return await real_handle(self, request)
+
+        monkeypatch.setattr(PaidAsyncTransport, "handle_async_request", late)
     e = execution()
     entered = asyncio.Event()
     released = asyncio.Event()
@@ -267,18 +281,24 @@ async def test_heartbeat_scopes_actual_child_and_drains_before_owner_exit(
                 ),
                 emit=emit,
                 payload={"task": "test"},
-                timeout_s=0.02 if ending == "deadline" else None,
+                timeout_s=60 if ending == "deadline" else None,
             )
 
     task = asyncio.create_task(run())
     await asyncio.wait_for(entered.wait(), 2)
     if ending == "cancel":
         task.cancel()
+    if ending == "deadline":
+        # Pass the deadline only once the request is on the wire, however slow
+        # the machine: move this loop's clock a minute ahead.
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        monkeypatch.setattr(loop, "time", lambda: real_time() + 61)
     await asyncio.sleep(1.1 if ending == "emit" else 0.06)
     assert not task.done()
     assert owner.store.claim_run_owner("r") is None
     released.set()
-    with pytest.raises(BaseException):
+    with pytest.raises(TimeoutError if ending == "deadline" else BaseException):
         await task
     assert drained.is_set()
 
@@ -1050,9 +1070,7 @@ async def test_sdk_deliberate_backoff_keeps_request_sequence_across_agent_runs(
     }
 
 
-def test_saved_prompt_bytes_survive_live_prompt_and_recipe_drift_blocks(
-    owner, monkeypatch
-):
+def test_saved_prompt_bytes_survive_live_prompt_drift(owner, monkeypatch):
     from backend.council.prompts import _load_prompt
 
     e = execution()
@@ -1071,10 +1089,192 @@ def test_saved_prompt_bytes_survive_live_prompt_and_recipe_drift_blocks(
     recovered = e.prepare_execution(owner)
     with e.execution_context(recovered):
         assert _load_prompt("stage1_analysis.md") == original
-    recipe = e._recipe()
-    monkeypatch.setattr(e, "_recipe", lambda: {**recipe, "incompatible": True})
-    with pytest.raises(ExecutionConflict):
-        e.prepare_execution(owner)
+
+
+def _deploy_edits_a_council_recipe_file(e, monkeypatch):
+    """A deploy between admission and the next unit changes a council recipe file."""
+    real = e._recipe
+
+    def edited():
+        recipe = real()
+        files = {**recipe["files"], "council/completion.py": "edited-on-disk"}
+        return {**recipe, "files": files}
+
+    monkeypatch.setattr(e, "_recipe", edited)
+
+
+def _answer(sent):
+    def send(request):
+        sent.append(request.content)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "answer"}}]}
+        )
+
+    return send
+
+
+def _member(e, llm, index):
+    return e.execute_unit(
+        f"s1/member/{index}/model-a/primary",
+        llm.chat_completions(
+            model_id="model-a", messages=[{"role": "user", "content": str(index)}]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_with_nothing_paid_in_flight_adopts_the_new_council_code(
+    owner, monkeypatch
+):
+    """EN-H8 for councils: a deploy that touched backend/council/completion.py
+    blocked every council in flight, though nothing paid was unsettled. The
+    council restarts on the code now on disk and its next unit sends; the
+    manifest that binds the paid rows is never rewritten."""
+    e = execution()
+    sent = []
+    llm = client(_answer(sent))
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        await _member(e, llm, 0)
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    restarted = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(restarted):
+        await _member(e, llm, 1)
+    assert len(sent) == 2
+    assert restarted.manifest_bytes == ctx.manifest_bytes
+    (record,) = ctx.manifest_path.parent.glob("recipe-adopted-*.json")
+    adoption = json.loads(record.read_text())
+    assert adoption["pinned"] == ctx.manifest["recipe"]
+    assert adoption["adopted"] == e._recipe()
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_council_runs_parallel_units_and_rechecks_on_restart(
+    owner, monkeypatch
+):
+    """Once adopted, a sibling's call in flight is this process's own work and
+    does not stop the next unit. A restart re-checks from the pinned recipe: a
+    call the restart cut off mid-flight blocks, whatever was adopted before."""
+    e = execution()
+    sent = []
+    first_in_flight, second_sent = asyncio.Event(), asyncio.Event()
+    sibling_states = []
+
+    async def send(request):
+        sent.append(request.content)
+        if json.loads(request.content)["messages"][0]["content"] == "0":
+            first_in_flight.set()
+            await asyncio.wait_for(second_sent.wait(), timeout=5)
+        else:
+            with storage.session_scope() as session:
+                sibling_states.extend(
+                    row.state
+                    for row in session.scalars(select(storage.PaidRequest))
+                    if row.scope_key.startswith("s1/member/0/")
+                )
+            second_sent.set()
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "answer"}}]}
+        )
+
+    llm = client(send)
+    e.prepare_execution(owner, llm_client=llm)
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    adopted = e.prepare_execution(owner, llm_client=llm)
+
+    async def second():
+        await first_in_flight.wait()
+        return await _member(e, llm, 1)
+
+    with e.execution_context(adopted):
+        await e.gather_units(_member(e, llm, 0), second())
+    assert sibling_states == ["dispatched"]
+    assert len(sent) == 2
+    with storage.session_scope() as session:
+        cut_off = session.scalar(
+            select(storage.PaidRequest).where(
+                storage.PaidRequest.scope_key.startswith("s1/member/0/")
+            )
+        )
+        cut_off.state = "dispatched"
+        session.commit()
+    with pytest.raises(ExecutionConflict, match="paid call s1/member/0/"):
+        e.prepare_execution(owner, llm_client=llm)
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsettled", ["dispatched", "unknown"])
+async def test_a_deploy_never_steps_over_an_unsettled_council_call(
+    owner, monkeypatch, unsettled
+):
+    e = execution()
+    sent = []
+    llm = client(_answer(sent))
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(ctx):
+        await _member(e, llm, 0)
+    with storage.session_scope() as session:
+        session.scalar(select(storage.PaidRequest)).state = unsettled
+        session.commit()
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    with pytest.raises(
+        ExecutionConflict,
+        match=rf"incompatible execution recipe or SDK: paid call s1/member/0/\S+ is {unsettled}",
+    ):
+        restarted = e.prepare_execution(owner, llm_client=llm)
+        with e.execution_context(restarted):
+            await _member(e, llm, 1)
+    assert len(sent) == 1
+    assert not list(ctx.manifest_path.parent.glob("recipe-adopted-*.json"))
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_adopts_over_a_prepared_council_call_and_sends_it_once(
+    owner, monkeypatch
+):
+    """A council call was journaled prepared, then its pinned model was not in
+    the catalogue, so nothing was sent. The next recipe deploy must not strand
+    the run on that row: the council adopts the new code and the call goes out
+    exactly once, through dispatched; a later restart replays its answer."""
+    from backend.paid_transport import dispatch_validation
+    from backend.run_runtime import ModelUnavailable
+
+    e = execution()
+    sent = []
+    llm = client(_answer(sent))
+
+    def unavailable(request):
+        raise ModelUnavailable("Pinned model is currently unavailable: model-a")
+
+    ctx = e.prepare_execution(owner, llm_client=llm)
+    token = dispatch_validation.set(unavailable)
+    try:
+        with e.execution_context(ctx):
+            with pytest.raises(ModelUnavailable):
+                await _member(e, llm, 0)
+    finally:
+        dispatch_validation.reset(token)
+    with storage.session_scope() as session:
+        assert [row.state for row in session.scalars(select(storage.PaidRequest))] == [
+            "prepared"
+        ]
+    assert sent == []
+    _deploy_edits_a_council_recipe_file(e, monkeypatch)
+    adopted = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(adopted):
+        await _member(e, llm, 0)
+    restarted = e.prepare_execution(owner, llm_client=llm)
+    with e.execution_context(restarted):
+        await _member(e, llm, 0)
+    assert len(sent) == 1
+    with storage.session_scope() as session:
+        rows = list(session.scalars(select(storage.PaidRequest)))
+    assert [(row.dispatch_ordinal, row.state) for row in rows] == [
+        (0, "response_saved")
+    ]
+    assert rows[0].dispatched_at is not None
+    assert list(ctx.manifest_path.parent.glob("recipe-adopted-*.json"))
 
 
 @pytest.mark.asyncio
@@ -1962,3 +2162,81 @@ async def test_owned_stage1_current_gpt56_members_receive_page_images(
         assert all(request["model"] == model for request in sent)
     finally:
         await context.aclose()
+
+
+# The exact acknowledged-500 shape the paid journal files as rejected.
+_ACK_500 = b'{"error":{"type":"server_error","code":"internal_server_error","message":"synthetic timeout"}}'
+_USAGE_WINDOW_429 = (
+    b'{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached",'
+    b'"resets_in_seconds":302400}}'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,body,expected_sends",
+    [
+        # Was 10: five sends in the primary unit, five in the reduced pass.
+        (500, _ACK_500, 6),
+        # A spent weekly window: no retry, no reduced pass.
+        (429, _USAGE_WINDOW_429, 1),
+    ],
+)
+async def test_stage1_member_sends_are_capped_and_a_spent_window_is_not_resent(
+    owner, tmp_path, monkeypatch, status, body, expected_sends
+):
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import llm_calls
+
+    e = execution()
+    report = seed_stages(owner, tmp_path, monkeypatch)
+
+    async def no_wait(_attempt):
+        return None
+
+    monkeypatch.setattr(llm_calls, "_sleep_backoff", no_wait)
+    sent = []
+
+    def send(req):
+        model = json.loads(req.content)["model"]
+        sent.append(model)
+        if model == "model-a":
+            return httpx.Response(status, content=body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "Complete\n<!-- END STAGE1 ANALYSIS -->"}}
+                ]
+            },
+        )
+
+    llm = client(send)
+    ctx = e.prepare_execution(owner, llm_client=llm)
+
+    async def emit(_):
+        pass
+
+    # The second pass replays the journal: the in-memory budget must make the
+    # same decisions from the saved receipts and send nothing new.
+    for _ in range(2):
+        with e.execution_context(ctx):
+            try:
+                await QEEGCouncilWorkflow(llm=llm)._stage1(
+                    "r", ["model-a", "model-b"], report, emit
+                )
+            except PaidOutcomeUnknown:
+                raise
+            except Exception:
+                pass
+    assert sent.count("model-a") == expected_sends
+    assert sent.count("model-b") == 1
+    with owner.transaction() as session:
+        rows = [
+            r
+            for r in session.scalars(select(storage.PaidRequest))
+            if "/model-a/" in r.scope_key
+        ]
+    assert len(rows) == expected_sends
+    assert {r.state for r in rows} == {"rejected"}
+    assert (sum("reduced-budget" in r.scope_key for r in rows) > 0) == (status == 500)

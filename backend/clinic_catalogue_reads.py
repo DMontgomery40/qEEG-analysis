@@ -223,7 +223,16 @@ def _generation_time():
         .correlate(ClinicArtifact)
         .scalar_subquery()
     )
-    return func.coalesce(ClinicArtifact.generated_at, receipt_time)
+    # Renderer registrations carry no generation time; a video is made when it
+    # is registered, so it must not sort below older dated videos.
+    return func.coalesce(
+        ClinicArtifact.generated_at,
+        receipt_time,
+        case(
+            (ClinicArtifact.document_kind == "video", ClinicArtifact.registered_at),
+            else_=None,
+        ),
+    )
 
 
 def _record_generation_time(artifact, provenance):
@@ -254,7 +263,9 @@ def _record_generation_time(artifact, provenance):
                 times.append(round(stamp.timestamp() * 1000))
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
-    return max(times) if times else None
+    if times:
+        return max(times)
+    return artifact.registered_at if artifact.document_kind == "video" else None
 
 
 def _working_file_ids(patient_uuids):
@@ -668,10 +679,14 @@ def patient_files(
         )
         indexed_total = total
         if mode != "delivery":
-            working_ids = _working_file_ids([patient.id])
-            query = query.where(ClinicArtifact.id.in_(working_ids))
+            query = query.where(ClinicArtifact.id.in_(_working_file_ids([patient.id])))
+            if mode in ("initial", "archive"):
+                # The hub's file lists. An archived file has left them; the full
+                # catalogue and delivery lookups still resolve it, so a chat card
+                # that already points at it keeps working.
+                query = query.where(ClinicArtifact.archived.is_(False))
             total = session.scalar(
-                select(func.count()).select_from(working_ids.subquery())
+                select(func.count()).select_from(query.order_by(None).subquery())
             )
         version = hashlib.sha256(
             _json(
@@ -679,7 +694,7 @@ def patient_files(
                     patientId=patient.label,
                     revision=patient_revision,
                     contractVersion=2,
-                    fileViewRevision=1,
+                    fileViewRevision=2,
                 )
             ).encode()
         ).hexdigest()

@@ -4,13 +4,18 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 import fcntl
+import logging
+import threading
 import hashlib
 import io
 import json
 import os
+import queue
 from pathlib import Path
 import re
+import shutil
 import tempfile
+import time
 import uuid
 from sqlalchemy import select
 from . import storage, reports, patient_files
@@ -29,6 +34,7 @@ from .clinic_records import (
     ClinicLegacyUpload,
 )
 from .patient_intake import (
+    IdentityMatchesAmbiguous,
     IdentityInput,
     find_patient_by_identity,
     identity_key,
@@ -245,6 +251,7 @@ def submit_upload(
     uploaded_at=None,
     registered=None,
     principal=None,
+    acknowledge_first=False,
 ):
     key = require_key(key)
     if principal not in (None, "workbench", "thrylen-service"):
@@ -311,6 +318,15 @@ def submit_upload(
             )
 
             if existing:
+                if not existing.analysis_json:
+                    # The stored request was cleared after the original submission;
+                    # a replay carrying it cannot bring it back (a raw TypeError
+                    # reached the hub here before 2026-10-02).
+                    raise CatalogueConflict(
+                        "This upload's analysis request was cleared after it was sent, "
+                        "so this retry cannot bring it back. Ask in chat for an analysis "
+                        "of these reports."
+                    )
                 policy_binding = json.loads(existing.analysis_json)["policyBinding"]
                 snapshot, _ = read_policy_binding(policy_binding)
                 policy = snapshot["publicPolicy"]
@@ -427,7 +443,7 @@ def submit_upload(
                         )
                     )
                 _bump(s)
-        return _resume_locked(chosen)
+        return _resume_locked(chosen, background=acknowledge_first)
 
 
 def _bind_patient(upload_id):
@@ -440,6 +456,7 @@ def _bind_patient(upload_id):
         m = json.loads(u.manifest_json)
         answer = json.loads(u.resolution_json) if u.resolution_json else m["resolution"]
         identity = _identity(m["identity"], answer)
+        note = None
         try:
             if answer.get("attachTo"):
                 exact = _patient(s, answer["attachTo"])
@@ -466,7 +483,21 @@ def _bind_patient(upload_id):
                 if len(report_dobs) > 1:
                     raise ValueError("Report items have different dates of birth")
                 if report_dobs and "birthdate" not in m["identity"]:
-                    merged["birthdate"] = next(iter(report_dobs))
+                    # Staff picked this chart, and the clinic is the authority on
+                    # who is who. A printed birthday a typo or a placeholder can
+                    # explain is noted; only one that differs in both month and
+                    # year is asked about (HUB-H8).
+                    printed = next(iter(report_dobs))
+                    on_chart = merged["birthdate"]
+                    if printed != on_chart:
+                        if _typo_or_placeholder(printed, on_chart):
+                            note = (
+                                f"The report's printed birthday {printed} differs "
+                                f"from this chart's {on_chart}; filed to the chart "
+                                "staff picked."
+                            )
+                        else:
+                            merged["birthdate"] = printed
                 merged.update(m["identity"])
                 if "firstName" in m["identity"] and "firstInitial" not in m["identity"]:
                     merged.pop("firstInitial", None)
@@ -477,6 +508,13 @@ def _bind_patient(upload_id):
                     s, identity, target_patient=target
                 )
                 if patient is None or patient.id != target.id:
+                    detail = _chart_difference(
+                        target,
+                        chart_birthdate=target.birthdate or parsed.birthdate,
+                        identity=identity,
+                        birthdate_from_report=bool(report_dobs)
+                        and "birthdate" not in m["identity"],
+                    )
                     raise IdentityNameConflict(
                         dict(
                             conflict="identity_name_mismatch",
@@ -489,16 +527,45 @@ def _bind_patient(upload_id):
                                     name=stored_full_name(target),
                                 )
                             ],
-                            detail="The supplied identity differs from this chart. Choose the same person or someone different.",
+                            detail=detail,
                         )
                     )
                 if not m["identity"]:
                     keep = True
+                _same_report_elsewhere(s, m, patient, identity)
             else:
                 patient, keep = find_patient_by_identity(s, identity)
+                if not identity.force_new:
+                    _same_report_elsewhere(s, m, patient, identity)
+                if patient is None and not identity.force_new:
+                    _offer_placeholder_charts(s, identity)
+                elif patient is not None and not identity.force_new:
+                    _ask_before_naming_a_placeholder(patient, identity)
         except IdentityNameConflict as error:
             u.status = "needs_operator_answer"
             u.conflict_json = _json(error.payload)
+            _bump(s)
+            return None
+        except IdentityMatchesAmbiguous as error:
+            # Two charts fit this name and birthday. That is a question for the
+            # clinic, asked the same way a name mismatch is, with both charts
+            # offered; before 2026-10-02 it was a 400 the hub could not answer.
+            from .patient_intake import stored_full_name
+
+            u.status = "needs_operator_answer"
+            u.conflict_json = _json(
+                dict(
+                    conflict="identity_ambiguous",
+                    incoming_name=" ".join(
+                        filter(None, [identity.first_name, identity.last_name])
+                    ),
+                    candidates=[
+                        dict(patient_id=p.label, name=stored_full_name(p))
+                        for p in error.candidates
+                    ],
+                    detail=str(error),
+                )
+            )
             _bump(s)
             return None
         if patient:
@@ -529,9 +596,178 @@ def _bind_patient(upload_id):
             )
         u.patient_uuid = patient.id
         u.conflict_json = None
+        u.identity_note = note
         u.status = "pending"
         _bump(s, patient.id)
         return patient.id
+
+
+def _typo_or_placeholder(printed, on_chart):
+    """Whether a printed birthday differs from the chart's in a way a typo
+    (the same month or the same year) or the chart's 01-01 placeholder can
+    explain."""
+    try:
+        on_chart = normalize_birthdate(on_chart)
+    except ValueError:
+        return False
+    if on_chart.startswith("01-01-"):
+        return True
+    return printed[:2] == on_chart[:2] or printed[-4:] == on_chart[-4:]
+
+
+def _ask_before_naming_a_placeholder(patient, identity):
+    """An exact id match on a placeholder chart that has no name yet is still a
+    guess: two people known only by unknown initials or a 01-01 birthday share an
+    id, and attaching would write this upload's names onto someone else's chart.
+    Ask once; the ordinary attachTo answer files it there (2026-10-02, HUB-H5)."""
+    from .patient_intake import stored_full_name
+
+    label = patient.label or ""
+    placeholder = "X" in label[:2] or label[3:8] == "01-01"
+    if not placeholder or stored_full_name(patient):
+        return
+    raise IdentityNameConflict(
+        dict(
+            conflict="placeholder_chart",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[dict(patient_id=label, name=stored_full_name(patient))],
+            detail=(
+                f"Is this the chart on file as {label}? That chart has no name yet, "
+                "so this upload could be someone else. Same person, or someone different?"
+            ),
+        )
+    )
+
+
+def _offer_placeholder_charts(s, identity):
+    """Ask before starting a chart beside one with an unknown initial or a
+    placeholder birthday that this upload may be (HUB-H5). A yes is the
+    ordinary attachTo answer; a relabel then fills in what was unknown."""
+    from .patient_intake import identity_key, placeholder_candidates, stored_full_name
+
+    offered = placeholder_candidates(s, identity)
+    if not offered:
+        return
+    labels = [p.label for p in offered]
+    if "X" in identity_key(identity)[:2]:
+        why = "This upload is missing an initial."
+    elif len(labels) == 1:
+        why = "That chart was started without the full initials or birthday."
+    else:
+        why = "Those charts were started without the full initials or birthday."
+    if len(labels) == 1:
+        detail = (
+            f"Is this the chart on file as {labels[0]}? {why} "
+            "Same person, or someone different?"
+        )
+    else:
+        detail = (
+            f"Is this one of the charts on file as {', '.join(labels)}? {why} "
+            "Say which one, or someone different."
+        )
+    raise IdentityNameConflict(
+        dict(
+            conflict="placeholder_chart",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[
+                dict(patient_id=p.label, name=stored_full_name(p)) for p in offered
+            ],
+            detail=detail,
+        )
+    )
+
+
+def _chart_difference(target, *, chart_birthdate, identity, birthdate_from_report):
+    """Say in plain words what differs between an upload and the chart it was
+    filed to. MF's dropdown upload sat parked four days behind a sentence that
+    never said the report's printed birthday was the difference."""
+    from .patient_intake import stored_full_name
+
+    said = []
+    try:
+        chart_dob = normalize_birthdate(chart_birthdate) if chart_birthdate else None
+    except ValueError:
+        chart_dob = None
+    try:
+        given_dob = normalize_birthdate(identity.birthdate) if identity.birthdate else None
+    except ValueError:
+        given_dob = identity.birthdate
+    if given_dob and chart_dob and given_dob != chart_dob:
+        source = (
+            "The report's printed birthday"
+            if birthdate_from_report
+            else "The birthday given"
+        )
+        said.append(f"{source} {given_dob} does not match this chart's {chart_dob}.")
+    given_name = " ".join(filter(None, [identity.first_name, identity.last_name]))
+    chart_name = stored_full_name(target)
+    if (
+        given_name
+        and chart_name
+        and given_name.casefold() != str(chart_name).casefold()
+    ):
+        said.append(f"The name {given_name} does not match this chart's {chart_name}.")
+    if not said:
+        said.append("The details on this upload differ from this chart.")
+    return " ".join(said) + " Same person, or someone different?"
+
+
+def _same_report_elsewhere(s, m, patient, identity):
+    """Tell once when this upload's exact report bytes are on another chart.
+
+    The same bytes are the same report. On 2026-10-02 a blacked-out report
+    already filed and analyzed on DM_09-23-1982 was dropped again, a new staff
+    member supplied a different name and birthday, and a second chart was
+    opened for it. When the identity given would file these bytes anywhere but
+    a chart that already holds them, the clinic is told where they are and
+    asked once; an attachTo or forceNew answer then applies what they say.
+    """
+    from .report_ownership import owner_sentence, same_bytes_owners
+
+    owners = {}
+    for item in m["items"]:
+        if item["metadata"].get("documentKind") != "report":
+            continue
+        for owner in same_bytes_owners(s, item["sha256"], item["size"]):
+            owners.setdefault(owner["patientUuid"], owner)
+    if not owners or (patient is not None and patient.id in owners):
+        return
+    ordered = list(owners.values())
+    raise IdentityNameConflict(
+        dict(
+            conflict="same_report_on_file",
+            incoming_name=" ".join(
+                filter(None, [identity.first_name, identity.last_name])
+            ),
+            candidates=[
+                dict(patient_id=o["patientId"], name=o["name"]) for o in ordered
+            ],
+            detail=owner_sentence(ordered) + " Same person, or someone different?",
+        )
+    )
+
+
+def _same_report(s, patient_uuid, meta):
+    """The report already on this chart with exactly these bytes, as
+    (artifact id, source id), or None."""
+    existing = s.scalar(
+        select(ClinicArtifact)
+        .where(
+            ClinicArtifact.patient_uuid == patient_uuid,
+            ClinicArtifact.source_kind == "report",
+            ClinicArtifact.sha256 == meta["sha256"],
+            ClinicArtifact.size == meta["size"],
+            ClinicArtifact.archived.is_(False),
+        )
+        .order_by(ClinicArtifact.id)
+    )
+    if existing is None or s.get(storage.Report, existing.source_id) is None:
+        return None
+    return existing.id, existing.source_id
 
 
 def _file_item(item_id, patient_uuid):
@@ -546,6 +782,19 @@ def _file_item(item_id, patient_uuid):
     if hashlib.sha256(data).hexdigest() != meta["sha256"] or len(data) != meta["size"]:
         raise CatalogueUnavailable("Staged upload byte binding changed")
     if kind == "report":
+        # The same bytes already on this chart are the same report. On
+        # 2026-09-29 one Wellness Basic PDF became two engine reports (hub
+        # upload, then a chat drop) and five paid runs landed on the copy.
+        with storage.session_scope() as s:
+            existing_binding = _same_report(s, patient_uuid, meta)
+        if existing_binding is not None:
+            with _write() as s:
+                item = s.get(ClinicUploadItem, item_id)
+                item.source_id = existing_binding[1]
+                item.artifact_id = existing_binding[0]
+                item.status = "registered"
+                item.error = None
+            return
         path, extracted, mime, _ = reports.save_report_upload(
             patient_id=patient_uuid,
             report_id=source_id,
@@ -570,101 +819,250 @@ def _file_item(item_id, patient_uuid):
         os.fsync(directory)
     with _write() as s:
         item = s.get(ClinicUploadItem, item_id)
-        u = s.get(ClinicUpload, item.upload_id)
-        s.info["clinic_source_metadata"] = {
-            source_id: dict(
-                uploaded_at=u.uploaded_at,
-                uploaded_by=u.uploaded_by,
-                session_date=meta["metadata"].get("sessionDate") or None,
-                provenance={
-                    kind + "Id": source_id,
-                    "uploadId": u.id,
-                    "itemIndex": item.position,
-                    "metadata": meta["metadata"],
-                },
-            )
-        }
-        if kind == "report":
-            storage.create_report(
-                s,
-                report_id=source_id,
-                patient_id=patient_uuid,
-                filename=meta["originalName"],
-                mime_type=mime,
-                stored_path=path,
-                extracted_text_path=extracted,
-                commit=False,
-            )
+        # Checked again inside this write, which holds the database's write
+        # lock: two filings of the same bytes can both pass the check above
+        # while each saves its copy, and the second one here joins the first
+        # (HUB-H12).
+        duplicate = _same_report(s, patient_uuid, meta) if kind == "report" else None
+        if duplicate is not None:
+            item.artifact_id, item.source_id = duplicate
+            item.status = "registered"
+            item.error = None
         else:
-            storage.create_patient_file(
-                s,
-                file_id=source_id,
-                patient_id=patient_uuid,
-                filename=meta["originalName"],
-                mime_type=mime,
-                stored_path=path,
-                size_bytes=size,
-                commit=False,
+            u = s.get(ClinicUpload, item.upload_id)
+            s.info["clinic_source_metadata"] = {
+                source_id: dict(
+                    uploaded_at=u.uploaded_at,
+                    uploaded_by=u.uploaded_by,
+                    session_date=meta["metadata"].get("sessionDate") or None,
+                    provenance={
+                        kind + "Id": source_id,
+                        "uploadId": u.id,
+                        "itemIndex": item.position,
+                        "metadata": meta["metadata"],
+                    },
+                )
+            }
+            if kind == "report":
+                storage.create_report(
+                    s,
+                    report_id=source_id,
+                    patient_id=patient_uuid,
+                    filename=meta["originalName"],
+                    mime_type=mime,
+                    stored_path=path,
+                    extracted_text_path=extracted,
+                    commit=False,
+                )
+            else:
+                storage.create_patient_file(
+                    s,
+                    file_id=source_id,
+                    patient_id=patient_uuid,
+                    filename=meta["originalName"],
+                    mime_type=mime,
+                    stored_path=path,
+                    size_bytes=size,
+                    commit=False,
+                )
+            artifact = s.scalar(
+                select(ClinicArtifact).where(
+                    ClinicArtifact.source_kind == kind,
+                    ClinicArtifact.source_id == source_id,
+                )
             )
-        artifact = s.scalar(
-            select(ClinicArtifact).where(
-                ClinicArtifact.source_kind == kind,
-                ClinicArtifact.source_id == source_id,
+            if artifact is None:
+                raise CatalogueUnavailable("Source catalogue registration incomplete")
+            item.artifact_id = artifact.id
+            item.status = "registered"
+            item.error = None
+    if duplicate is not None:
+        # The copy this filing saved under its own fresh id is never referenced.
+        shutil.rmtree(reports.report_dir(patient_uuid, source_id), ignore_errors=True)
+    elif kind == "report":
+        # Name, never block: a report whose printed birthday, ages or sex
+        # disagree with this chart, or whose bytes or visit already sit on
+        # another chart, becomes an engine log event at once, and the health
+        # check's chart consistency lane emails David within the half hour.
+        # Six wrong-chart filings were found by accident, days to months later.
+        try:
+            from .chart_consistency import note_new_filing
+
+            note_new_filing(patient_uuid, source_id)
+        except Exception:  # the filing stands whatever the detector does
+            pass
+
+
+# One lock per upload so a filing in flight is never started twice in this
+# process: the hub's status loop replays a pending submission while it waits.
+_FILING_LOCKS: dict[str, threading.Lock] = {}
+_FILING_GUARD = threading.Lock()
+
+
+def _filing_lock(upload_id):
+    with _FILING_GUARD:
+        return _FILING_LOCKS.setdefault(upload_id, threading.Lock())
+
+
+def _file_items(upload_id, patient_uuid):
+    with storage.session_scope() as s:
+        ids = list(
+            s.scalars(
+                select(ClinicUploadItem.id)
+                .where(ClinicUploadItem.upload_id == upload_id)
+                .order_by(ClinicUploadItem.position)
             )
         )
-        if artifact is None:
-            raise CatalogueUnavailable("Source catalogue registration incomplete")
-        item.artifact_id = artifact.id
-        item.status = "registered"
-        item.error = None
+    for item_id in ids:
+        try:
+            _file_item(item_id, patient_uuid)
+        except Exception as error:
+            with _write() as s:
+                item = s.get(ClinicUploadItem, item_id)
+                item.status = "failed"
+                item.error = type(error).__name__ + ": Free filing needs retry"
+                _bump(s, patient_uuid)
+    with _write() as s:
+        u = s.get(ClinicUpload, upload_id)
+        statuses = list(
+            s.scalars(
+                select(ClinicUploadItem.status).where(
+                    ClinicUploadItem.upload_id == upload_id
+                )
+            )
+        )
+        status = "registered" if all(x == "registered" for x in statuses) else "failed"
+        if u.status != status:
+            u.status = status
+            _bump(s, patient_uuid)
 
 
-def _resume_locked(upload_id):
+# Filing extracts and OCRs every page, so at most this many run at once; more
+# hub uploads wait their turn in the queue and read "pending" meanwhile. The
+# workers are daemons like the per-upload threads they replace, so a restart
+# never waits on the queue: unfiled uploads are filed again on replay.
+_FILING_WORKERS = 2
+_FILING_QUEUE: queue.SimpleQueue = queue.SimpleQueue()
+_FILING_THREADS: list[threading.Thread] = []
+
+# A hung filing must not hold a worker until the next restart. One report
+# files in about 23 s (09-29) and a long scanned PDF can OCR for a few
+# minutes, so a filing still running after ten minutes is stalled: one more
+# worker starts for each stalled one, up to a hard ceiling, so the queue keeps
+# moving. A stalled thread is never killed; when it ends, the extra worker
+# retires. The stalled upload still reads "pending", which the workbench
+# health check reports to David once it has waited two hours.
+_FILING_STALL_S = 600.0
+_FILING_WORKERS_MAX = 4
+_FILING_WATCH_S = 30.0
+_FILING_BUSY: dict[threading.Thread, tuple[str, float]] = {}
+# Filings the watchdog has found stalled, as (worker, start); the one record
+# of what is stalled, so a worker never re-judges it against its own clock.
+_FILING_STALLED: set[tuple[threading.Thread, float]] = set()
+_FILING_WATCHDOG: list[threading.Thread] = []
+
+
+def _filing_target_locked():
+    stalled = sum(
+        1
+        for worker, (_, started) in _FILING_BUSY.items()
+        if (worker, started) in _FILING_STALLED
+    )
+    return min(_FILING_WORKERS_MAX, _FILING_WORKERS + stalled)
+
+
+def _start_filing_workers_locked():
+    _FILING_THREADS[:] = [t for t in _FILING_THREADS if t.is_alive()]
+    while len(_FILING_THREADS) < _filing_target_locked():
+        worker = threading.Thread(target=_filing_worker, name="clinic-filing", daemon=True)
+        worker.start()
+        _FILING_THREADS.append(worker)
+    if not any(t.is_alive() for t in _FILING_WATCHDOG):
+        watchdog = threading.Thread(
+            target=_filing_watchdog, name="clinic-filing-watchdog", daemon=True
+        )
+        watchdog.start()
+        _FILING_WATCHDOG[:] = [watchdog]
+
+
+def _filing_worker():
+    me = threading.current_thread()
+    while True:
+        upload_id, patient_uuid, lock = _FILING_QUEUE.get()
+        with _FILING_GUARD:
+            _FILING_BUSY[me] = (upload_id, time.monotonic())
+        try:
+            _file_items(upload_id, patient_uuid)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "clinic_background_filing_failed upload_id=%s", upload_id
+            )
+        finally:
+            with _FILING_GUARD:
+                _FILING_BUSY.pop(me, None)
+            lock.release()
+        with _FILING_GUARD:
+            live = [t for t in _FILING_THREADS if t.is_alive()]
+            if len(live) > _filing_target_locked():
+                if me in _FILING_THREADS:
+                    _FILING_THREADS.remove(me)
+                return
+
+
+def _check_filing_stalls(now=None):
+    """Name each filing that has run past the bound once, and start the
+    replacement workers the stalls call for."""
+    now = time.monotonic() if now is None else now
+    with _FILING_GUARD:
+        running = {(worker, started) for worker, (_, started) in _FILING_BUSY.items()}
+        _FILING_STALLED.intersection_update(running)
+        for worker, (upload_id, started) in _FILING_BUSY.items():
+            if now - started > _FILING_STALL_S and (worker, started) not in _FILING_STALLED:
+                _FILING_STALLED.add((worker, started))
+                logging.getLogger(__name__).warning(
+                    "clinic_filing_stalled upload_id=%s running_s=%d",
+                    upload_id,
+                    now - started,
+                )
+        _start_filing_workers_locked()
+
+
+def _filing_watchdog():
+    while True:
+        time.sleep(_FILING_WATCH_S)
+        try:
+            _check_filing_stalls()
+        except Exception:
+            logging.getLogger(__name__).exception("clinic_filing_watchdog_failed")
+
+
+def _file_later(upload_id, patient_uuid):
+    """File after the answer has gone. Netlify ends a synchronous function at
+    60 s and filing takes about 23 s per report (09-29), so a hub request that
+    filed three reports inline read as a failure while the engine finished.
+    The upload's lock is held from queueing until its filing ends, so a replay
+    while it waits is not queued twice."""
+    lock = _filing_lock(upload_id)
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        with _FILING_GUARD:
+            _start_filing_workers_locked()
+        _FILING_QUEUE.put((upload_id, patient_uuid, lock))
+    except BaseException:
+        lock.release()
+        raise
+
+
+def _resume_locked(upload_id, background=False):
     patient_uuid = _bind_patient(upload_id)
     if patient_uuid:
-        with storage.session_scope() as s:
-            ids = list(
-                s.scalars(
-                    select(ClinicUploadItem.id)
-                    .where(ClinicUploadItem.upload_id == upload_id)
-                    .order_by(ClinicUploadItem.position)
-                )
-            )
-        for item_id in ids:
-            try:
-                _file_item(item_id, patient_uuid)
-            except Exception as error:
-                with _write() as s:
-                    item = s.get(ClinicUploadItem, item_id)
-                    item.status = "failed"
-                    item.error = type(error).__name__ + ": Free filing needs retry"
-                    _bump(s, patient_uuid)
-        with _write() as s:
-            u = s.get(ClinicUpload, upload_id)
-            statuses = list(
-                s.scalars(
-                    select(ClinicUploadItem.status).where(
-                        ClinicUploadItem.upload_id == upload_id
-                    )
-                )
-            )
-            status = (
-                "registered" if all(x == "registered" for x in statuses) else "failed"
-            )
-            if u.status != status:
-                u.status = status
-                _bump(s, patient_uuid)
+        if background:
+            _file_later(upload_id, patient_uuid)
+        else:
+            with _filing_lock(upload_id):
+                _file_items(upload_id, patient_uuid)
     return get_upload(upload_id)
-
-
-def resume_upload(upload_id):
-    with storage.session_scope() as s:
-        u = s.get(ClinicUpload, upload_id)
-        if not u:
-            raise CatalogueNotFound("Upload not found")
-        key = u.admission_key
-    with upload_lock(key):
-        return _resume_locked(upload_id)
 
 
 def _upload_json(s, u):
@@ -726,15 +1124,40 @@ def _upload_json(s, u):
                 else "pending_registration"
             ),
         }
+        if not run:
+            from .clinic_analysis_intents import admission_block
+
+            blocked = admission_block(u.id, u)
+            if blocked:
+                analysis["status"] = "blocked"
+                analysis["blockedReason"] = blocked
+    elif m.get("analysisIntent"):
+        # The upload was sent with "analyze" ticked and the stored request has
+        # since been cleared. SC's confirmed request was cleared by hand after
+        # 09-29 and her receipt then read as done (HUB-H2); say it was withdrawn.
+        intent = m["analysisIntent"]
+        run = s.scalar(
+            select(storage.Run).where(storage.Run.operation_id == intent["operationId"])
+        )
+        analysis = dict(
+            operationId=intent["operationId"],
+            reportItemIndexes=intent["reportItemIndexes"],
+            reportIds=[],
+            runId=run.id if run else None,
+            status=run.status if run else "withdrawn",
+        )
     return dict(
         uploadId=u.id,
         status=u.status,
         patientId=patient.label if patient else None,
         identity=m["identity"],
         conflict=json.loads(u.conflict_json) if u.conflict_json else None,
+        identityNote=u.identity_note,
         items=items,
         uploadedAt=u.uploaded_at,
         uploadedBy=u.uploaded_by,
+        # Who sent it: "thrylen-service" is the hub, "workbench" the clinic chat.
+        uploadedPrincipal=u.uploaded_principal,
         analysis=analysis,
     )
 
@@ -767,16 +1190,26 @@ def get_upload(upload_id):
         raise CatalogueNotFound("Upload not found")
 
 
+def _unreadable_reason(error):
+    if isinstance(error, (CatalogueConflict, CatalogueNotFound, CatalogueUnavailable)):
+        return str(error)[:160] or "This upload's saved record could not be read."
+    return "This upload's saved record could not be read."
+
+
 def list_uploads():
     with storage.session_scope() as s:
-        uploads = [
-            _upload_json(s, u)
-            for u in s.scalars(
-                select(ClinicUpload).order_by(
-                    ClinicUpload.uploaded_at.desc(), ClinicUpload.id
+        uploads = []
+        for u in s.scalars(
+            select(ClinicUpload).order_by(ClinicUpload.uploaded_at.desc(), ClinicUpload.id)
+        ):
+            # One damaged row is that row's problem, not the whole list's: the
+            # workbench read every pending upload as UPLOADS_UNAVAILABLE.
+            try:
+                uploads.append(_upload_json(s, u))
+            except Exception as error:
+                uploads.append(
+                    dict(uploadId=u.id, status="unreadable", error=_unreadable_reason(error))
                 )
-            )
-        ]
         admitted = {u["uploadId"] for u in uploads}
         uploads.extend(
             _legacy_json(u)
@@ -788,7 +1221,7 @@ def list_uploads():
         return _envelope(s, uploads=uploads)
 
 
-def resolve_upload(upload_id, *, key, resolution, actor=None):
+def resolve_upload(upload_id, *, key, resolution, actor=None, acknowledge_first=False):
     key = require_key(key)
     resolution = _resolution(resolution)
     if not resolution:
@@ -847,62 +1280,4 @@ def resolve_upload(upload_id, *, key, resolution, actor=None):
                     )
                 )
                 _bump(s)
-        return _resume_locked(upload_id)
-
-
-def promote_upload(upload_id, portal_dir):
-    """Retryable exact byte projection; persist chosen path before any copy."""
-    with storage.session_scope() as s:
-        u = s.get(ClinicUpload, upload_id)
-        if not u:
-            raise CatalogueNotFound("Upload not found")
-        key = u.admission_key
-    with upload_lock(key):
-        with storage.session_scope() as s:
-            u = s.get(ClinicUpload, upload_id)
-            if u.status != "registered":
-                raise CatalogueConflict("Upload items remain unfinished")
-            label = s.get(storage.Patient, u.patient_uuid).label
-            ids = list(
-                s.scalars(
-                    select(ClinicUploadItem.id)
-                    .where(ClinicUploadItem.upload_id == upload_id)
-                    .order_by(ClinicUploadItem.position)
-                )
-            )
-        outputs = []
-        for item_id in ids:
-            with _write() as s:
-                item = s.get(ClinicUploadItem, item_id)
-                m = json.loads(item.metadata_json)
-                data = Path(item.staging_path).read_bytes()
-                if hashlib.sha256(data).hexdigest() != m["sha256"]:
-                    raise CatalogueUnavailable("Staging bytes changed")
-                if item.projection_path:
-                    path = Path(item.projection_path)
-                    if path.parent != Path(portal_dir) / label:
-                        raise CatalogueConflict(
-                            "Projection target differs from original binding"
-                        )
-                else:
-                    name = Path(m["originalName"].replace("\\", "/")).name
-                    path = Path(portal_dir) / label / name
-                    if path.exists() and path.read_bytes() != data:
-                        path = path.with_name(
-                            path.stem + "__" + item.source_id + path.suffix
-                        )
-                    # Every item in a same-name submission reserves its own path before copying.
-                    occupied = s.scalar(
-                        select(ClinicUploadItem.id).where(
-                            ClinicUploadItem.projection_path == str(path),
-                            ClinicUploadItem.id != item.id,
-                        )
-                    )
-                    if occupied:
-                        path = path.with_name(
-                            path.stem + "__" + item.source_id + path.suffix
-                        )
-                    item.projection_path = str(path)
-            _immutable(path, data)
-            outputs.append(str(path))
-        return outputs
+        return _resume_locked(upload_id, background=acknowledge_first)

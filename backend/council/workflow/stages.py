@@ -13,6 +13,8 @@ from ...reports import extract_pdf_full
 from ...storage import Report, get_report, get_run
 from ...storage import session_scope
 from ..ai_review_agents import run_stage2_peer_review_json, run_stage5_final_review_json
+from ...paid_transport import DispatchGate, dispatch_gate
+from .llm_calls import is_window_limit, member_budget_spent, member_send_budget
 from ..execution import (
     execute_unit,
     gather_units,
@@ -69,7 +71,15 @@ class _StagesMixin:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
         interval_s = self._int_env("QEEG_PROGRESS_HEARTBEAT_S", 30)
-        task = asyncio.ensure_future(awaitable)
+        # The unit's task inherits this gate. At the deadline the gate stops new
+        # paid calls while one already in flight completes and saves its receipt;
+        # cancelling mid-flight would record an unknown outcome and block the run.
+        gate = DispatchGate()
+        gate_token = dispatch_gate.set(gate)
+        try:
+            task = asyncio.ensure_future(awaitable)
+        finally:
+            dispatch_gate.reset(gate_token)
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         deadline = started_at + timeout_s if timeout_s is not None else None
@@ -80,9 +90,7 @@ class _StagesMixin:
                 if deadline is not None:
                     remaining_s = deadline - loop.time()
                     if remaining_s <= 0:
-                        raise TimeoutError(
-                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
-                        )
+                        return await self._finish_after_deadline(task, gate, timeout_s, payload)
                     wait_s = (
                         min(wait_s, remaining_s) if wait_s is not None else remaining_s
                     )
@@ -92,9 +100,7 @@ class _StagesMixin:
                     if task.done():
                         return await task
                     if deadline is not None and loop.time() >= deadline:
-                        raise TimeoutError(
-                            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
-                        )
+                        return await self._finish_after_deadline(task, gate, timeout_s, payload)
                     heartbeat_count += 1
                     await emit(
                         {
@@ -111,6 +117,19 @@ class _StagesMixin:
                 raise_if_execution_blocked(child_error)
             raise_if_execution_blocked(error)
             raise
+
+    async def _finish_after_deadline(self, task, gate, timeout_s, payload):
+        """Stop new paid calls; if one is on the wire, let it land and save first."""
+        grace_s = self._int_env("QEEG_UNIT_DEADLINE_GRACE_S", 660)
+        loop = asyncio.get_running_loop()
+        give_up_at = loop.time() + max(1, grace_s)
+        inflight = gate.stop()
+        while inflight and not task.done() and loop.time() < give_up_at:
+            await asyncio.wait({task}, timeout=0.05)
+            inflight = gate.inflight
+        raise TimeoutError(
+            f"Timed out after {timeout_s}s waiting for {payload.get('task') or 'task'}"
+        )
 
     @staticmethod
     def _select_discovered_model_id(preferred: str) -> str | None:
@@ -929,62 +948,69 @@ class _StagesMixin:
                     "task": "stage1_model",
                     "model_id": model_id,
                 }
-                try:
-                    text = await self._await_with_heartbeat(
-                        execute_unit(
-                            f"s1/member/{member_index}/{model_id}/primary",
-                            self._call_longform_chat_with_repairs(
-                                model_id=model_id,
-                                prompt_text=final_prompt.strip(),
-                                temperature=0.2,
-                                max_tokens=stage1_max_tokens,
-                                end_sentinel=end_sentinel,
-                                required_headings=None,
+                # One send budget covers the primary unit, its retries and the
+                # reduced-budget pass (MEMBER_SEND_LIMIT).
+                with member_send_budget():
+                    try:
+                        text = await self._await_with_heartbeat(
+                            execute_unit(
+                                f"s1/member/{member_index}/{model_id}/primary",
+                                self._call_longform_chat_with_repairs(
+                                    model_id=model_id,
+                                    prompt_text=final_prompt.strip(),
+                                    temperature=0.2,
+                                    max_tokens=stage1_max_tokens,
+                                    end_sentinel=end_sentinel,
+                                    required_headings=None,
+                                ),
                             ),
-                        ),
-                        emit=emit,
-                        payload=stage1_payload,
-                    )
-                except Exception as primary_exc:
-                    raise_if_execution_blocked(primary_exc)
-                    if current_execution() is not None and not is_clinical_failure(
-                        primary_exc, key=f"s1/member/{member_index}/{model_id}/primary"
-                    ):
-                        raise
-                    if isinstance(model_id, str) and model_id.startswith("mock-"):
-                        raise
-                    await emit(
-                        {
-                            **stage1_payload,
-                            "status": "retry",
-                            "error": str(primary_exc)
-                            or primary_exc.__class__.__name__,
-                            "max_tokens": stage1_retry_max_tokens,
-                            "operatorHint": "Stage 1 upstream failed after heartbeat; retrying the same model with a smaller complete-output budget.",
-                        }
-                    )
-                    retry_prompt = (
-                        f"{final_prompt.strip()}\n\n---\n\n"
-                        "RETRY CONSTRAINT:\n"
-                        "The previous upstream call failed before returning usable text. "
-                        "Return a concise but complete Stage 1 analysis, preserve all critical numeric findings, "
-                        "do not invent missing values, and still end with the required sentinel line.\n"
-                    )
-                    text = await self._await_with_heartbeat(
-                        execute_unit(
-                            f"s1/member/{member_index}/{model_id}/reduced-budget",
-                            self._call_longform_chat_with_repairs(
-                                model_id=model_id,
-                                prompt_text=retry_prompt,
-                                temperature=0.2,
-                                max_tokens=stage1_retry_max_tokens,
-                                end_sentinel=end_sentinel,
-                                required_headings=None,
+                            emit=emit,
+                            payload=stage1_payload,
+                        )
+                    except Exception as primary_exc:
+                        raise_if_execution_blocked(primary_exc)
+                        if current_execution() is not None and not is_clinical_failure(
+                            primary_exc, key=f"s1/member/{member_index}/{model_id}/primary"
+                        ):
+                            raise
+                        if isinstance(model_id, str) and model_id.startswith("mock-"):
+                            raise
+                        # A spent usage window will refuse the reduced pass too, and
+                        # the member's six sends may already be spent (EN-H12).
+                        if is_window_limit(primary_exc) or member_budget_spent():
+                            raise
+                        await emit(
+                            {
+                                **stage1_payload,
+                                "status": "retry",
+                                "error": str(primary_exc)
+                                or primary_exc.__class__.__name__,
+                                "max_tokens": stage1_retry_max_tokens,
+                                "operatorHint": "Stage 1 upstream failed after heartbeat; retrying the same model with a smaller complete-output budget.",
+                            }
+                        )
+                        retry_prompt = (
+                            f"{final_prompt.strip()}\n\n---\n\n"
+                            "RETRY CONSTRAINT:\n"
+                            "The previous upstream call failed before returning usable text. "
+                            "Return a concise but complete Stage 1 analysis, preserve all critical numeric findings, "
+                            "do not invent missing values, and still end with the required sentinel line.\n"
+                        )
+                        text = await self._await_with_heartbeat(
+                            execute_unit(
+                                f"s1/member/{member_index}/{model_id}/reduced-budget",
+                                self._call_longform_chat_with_repairs(
+                                    model_id=model_id,
+                                    prompt_text=retry_prompt,
+                                    temperature=0.2,
+                                    max_tokens=stage1_retry_max_tokens,
+                                    end_sentinel=end_sentinel,
+                                    required_headings=None,
+                                ),
                             ),
-                        ),
-                        emit=emit,
-                        payload={**stage1_payload, "attempt": "retry"},
-                    )
+                            emit=emit,
+                            payload={**stage1_payload, "attempt": "retry"},
+                        )
                 enforce_complete = stage1_require_complete and not (
                     isinstance(model_id, str) and model_id.startswith("mock-")
                 )

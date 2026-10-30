@@ -123,7 +123,14 @@ def test_complete_source_admission_and_operation_retry(admission, count):
     ]:
         response = client.post("/api/runs", json={**req, **changed})
         assert response.status_code in (400, 409)
-    new = client.post("/api/runs", json={**req, "operation_id": "intentional-new"})
+    # The same request under a new operation id is a duplicate council while
+    # the first one runs (2026-09-29: five runs on one PDF); the operator's
+    # "run it again" is force_new.
+    duplicate = client.post("/api/runs", json={**req, "operation_id": "intentional-new"})
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"]["code"] == "ANALYSIS_ALREADY_RUNNING"
+    assert duplicate.json()["detail"]["run_id"] == run["id"]
+    new = client.post("/api/runs", json={**req, "operation_id": "intentional-new", "force_new": True})
     assert new.status_code == 200
     assert new.json()["id"] != run["id"]
 
@@ -593,18 +600,23 @@ def test_concurrent_same_operation_creates_one_report_and_run(admission, monkeyp
 
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize(
-    "left_observation,right_observation,expected",
+    "left_observation,right_observation,inferred,operator_mapped",
     [
-        ("Alpha power at Cz: 5 uV2", "Alpha power at Cz: 40 uV2", 409),
-        ("Coherence F3-F4: 0.20", "Coherence F3-F4: 0.95", 409),
-        ("Theta peak at Fz: 4 Hz", "Theta peak at Fz: 7 Hz", 409),
-        ("Alpha power at Cz: 5 uV2", "Alpha power at Cz: 5 uV2", 200),
-        ("Alpha power at Cz: 5 uV2", "", 409),
+        ("Alpha power at Cz: 5 uV2", "Alpha power at Cz: 40 uV2", 409, 200),
+        ("Coherence F3-F4: 0.20", "Coherence F3-F4: 0.95", 409, 200),
+        ("Theta peak at Fz: 4 Hz", "Theta peak at Fz: 7 Hz", 409, 200),
+        ("Alpha power at Cz: 5 uV2", "Alpha power at Cz: 5 uV2", 200, 200),
+        ("Alpha power at Cz: 5 uV2", "", 409, 200),
     ],
 )
 def test_same_date_merge_checks_complete_observed_evidence(
-    admission, explicit, left_observation, right_observation, expected
+    admission, explicit, left_observation, right_observation, inferred, operator_mapped
 ):
+    # Differing unparsed text refuses an inferred merge. An operator's explicit
+    # mapping decides instead (David, 2026-10-02) once dates and parsed values
+    # agree; the admission then records that the operator asserted the visit.
+    expected = operator_mapped if explicit else inferred
+    differs = left_observation != right_observation
     client, payload, tmp, _ = admission
     originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
     for original, observation in zip(originals, [left_observation, right_observation]):
@@ -623,6 +635,13 @@ def test_same_date_merge_checks_complete_observed_evidence(
         assert response.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
         with storage.session_scope() as session:
             assert not list(session.scalars(select(storage.Run)))
+    else:
+        sources = response.json()["source_manifest"]["sources"]
+        assert [s.get("shared_session_provenance") for s in sources] == (
+            [{"1": "operator_asserted_over_differing_source_text"}] * 2
+            if differs
+            else [None, None]
+        )
 
 
 @pytest.mark.parametrize("stream", ["pypdf", "pymupdf", "apple_vision", "tesseract"])
@@ -693,6 +712,268 @@ def test_partial_multisession_evidence_needs_operator_mapping(admission, explici
     assert response.status_code == (200 if explicit else 409), response.text
 
 
+@pytest.mark.parametrize(
+    "later_first_cell,expected",
+    [("270 (+62) ms", 200), ("271 (+62) ms", 409)],
+)
+def test_ocr_plus_minus_lookalike_does_not_fake_a_shared_session_conflict(
+    admission, later_first_cell, expected
+):
+    # Two WAVi reports of one patient share the 1/14/2026 visit. The earlier
+    # report's OCR read that row's "±" as "£" in session 3, which shifted 54
+    # into session 4 and refused a merge whose values agreed.
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    bodies = [
+        "Session 1 (10/24/2025) Baseline\nSession 2 (11/14/2025) Followup\n"
+        "Session 3 (12/8/2025) Followup\nSession 4 (1/14/2026) Followup\n"
+        "Physical Reaction Time 247 (+45) ms 249 (+48) ms 273 (£54) ms "
+        "270 (+62) ms 281-405 ms\n",
+        "Session 1 (1/14/2026) Followup\nSession 2 (2/18/2026) Followup\n"
+        f"Physical Reaction Time {later_first_cell} 257 (+62) ms 279-402 ms\n",
+    ]
+    for report, body in zip(originals, bodies):
+        directory = Path(report.stored_path).parent
+        (directory / "extracted_enhanced.txt").write_text("=== PAGE 1 / 1 ===\n" + body)
+        for path in (directory / "sources").glob("*.txt"):
+            path.write_text(body)
+    request = {
+        **payload,
+        "report_ids": [r.id for r in originals],
+        "source_session_aliases": {
+            originals[0].id: {"1": 1, "2": 2, "3": 3, "4": 4},
+            originals[1].id: {"1": 4, "2": 5},
+        },
+    }
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == expected, response.text
+    if expected == 409:
+        assert response.json()["detail"]["reason"] == (
+            "A shared global session has conflicting measured values"
+        )
+
+
+# CV_02-12-2012's after-30 and after-40 WAVi exports share the 1/14/2026 visit:
+# after-30 local Session 4 and after-40 local Session 1. Excerpts of their text.
+# The summary values agree; the single-visit coherence page cannot, because each
+# export generated on its own day and colours against its own first session.
+_EARLIER_EXPORT = [
+    "Session 1 (10/24/2025) Baseline\nSession 2 (11/14/2025) Followup\n"
+    "Session 3 (12/8/2025) Followup\nSession 4 (1/14/2026) Followup\n"
+    "Physical Reaction Time 247 (+45) ms 249 (+48) ms 273 (+54) ms "
+    "270 (+62) ms 281-405 ms\n",
+    "WAVi Wellness Basic Report Generated: 1/14/2026 2:52 PM\n"
+    "Coherence Band Table, P300 Eyes Closed\nSession 4 (1/14/2026)\n"
+    "T = Theta (4.5-7.5 Hz) (Difference from reference session)\n",
+]
+_CV_MAPPING = ({"1": 1, "2": 2, "3": 3, "4": 4}, {"1": 4, "2": 5})
+_OPERATOR_ASSERTED = "operator_asserted_over_differing_source_text"
+
+
+def _later_export(*, first_cell="270 (+62) ms", date="1/14/2026", page_date=None):
+    return [
+        f"Session 1 ({date}) Followup\nSession 2 (2/18/2026) Followup\n"
+        f"Physical Reaction Time {first_cell} 257 (+62) ms 279-402 ms\n",
+        "WAVi Wellness Basic Report Generated: 2/18/2026 2:55 PM\n"
+        f"Coherence Band Table, P300 Eyes Closed\nSession 1 ({page_date or date})\n"
+        "T = Theta (4.5-7.5 Hz) (Difference from reference session)\n",
+    ]
+
+
+def _exports_of_one_visit(tmp, patient_id, later):
+    originals = []
+    for pages in (_EARLIER_EXPORT, later):
+        report = source(tmp, patient_id, pages=2)
+        directory = Path(report.stored_path).parent
+        (directory / "extracted_enhanced.txt").write_text(
+            "\n\n".join(f"=== PAGE {n} / 2 ===\n{body}" for n, body in enumerate(pages, 1))
+        )
+        for n, body in enumerate(pages, 1):
+            for path in (directory / "sources").glob(f"page-{n}.*.txt"):
+                path.write_text(body)
+        originals.append(report)
+    return originals
+
+
+def _cv_request(payload, originals, *, explicit=True, **extra):
+    request = {**payload, "report_ids": [r.id for r in originals], **extra}
+    if explicit:
+        request["source_session_aliases"] = {
+            r.id: mapping for r, mapping in zip(originals, _CV_MAPPING)
+        }
+    return request
+
+
+def test_operator_mapping_admits_two_exports_of_one_visit_and_records_it(
+    admission, monkeypatch
+):
+    from backend import analysis_inputs as inputs
+    from backend.council.report_text import (
+        _expected_session_indices,
+        _facts_from_report_text_summary,
+        _page_session_alias_map,
+    )
+    from backend.council.workflow.data_pack import _DataPackMixin
+
+    client, payload, tmp, _ = admission
+    originals = _exports_of_one_visit(tmp, payload["patient_id"], _later_export())
+    request = _cv_request(payload, originals, operation_id="cv-shared-visit")
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == 200, response.text
+    run = response.json()
+    sources = run["source_manifest"]["sources"]
+    assert [s["session_aliases"] for s in sources] == list(_CV_MAPPING)
+    assert [s["mapping_provenance"] for s in sources] == ["operator", "operator"]
+    # Only the shared visit carries the assertion, on both of its sources.
+    assert [s.get("shared_session_provenance") for s in sources] == [
+        {"4": _OPERATOR_ASSERTED},
+        {"1": _OPERATOR_ASSERTED},
+    ]
+
+    # The council reads page labels, not the manifest: every page of both
+    # sources names the asserted visit, and only that visit.
+    with storage.session_scope() as s:
+        report = storage.get_report(s, run["report_id"])
+    directory = Path(report.stored_path).parent
+    labels = json.loads((directory / "metadata.json").read_text())[
+        "synthetic_combined"
+    ]["page_labels"]
+    for page, shared_local in [(1, 4), (2, 4), (3, 1), (4, 1)]:
+        parts = labels[str(page)].split("; ")[2:]
+        assert [p.split(" (")[0].split(" =>")[0] for p in parts if "operator" in p] == [
+            f"local Session {shared_local}"
+        ], labels[str(page)]
+
+    # Both exports' facts for the shared visit land on global session 4 and
+    # agree, so the data pack's strict conflict gate has nothing to refuse.
+    text = (directory / "extracted_enhanced.txt").read_text()
+    expected = _expected_session_indices(text)
+    assert expected == [1, 2, 3, 4, 5]
+    facts = _facts_from_report_text_summary(text, expected_sessions=expected)
+    shared = [f for f in facts if f["session_index"] == 4]
+    assert {f["source_page"] for f in shared} == {1, 3}
+    assert _DataPackMixin._find_fact_conflicts(facts) == []
+    canonical = _DataPackMixin._normalize_facts_for_page_session_aliases(
+        facts,
+        page_session_aliases=_page_session_alias_map(text),
+        input_namespace="global",
+    )
+    assert [
+        (f["value"], f["sd_plus_minus"])
+        for f in canonical
+        if f["session_index"] == 4 and f["metric"] == "physical_reaction_time"
+    ] == [(270, 62)]
+
+    # The same operation replays to the same run, and a lost composition is
+    # rebuilt byte for byte from the saved manifest, assertion included.
+    replay = client.post("/api/runs", json=request)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == run["id"]
+    assert replay.json()["source_manifest"] == run["source_manifest"]
+    before = inputs._asset_inventory(directory)
+    import shutil
+
+    shutil.rmtree(directory)
+
+    def forbid(*args, **kwargs):
+        pytest.fail("Generic OCR must not be called for combined sources")
+
+    monkeypatch.setattr(inputs.reports, "extract_pdf_full", forbid)
+    assert inputs.repair_combined_report(report, run_id=run["id"])
+    assert inputs._asset_inventory(directory) == before
+
+
+def test_inferred_merge_of_two_exports_still_refuses_differing_text(admission):
+    client, payload, tmp, _ = admission
+    originals = _exports_of_one_visit(tmp, payload["patient_id"], _later_export())
+    response = client.post(
+        "/api/runs", json=_cv_request(payload, originals, explicit=False)
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["reason"] == (
+        "A shared global session has differing attributable source evidence; "
+        "resolve the source observations before merging visits"
+    )
+    with storage.session_scope() as session:
+        assert not list(session.scalars(select(storage.Run)))
+
+
+@pytest.mark.parametrize(
+    "later,reason",
+    [
+        (
+            _later_export(first_cell="271 (+62) ms"),
+            "A shared global session has conflicting measured values",
+        ),
+        (
+            _later_export(first_cell="270 (+61) ms"),
+            "A shared global session has conflicting measured values",
+        ),
+        (
+            _later_export(date="1/15/2026"),
+            "Explicit aliases contradict known chronological order",
+        ),
+        (
+            _later_export(page_date="1/15/2026"),
+            "A shared global session has conflicting source dates",
+        ),
+    ],
+)
+def test_operator_mapping_still_needs_agreeing_dates_and_values(
+    admission, later, reason
+):
+    client, payload, tmp, _ = admission
+    originals = _exports_of_one_visit(tmp, payload["patient_id"], later)
+    response = client.post("/api/runs", json=_cv_request(payload, originals))
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
+    assert detail["reason"] == reason
+    with storage.session_scope() as session:
+        assert not list(session.scalars(select(storage.Run)))
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize(
+    "left_n100,right_n100,expected",
+    [
+        ("45 -6.2 98", "45 -6.2 98", 200),
+        ("45 -6.2 98", "45 -9.8 98", 409),
+        ("45 -6.2 98", "45 -6.2 112", 409),
+    ],
+)
+def test_shared_visit_compares_the_n100_reading(
+    admission, explicit, left_n100, right_n100, expected
+):
+    # N100 facts carry uv/ms, not value. Admission compared value/sd only, so
+    # every N100 reading looked equal and an operator-mapped visit with two
+    # different N100 readings was admitted.
+    client, payload, tmp, _ = admission
+    originals = [source(tmp, payload["patient_id"]) for _ in range(2)]
+    for original, reading in zip(originals, [left_n100, right_n100]):
+        block = (
+            "\nCentral-Frontal Average\nN100-UV MS\n"
+            f"{reading}\nMaximum N100 reported between 30-120 msec.\n"
+        )
+        directory = Path(original.stored_path).parent
+        for path in [
+            directory / "extracted_enhanced.txt",
+            *sorted((directory / "sources").glob("*.txt")),
+        ]:
+            path.write_text(path.read_text() + block)
+    request = {**payload, "report_ids": [r.id for r in originals]}
+    if explicit:
+        request["source_session_aliases"] = {r.id: {"1": 1} for r in originals}
+    response = client.post("/api/runs", json=request)
+    assert response.status_code == expected, response.text
+    if expected == 409:
+        assert response.json()["detail"]["reason"] == (
+            "A shared global session has conflicting measured values"
+        )
+        with storage.session_scope() as session:
+            assert not list(session.scalars(select(storage.Run)))
+
+
 def test_stricter_admission_preserves_identical_banked_operation_receipt(
     admission, monkeypatch
 ):
@@ -723,7 +1004,7 @@ def test_stricter_admission_preserves_identical_banked_operation_receipt(
     assert repeated.status_code == 200, repeated.text
     assert repeated.json()["id"] == first.json()["id"]
     assert repeated.json()["source_manifest"] == first.json()["source_manifest"]
-    new = client.post("/api/runs", json={**request, "operation_id": "new-admission"})
+    new = client.post("/api/runs", json={**request, "operation_id": "new-admission", "force_new": True})
     assert new.status_code == 409
     assert new.json()["detail"]["code"] == "ANALYSIS_SESSION_MAPPING_REQUIRED"
 
@@ -1000,6 +1281,32 @@ def test_legacy_reservation_remains_strict_without_invented_snapshot(admission, 
         ) == original_identity
         assert reservation.immutable_request_json is None
         assert reservation.model_fields_json is None
+
+
+def test_reservation_saved_before_force_new_existed_still_replays(admission):
+    # 1396b92 added force_new to every create_run request. A reservation saved
+    # before it has no such key, and its replay answered 409
+    # ANALYSIS_OPERATION_CONFLICT instead of the run it had admitted.
+    client, payload, tmp, _ = admission
+    report = source(tmp, payload["patient_id"])
+    request = {**payload, "report_id": report.id, "operation_id": "before-force-new"}
+    first = client.post("/api/runs", json=request)
+    assert first.status_code == 200, first.text
+    with storage.session_scope() as s:
+        reservation = s.get(storage.AnalysisInputReservation, request["operation_id"])
+        saved = json.loads(reservation.immutable_request_json)
+        assert saved.pop("force_new") is False
+        reservation.immutable_request_json = json.dumps(
+            saved, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        s.commit()
+    repeated = client.post("/api/runs", json=request)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["id"] == first.json()["id"]
+    # The operator's yes on a replayed operation is still a different request.
+    forced = client.post("/api/runs", json={**request, "force_new": True})
+    assert forced.status_code == 409
+    assert forced.json()["detail"]["code"] == "ANALYSIS_OPERATION_CONFLICT"
 
 
 def test_reserved_recovery_keeps_saved_mapping_despite_policy_change(

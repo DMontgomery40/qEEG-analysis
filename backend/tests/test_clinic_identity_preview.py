@@ -4,7 +4,10 @@ import pytest
 from sqlalchemy import event
 from backend import storage
 from backend.tests.test_clinic_api import live_api  # noqa: F401
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 
 
 def test_selected_chart_compares_every_supplied_field_without_writes(live_api):

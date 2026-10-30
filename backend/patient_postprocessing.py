@@ -15,16 +15,34 @@ from importlib.metadata import version
 from pathlib import Path
 from types import MappingProxyType
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 
 from . import config, storage, patient_facing_pdf
-from .council.execution import _hash, _json, _publish, _execution_client, drain_task
+from .council.execution import (
+    _hash,
+    _json,
+    _publish,
+    _execution_client,
+    adopt_recipe,
+    drain_task,
+)
 from .execution_settings import settings
-from .paid_transport import PaidOutcomeUnknown, post_paid_scope
-from .run_execution import ExecutionConflict, ExecutionStore
+from .logging_utils import get_logger
+from .paid_transport import (
+    UNSENT_FAILURES,
+    PaidOutcomeUnknown,
+    manifest_attempt,
+    patient_facing_scope,
+    post_paid_scope,
+    unsent_classification,
+)
+from .run_execution import ExecutionConflict, ExecutionStore, UNSETTLED_PAID_STATES
 from .portal_files import normalize_portal_patient_id
+from .patient_rekey import rename_in_name
 from . import portal_sync
 from scripts import generate_patient_facing_writeups as writer
+
+LOGGER = get_logger(__name__)
 
 
 def _recipe():
@@ -55,7 +73,6 @@ def snapshot_post_config(env, discovered, *, base_url, timeout_s):
     return {
         "enabled": env.get("QEEG_AUTO_PATIENT_FACING", "1").lower().strip()
         not in ("", "0", "false", "no", "off", "n"),
-        "retired_cathode_flag": env.get("QEEG_AUTO_CATHODE_VIDEO", ""),
         "model_preference": preferred,
         "model_id": resolved,
         "version_prefix": (
@@ -80,6 +97,26 @@ def snapshot_post_config(env, discovered, *, base_url, timeout_s):
         in ("1", "true", "yes", "on", "y"),
         "sync_repo": str(portal_sync.portal_sync_repo().resolve()),
     }
+
+
+def _note_writer_fallback(run_id, label, cfg):
+    """Name a write-up whose writer is the fallback, not the preference (EN-H10).
+
+    snapshot_post_config takes z-ai/glm-5.2 when the preferred writer is not in
+    the live catalogue, and nothing said so. Called once, when a write-up pins
+    its writer; a preference that resolves to its own discovered id (an alias,
+    a different case) is not a fallback.
+    """
+    preferred, used = cfg["model_preference"], cfg["model_id"]
+    if config.resolve_model_preference(preferred, [used]) == used:
+        return
+    LOGGER.warning(
+        "patient_facing_writer_fallback",
+        run_id=run_id,
+        patient_id=label,
+        preferred=preferred,
+        used=used,
+    )
 
 
 def _root(owner):
@@ -178,7 +215,7 @@ def _manifest(owner, cfg, *, explicit=False):
         )
         destinations = {
             kind: str(Path(cfg["portal_dir"]) / patient.label / (stem + ext))
-            for kind, ext in (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json"))
+            for kind, ext in _OUTPUT_EXTENSIONS
         }
         if Path(stem).name != stem:
             raise PostAdmissionUnavailable(
@@ -215,10 +252,14 @@ def _manifest(owner, cfg, *, explicit=False):
             date=now.date().isoformat(),
             generated_at=now.isoformat(),
             destinations=destinations,
-            max_tokens=12000,
+            # Reasoning writers spend part of this budget before the text;
+            # 12000 truncated full-length summaries mid-appendix.
+            max_tokens=32000,
             temperature=0.2,
         )
     _publish(owner, path, _json(data))
+    if enabled:
+        _note_writer_fallback(run.id, patient.label, cfg)
     return path, data
 
 
@@ -238,18 +279,7 @@ def prepare_completion_posts(owner, cfg):
             "blocked_reason": str(error),
         }
         _publish(owner, path, _json(data))
-    cathode = {
-        "schema_version": 1,
-        "run_id": owner.run_id,
-        "kind": "cathode",
-        "reason": "manual_fallback",
-        "diagnostic": "automatic_cathode_routing_retired"
-        if cfg["retired_cathode_flag"]
-        else None,
-    }
-    cp = _root(owner) / "cathode.json"
-    _publish(owner, cp, _json(cathode))
-    return [(path, data), (cp, cathode)]
+    return [(path, data)]
 
 
 def register_completion_posts(session, owner, prepared):
@@ -262,7 +292,7 @@ def register_completion_posts(session, owner, prepared):
             if (row.manifest_path, row.manifest_hash) != (str(path), digest):
                 raise ExecutionConflict("post obligation binding changed")
             continue
-        skip = data["kind"] == "cathode" or not data["enabled"]
+        skip = not data["enabled"]
         session.add(
             storage.PostObligation(
                 run_id=owner.run_id,
@@ -274,22 +304,22 @@ def register_completion_posts(session, owner, prepared):
                 else "blocked"
                 if data.get("blocked_reason")
                 else "pending",
-                blocked_reason=(
-                    "manual_fallback" if data["kind"] == "cathode" else "disabled"
-                )
-                if skip
-                else data.get("blocked_reason"),
+                blocked_reason="disabled" if skip else data.get("blocked_reason"),
                 owner_token=owner.token,
                 owner_generation=owner.generation,
             )
         )
 
 
-def admit_patient_facing(store: ExecutionStore, run_id: str, *, config_snapshot):
+def admit_patient_facing(
+    store: ExecutionStore, run_id: str, *, config_snapshot, regenerate=False
+):
     """Explicit authorized historical action. Repeated/concurrent calls rejoin.
 
     Returns projection; never runs council or modifies its input/model attestation.
     Busy ownership returns an admitting projection for E6 to retry the same call.
+    With regenerate, a blocked post starts its next attempt (EN-H3); any other
+    existing post rejoins as before.
     """
     from .orchestration import run_downstream_delivery_gaps, summarize_run_progress
     from sqlalchemy.orm import Session
@@ -299,8 +329,14 @@ def admit_patient_facing(store: ExecutionStore, run_id: str, *, config_snapshot)
         if run is None:
             raise KeyError(run_id)
         prior = session.get(storage.PostObligation, (run_id, "patient_facing"))
-        if prior is not None:
+        reopen = prior is not None and regenerate and prior.state == "blocked"
+        if prior is not None and not reopen:
             return project_patient_facing(store, run_id)
+    if reopen:
+        # Outside the read session: the reopen claims and writes the run.
+        return _regenerate_patient_facing(store, run_id, config_snapshot)
+    with Session(store.engine) as session:
+        run = session.get(storage.Run, run_id)
         artifacts = list(
             session.scalars(
                 select(storage.Artifact).where(storage.Artifact.run_id == run_id)
@@ -350,18 +386,155 @@ def admit_patient_facing(store: ExecutionStore, run_id: str, *, config_snapshot)
     return project_patient_facing(store, run_id)
 
 
+def _regenerated_manifest(owner, prior_path, prior_hash, prior_reason, cfg):
+    """The next attempt of a blocked write-up: same paid prompt, new scope and files.
+
+    The clinical content of the paid request is copied from the blocked
+    attempt, never rebuilt, so the model is asked exactly what it was asked
+    before. The configuration is this request's own snapshot: an old one pins
+    the code recipe of its day, which every later deploy refuses. The new
+    attempt writes to its own folder and to filenames that do not exist yet,
+    so every record of the earlier attempt stays valid.
+    """
+    old = _load(prior_path, prior_hash)
+    if old.get("run_id") != owner.run_id or old.get("kind") != "patient_facing":
+        raise ExecutionConflict("post manifest identity changed")
+    if "prompt" not in old:
+        raise PostAdmissionUnavailable(
+            "this write-up was blocked before it had a prompt, so asking again "
+            "cannot help: "
+            + str(old.get("blocked_reason") or prior_reason or "reason not recorded")
+        )
+    attempt = manifest_attempt(old) + 1
+    path = _root(owner) / f"attempt-{attempt}" / "patient_facing.json"
+    if path.exists():
+        # An earlier request published this attempt and stopped before the
+        # obligation moved to it. The same blocked attempt rejoins that file.
+        saved = _load(path)
+        if (
+            saved.get("run_id"),
+            saved.get("kind"),
+            saved.get("attempt"),
+            saved.get("previous_manifest_hash"),
+        ) != (owner.run_id, "patient_facing", attempt, prior_hash):
+            raise ExecutionConflict("orphan post manifest identity changed")
+        return path, saved
+    with owner.transaction() as session:
+        run = session.get(storage.Run, owner.run_id)
+        patient = session.get(storage.Patient, old["patient_id"])
+        if patient is None or run.patient_id != old["patient_id"]:
+            raise ExecutionConflict("original patient identity changed")
+        label = patient.label
+    if normalize_portal_patient_id(label) != label:
+        raise PostAdmissionUnavailable(
+            "current patient label is not a canonical clinic id"
+        )
+    data = {
+        "schema_version": 1,
+        "run_id": owner.run_id,
+        "kind": "patient_facing",
+        "explicit": True,
+        "enabled": True,
+        "config": cfg,
+        "attempt": attempt,
+        "previous_manifest_hash": prior_hash,
+        **{
+            key: old[key]
+            for key in (
+                "patient_id",
+                "selected_artifact_id",
+                "sources",
+                "source_fingerprint",
+                "prompt",
+                "version",
+                "date",
+                "max_tokens",
+                "temperature",
+            )
+        },
+        "patient_label": label,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for number in range(attempt, attempt + 1000):
+        data["stem_suffix"] = f"-{number}"
+        data["destinations"] = _destinations(data, label)
+        if not any(Path(p).exists() for p in data["destinations"].values()):
+            break
+    else:
+        raise PostAdmissionUnavailable("no free filename for another write-up")
+    _publish(owner, path, _json(data))
+    _note_writer_fallback(owner.run_id, label, cfg)
+    return path, data
+
+
+def _regenerate_patient_facing(store, run_id, cfg):
+    """Explicit clinic request: one more try at a blocked write-up, no new council.
+
+    Only a blocked post whose run has no unsettled paid call is reopened; an
+    unknown outcome is reconciled first, never stepped over.
+    """
+    from sqlalchemy.orm import Session
+
+    with Session(store.engine) as session:
+        unsettled = session.scalar(
+            select(storage.PaidRequest)
+            .where(
+                storage.PaidRequest.run_id == run_id,
+                storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+            )
+            .limit(1)
+        )
+        if unsettled is not None:
+            raise ExecutionConflict(
+                "the write-up cannot be asked for again yet: paid call "
+                f"{unsettled.scope_key} is {unsettled.state}; reconcile it first"
+            )
+    owner = store.claim_run_owner(run_id, regenerate_post=True)
+    if owner is None:
+        projection = project_patient_facing(store, run_id)
+        if projection["state"] == "blocked":
+            return {"run_id": run_id, "state": "admitting", "verified": False}
+        return projection
+    run_reason = None
+    try:
+        with owner.transaction() as session:
+            run_reason = session.get(storage.Run, run_id).blocked_reason
+            prior = session.get(storage.PostObligation, (run_id, "patient_facing"))
+            prior_path, prior_hash, prior_reason = (
+                prior.manifest_path,
+                prior.manifest_hash,
+                prior.blocked_reason,
+            )
+        path, data = _regenerated_manifest(
+            owner, prior_path, prior_hash, prior_reason, cfg
+        )
+        owner.reopen_blocked_post(
+            "patient_facing",
+            expected_manifest_hash=prior_hash,
+            manifest_path=str(path),
+            manifest_hash=_hash(_json(data)),
+        )
+    except BaseException:
+        owner.release(
+            state="blocked",
+            blocked_reason=run_reason or "patient-facing document blocked",
+        )
+        raise
+    owner.release(state="pending")
+    return project_patient_facing(store, run_id)
+
+
 def _verify_manifest(owner, data):
-    if data["run_id"] != owner.run_id or data["config"]["recipe"] != _recipe():
-        raise ExecutionConflict("incompatible patient output recipe")
+    if data["run_id"] != owner.run_id:
+        raise ExecutionConflict("post manifest identity changed")
     with owner.transaction() as session:
         run = session.get(storage.Run, owner.run_id)
         patient = session.get(storage.Patient, data["patient_id"])
-        if (
-            run.patient_id != data["patient_id"]
-            or patient is None
-            or patient.label != data["patient_label"]
-        ):
+        # The patient is the UUID. A relabel since the manifest was pinned is
+        # the same patient under a corrected id, not a different one (EN-H7).
+        if run.patient_id != data["patient_id"] or patient is None:
             raise ExecutionConflict("original patient identity changed")
+        current_label = patient.label
         rows = {
             s["artifact_id"]: session.get(storage.Artifact, s["artifact_id"])
             for s in data["sources"]
@@ -385,6 +558,41 @@ def _verify_manifest(owner, data):
             raise ExecutionConflict("original source bytes changed")
     if _hash(_json(data["sources"])) != data["source_fingerprint"]:
         raise ExecutionConflict("original source fingerprint changed")
+    return current_label
+
+
+# New sends one write-up pass may make after a send that never left.
+_UNSENT_RESENDS = 2
+
+_OUTPUT_EXTENSIONS = (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json"))
+
+
+def _destinations(data, label):
+    """Output paths of one attempt; attempts after the first carry a suffix."""
+    stem = writer._output_stem(
+        patient_label=label, version=data["version"], date_str=data["date"]
+    ) + data.get("stem_suffix", "")
+    if Path(stem).name != stem:
+        raise PostAdmissionUnavailable(
+            "output version must be a single filename component"
+        )
+    folder = Path(data["config"]["portal_dir"]) / label
+    return {kind: str(folder / (stem + ext)) for kind, ext in _OUTPUT_EXTENSIONS}
+
+
+def _route_to_current_label(data, label):
+    """File the document under the patient's id as it is now.
+
+    A relabel between council completion and generation used to block the
+    document because the manifest pinned the old label (EN-H7). Identity
+    changes rename files and routing only: the pinned prompt is paid request
+    bytes and stays exactly as admitted.
+    """
+    if label == data["patient_label"]:
+        return data
+    if normalize_portal_patient_id(label) != label:
+        raise ExecutionConflict("current patient label is not a canonical clinic id")
+    return {**data, "patient_label": label, "destinations": _destinations(data, label)}
 
 
 def _accepted_output(owner, root, kind, destination, produce):
@@ -412,8 +620,8 @@ def _accepted_output(owner, root, kind, destination, produce):
     return {k: binding[k] for k in ("path", "size", "sha256")}
 
 
-def _publish_outputs(owner, data, md, meta):
-    root = _root(owner) / "outputs"
+def _publish_outputs(owner, base, data, md, meta):
+    root = base / "outputs"
     result = {}
     result["md"] = _accepted_output(
         owner, root, "md", data["destinations"]["md"], lambda: (md + "\n").encode()
@@ -422,13 +630,20 @@ def _publish_outputs(owner, data, md, meta):
     from .clinic_producers import register_patient_output
 
     register_patient_output(owner, data, "md", result["md"])
+    # The PDF is the bound markdown, which can predate this process's writer
+    # code when a write-up adopted a newer recipe (EN-H8).
+    bound_md = (
+        bytes.fromhex(_load(root / "md.json")["bytes_hex"])
+        .decode("utf-8")
+        .removesuffix("\n")
+    )
 
     def pdf():
         with owner.file_guard(), tempfile.TemporaryDirectory(dir=root) as directory:
             path = Path(directory) / "report.pdf"
             with patient_facing_pdf.patient_pdf_assets(data["config"]["logo_uri"]):
                 writer.render_patient_facing_markdown_to_pdf(
-                    md, path, patient_label=data["patient_label"]
+                    bound_md, path, patient_label=data["patient_label"]
                 )
             return path.read_bytes()
 
@@ -448,10 +663,18 @@ def _publish_outputs(owner, data, md, meta):
     return result
 
 
-def _verify_outputs(outputs):
+def _verify_outputs(outputs, current_label=None):
     for binding in outputs.values():
+        path = Path(binding["path"])
+        if current_label and not path.exists():
+            # A rekey after the document was written renames its files under
+            # the patient's current id (patient_rekey); the receipts keep the
+            # old paths. The bytes must still be exactly the bound ones.
+            path = path.parent.parent / current_label / rename_in_name(
+                path.name, path.parent.name, current_label
+            )
         try:
-            raw = Path(binding["path"]).read_bytes()
+            raw = path.read_bytes()
         except OSError as error:
             raise ExecutionConflict("required output unavailable") from error
         if len(raw) != binding["size"] or _hash(raw) != binding["sha256"]:
@@ -497,9 +720,23 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
     )
     client = None
     setting_token = None
+    scope_key = None
+    # Each attempt keeps its outputs and receipts beside its own manifest.
+    base = Path(row.manifest_path).parent
     try:
         data = _load(row.manifest_path, row.manifest_hash)
-        _verify_manifest(owner, data)
+        scope_key = patient_facing_scope(manifest_attempt(data))
+        # A write-up with nothing in flight continues on the code on disk;
+        # outputs already bound keep their bytes (EN-H8).
+        adopt_recipe(
+            owner,
+            base,
+            row.manifest_hash,
+            data["config"]["recipe"],
+            _recipe(),
+            "patient output recipe",
+        )
+        data = _route_to_current_label(data, _verify_manifest(owner, data))
         cfg = data["config"]
         client = _execution_client(llm_client)
         client._base_url, client._timeout_s = cfg["base_url"], cfg["timeout_s"]
@@ -509,13 +746,24 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                 select(storage.PaidRequest)
                 .where(
                     storage.PaidRequest.run_id == owner.run_id,
-                    storage.PaidRequest.scope_key == "post/patient_facing/generation",
+                    storage.PaidRequest.scope_key == scope_key,
                 )
                 .order_by(storage.PaidRequest.dispatch_ordinal.desc())
                 .limit(1)
             )
         if prior is None or prior.state in ("prepared", "rejected"):
-            if cfg["model_id"] not in await client.list_models():
+            try:
+                available = await client.list_models()
+            except Exception as error:
+                # The proxy blinked. That is a retry in a few seconds, not a
+                # blocked patient document (2026-10-02 engine map, H6).
+                from .run_runtime import ModelUnavailable
+
+                raise ModelUnavailable(
+                    "patient model catalogue unavailable; retrying",
+                    model=cfg["model_id"],
+                ) from error
+            if cfg["model_id"] not in available:
                 raise ExecutionConflict("pinned patient model unavailable")
         with post_paid_scope(
             owner,
@@ -526,7 +774,9 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
         ) as scope:
             meta = {
                 "patient_label": data["patient_label"],
-                "patient_id": data["patient_id"],
+                # The clinic id, as everywhere else; the engine's UUID never
+                # leaves the engine (EN-H15; nothing read it here).
+                "patient_id": data["patient_label"],
                 "run_id": owner.run_id,
                 "llm_model_id": cfg["model_id"],
                 "generated_at": data["generated_at"],
@@ -544,25 +794,49 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
                     for s in data["sources"]
                 ],
             }
-            outputs = await writer.generate_writeup(
-                client,
-                model_id=cfg["model_id"],
-                prompt=data["prompt"],
-                temperature=data["temperature"],
-                max_tokens=data["max_tokens"],
-                label=data["patient_label"],
-                meta=meta,
-                **{
-                    kind + "_path": Path(data["destinations"][kind])
-                    for kind in ("md", "pdf", "meta")
-                },
-                publisher=lambda md, meta: _owned_free_work(
-                    owner, _publish_outputs, owner, data, md, meta
-                ),
-            )
+            # A send that never left this machine is asked again in the same
+            # pass, at the next ordinal (EN-H2). The journal replays earlier
+            # unsent rows as the same failures, so each pass allows that many
+            # plus _UNSENT_RESENDS new tries.
+            with owner.transaction() as session:
+                tries = _UNSENT_RESENDS + session.scalar(
+                    select(func.count())
+                    .select_from(storage.PaidRequest)
+                    .where(
+                        storage.PaidRequest.run_id == owner.run_id,
+                        storage.PaidRequest.scope_key == scope_key,
+                        storage.PaidRequest.state == "rejected",
+                        storage.PaidRequest.error_classification.in_(
+                            tuple(UNSENT_FAILURES)
+                        ),
+                    )
+                )
+            while True:
+                try:
+                    outputs = await writer.generate_writeup(
+                        client,
+                        model_id=cfg["model_id"],
+                        prompt=data["prompt"],
+                        temperature=data["temperature"],
+                        max_tokens=data["max_tokens"],
+                        label=data["patient_label"],
+                        meta=meta,
+                        **{
+                            kind + "_path": Path(data["destinations"][kind])
+                            for kind in ("md", "pdf", "meta")
+                        },
+                        publisher=lambda md, meta: _owned_free_work(
+                            owner, _publish_outputs, owner, base, data, md, meta
+                        ),
+                    )
+                    break
+                except writer.UpstreamError as error:
+                    if not tries or unsent_classification(error.__cause__) is None:
+                        raise
+                    tries -= 1
             scope.raise_if_blocked()
         _verify_outputs(outputs)
-        sync_path = _root(owner) / "sync.json"
+        sync_path = base / "sync.json"
         if not sync_path.exists():
             if cfg["sync_enabled"]:
                 if sync is None:
@@ -593,11 +867,11 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
             "run_id": owner.run_id,
             "manifest_hash": row.manifest_hash,
             "outputs": outputs,
-            "paid": _paid_bindings(owner.store, owner.run_id),
+            "paid": _paid_bindings(owner.store, owner.run_id, scope_key),
             "sync": sync_receipt,
             "delivery_verified": False,
         }
-        receipt_path = _root(owner) / "complete.json"
+        receipt_path = base / "complete.json"
         _publish(owner, receipt_path, _json(receipt))
         _verify_outputs(outputs)
         owner.transition_post_obligation(
@@ -608,13 +882,21 @@ async def continue_patient_facing(owner, *, llm_client, sync=None):
             receipt_hash=_hash(_json(receipt)),
         )
     except writer.UpstreamError as error:
+        # A provider answer is final for this attempt; a request that never
+        # left this machine is a retry (EN-H2).
         with owner.transaction() as session:
             acknowledged = session.scalar(
                 select(storage.PaidRequest)
                 .where(
                     storage.PaidRequest.run_id == owner.run_id,
-                    storage.PaidRequest.scope_key == "post/patient_facing/generation",
+                    storage.PaidRequest.scope_key == scope_key,
                     storage.PaidRequest.state.in_(["response_saved", "rejected"]),
+                    or_(
+                        storage.PaidRequest.error_classification.is_(None),
+                        storage.PaidRequest.error_classification.notin_(
+                            tuple(UNSENT_FAILURES)
+                        ),
+                    ),
                 )
                 .limit(1)
             )
@@ -652,6 +934,8 @@ def project_patient_facing(store, run_id):
         row = session.get(storage.PostObligation, (run_id, "patient_facing"))
         if row is None:
             return {"run_id": run_id, "state": "absent", "verified": False}
+        run = session.get(storage.Run, run_id)
+        patient = session.get(storage.Patient, run.patient_id) if run else None
         result = {
             "run_id": run_id,
             "state": row.state,
@@ -663,15 +947,23 @@ def project_patient_facing(store, run_id):
         }
         try:
             manifest = _load(row.manifest_path, row.manifest_hash)
+            current_label = (
+                patient.label
+                if patient is not None and patient.id == manifest["patient_id"]
+                else None
+            )
             local_path = Path(row.manifest_path).parent / "outputs" / "local.json"
             result["local_complete"] = False
             if local_path.exists():
                 local = _load(local_path)
+                # A relabel before generation files under the current id
+                # (EN-H7); every other part of each path stays as pinned.
+                filed_label = Path(local["md"]["path"]).parent.name
                 if {
                     kind: binding["path"] for kind, binding in local.items()
-                } != manifest["destinations"]:
+                } != _route_to_current_label(manifest, filed_label)["destinations"]:
                     raise ExecutionConflict("local output destinations changed")
-                _verify_outputs(local)
+                _verify_outputs(local, current_label)
                 result.update(local_complete=True, outputs=local)
             if row.state == "done":
                 receipt = _load(row.receipt_path, row.receipt_hash)
@@ -680,20 +972,21 @@ def project_patient_facing(store, run_id):
                     or receipt["manifest_hash"] != row.manifest_hash
                 ):
                     raise ExecutionConflict("completion binding changed")
-                if receipt["paid"] != _paid_bindings(store, run_id):
+                scope_key = patient_facing_scope(manifest_attempt(manifest))
+                if receipt["paid"] != _paid_bindings(store, run_id, scope_key):
                     raise ExecutionConflict("original generation binding changed")
-                _verify_outputs(receipt["outputs"])
+                _verify_outputs(receipt["outputs"], current_label)
                 result.update(
                     verified=True, outputs=receipt["outputs"], sync=receipt["sync"]
                 )
-        except (ExecutionConflict, KeyError, TypeError) as error:
+        except (ExecutionConflict, KeyError, TypeError, ValueError) as error:
             result.update(
                 verified=False, local_complete=False, integrity_error=str(error)
             )
         return result
 
 
-def _paid_bindings(store, run_id):
+def _paid_bindings(store, run_id, scope_key):
     """Verify complete original request/response files even after local completion."""
     from sqlalchemy.orm import Session
 
@@ -716,18 +1009,25 @@ def _paid_bindings(store, run_id):
                 select(storage.PaidRequest)
                 .where(
                     storage.PaidRequest.run_id == run_id,
-                    storage.PaidRequest.scope_key == "post/patient_facing/generation",
+                    storage.PaidRequest.scope_key == scope_key,
                 )
                 .order_by(storage.PaidRequest.dispatch_ordinal)
             )
         )
         bindings = [{key: getattr(row, key) for key in fields} for row in rows]
+        # Read beside the bindings, never into them: done receipts already
+        # bind exactly these fields.
+        unsent = [
+            row.state == "rejected" and row.error_classification in UNSENT_FAILURES
+            for row in rows
+        ]
     if not bindings:
         raise ExecutionConflict("original generation receipt missing")
-    for binding in bindings:
+    for binding, never_sent in zip(bindings, unsent):
         if binding["state"] not in ("response_saved", "rejected"):
             raise ExecutionConflict("original generation is unresolved")
-        for kind in ("request", "response"):
+        # A request that never left this machine has no response file.
+        for kind in ("request",) if never_sent else ("request", "response"):
             try:
                 raw = Path(binding[kind + "_path"]).read_bytes()
             except (OSError, TypeError) as error:

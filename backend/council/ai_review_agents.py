@@ -424,12 +424,15 @@ async def run_stage5_final_review(
     prompt_text: str,
     model_override: Any = None,
 ) -> Stage5FinalReviewPayload:
+    # GLM's completion allowance includes reasoning. A real final review used
+    # all 2500 tokens for reasoning and never produced its structured vote.
+    max_tokens = 8192 if model_id == "z-ai/glm-5.3-flash" else 2500
     if model_override is not None:
         return await _run_agent_with_backoff(
             agent=_STAGE5_REVIEW_AGENT,
             prompt_text=prompt_text,
             model=model_override,
-            model_settings=_model_settings(model_id, temperature=0.1, max_tokens=2500),
+            model_settings=_model_settings(model_id, temperature=0.1, max_tokens=max_tokens),
         )
 
     sequence = _ReviewRequests()
@@ -441,7 +444,7 @@ async def run_stage5_final_review(
                 prompt_text=prompt_text,
                 model=chat_model,
                 model_settings=_model_settings(
-                    model_id, temperature=0.1, max_tokens=2500
+                    model_id, temperature=0.1, max_tokens=max_tokens
                 ),
             )
         except ModelHTTPError as err:
@@ -458,7 +461,7 @@ async def run_stage5_final_review(
                 prompt_text=prompt_text,
                 model=responses_model,
                 model_settings=_model_settings(
-                    model_id, temperature=0.1, max_tokens=2500
+                    model_id, temperature=0.1, max_tokens=max_tokens
                 ),
             )
 

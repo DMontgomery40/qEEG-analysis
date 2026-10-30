@@ -5,7 +5,10 @@ import pytest
 from sqlalchemy import select
 from backend import storage, patient_postprocessing as post
 from backend.tests.test_patient_postprocessing import ready  # noqa: F401
-from backend.tests.clinic_test_helpers import forbid_clinic_paid  # noqa: F401
+from backend.tests.clinic_test_helpers import (  # noqa: F401
+    configured_models_discovered,
+    forbid_clinic_paid,
+)
 
 
 @pytest.mark.asyncio
@@ -96,33 +99,6 @@ def test_confirmed_original_policy_survives_settings_drift_and_replay(
     finally:
         owner.release()
         owner.close()
-
-
-def test_shared_execution_retires_old_dispatch_before_remote_reads(
-    temp_data_dir, monkeypatch
-):
-    from backend.portal_sync import spawn_portal_pipeline
-    from scripts.portal_pipeline_worker import process_patient
-
-    monkeypatch.setenv("QEEG_CLINIC_SHARED_EXECUTION", "1")
-
-    class NoRemote:
-        def __getattr__(self, name):
-            pytest.fail(
-                "Old metadata/index/dispatch path must retire before remote reads"
-            )
-
-    assert spawn_portal_pipeline("ZZ_01-01-1900") is False
-    result = process_patient(
-        client=NoRemote(),
-        portal_dir=temp_data_dir,
-        status_dir=temp_data_dir / "status",
-        patient_id="ZZ_01-01-1900",
-        job_reports=[],
-        dry_run=False,
-        allow_paid_runs=True,
-    )
-    assert result.status == "retired" and not result.ran_batch
 
 
 @pytest.mark.asyncio
@@ -245,3 +221,36 @@ async def test_consumer_retries_admission_and_missing_start_separately(
 
     runtime.admission = forbidden
     await intents.activate_confirmed_uploads(runtime)
+
+
+def test_pending_retries_end_in_a_blocked_run_with_a_plain_reason(monkeypatch):
+    # 2026-10-02: one run was claimed 30,561 times over three days.
+    from backend import run_runtime
+
+    monkeypatch.setattr(run_runtime, "PENDING_RETRY_LIMIT", 3)
+    monkeypatch.setattr(run_runtime, "GENERATION_BACKSTOP", 500)
+    assert run_runtime._capped_disposition("pending", "All models failed during Stage 1", 1, 5) == (
+        "pending", "All models failed during Stage 1")
+    assert run_runtime._capped_disposition("pending", "All models failed during Stage 1", 3, 7) == (
+        "blocked", "gave up after 3 failed attempts: All models failed during Stage 1")
+    assert run_runtime._capped_disposition("blocked", "paid_outcome_unknown", 9, 9) == ("blocked", "paid_outcome_unknown")
+    assert run_runtime._capped_disposition("pending", "x", 1, 500)[0] == "pending", "one blip at high generation is not a verdict"
+    assert run_runtime._capped_disposition("pending", "x", 3, 500)[0] == "blocked", "the generation backstop survives restarts"
+    # a missing model or an unreachable catalogue is a wait, never an attempt
+    waiting = run_runtime.ModelUnavailable("Pinned council catalogue is unavailable before first execution")
+    assert run_runtime._is_availability_wait(waiting)
+    wrapped = RuntimeError("outer")
+    wrapped.__cause__ = waiting
+    assert run_runtime._is_availability_wait(wrapped)
+    assert not run_runtime._is_availability_wait(RuntimeError("All models failed during Stage 1"))
+
+
+def test_a_complete_run_with_a_blocked_document_is_blocked_not_stranded():
+    # 2026-10-02: c8215c9e and 2cb44aac sat "complete / pending" for days.
+    from backend import run_runtime
+
+    assert run_runtime._strand_guard("pending", "missing sections", "complete", "blocked", "missing required sections") == (
+        "blocked", "patient-facing document blocked: missing required sections")
+    assert run_runtime._strand_guard("pending", "x", "running", "blocked", "y") == ("pending", "x")
+    assert run_runtime._strand_guard("pending", "x", "complete", "pending", None) == ("pending", "x")
+    assert run_runtime._strand_guard("done", None, "complete", "blocked", "y") == ("done", None)

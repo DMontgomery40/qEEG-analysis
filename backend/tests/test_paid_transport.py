@@ -7,12 +7,15 @@ from pathlib import Path
 
 import httpx
 import pytest
+from unittest.mock import patch
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend import storage
 from backend.run_execution import ExecutionStore, ExecutionConflict
 
+
+SERVER_ERROR_BODY = b'{"error":{"type":"server_error","code":"internal_server_error","message":"synthetic timeout"}}'
 
 def paid():
     assert importlib.util.find_spec("backend.paid_transport"), "paid boundary absent"
@@ -983,7 +986,7 @@ async def test_acknowledged_rejection_status_replays_independently_of_body(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,failures", [(429, 2), (429, 5), (401, 1)])
+@pytest.mark.parametrize("status,failures", [(429, 2), (429, 5), (401, 1), (500, 1), (500, 5)])
 @pytest.mark.parametrize("branch", ["chat", "responses"])
 async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
     owner, monkeypatch, status, failures, branch
@@ -1002,7 +1005,7 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
     def send(request):
         calls.append(1)
         if len(calls) <= failures:
-            return httpx.Response(status, content=b"plain acknowledged rejection")
+            return httpx.Response(status, content=SERVER_ERROR_BODY if status == 500 else b"plain acknowledged rejection")
         return httpx.Response(
             200,
             json={"output_text": "ok"}
@@ -1055,6 +1058,7 @@ async def test_owned_workflow_acknowledged_status_keeps_bounded_retry_and_auth(
     ],
 )
 @pytest.mark.parametrize("rejected_status,rejected_body", [
+    (500, SERVER_ERROR_BODY),
     (402, b'{"error":{"message":"Insufficient Balance"}}'),
     (400, b'{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled."}}'),
 ])
@@ -1235,3 +1239,239 @@ p.reconcile_blocked_run(store,'r')
         assert len(requests) == 1 and requests[0].state == "rejected"
         assert Path(requests[0].request_path).read_bytes() == b"original"
     assert len(store.list_due_runs(datetime.now(timezone.utc))) == 1
+
+
+@pytest.mark.asyncio
+async def test_unit_deadline_stops_new_dispatch_but_saves_the_inflight_call(owner, monkeypatch):
+    # 2026-09-29: a Stage 1 chunk deadline cancelled a transcript call mid-flight;
+    # the journal recorded an unknown outcome and the whole run blocked. A deadline
+    # must stop new paid calls before they are sent and let the in-flight one land.
+    from backend.council.workflow.stages import _StagesMixin
+
+    p = paid()
+    monkeypatch.setenv("QEEG_UNIT_DEADLINE_GRACE_S", "10")
+    calls = []
+
+    async def send(request):
+        calls.append(request.content)
+        await asyncio.sleep(1.6)
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+
+        async def unit():
+            with scope(owner):
+                await client.post("http://test/v1/responses", content=b"first")
+                await client.post("http://test/v1/responses", content=b"second")
+
+        with pytest.raises((TimeoutError, p.DispatchStopped)):
+            await _StagesMixin()._await_with_heartbeat(
+                unit(), emit=None, payload={"task": "unit"}, timeout_s=1
+            )
+    states = [r.state for r in rows(owner)]
+    assert calls == [b"first"]
+    assert states == ["response_saved"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body,acknowledged", [
+    (500, SERVER_ERROR_BODY, True),
+    (500, b'{"error":{"type":"server_error"}}', False),
+    (500, b'{"error":{"code":"internal_server_error"}}', False),
+    (500, b'{"error":{"type":"server_error","code":"overloaded"}}', False),
+    (500, b'{"error":"server_error"}', False),
+    (500, b'not json', False),
+    (500, b'{"error":{"type":"server_error","code":"internal_server_error"},"choices":[{"message":{"content":"unexpected output"}}]}', False),
+    (502, SERVER_ERROR_BODY, False), (503, SERVER_ERROR_BODY, False), (504, SERVER_ERROR_BODY, False),
+])
+@pytest.mark.parametrize("sync", [False, True])
+async def test_complete_allowlisted_server_failure_replays_without_rebilling_claim(owner, status, body, acknowledged, sync):
+    p = paid()
+    calls = []
+    def send(request):
+        calls.append(1)
+        return httpx.Response(status, content=body)
+    for _ in range(2):
+        with scope(owner):
+            try:
+                if sync:
+                    with httpx.Client(transport=p.PaidSyncTransport(httpx.MockTransport(send))) as client:
+                        response = client.post("http://test/v1/chat/completions", content=b"original")
+                else:
+                    async with httpx.AsyncClient(transport=p.PaidAsyncTransport(httpx.MockTransport(send))) as client:
+                        response = await client.post("http://test/v1/chat/completions", content=b"original")
+            except p.PaidOutcomeUnknown:
+                assert not acknowledged
+                continue
+        assert acknowledged and response.status_code == status and response.content == body
+    assert calls == [1]
+    row = rows(owner)[0]
+    assert row.state == ("rejected" if acknowledged else "unknown")
+    assert row.error_classification == ("acknowledged_server_error_billing_unknown" if acknowledged else "unclassified_http_response")
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_server_failure_retry_budget_survives_reconstruction(owner, monkeypatch):
+    from backend.llm_client import AsyncOpenAICompatClient
+    from backend.council import QEEGCouncilWorkflow
+    from backend.council.workflow import llm_calls
+    class InterruptedBackoff(BaseException):
+        pass
+    calls, sleeps = [], []
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            raise InterruptedBackoff
+    monkeypatch.setattr(llm_calls, "_sleep_backoff", sleep)
+    def send(request):
+        calls.append(request.content)
+        return httpx.Response(500, content=SERVER_ERROR_BODY)
+    client = AsyncOpenAICompatClient(base_url="http://test", api_key="", transport=httpx.MockTransport(send))
+    workflow = QEEGCouncilWorkflow(llm=client)
+    args = dict(model_id="model", prompt_text="original", max_tokens=100, temperature=0.2)
+    try:
+        with scope(owner, "stage4"), pytest.raises(InterruptedBackoff):
+            await workflow._call_model_chat(**args)
+        assert len(calls) == 3
+        for _ in range(2):
+            with scope(owner, "stage4"), pytest.raises(Exception) as failure:
+                await workflow._call_model_chat(**args)
+            assert getattr(failure.value, "status_code", None) == 500
+            assert not isinstance(failure.value, paid().PaidOutcomeUnknown)
+    finally:
+        await client.aclose()
+    assert len(calls) == 5 and len(set(calls)) == 1
+    assert [(r.dispatch_ordinal, r.state) for r in rows(owner)] == [(n, "rejected") for n in range(5)]
+
+
+UNSENT = [
+    ("connect_refused", lambda: httpx.ConnectError("[Errno 61] Connection refused")),
+    (
+        "connect_refused",  # a failed DNS lookup is an OSError while connecting
+        lambda: httpx.ConnectError("[Errno 8] nodename nor servname provided"),
+    ),
+    ("connect_timeout", lambda: httpx.ConnectTimeout("timed out")),
+    ("proxy_refused", lambda: httpx.ProxyError("407 Proxy Authentication Required")),
+    ("pool_timeout", lambda: httpx.PoolTimeout("no pooled connection in time")),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classification,failure", UNSENT, ids=lambda v: getattr(v, "__name__", v))
+async def test_a_provably_unsent_request_is_rejected_and_never_parks_the_run(
+    owner, classification, failure
+):
+    """EN-H2: nine live rows sat `unknown / transport_or_receipt_failure` and
+    parked their runs for good. A request that failed before any byte left
+    (refused, DNS, connect timeout, proxy handshake, pool wait) is filed
+    rejected, replays as the same failure, and leaves the run free to
+    continue. The next ordinal is an ordinary new send."""
+    p = paid()
+    calls = []
+    kind = type(failure())
+
+    def send(request):
+        calls.append(1)
+        if len(calls) == 1:
+            raise failure()
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+        for _ in range(2):  # first pass live, second pass a replay of the cycle
+            with scope(owner) as cursor:
+                with pytest.raises(kind):
+                    await client.post("http://test/v1/responses", content=b"original")
+                response = await client.post("http://test/v1/responses", content=b"original")
+                assert response.json() == {"ok": True}
+                cursor.raise_if_blocked()
+        p.raise_if_paid_blocked(owner)
+    assert len(calls) == 2
+    first, second = rows(owner)
+    assert (first.state, first.error_classification) == ("rejected", classification)
+    assert second.state == "response_saved"
+
+
+@pytest.mark.parametrize("classification,failure", UNSENT[2:], ids=lambda v: getattr(v, "__name__", v))
+def test_the_synchronous_transport_files_unsent_requests_the_same_way(
+    owner, classification, failure
+):
+    p = paid()
+    calls = []
+
+    def send(request):
+        calls.append(1)
+        raise failure()
+
+    with httpx.Client(transport=p.PaidSyncTransport(httpx.MockTransport(send))) as client:
+        with scope(owner) as cursor:
+            with pytest.raises(type(failure())):
+                client.post("http://test/v1/responses", content=b"original")
+            cursor.raise_if_blocked()
+    p.raise_if_paid_blocked(owner)
+    (row,) = rows(owner)
+    assert (row.state, row.error_classification) == ("rejected", classification)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.WriteTimeout("write timed out"),
+        httpx.WriteError("broken pipe"),
+        httpx.ReadError("connection reset"),
+        httpx.RemoteProtocolError("server disconnected without a response"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+async def test_a_failure_after_bytes_may_have_left_stays_unknown(owner, failure):
+    p = paid()
+
+    def send(request):
+        raise failure
+
+    async with httpx.AsyncClient(
+        transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+    ) as client:
+        with scope(owner):
+            with pytest.raises(p.PaidOutcomeUnknown):
+                await client.post("http://test/v1/responses", content=b"original")
+    (row,) = rows(owner)
+    assert (row.state, row.error_classification) == ("unknown", "transport_or_receipt_failure")
+
+
+async def test_a_call_filed_unknown_records_what_the_error_was(owner):
+    """2026-10-02: seven stuck unknown rows had no traceable cause because the
+    engine never recorded the exception. A dropped read is still filed unknown
+    (money may have moved), and the log now names the error type and message,
+    with no request or response body."""
+    p = paid()
+
+    def send(request):
+        raise httpx.ReadTimeout("read timed out after 600 s", request=request)
+
+    logged = []
+
+    class _Logger:
+        def warning(self, event, **fields):
+            logged.append({"event": event, **fields})
+
+    # The real structlog logger is configured and cached by the app at import;
+    # the module's LOGGER is what the filing calls, so it is what is observed.
+    with patch.object(p, "LOGGER", _Logger()):
+        async with httpx.AsyncClient(
+            transport=p.PaidAsyncTransport(httpx.MockTransport(send))
+        ) as client:
+            with scope(owner) as cursor:
+                with pytest.raises(p.PaidOutcomeUnknown):
+                    await client.post("http://test/v1/responses", content=b"original")
+    (row,) = rows(owner)
+    assert (row.state, row.error_classification) == ("unknown", "transport_or_receipt_failure")
+    events = [e for e in logged if e.get("event") == "paid_outcome_unknown"]
+    assert len(events) == 1, logged
+    assert events[0]["error_type"] == "ReadTimeout"
+    assert "read timed out" in events[0]["error"]
+    assert "original" not in str(events[0])

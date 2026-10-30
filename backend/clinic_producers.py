@@ -137,12 +137,17 @@ def register_original_output(
 
 def register_patient_output(owner, data, kind, binding):
     generated = int(datetime.fromisoformat(data["generated_at"]).timestamp() * 1000)
+    attempt = data.get("attempt", 1)
     with owner.file_guard():
         return register_original_output(
             patient_uuid=data["patient_id"],
             source_kind="patient-facing",
+            # Each catalogue source identity is write-once, so a regenerated
+            # write-up (attempt 2+) registers under its own; attempt 1 is unchanged.
             source_id=json.dumps(
-                [owner.run_id, "patient_facing", kind], separators=(",", ":")
+                [owner.run_id, "patient_facing", kind]
+                + ([attempt] if attempt != 1 else []),
+                separators=(",", ":"),
             ),
             path=binding["path"],
             original_name=Path(binding["path"]).name,

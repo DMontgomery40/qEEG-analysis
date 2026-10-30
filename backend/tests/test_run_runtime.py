@@ -197,7 +197,6 @@ def clinical(temp_data_dir, monkeypatch):
     config.DISCOVERED_MODEL_IDS.update(("mock-a", "mock-b"))
     monkeypatch.setattr(core, "ARTIFACTS_DIR", temp_data_dir / "artifacts")
     monkeypatch.setenv("QEEG_AUTO_PATIENT_FACING", "0")
-    monkeypatch.setenv("QEEG_AUTO_CATHODE_VIDEO", "1")
     monkeypatch.setenv("QEEG_ROUTE_OPENROUTER_EXTRAS_DIRECT", "0")
 
     async def review(**kwargs):
@@ -273,7 +272,6 @@ async def test_actual_six_stage_resume_preserves_policy_and_avoids_second_dispat
         raise AssertionError("legacy auto generator launched")
 
     monkeypatch.setattr(main, "_auto_generate_patient_facing_for_run", forbidden)
-    monkeypatch.setattr(main, "_auto_generate_cathode_video_for_run", forbidden)
     runtime = runtime_type()(
         clinical,
         llm=llm,
@@ -294,9 +292,9 @@ async def test_actual_six_stage_resume_preserves_policy_and_avoids_second_dispat
     with Session(clinical.engine) as session:
         assert session.query(storage.StageReceipt).count() == 6
         assert session.query(storage.PaidRequest).count() == 7
+        # A completed council owes one patient-facing post and nothing else.
         assert {p.kind: p.state for p in session.query(storage.PostObligation)} == {
             "patient_facing": "skipped",
-            "cathode": "skipped",
         }
 
 
@@ -573,6 +571,56 @@ async def test_runtime_post_only_recovers_free_work_without_council(
         assert session.query(storage.StageReceipt).count() == 0
 
 
+@pytest.mark.asyncio
+async def test_a_relabel_before_the_write_up_still_ends_the_run_done(
+    temp_data_dir, monkeypatch
+):
+    # 4765812 filed the write-up under the corrected id, but the projection
+    # compared it with the old id's pinned paths, so the runtime raised
+    # "completed patient outputs failed verification" and parked a finished
+    # run as blocked while its clinical status read complete.
+    from backend import patient_postprocessing as post
+    from backend.tests.test_patient_postprocessing import ready as ready_fixture, llm
+
+    store, run_id, cfg = ready_fixture.__wrapped__(temp_data_dir, monkeypatch)
+    post.admit_patient_facing(store, run_id, config_snapshot=cfg)
+    with Session(store.engine) as session:
+        run = session.get(storage.Run, run_id)
+        session.get(storage.Patient, run.patient_id).label = "ZA_01-01-1900"
+        session.commit()
+    monkeypatch.setattr(
+        post.writer,
+        "render_patient_facing_markdown_to_pdf",
+        lambda *args, **kwargs: args[1].write_bytes(b"%PDF synthetic original"),
+    )
+
+    class NoCouncil:
+        async def run_pipeline(self, *args, **kwargs):
+            raise AssertionError("post-only request entered council")
+
+    calls = []
+    client = llm(calls)
+    runtime = runtime_type()(
+        store,
+        llm=client,
+        workflow=NoCouncil(),
+        sync=lambda *args: True,
+        poll_interval=0.01,
+        retry_delay=0.02,
+    )
+    await runtime.start()
+    try:
+        await until(lambda: saved_run(store, run_id)[0] in ("done", "blocked"))
+    finally:
+        await runtime.stop()
+        await client.aclose()
+    assert saved_run(store, run_id) == ("done", "complete", None), saved_run(store, run_id)
+    result = post.project_patient_facing(store, run_id)
+    assert result["verified"], result
+    assert all("/ZA_01-01-1900/" in o["path"] for o in result["outputs"].values())
+    assert len(calls) == 1
+
+
 _THREAD_CONSUMER = r"""
 import asyncio,json,os,sys,time
 from pathlib import Path
@@ -744,7 +792,6 @@ async def test_startup_accepts_recovery_while_initial_catalogue_is_unavailable(
     monkeypatch.setattr(main, "AsyncOpenAICompatClient", lambda **kwargs: llm)
     monkeypatch.setattr(main, "_ensure_project_clipr_config", lambda: None)
     monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: None)
-    monkeypatch.setenv("QEEG_PORTAL_RAW_SYNC_WATCHER", "0")
     monkeypatch.setattr(main.app.state, "run_runtime", None, raising=False)
     try:
         await asyncio.wait_for(main._startup(), 0.5)
@@ -921,3 +968,162 @@ async def test_billing_reconciliation_continues_original_six_stage_run(
     finally:
         await first.stop()
         await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_done_with_an_open_document_parks_the_run_and_names_it(temp_data_dir):
+    """EN-H14: release("done") refused for an open obligation used to escape
+    _run_owned, leave the row owned and be re-claimed every few seconds with
+    nothing said. It now parks the run once, naming what is still open."""
+    store = ExecutionStore(storage.engine)
+    calls = []
+
+    async def continuation(owner):
+        calls.append(owner.run_id)
+        return "done", None
+
+    add_run(store, "open-post")
+    with Session(store.engine) as session:
+        session.add(
+            storage.PostObligation(
+                run_id="open-post",
+                kind="patient_facing",
+                manifest_path="/nowhere/patient_facing.json",
+                manifest_hash="0" * 64,
+                owner_token="admission",
+                owner_generation=0,
+                state="pending",
+            )
+        )
+        session.commit()
+
+    def parked():
+        with Session(store.engine) as session:
+            run = session.get(storage.Run, "open-post")
+            return run.execution_state == "blocked" and run
+
+    runtime = runtime_type()(
+        store, continuation=continuation, poll_interval=0.02, retry_delay=0.05
+    )
+    await runtime.start()
+    try:
+        await until(lambda: bool(parked()))
+        await asyncio.sleep(0.3)  # several retry intervals: nothing re-claims it
+    finally:
+        await runtime.stop()
+    run = parked()
+    assert run.blocked_reason == (
+        "outstanding execution obligations: patient_facing document pending"
+    )
+    assert run.owner_token is None
+    assert calls == ["open-post"]
+
+
+def test_an_availability_wait_longer_than_a_day_blocks_with_the_model_named():
+    from backend import run_runtime as rr
+
+    reason = "Pinned model is currently unavailable: gone-model"
+    # Inside the limit it stays a wait.
+    assert rr._waited_disposition(
+        "pending", reason, "gone-model", 1000.0, 1000.0 + 86400, limit=86400
+    ) == ("pending", reason)
+    # Past it, blocked with a plain reason that names the model.
+    assert rr._waited_disposition(
+        "pending", reason, "gone-model", 1000.0, 1000.0 + 86401, limit=86400
+    ) == (
+        "blocked",
+        "the model gone-model has not been available for a day; "
+        "nothing retries this by itself",
+    )
+    # Other states are untouched.
+    assert rr._waited_disposition(
+        "blocked", "x", "gone-model", 0.0, 10**9, limit=1
+    ) == ("blocked", "x")
+    # The model id is read through the cause chain.
+    try:
+        try:
+            raise rr.ModelUnavailable(reason, model="gone-model")
+        except rr.ModelUnavailable as inner:
+            raise RuntimeError("wrapped") from inner
+    except RuntimeError as outer:
+        assert rr._unavailable_model(outer) == "gone-model"
+        assert rr._is_availability_wait(outer)
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_model_never_returns_is_blocked_after_the_wait_limit(
+    temp_data_dir, monkeypatch
+):
+    """A ModelUnavailable wait is exempt from the 20-attempt cap, so a model
+    that never came back meant a re-claim every 5 s for ever."""
+    from backend import run_runtime as rr
+
+    monkeypatch.setattr(rr, "MODEL_WAIT_LIMIT_S", 86400.0)
+    store = ExecutionStore(storage.engine)
+    calls = []
+
+    async def continuation(owner):
+        calls.append(owner.run_id)
+        raise rr.ModelUnavailable(
+            "Pinned model is currently unavailable: gone-model", model="gone-model"
+        )
+
+    add_run(store, "waiting")
+    runtime = runtime_type()(
+        store, continuation=continuation, poll_interval=0.02, retry_delay=0.05
+    )
+    clock = iter([0.0, 3600.0] + [90000.0] * 1000)
+    runtime._clock = lambda: next(clock)
+
+    def parked():
+        with Session(store.engine) as session:
+            run = session.get(storage.Run, "waiting")
+            return run.execution_state == "blocked" and run
+
+    await runtime.start()
+    try:
+        await until(lambda: bool(parked()))
+        await asyncio.sleep(0.3)  # several retry intervals: nothing re-claims it
+    finally:
+        await runtime.stop()
+    run = parked()
+    assert run.blocked_reason == (
+        "the model gone-model has not been available for a day; "
+        "nothing retries this by itself"
+    )
+    assert run.owner_token is None
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_failing_upload_activation_does_not_stop_the_scan(
+    temp_data_dir, monkeypatch
+):
+    # The confirmed-upload activation ran unguarded inside the scan, so one
+    # exception there (a backoff overflow, a locked database) ended the scan
+    # task and no run was claimed again until a restart.
+    from backend import clinic_analysis_intents, clinic_execution_cutover
+
+    store = ExecutionStore(storage.engine)
+    activations = []
+
+    async def activate(runtime):
+        activations.append(1)
+        raise OverflowError("int too large to convert to float")
+
+    monkeypatch.setattr(clinic_execution_cutover, "shared_execution_enabled", lambda: True)
+    monkeypatch.setattr(clinic_analysis_intents, "activate_confirmed_uploads", activate)
+    calls = []
+
+    async def continuation(owner):
+        calls.append(owner.run_id)
+        return "done", None
+
+    runtime = runtime_type()(store, continuation=continuation, poll_interval=0.01)
+    await runtime.start()
+    try:
+        add_run(store, "r")
+        await until(lambda: calls == ["r"])
+        await until(lambda: len(activations) > 2)
+    finally:
+        await runtime.stop()

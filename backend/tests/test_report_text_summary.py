@@ -230,3 +230,173 @@ def test_local_column_order_comes_from_source_legend():
     assert [
         (f["local_session_index"], f["session_index"], f["value"]) for f in facts
     ] == [(2, 3, 280), (1, 2, 290)]
+
+
+# WAVi's glossary page (verbatim) mentions every summary label in prose. On
+# 2026-09-29 it produced a phantom second P300 value (300 ms from "P300", 3 µV
+# from "C3") for every session, so identical visits in two reports "conflicted".
+WAVI_GLOSSARY_PAGE = (
+    "P300 Metrics\n"
+    "Physical Reaction Time: The average time of the physical response to rare tones, derived from mouse or keyboard input.\n"
+    'Reported as "N/A" if there were less than 15 physical responses to rare tones.\n'
+    "Audio P300 Delay and Audio P300 Voltage metrics are derived from Central-Parietal (C-P) locations CZ, C3, C4, PZ, P3, and P4 with\n"
+    "sufficient yield.\n"
+    "Audio P300 Delay: The fastest C-P latency between 240-499 ms after a rare tone, among locations that are at least 3 μV.\n"
+    'Reported as "N/A" if no C-P location is at least 3 μV, or no C-P location has a yield of at least 20 rare events.\n'
+    "Audio P300 Voltage: The largest C-P amplitude between 240-499 ms after a rare tone.\n"
+    'Reported as "< 0 μV" if the voltage at all C-P locations is less than 0 μV.\n'
+)
+
+
+def _metric_values(facts, metric):
+    out = {}
+    for f in facts:
+        if f.get("metric") == metric:
+            out.setdefault(f["session_index"], []).append((f["value"], f.get("sd_plus_minus")))
+    return out
+
+
+def test_glossary_page_adds_no_summary_values():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 12 ===\n"
+        "Physical Reaction Time                282 (±56) ms        252–362 ms\n"
+        "Audio P300 Delay                      344 ms              265–344 ms\n"
+        "Audio P300 Voltage                    4.2 μV              7–18 μV\n"
+        "=== PAGE 12 / 12 ===\n" + WAVI_GLOSSARY_PAGE
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1])
+
+    assert _metric_values(facts, "audio_p300_delay") == {1: [(344, None)]}
+    assert _metric_values(facts, "audio_p300_voltage") == {1: [(4.2, None)]}
+    assert _metric_values(facts, "physical_reaction_time") == {1: [(282, 56)]}
+
+
+def test_plus_minus_sd_is_read_like_plus_sd():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 2 ===\n"
+        "Physical Reaction Time      282 (±56) ms      337 (+109) ms      252–362 ms\n"
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2])
+    assert _metric_values(facts, "physical_reaction_time") == {1: [(282, 56)], 2: [(337, 109)]}
+
+
+# Tesseract's reading of a real four-session WAVi summary (1/14/2026 report):
+# the third cell's "±" came through as "£", the others as "+".
+_FOUR_SESSION_RT_ROW = (
+    "Physical Reaction Time 247 (+45) ms 249 (+48) ms 273 (£54) ms 270 (+62) ms 281-405 ms"
+)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _FOUR_SESSION_RT_ROW,
+        *(
+            _FOUR_SESSION_RT_ROW.replace("(+", f"({glyph}").replace("(£", f"({glyph}")
+            for glyph in ["+", "£", "t", "=", "±", ""]
+        ),
+    ],
+    ids=["ocr-row", "plus", "pound", "t", "equals", "plus-minus", "missing"],
+)
+def test_ocr_lookalike_plus_minus_keeps_each_sd_with_its_session(row):
+    # The "£" cell was read as 273 with no SD, then 54 took session 4's column,
+    # so a merge with a report printing session 4 as "270 (+62) ms" was refused.
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 17 ===\n"
+        "Assessment Scores Session 1 Session 2 Session 3 Session 4 Target\n"
+        "(10/24/2025) (11/14/2025) (12/8/2025) (1/14/2026) Range\n"
+        "Performance Assessments\n" + row + "\n"
+        "Trail Making Test A 63 sec 41 sec 50 sec 42 sec 43-74 sec\n"
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2, 3, 4])
+    rt = [f for f in facts if f.get("metric") == "physical_reaction_time"]
+
+    assert _metric_values(facts, "physical_reaction_time") == {
+        1: [(247, 45)],
+        2: [(249, 48)],
+        3: [(273, 54)],
+        4: [(270, 62)],
+    }
+    assert {f["target_range"] for f in rt} == {"281-405 ms"}
+
+
+def test_ocr_low_yield_marker_fragment_does_not_hide_the_row():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 12 ===\n"
+        "Audio P300 Delay fl 284 ms f= 240 ms 240 ms 252-327 ms\n"
+        "=== PAGE 12 / 12 ===\n" + WAVI_GLOSSARY_PAGE
+    )
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1])
+    assert _metric_values(facts, "audio_p300_delay") == {1: [(284, None)]}
+
+
+def test_a_long_blank_run_after_a_label_is_read_in_linear_time():
+    # The row check let "\s+" and "\s*" split one blank run every possible
+    # way, so a label followed by W spaces and no value cost O(W^2): 16k
+    # spaces took 1.3 s and 50k about 12 s, per label.
+    import time
+
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = "=== PAGE 1 / 1 ===\nPhysical Reaction Time" + " " * 50_000 + "x\n"
+    started = time.perf_counter()
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2])
+    assert time.perf_counter() - started < 1.0
+    assert _metric_values(facts, "physical_reaction_time") == {}
+    padded = "=== PAGE 1 / 1 ===\nPhysical Reaction Time" + " " * 50_000 + "282 ms 252-362 ms\n"
+    facts = _facts_from_report_text_summary(padded, expected_sessions=[1])
+    assert _metric_values(facts, "physical_reaction_time") == {1: [(282, None)]}
+
+
+def test_a_long_digit_run_in_a_p300_row_is_read_in_linear_time():
+    # The reference-range search and the cell scan could start inside a digit
+    # run at every position, so a P300 row with a long run of digits cost
+    # O(n^2): 16k digits took about 5.5 s across the two patterns.
+    import time
+
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = (
+        "=== PAGE 1 / 1 ===\nAudio P300 Delay 300 ms " + "1" * 20_000 + "a\n"
+    )
+    started = time.perf_counter()
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1])
+    assert time.perf_counter() - started < 1.0
+    assert _metric_values(facts, "audio_p300_delay") == {1: [(300, None)]}
+
+
+def test_ocr_garbled_first_cell_keeps_the_rest_of_the_row():
+    from backend.council.report_text import _facts_from_report_text_summary
+
+    report_text = "=== PAGE 1 / 6 ===\nCZ Eyes Closed Theta/Beta (Power) i.1 1.2 0.9 0.8-1.9\n"
+    facts = _facts_from_report_text_summary(report_text, expected_sessions=[1, 2, 3])
+    vals = _metric_values(facts, "cz_theta_beta_ratio_ec")
+    assert vals[2] == [(1.2, None)] and vals[3] == [(0.9, None)]
+
+
+@pytest.mark.parametrize("metric,label,values,unit,target", [
+    ("audio_p300_delay", "Audio P300 Delay", [344, None, 289], "ms", "265-344"),
+    ("audio_p300_voltage", "Audio P300 Voltage", [4.2, None, 9.3], "uV", "7-18"),
+])
+@pytest.mark.parametrize("missing_index", [0, 1, 2])
+@pytest.mark.parametrize("separator", ["-", "–", "—"])
+def test_p300_missing_cell_keeps_session_and_reference(metric, label, values, unit, target, missing_index, separator):
+    from backend.council.report_text import _facts_from_report_text_summary
+    values = [344, 310, 289] if metric.endswith("delay") else [4.2, 6.5, 9.3]
+    values[missing_index] = None
+    target = target.replace("-", separator)
+    text = "=== PAGE 1 / 1 ===\nSession 1 Session 2 Session 3\n" + label + " " + " ".join(
+        "N/A" if v is None else f"{v} {unit}" for v in values
+    ) + f" {target} {unit}\n"
+    facts = _facts_from_report_text_summary(text, expected_sessions=[1, 2, 3])
+    selected = {f["session_index"]: f for f in facts if f.get("metric") == metric}
+    assert {i: selected.get(i, {}).get("value") for i in [1, 2, 3]} == dict(enumerate(values, 1))
+    assert all(f["target_range"] == target.replace(separator, "-") + (" ms" if metric.endswith("delay") else " µV") for f in selected.values())

@@ -1,14 +1,11 @@
-"""The queue of hub uploads that have no patient yet.
+"""The parked hub-upload records the clinic API lists and resolves.
 
-An upload arrives from the hub before anyone knows whose it is. Usually the
-worker files it within one cycle and nobody needs to look. When the name on it
-does not match the chart it lands next to, it parks — and a parked upload nobody
-can list is a lost upload, so the worker writes a record here and the API serves
-and resolves it.
-
-Records live beside the pipeline job status files, in the engine's own data
-directory. Blob credentials stay with the worker: it is the only thing that
-talks to the store, and the operator's answer reaches it through this record.
+An upload arrives from the hub before anyone knows whose it is. When the name
+on it does not match the chart it lands next to, it parks, and a parked upload
+nobody can list is a lost upload. These records are read through the shared
+clinic upload catalogue; legacy JSON records written beside the pipeline job
+status files in the engine's data directory are imported once and then served
+from the database.
 """
 
 from __future__ import annotations
@@ -25,9 +22,7 @@ from .orchestration import pipeline_job_status_dir
 UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 STATUS_PENDING = "pending"
-STATUS_NEEDS_OPERATOR_ANSWER = "needs_operator_answer"
 STATUS_REGISTERED = "registered"
-STATUS_FAILED = "failed"
 
 
 def uploads_dir() -> Path:
@@ -121,75 +116,3 @@ def list_uploads() -> list[dict[str, Any]]:
         key=lambda r: int(r.get("updatedAt") or r.get("uploadedAt") or 0),
         reverse=True,
     )
-
-
-def record_seen(*, upload_id: str, identity: dict[str, Any]) -> None:
-    existing = read_upload(upload_id)
-    if existing:
-        return
-    write_upload(
-        dict(
-            uploadId=upload_id, identity=identity, status=STATUS_PENDING, conflict=None
-        )
-    )
-
-
-def record_parked(
-    *, upload_id: str, identity: dict[str, Any], conflict: dict[str, Any]
-) -> None:
-    """Park an upload whose name does not match the chart it would land on."""
-    existing = read_upload(upload_id) or {}
-    write_upload(
-        {
-            **existing,
-            "uploadId": upload_id,
-            "identity": identity,
-            "status": STATUS_NEEDS_OPERATOR_ANSWER,
-            "conflict": conflict,
-            "resolution": None,
-        }
-    )
-
-
-def record_registered(*, upload_id: str, patient_id: str) -> None:
-    """Close an upload out. The record stays so a late answer can be told so."""
-    existing = read_upload(upload_id) or {}
-    write_upload(
-        {
-            **existing,
-            "uploadId": upload_id,
-            "status": STATUS_REGISTERED,
-            "patientId": patient_id,
-            "conflict": None,
-            "resolution": None,
-        }
-    )
-
-
-def pending_resolution(upload_id: str) -> dict[str, Any] | None:
-    """The operator's answer, if one is waiting to be acted on."""
-    record = read_upload(upload_id) or {}
-    resolution = record.get("resolution")
-    return resolution if isinstance(resolution, dict) and resolution else None
-
-
-def record_failed(*, upload_id: str, error: str) -> None:
-    """Note an upload that fell over, so it is visible rather than just gone.
-
-    Best effort: recording a failure must never raise on top of the failure it
-    is recording.
-    """
-    if not is_valid_upload_id(upload_id):
-        return
-    try:
-        existing = read_upload(upload_id) or {}
-        write_upload(
-            {
-                **existing,
-                "uploadId": upload_id,
-                "status": STATUS_FAILED,
-                "error": error,
-            }
-        )
-    except OSError:
-        return

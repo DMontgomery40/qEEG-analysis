@@ -22,10 +22,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from . import storage
+from .logging_utils import get_logger
 from .run_execution import ExecutionConflict, RunOwner
+
+
+LOGGER = get_logger(__name__)
+
+
+# httpx raises these only before a request byte is written, so nothing reached
+# the provider and no money moved (EN-H2). Checked against httpx 0.28.1 and
+# httpcore 1.0.9: ConnectError comes from opening the connection, including a
+# refused port, a failed DNS lookup (OSError) and a failed TLS handshake
+# (_backends/anyio.py connect_tcp, start_tls); ConnectTimeout from the same
+# steps running out of time; ProxyError from a proxy refusing the CONNECT or
+# SOCKS handshake before the tunnel exists (_async/http_proxy.py,
+# _async/socks_proxy.py); PoolTimeout from waiting for a pooled connection
+# (_synchronization.py). Read and write failures stay unknown.
+UNSENT_FAILURES = {
+    "connect_refused": httpx.ConnectError,
+    "connect_timeout": httpx.ConnectTimeout,
+    "proxy_refused": httpx.ProxyError,
+    "pool_timeout": httpx.PoolTimeout,
+}
+
+
+def unsent_classification(exc):
+    """The journal classification of a provably unsent failure, else None."""
+    for classification, kind in UNSENT_FAILURES.items():
+        if isinstance(exc, kind):
+            return classification
+    return None
 
 
 class PaidOutcomeUnknown(RuntimeError):
@@ -57,6 +86,46 @@ dispatch_validation = ContextVar("qeeg_dispatch_validation", default=None)
 
 _worker_scope: ContextVar[PaidScope | None] = ContextVar(
     "qeeg_paid_worker", default=None
+)
+
+
+class DispatchStopped(RuntimeError):
+    """A unit deadline passed before this paid request; nothing was sent."""
+
+
+class DispatchGate:
+    """Lets a caller stop new paid dispatches without cancelling one in flight.
+
+    Cancelling an in-flight paid call leaves an unknown outcome that blocks the
+    whole run, so a deadline closes this gate instead: later requests fail before
+    any receipt is written, and the call already on the wire completes and saves.
+    """
+
+    def __init__(self):
+        self.stopped = False
+        self.inflight = 0
+        self._lock = threading.Lock()
+
+    def stop(self):
+        with self._lock:
+            self.stopped = True
+            return self.inflight
+
+    def enter(self):
+        # Count first, then check, under one lock: a deadline that stops the gate
+        # either sees this call in flight or this call sees the gate stopped.
+        with self._lock:
+            if self.stopped:
+                raise DispatchStopped("unit deadline reached before this paid request")
+            self.inflight += 1
+
+    def leave(self):
+        with self._lock:
+            self.inflight -= 1
+
+
+dispatch_gate: ContextVar[DispatchGate | None] = ContextVar(
+    "qeeg_dispatch_gate", default=None
 )
 
 
@@ -209,7 +278,10 @@ def _rejection(status, body):
     """Acknowledged auth/rate-limit responses and explicit endpoint rejections.
 
     A complete 401, 402 or 429 response rejects this attempt independently of its
-    optional error body. Ambiguous server errors remain outcome-unknown.
+    optional error body. The allowlisted complete server error also ends this
+    ordinal without output, but billing remains unknown. Rejected never implies
+    unbilled; only the caller's bounded retry policy may send a new ordinal.
+    Other server errors and transport ambiguity remain outcome-unknown.
     """
     if status == 401:
         return "authentication_rejected"
@@ -218,10 +290,18 @@ def _rejection(status, body):
     if status == 429:
         return "rate_limit_rejected"
     try:
-        error = json.loads(body).get("error", {})
+        document = json.loads(body)
+        error = document.get("error", {})
         message = error.get("message", "").lower()
     except (ValueError, AttributeError, TypeError):
         return None
+    if (
+        status == 500
+        and set(document) == {"error"}
+        and error.get("type") == "server_error"
+        and error.get("code") == "internal_server_error"
+    ):
+        return "acknowledged_server_error_billing_unknown"
     if status == 400 and (
         "reasoning is mandatory" in message and "cannot be disabled" in message
     ):
@@ -233,6 +313,45 @@ def _rejection(status, body):
     ):
         return "chat_endpoint_rejected"
     return None
+
+
+PATIENT_FACING_SCOPE = "post/patient_facing/generation"
+_PATIENT_FACING_PREFIX = "post/patient_facing/"
+
+
+def patient_facing_scope(attempt=1):
+    """The paid scope key of one patient-facing write-up attempt.
+
+    The journal binds a scope to one manifest, so a regeneration after a block
+    gets its own key. Attempt 1 keeps the original key, so every receipt
+    already saved under it stays valid.
+    """
+    if attempt == 1:
+        return PATIENT_FACING_SCOPE
+    if type(attempt) is not int or attempt < 2:
+        raise ValueError("patient-facing attempt must be a positive integer")
+    return f"{_PATIENT_FACING_PREFIX}{attempt}"
+
+
+def patient_facing_attempt(scope_key):
+    """The attempt a paid scope key belongs to; None if it is not a write-up."""
+    if scope_key == PATIENT_FACING_SCOPE:
+        return 1
+    if not (scope_key or "").startswith(_PATIENT_FACING_PREFIX):
+        return None
+    tail = scope_key[len(_PATIENT_FACING_PREFIX) :]
+    if tail.isascii() and tail.isdigit():
+        attempt = int(tail)
+        if attempt >= 2 and patient_facing_scope(attempt) == scope_key:
+            return attempt
+    return None
+
+
+def manifest_attempt(manifest):
+    """Attempt number recorded in a patient-facing manifest (absent means 1)."""
+    attempt = manifest.get("attempt", 1)
+    patient_facing_scope(attempt)
+    return attempt
 
 
 def reconcile_blocked_run(store, run_id):
@@ -259,18 +378,58 @@ def reconcile_blocked_run(store, run_id):
                                 "response_saved",
                             ]
                         ),
+                        # An unsent request has no response file to check.
+                        or_(
+                            storage.PaidRequest.error_classification.is_(None),
+                            storage.PaidRequest.error_classification.notin_(
+                                tuple(UNSENT_FAILURES)
+                            ),
+                        ),
                     )
                 )
             )
         if not requests:
             raise ExecutionConflict("blocked run has no dispatched paid receipts")
+        # A regenerated write-up re-validates only its current attempt. Earlier
+        # attempts were settled before the regeneration was admitted and are
+        # bound to their own manifests, so they are skipped, never re-checked
+        # against the current one.
+        current_attempt = None
+        if any(r.scope_key.startswith("post/") for r in requests):
+            with owner.transaction() as session:
+                post = session.get(storage.PostObligation, (run_id, "patient_facing"))
+            if post is None:
+                raise ExecutionConflict("original post obligation is missing")
+            with owner.file_guard():
+                try:
+                    raw = Path(post.manifest_path).read_bytes()
+                    if _hash(raw) != post.manifest_hash:
+                        raise ValueError("post manifest hash changed")
+                    current_attempt = manifest_attempt(json.loads(raw))
+                except (OSError, ValueError, AttributeError, TypeError) as error:
+                    raise ExecutionConflict("invalid post-only manifest") from error
+        earlier = set()
+        for r in requests:
+            attempt = patient_facing_attempt(r.scope_key)
+            if attempt is not None and attempt < current_attempt:
+                if r.state not in ("response_saved", "rejected"):
+                    raise ExecutionConflict(
+                        "an earlier patient-facing attempt is unresolved"
+                    )
+                earlier.add((r.scope_key, r.dispatch_ordinal))
+        requests = [r for r in requests if (r.scope_key, r.dispatch_ordinal) not in earlier]
+        if not requests:
+            raise ExecutionConflict("blocked run has no dispatched paid receipts")
+        current_scope = (
+            patient_facing_scope(current_attempt) if current_attempt else None
+        )
         # Receipt classification may already have committed before interruption.
         # The run's paid-outcome block remains the durable recovery checkpoint.
         # Re-validate those receipts too, preserving their original body/hash.
         paid_post_reasons = {
             str(PaidOutcomeUnknown((r.run_id, r.scope_key, r.dispatch_ordinal), reason))
             for r in requests
-            if r.scope_key == "post/patient_facing/generation"
+            if r.scope_key == current_scope
             for reason in (
                 "paid_outcome_unknown",
                 "unclassified_http_response",
@@ -291,7 +450,7 @@ def reconcile_blocked_run(store, run_id):
                 extensions={"timeout": route["timeout"]},
             )
             if row.scope_key.startswith("post/"):
-                if row.scope_key != "post/patient_facing/generation":
+                if row.scope_key != current_scope:
                     raise ExecutionConflict("unsupported post receipt scope")
                 with owner.transaction() as session:
                     post = session.get(
@@ -437,7 +596,7 @@ class _Receipt:
         with self.owner.transaction() as session:
             row = session.get(storage.PaidRequest, self.key)
             self._verify_row(row)
-            state = row.state
+            state, classification = row.state, row.error_classification
             if state == "prepared":
                 # A prior explicit unknown elsewhere cannot become a new request.
                 blocked = session.scalar(
@@ -460,14 +619,48 @@ class _Receipt:
                     self.owner.generation,
                 )
         if state != "prepared":
+            if state == "rejected" and classification in UNSENT_FAILURES:
+                # Replays the original failure so the caller takes the same
+                # path it took then; nothing was sent, then or now.
+                raise UNSENT_FAILURES[classification](
+                    f"{classification} before any byte was sent (journaled)",
+                    request=self.request,
+                )
             if state in ("response_saved", "rejected"):
                 raise ExecutionConflict("acknowledged response file missing")
             self.unknown("paid_outcome_unknown")
         return None
 
-    def unknown(self, reason):
+    def refused(self, classification):
+        """The request failed before a byte of it left this machine.
+
+        Filed rejected, not unknown, so it never parks the run (EN-H2). Only
+        the UNSENT_FAILURES classes come here; a read or write timeout, a
+        dropped connection or a protocol error stays unknown.
+        """
+        with self.owner.transaction() as session:
+            row = session.get(storage.PaidRequest, self.key)
+            self._verify_row(row)
+            if row.state == "dispatched":
+                row.state = "rejected"
+                row.error_classification = classification
+
+    def unknown(self, reason, cause=None):
         unknown = PaidOutcomeUnknown(self.key, reason)
         self.scope.blocked = unknown
+        # Seven of the thirteen stuck unknown rows on 2026-10-02 had no traceable
+        # cause because nothing recorded the exception. Name it here, without
+        # the request or response body.
+        run_id, scope_key, ordinal = self.key
+        LOGGER.warning(
+            "paid_outcome_unknown",
+            run_id=str(run_id),
+            scope_key=str(scope_key),
+            dispatch_ordinal=int(ordinal),
+            reason=str(reason),
+            error_type=type(cause).__name__ if cause is not None else "",
+            error=(str(cause) or "")[:200] if cause is not None else "",
+        )
         try:
             with self.owner.transaction() as session:
                 row = session.get(storage.PaidRequest, self.key)
@@ -600,6 +793,16 @@ class PaidAsyncTransport(httpx.AsyncBaseTransport):
         scope = _scope.get()
         if scope is None or request.method == "GET":
             return await self.inner.handle_async_request(request)
+        gate = dispatch_gate.get()
+        if gate is None:
+            return await self._paid_request(scope, request)
+        gate.enter()
+        try:
+            return await self._paid_request(scope, request)
+        finally:
+            gate.leave()
+
+    async def _paid_request(self, scope, request):
         await request.aread()
         try:
             receipt = _Receipt(scope, request)
@@ -626,11 +829,16 @@ class PaidAsyncTransport(httpx.AsyncBaseTransport):
         except BaseException as exc:
             if receipt.acknowledged:
                 raise
+            unsent = None if response is not None else unsent_classification(exc)
+            if unsent is not None:
+                receipt.refused(unsent)
+                raise
             try:
                 receipt.unknown(
                     "cancelled_after_dispatch"
                     if isinstance(exc, asyncio.CancelledError)
-                    else "transport_or_receipt_failure"
+                    else "transport_or_receipt_failure",
+                    cause=exc,
                 )
             except PaidOutcomeUnknown as unknown:
                 if isinstance(exc, asyncio.CancelledError):
@@ -655,6 +863,16 @@ class PaidSyncTransport(httpx.BaseTransport):
         scope = _scope.get()
         if scope is None or request.method == "GET":
             return self.inner.handle_request(request)
+        gate = dispatch_gate.get()
+        if gate is None:
+            return self._paid_request(scope, request)
+        gate.enter()
+        try:
+            return self._paid_request(scope, request)
+        finally:
+            gate.leave()
+
+    def _paid_request(self, scope, request):
         request.read()
         try:
             receipt = _Receipt(scope, request)
@@ -678,8 +896,12 @@ class PaidSyncTransport(httpx.BaseTransport):
         except BaseException as exc:
             if receipt.acknowledged:
                 raise
+            unsent = None if response is not None else unsent_classification(exc)
+            if unsent is not None:
+                receipt.refused(unsent)
+                raise
             try:
-                receipt.unknown("transport_or_receipt_failure")
+                receipt.unknown("transport_or_receipt_failure", cause=exc)
             except PaidOutcomeUnknown as unknown:
                 raise unknown from exc
         finally:
@@ -786,7 +1008,8 @@ def post_paid_scope(
                 and saved["kind"] == kind == "patient_facing"
                 and saved["source_fingerprint"] == source_fingerprint
             )
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            semantic_key = patient_facing_scope(manifest_attempt(saved))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise ExecutionConflict("invalid post-only manifest") from error
         if not valid:
             raise ExecutionConflict("post-only scope differs from source manifest")
@@ -804,9 +1027,7 @@ def post_paid_scope(
             != (str(manifest_path), manifest_hash)
         ):
             raise ExecutionConflict("post-only obligation differs from scope")
-    cursor = PaidScope(
-        owner, "post/patient_facing/generation", manifest_hash, source_fingerprint
-    )
+    cursor = PaidScope(owner, semantic_key, manifest_hash, source_fingerprint)
     token = _scope.set(cursor)
     try:
         yield cursor

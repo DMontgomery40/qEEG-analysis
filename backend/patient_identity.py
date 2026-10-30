@@ -33,14 +33,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 
+# ASCII digits only, and ``\Z`` rather than ``$``: Python's ``\d`` also matches
+# fullwidth and Arabic-Indic digits, and ``$`` matches before a trailing newline,
+# so either would let a look-alike string through as a folder name or blob key.
 CANONICAL_PATIENT_ID_RE = re.compile(
-    r"^[A-Z]{2}_\d{2}-\d{2}-\d{4}(?:_(?:[2-9]|[1-9]\d+))?$"
+    r"^[A-Z]{2}_\d{2}-\d{2}-\d{4}(?:_(?:[2-9]|[1-9]\d+))?\Z", re.ASCII
 )
 
 _PARTS_RE = re.compile(
     r"^(?P<first>[A-Z])(?P<last>[A-Z])_"
     r"(?P<birthdate>\d{2}-\d{2}-\d{4})"
-    r"(?:_(?P<ordinal>\d+))?$"
+    r"(?:_(?P<ordinal>\d+))?\Z",
+    re.ASCII,
 )
 
 _LOOSE_BIRTHDATE_RE = re.compile(r"^(\d{1,2})-(\d{1,2})-(\d{4})$")

@@ -323,8 +323,25 @@ def _summary_page_facts(
     """Parse numeric cells using only this source page's local session columns."""
 
     def find_line_contains(needle: str) -> str | None:
-        m = re.search(rf"(?im)^.*{re.escape(needle)}.*$", page_text)
-        return m.group(0).strip() if m else None
+        # Only a table row counts: the label, an optional parenthetical such as
+        # "(Power)", then a value cell. WAVi's glossary page repeats every label
+        # in prose ("Audio P300 Delay and Audio P300 Voltage metrics are derived
+        # from ... C3 ..."), which otherwise yields phantom values like 300 ms.
+        for m in re.finditer(rf"(?im)^.*{re.escape(needle)}.*$", page_text):
+            line = m.group(0)
+            rest = line[line.lower().find(needle.lower()) + len(needle) :]
+            rest = re.sub(r"^\s*\([^)\n]*\)", "", rest)
+            # Allow up to two short OCR fragments before the first clean cell: the
+            # low-yield marker is often read as "fl", "f=" or "m", and 1.1 as "i.1".
+            # The comparator is its own branch so "\s+" alone owns the blank run;
+            # "\s+" then an optional "\s*" made a long run quadratic.
+            if re.match(
+                r"(?:\s+(?![:(])\S{1,3}){0,2}\s+(?:m?N/?A\b|[<>≤≥]\s*-?\d|-?\d)",
+                rest,
+                re.I,
+            ):
+                return line.strip()
+        return None
 
     def find_line_startswith(label: str) -> str | None:
         m = re.search(rf"(?im)^{re.escape(label)}\b.*$", page_text)
@@ -353,8 +370,12 @@ def _summary_page_facts(
             value_part = value_part[: m_range.start()]
         # OCR can omit units from some or all cells. Consume each value and
         # its parenthesized SD together before advancing to the next column.
+        # OCR reads the "±" as "+", "£", "t", "=" or drops it; any one glyph
+        # before the SD digits is that sign, never a session value of its own.
         cells = re.findall(
-            r"(\d+)\s*(?:\(\s*\+?(\d+)\s*\))?(?:\s*ms)?", value_part, re.I
+            r"(\d+)\s*(?:\(\s*(?:[^\d\s()]\s*)?(\d+)\s*\))?(?:\s*ms)?",
+            value_part,
+            re.I,
         )
         for sess, (token, sd) in zip(expected_sessions, cells):
             val = _safe_int(token)
@@ -422,60 +443,43 @@ def _summary_page_facts(
                         }
                     )
 
-    # Audio P300 Delay/Voltage.
-    delay_line = find_line_contains("Audio P300 Delay")
-    if delay_line:
-        # Avoid pulling digits from the label itself (e.g., "P300" -> 300).
-        toks = _number_tokens(tail_after(delay_line, "Audio P300 Delay"))
-        if len(toks) >= len(expected_sessions):
-            vals = toks[: len(expected_sessions)]
-            range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
-            target = None
-            if len(range_toks) == 2:
-                target = f"{range_toks[0]}-{range_toks[1]} ms"
-            for sess, tok in zip(expected_sessions, vals):
-                val = _safe_int(tok)
-                if val is None:
-                    continue
-                out.append(
-                    {
-                        "fact_type": "evoked_potential",
-                        "metric": "audio_p300_delay",
-                        "session_index": sess,
-                        "value": val,
-                        "unit": "ms",
-                        "target_range": target,
-                        "shown_as": delay_line.strip(),
-                        "source_page": source_page,
-                    }
-                )
-
-    volt_line = find_line_contains("Audio P300 Voltage")
-    if volt_line:
-        # Avoid pulling digits from the label itself (e.g., "P300" -> 300).
-        toks = _number_tokens(tail_after(volt_line, "Audio P300 Voltage"))
-        if len(toks) >= len(expected_sessions):
-            vals = toks[: len(expected_sessions)]
-            range_toks = toks[len(expected_sessions) : len(expected_sessions) + 2]
-            target = None
-            if len(range_toks) == 2:
-                target = f"{range_toks[0]}-{range_toks[1]} µV"
-            for sess, tok in zip(expected_sessions, vals):
-                val = _safe_float(tok)
-                if val is None:
-                    continue
-                out.append(
-                    {
-                        "fact_type": "evoked_potential",
-                        "metric": "audio_p300_voltage",
-                        "session_index": sess,
-                        "value": val,
-                        "unit": "µV",
-                        "target_range": target,
-                        "shown_as": volt_line.strip(),
-                        "source_page": source_page,
-                    }
-                )
+    # Audio P300 Delay/Voltage. Missing cells still occupy a session column;
+    # reference bounds are not measurements, even when fewer cells are present.
+    for label, metric, unit, convert in (
+        ("Audio P300 Delay", "audio_p300_delay", "ms", _safe_int),
+        ("Audio P300 Voltage", "audio_p300_voltage", "µV", _safe_float),
+    ):
+        line = find_line_contains(label)
+        if not line:
+            continue
+        value_part = tail_after(line, label)
+        target = None
+        # A number starts only where a digit run starts, and the unit owns its
+        # trailing blanks: either gap let a long run of digits or spaces cost
+        # O(n^2). Matches, spans and groups are unchanged.
+        reference = re.search(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)"
+            r"\s*(?:(?:ms|[uµμ]V)\s*)?$", value_part, re.I,
+        )
+        if reference:
+            target = f"{reference.group(1)}-{reference.group(2)} {unit}"
+            value_part = value_part[:reference.start()]
+        cells = re.findall(r"(?i)(?:[m■]?N/?A|(?<!\d)\d+(?:\.\d+)?)\b", value_part)
+        for sess, token in zip(expected_sessions, cells):
+            missing = re.fullmatch(r"[m■]?N/?A", token, re.I) is not None
+            value = None if missing else convert(token)
+            if value is None and not missing:
+                continue
+            out.append({
+                "fact_type": "evoked_potential",
+                "metric": metric,
+                "session_index": sess,
+                "value": value,
+                "unit": unit,
+                "target_range": target,
+                "shown_as": "N/A" if missing else line.strip(),
+                "source_page": source_page,
+            })
 
     # State summary metrics (ratios).
     state_lines = [

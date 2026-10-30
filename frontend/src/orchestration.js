@@ -12,22 +12,10 @@ const ACTION_DEFINITIONS = [
     successMessage: 'Portal sync requested.',
   },
   {
-    id: 'rerun_pipeline',
-    label: 'Rerun council batch',
-    requestLabel: 'council batch rerun',
-    successMessage: 'Council batch rerun requested.',
-  },
-  {
     id: 'regenerate_patient_facing',
     label: 'Regenerate patient-facing',
     requestLabel: 'patient-facing regeneration',
     successMessage: 'Patient-facing regeneration requested.',
-  },
-  {
-    id: 'prepare_cathode_handoff',
-    label: 'Prepare Cathode handoff',
-    requestLabel: 'Cathode handoff preparation',
-    successMessage: 'Cathode handoff preparation requested.',
   },
   {
     id: 'export_council_artifacts',
@@ -50,7 +38,6 @@ const SECTION_DEFINITIONS = [
     title: 'Worker / pipeline',
     aliases: ['worker', 'pipeline', 'pipeline_worker', 'job', 'pipeline_job', 'pipeline_state'],
   },
-  { id: 'cathode', title: 'Cathode', aliases: ['cathode', 'cathode_handoff', 'handoff'] },
 ];
 
 function isRecord(value) {

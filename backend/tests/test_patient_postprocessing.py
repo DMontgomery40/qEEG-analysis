@@ -165,6 +165,76 @@ async def test_each_output_boundary_replays_once(ready, monkeypatch, boundary):
 
 
 @pytest.mark.asyncio
+async def test_a_write_up_send_that_never_left_is_retried_not_blocked(ready):
+    """EN-H2 on the write-up: a connect timeout reaches no provider. The
+    write-up stays open, the next pass sends once more, and the finished
+    document verifies with the unsent row in its receipt."""
+    owner = admit(ready)
+    sent = []
+    try:
+        # The proxy is down for the whole pass: three tries, all unsent.
+        with pytest.raises(writer.UpstreamError):
+            await post.continue_patient_facing(
+                owner, llm_client=llm(sent, response=httpx.ConnectTimeout("timed out"))
+            )
+    finally:
+        owner.close()
+    assert len(sent) == 1 + post._UNSENT_RESENDS
+    assert _post_row(ready[1])[0] != "blocked"
+    # The next pass replays those three and sends once more, which lands.
+    owner = ready[0].claim_run_owner(ready[1])
+    try:
+        result = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 2 + post._UNSENT_RESENDS
+    states = [state for _, (state, _, _) in sorted(_paid_rows(ready[1]).items())]
+    assert states == ["rejected"] * (1 + post._UNSENT_RESENDS) + ["response_saved"]
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+
+
+class _Events(list):
+    def warning(self, event, **fields):
+        self.append({"event": event, **fields})
+
+
+@pytest.mark.parametrize(
+    "preference,discovered,fallback",
+    [("writer", ["z-ai/glm-5.2"], True), ("Writer", ["writer"], False)],
+)
+def test_a_fallback_writer_is_named_once_when_the_write_up_pins_it(
+    ready, monkeypatch, preference, discovered, fallback
+):
+    """EN-H10: when the preferred writer was missing from the catalogue the
+    write-up quietly went to z-ai/glm-5.2. The engine now names it once per
+    write-up, with the patient id; the hub's policy preview, which snapshots
+    on every view, stays quiet."""
+    store, run_id, _ = ready
+    events = _Events()
+    monkeypatch.setattr(post, "LOGGER", events)
+    cfg = post.snapshot_post_config(
+        {"QEEG_PATIENT_FACING_MODEL": preference}, discovered, base_url="", timeout_s=600.0
+    )
+    assert events == []
+    for _ in range(2):  # a repeated request rejoins the same write-up
+        post.admit_patient_facing(store, run_id, config_snapshot=cfg)
+    named = [e for e in events if e["event"] == "patient_facing_writer_fallback"]
+    if fallback:
+        assert named == [
+            {
+                "event": "patient_facing_writer_fallback",
+                "run_id": run_id,
+                "patient_id": "ZZ_01-01-1900",
+                "preferred": "writer",
+                "used": "z-ai/glm-5.2",
+            }
+        ]
+    else:
+        assert named == []
+
+
+@pytest.mark.asyncio
 async def test_pdf_failure_new_run_settings_catalogue_cannot_change_original(
     ready, monkeypatch
 ):
@@ -338,7 +408,6 @@ def test_clinical_complete_and_independent_post_dispositions_are_atomic(
 
     store, run_id, cfg = ready
     cfg["enabled"] = enabled
-    cfg["retired_cathode_flag"] = "1"
     store.request_run_start(run_id)
     owner = store.claim_run_owner(run_id)
     with owner.transaction() as session:
@@ -357,20 +426,17 @@ def test_clinical_complete_and_independent_post_dispositions_are_atomic(
         assert rows["patient_facing"].state == (
             "skipped" if not enabled else "blocked" if missing else "pending"
         )
-        assert rows["cathode"].state == "skipped"
-        assert rows["cathode"].blocked_reason == "manual_fallback"
-        assert (
-            post._load(rows["cathode"].manifest_path)["diagnostic"]
-            == "automatic_cathode_routing_retired"
-        )
+        # Retired Cathode routing leaves no obligation and no manifest behind.
+        assert set(rows) == {"patient_facing"}
+        assert not (post._root(owner) / "cathode.json").exists()
         completion.project_run_status(None, run_id, status="complete")
         with owner.transaction() as session:
-            assert len(list(session.scalars(select(storage.PostObligation)))) == 2
+            assert len(list(session.scalars(select(storage.PostObligation)))) == 1
     finally:
         owner.release()
 
 
-def test_complete_transaction_rolls_back_both_dispositions(ready, monkeypatch):
+def test_complete_transaction_rolls_back_status_and_post_together(ready, monkeypatch):
     from backend.council import completion
     from types import SimpleNamespace
 
@@ -401,7 +467,7 @@ def test_complete_transaction_rolls_back_both_dispositions(ready, monkeypatch):
         completion.project_run_status(None, run_id, status="complete")
         with owner.transaction() as session:
             assert session.get(storage.Run, run_id).status == "complete"
-            assert len(list(session.scalars(select(storage.PostObligation)))) == 2
+            assert len(list(session.scalars(select(storage.PostObligation)))) == 1
     finally:
         owner.release()
 
@@ -612,24 +678,173 @@ async def test_acknowledged_endpoint_fallback_recovers_without_catalogue(
         owner.close()
 
 
+def _deploy_edits_a_recipe_file(monkeypatch):
+    """A deploy between admission and generation changes a post recipe file."""
+    real = post._recipe
+
+    def edited():
+        recipe = real()
+        files = {**recipe["files"], "backend/patient_facing_pdf.py": "edited-on-disk"}
+        return {**recipe, "files": files}
+
+    monkeypatch.setattr(post, "_recipe", edited)
+
+
+def _die_after_markdown_is_bound(monkeypatch):
+    original = post._publish
+
+    def publish(owner, path, data):
+        original(owner, path, data)
+        if path.name == "md.json":
+            raise OSError("death after the markdown was bound")
+
+    monkeypatch.setattr(post, "_publish", publish)
+    return original
+
+
 @pytest.mark.asyncio
-async def test_changed_render_dependency_parks_without_new_generation(
+async def test_a_deploy_before_the_write_up_is_paid_adopts_the_new_code(
     ready, monkeypatch
+):
+    """EN-H8: three live write-ups sat blocked because a deploy changed a
+    recipe file after admission, and only a paid regeneration recovered them.
+    Nothing was paid yet, so the write-up runs on the code now on disk and makes
+    its one authorized generation."""
+    owner = admit(ready)
+    _deploy_edits_a_recipe_file(monkeypatch)
+    sent = []
+    try:
+        result = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 1
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+    (record,) = Path(result["manifest_path"]).parent.glob("recipe-adopted-*.json")
+    assert json.loads(record.read_text())["adopted"] == post._recipe()
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_after_the_paid_answer_finishes_from_the_saved_answer(
+    ready, monkeypatch
+):
+    """The answer was paid for and its markdown bound before the process died;
+    then a deploy changed the writer. The saved answer finishes the write-up
+    with no new send, and the PDF is made from the markdown that was bound, not
+    from what the new writer code would make of the answer."""
+    owner = admit(ready)
+    sent = []
+    original = _die_after_markdown_is_bound(monkeypatch)
+    try:
+        with pytest.raises(OSError):
+            await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.close()
+    monkeypatch.setattr(post, "_publish", original)
+    _deploy_edits_a_recipe_file(monkeypatch)
+    real_chat = writer._chat_with_retries
+
+    async def new_writer_code(*args, **kwargs):
+        return (await real_chat(*args, **kwargs)) + "\n\nAdded by the new writer."
+
+    rendered = []
+    real_render = writer.render_patient_facing_markdown_to_pdf
+
+    def render(md, path, **kwargs):
+        rendered.append(md)
+        return real_render(md, path, **kwargs)
+
+    monkeypatch.setattr(writer, "_chat_with_retries", new_writer_code)
+    monkeypatch.setattr(writer, "render_patient_facing_markdown_to_pdf", render)
+    owner = ready[0].claim_run_owner(ready[1])
+    try:
+        result = await post.continue_patient_facing(
+            owner, llm_client=llm(sent, catalogue=False)
+        )
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 1
+    bound = Path(result["outputs"]["md"]["path"]).read_text()
+    assert "new writer" not in bound
+    assert rendered == [bound.removesuffix("\n")]
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsettled", ["dispatched", "unknown"])
+async def test_a_deploy_never_steps_over_an_unsettled_write_up_call(
+    ready, monkeypatch, unsettled
 ):
     owner = admit(ready)
     sent = []
-    real_version = post.version
-    monkeypatch.setattr(
-        post,
-        "version",
-        lambda name: "incompatible" if name == "weasyprint" else real_version(name),
-    )
+    original = _die_after_markdown_is_bound(monkeypatch)
+    try:
+        with pytest.raises(OSError):
+            await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.close()
+    monkeypatch.setattr(post, "_publish", original)
+    with storage.session_scope() as session:
+        session.scalar(select(storage.PaidRequest)).state = unsettled
+        session.commit()
+    _deploy_edits_a_recipe_file(monkeypatch)
+    owner = ready[0].claim_run_owner(ready[1])
     try:
         with pytest.raises(ExecutionConflict, match="recipe"):
             await post.continue_patient_facing(owner, llm_client=llm(sent))
-        assert sent == []
     finally:
         owner.close()
+    assert len(sent) == 1
+    assert _post_row(ready[1])[0] == "blocked"
+    root = post._root(owner)
+    assert not list(root.glob("recipe-adopted-*.json"))
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_adopts_over_a_prepared_write_up_call_and_sends_it_once(
+    ready, monkeypatch
+):
+    """The process died after the write-up call was journaled prepared and
+    before it was sent. A recipe deploy then must not strand the write-up: it
+    adopts the new code, sends that call once through dispatched, and finishes."""
+    from backend import paid_transport
+
+    class Death(BaseException):
+        pass
+
+    owner = admit(ready)
+    sent = []
+    verify_files = paid_transport._Receipt._verify_files
+
+    def die_before_dispatch(receipt):
+        raise Death("process died before the call was dispatched")
+
+    monkeypatch.setattr(paid_transport._Receipt, "_verify_files", die_before_dispatch)
+    try:
+        with pytest.raises(Death):
+            await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.close()
+    monkeypatch.setattr(paid_transport._Receipt, "_verify_files", verify_files)
+    prepared = _paid_rows(ready[1])
+    assert [state for state, _, _ in prepared.values()] == ["prepared"]
+    assert sent == []
+    _deploy_edits_a_recipe_file(monkeypatch)
+    owner = ready[0].claim_run_owner(ready[1])
+    try:
+        result = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release()
+    assert result["state"] == "done" and result["verified"] is True, result
+    assert len(sent) == 1
+    finished = _paid_rows(ready[1])
+    assert finished.keys() == prepared.keys()
+    ((key, (state, request_hash, _)),) = finished.items()
+    assert (state, request_hash) == ("response_saved", prepared[key][1])
+    assert post.project_patient_facing(ready[0], ready[1])["verified"] is True
+    (record,) = Path(result["manifest_path"]).parent.glob("recipe-adopted-*.json")
+    assert json.loads(record.read_text())["adopted"] == post._recipe()
 
 
 @pytest.mark.asyncio
@@ -854,3 +1069,360 @@ async def test_reconcile_saved_post_billing_rejection_uses_post_admission(
     finally:
         owner.close()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_relabel_after_completion_files_the_document_under_the_new_id(
+    ready, temp_data_dir
+):
+    """EN-H7 + EN-H15: the clinic corrected the id between council completion
+    and generation. The document used to block on "original patient identity
+    changed". It is the same patient (same UUID), so the files land under the
+    current id, the meta names the clinic id, and the paid prompt is unchanged."""
+    ready[2]["sync_enabled"] = True
+    owner = admit(ready)
+    from sqlalchemy.orm import Session
+
+    with Session(storage.engine) as session:
+        patient = session.get(storage.Patient, session.get(storage.Run, owner.run_id).patient_id)
+        uuid = patient.id
+        patient.label = "ZA_01-01-1900"
+        session.commit()
+    sent, synced = [], []
+    try:
+        result = await post.continue_patient_facing(
+            owner,
+            llm_client=llm(sent),
+            sync=lambda label: synced.append(label) or True,
+        )
+    finally:
+        owner.release()
+    assert result["state"] == "done", result
+    folder = temp_data_dir / "portal_patients"
+    old = folder / "ZZ_01-01-1900"
+    assert not old.exists() or not list(old.glob("*__meta.json")), list(old.iterdir())
+    written = sorted(p.name for p in (folder / "ZA_01-01-1900").iterdir())
+    assert len(written) == 3 and all(n.startswith("ZA_01-01-1900") for n in written), written
+    meta = json.loads(next((folder / "ZA_01-01-1900").glob("*__meta.json")).read_text())
+    assert meta["patient_id"] == meta["patient_label"] == "ZA_01-01-1900"
+    assert uuid not in json.dumps(meta)
+    assert synced == ["ZA_01-01-1900"]
+    # One paid send, of the prompt as admitted: the relabel never rewrites it.
+    assert len(sent) == 1 and b"ZA_01-01-1900" not in sent[0]
+    # The finished document verifies: the projection used to compare the
+    # outputs with the pinned old-id paths, so it read "local output
+    # destinations changed" and the runtime failed the done run.
+    assert result["verified"] and result["local_complete"], result
+    # Only the id may differ from what was pinned: an output filed under any
+    # other name still fails, even when its bytes check out.
+    local_path = Path(result["manifest_path"]).parent / "outputs" / "local.json"
+    local = json.loads(local_path.read_text())
+    moved = Path(local["md"]["path"]).with_name("ZA_01-01-1900-other.md")
+    moved.write_bytes(Path(local["md"]["path"]).read_bytes())
+    local["md"]["path"] = str(moved)
+    local_path.write_text(json.dumps(local))
+    tampered = post.project_patient_facing(owner.store, owner.run_id)
+    assert tampered["integrity_error"] == "local output destinations changed", tampered
+
+
+@pytest.mark.asyncio
+async def test_a_rekey_after_the_write_up_keeps_it_verified_under_the_new_id(
+    ready, temp_data_dir
+):
+    """The rekey renames a finished write-up's files under the patient's new id
+    and leaves their bytes alone, but the receipts keep the old paths, so the
+    projection read "required output unavailable" for finished work."""
+    from sqlalchemy.orm import Session
+    from backend import patient_rekey
+
+    ready[2]["sync_enabled"] = True
+    owner = admit(ready)
+    try:
+        result = await post.continue_patient_facing(
+            owner, llm_client=llm([]), sync=lambda label: True
+        )
+    finally:
+        owner.release()
+    assert result["verified"], result
+    folder = temp_data_dir / "portal_patients"
+    with Session(storage.engine) as session:
+        uuid = session.get(storage.Run, owner.run_id).patient_id
+        plan = patient_rekey.plan_patient_rekey(
+            "ZZ_01-01-1900", "ZA_01-01-1900", portal_root=folder
+        )
+        patient_rekey.apply_patient_rekey(plan, session=session, patient_uuid=uuid)
+    assert not (folder / "ZZ_01-01-1900").exists()
+    moved = post.project_patient_facing(owner.store, owner.run_id)
+    assert moved["verified"] and moved["local_complete"], moved
+    # Renamed is fine; changed bytes are not.
+    pdf = next((folder / "ZA_01-01-1900").glob("*.pdf"))
+    pdf.write_bytes(pdf.read_bytes() + b"%")
+    changed = post.project_patient_facing(owner.store, owner.run_id)
+    assert changed["integrity_error"] == "required output binding changed", changed
+
+
+# EN-H3: a blocked write-up used to be final; the only way to get it was a whole
+# new paid council run. An explicit request now starts its next attempt.
+INVALID = {"choices": [{"message": {"content": "incomplete"}}]}
+
+
+async def _block_attempt(owner, sent, response=INVALID):
+    """Drive one attempt to a blocked write-up and park the run as the runtime does."""
+    with pytest.raises(Exception):
+        await post.continue_patient_facing(
+            owner, llm_client=llm(sent, response=response)
+        )
+    with owner.transaction() as session:
+        row = session.get(storage.PostObligation, (owner.run_id, "patient_facing"))
+        assert row.state == "blocked"
+        reason = row.blocked_reason
+    owner.release(
+        state="blocked", blocked_reason="patient-facing document blocked: " + reason
+    )
+
+
+def _post_row(run_id):
+    with storage.session_scope() as session:
+        row = session.get(storage.PostObligation, (run_id, "patient_facing"))
+        return row.state, row.manifest_path, row.manifest_hash, row.blocked_reason
+
+
+def _paid_rows(run_id):
+    with storage.session_scope() as session:
+        return {
+            (r.scope_key, r.dispatch_ordinal): (r.state, r.request_hash, r.response_hash)
+            for r in session.scalars(
+                select(storage.PaidRequest).where(storage.PaidRequest.run_id == run_id)
+            )
+        }
+
+
+@pytest.mark.asyncio
+async def test_regenerate_blocked_write_up_asks_again_without_a_new_council(ready):
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(admit(ready), sent)
+    _, first_path, first_hash, _ = _post_row(run_id)
+    first = post._load(first_path, first_hash)
+    first_bytes = Path(first_path).read_bytes()
+
+    result = post.admit_patient_facing(
+        store, run_id, config_snapshot=cfg, regenerate=True
+    )
+
+    assert result["state"] == "pending" and result["blocked_reason"] is None
+    second = post._load(result["manifest_path"], result["manifest_hash"])
+    assert second["attempt"] == 2 and second["prompt"] == first["prompt"]
+    assert Path(result["manifest_path"]).parent.name == "attempt-2"
+    assert Path(first_path).read_bytes() == first_bytes
+    for kind, ext in (("md", ".md"), ("pdf", ".pdf"), ("meta", "__meta.json")):
+        old_name = first["destinations"][kind]
+        assert second["destinations"][kind] == old_name.removesuffix(ext) + "-2" + ext
+        assert not Path(second["destinations"][kind]).exists()
+    with storage.session_scope() as session:
+        run = session.get(storage.Run, run_id)
+        assert (run.execution_state, run.blocked_reason) == ("pending", None)
+
+    # The ordinary consumer picks it up: one more paid send, byte-identical.
+    owner = store.claim_run_owner(run_id)
+    assert owner is not None
+    try:
+        done = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release(state="done")
+    assert done["state"] == "done" and done["verified"] is True, done
+    assert len(sent) == 2 and sent[1] == sent[0]
+    paid = _paid_rows(run_id)
+    assert set(paid) == {
+        ("post/patient_facing/generation", 0),
+        ("post/patient_facing/2", 0),
+    }
+    assert (
+        paid[("post/patient_facing/2", 0)][1]
+        == paid[("post/patient_facing/generation", 0)][1]
+    )
+    assert {k: b["path"] for k, b in done["outputs"].items()} == second["destinations"]
+    # A finished write-up rejoins; asking again never spends again.
+    again = post.admit_patient_facing(
+        store, run_id, config_snapshot=cfg, regenerate=True
+    )
+    assert again["state"] == "done" and len(sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsettled", ["unknown_send", "prepared", "dispatched"])
+async def test_regenerate_never_steps_over_an_unsettled_paid_call(ready, unsettled):
+    from types import SimpleNamespace
+
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(
+        admit(ready),
+        sent,
+        response=httpx.ReadError("lost") if unsettled == "unknown_send" else INVALID,
+    )
+    if unsettled != "unknown_send":
+        with storage.session_scope() as session:
+            session.scalar(select(storage.PaidRequest)).state = unsettled
+            session.commit()
+    assert _paid_rows(run_id)[("post/patient_facing/generation", 0)][0] == (
+        "unknown" if unsettled == "unknown_send" else unsettled
+    )
+    before = _post_row(run_id)
+    assert before[0] == "blocked"
+
+    with pytest.raises(ExecutionConflict, match="reconcile it first"):
+        post.admit_patient_facing(store, run_id, config_snapshot=cfg, regenerate=True)
+
+    assert _post_row(run_id) == before
+    root = post._root(SimpleNamespace(store=store, run_id=run_id))
+    assert not (root / "attempt-2").exists()
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_regeneration_takes_attempt_three(ready):
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(admit(ready), sent)
+    post.admit_patient_facing(store, run_id, config_snapshot=cfg, regenerate=True)
+    await _block_attempt(store.claim_run_owner(run_id), sent)
+
+    result = post.admit_patient_facing(
+        store, run_id, config_snapshot=cfg, regenerate=True
+    )
+
+    third = post._load(result["manifest_path"], result["manifest_hash"])
+    assert result["state"] == "pending" and third["attempt"] == 3
+    assert Path(result["manifest_path"]).parent.name == "attempt-3"
+    for kind, ending in (("md", "-3.md"), ("pdf", "-3.pdf"), ("meta", "-3__meta.json")):
+        assert third["destinations"][kind].endswith(ending), third["destinations"]
+    owner = store.claim_run_owner(run_id)
+    try:
+        done = await post.continue_patient_facing(owner, llm_client=llm(sent))
+    finally:
+        owner.release(state="done")
+    assert done["verified"] is True
+    assert {key[0] for key in _paid_rows(run_id)} == {
+        "post/patient_facing/generation",
+        "post/patient_facing/2",
+        "post/patient_facing/3",
+    }
+    assert len(sent) == 3 and sent[0] == sent[1] == sent[2]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_script_skips_settled_rows_of_earlier_attempts(
+    ready, monkeypatch
+):
+    """The paid-run reconcile script re-checked every post row against the
+    current manifest, so a regenerated write-up whose new attempt ended unknown
+    could never be reconciled: the first attempt's row failed that check."""
+    import subprocess
+    import sys
+
+    from backend import paid_transport as paid
+
+    store, run_id, cfg = ready
+    sent = []
+    await _block_attempt(admit(ready), sent)
+    post.admit_patient_facing(store, run_id, config_snapshot=cfg, regenerate=True)
+    first_row = _paid_rows(run_id)[("post/patient_facing/generation", 0)]
+
+    def billing(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "writer"}]})
+        sent.append(request.content)
+        return httpx.Response(402, json={"error": {"message": "Insufficient Balance"}})
+
+    client = llm(sent)
+    client._transport = httpx.MockTransport(billing)
+    original = paid._rejection
+    owner = store.claim_run_owner(run_id)
+    with monkeypatch.context() as old:
+        old.setattr(
+            paid,
+            "_rejection",
+            lambda status, body: None if status == 402 else original(status, body),
+        )
+        with pytest.raises(paid.PaidOutcomeUnknown):
+            await post.continue_patient_facing(owner, llm_client=client)
+    owner.release(state="blocked", blocked_reason="paid_outcome_unknown")
+    await client.aclose()
+    assert _paid_rows(run_id)[("post/patient_facing/2", 0)][0] == "unknown"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "backend.scripts.reconcile_paid_run",
+            "--data-dir",
+            str(Path(store.engine.url.database).parent),
+            run_id,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Saved receipts reconciled" in result.stdout
+    rows = _paid_rows(run_id)
+    assert rows[("post/patient_facing/generation", 0)] == first_row
+    assert rows[("post/patient_facing/2", 0)][0] == "rejected"
+    assert _post_row(run_id)[0] == "pending"
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["asked", "unknown", "not_asked"])
+async def test_regenerate_action_reopens_a_blocked_write_up(
+    ready, temp_data_dir, monkeypatch, case
+):
+    """The action used to answer a blocked write-up with scheduled: false and
+    nothing else; it only admitted a post not yet made. Another attempt spends,
+    so it happens only when the request carries the clinic's explicit yes."""
+    unknown = case == "unknown"
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+
+    from backend import main
+    from backend.run_runtime import RunRuntime
+
+    store, run_id, _ = ready
+    sent = []
+    await _block_attempt(
+        admit(ready),
+        sent,
+        response=httpx.ReadError("lost") if unknown else INVALID,
+    )
+    with storage.session_scope() as session:
+        patient_id = session.get(storage.Run, run_id).patient_id
+    monkeypatch.setenv("QEEG_MOCK_LLM", "1")
+    monkeypatch.setattr(
+        main, "_ensure_project_clipr_config", lambda: temp_data_dir / "clipr.conf"
+    )
+    monkeypatch.setattr(main, "_sync_home_auth_to_project", lambda: 0)
+    monkeypatch.setattr(RunRuntime, "start", AsyncMock())
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            f"/api/patients/{patient_id}/actions/regenerate_patient_facing",
+            json={"run_id": run_id, "regenerate_blocked": case != "not_asked"},
+        )
+    if case == "not_asked":
+        assert response.status_code == 200, response.text
+        assert response.json()["scheduled"] is False
+        assert response.json()["postprocessing"]["state"] == "blocked"
+        assert _post_row(run_id)[0] == "blocked"
+    elif unknown:
+        assert response.status_code == 409, response.text
+        assert "reconcile it first" in response.text
+        assert _post_row(run_id)[0] == "blocked"
+    else:
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["scheduled"] is True
+        assert body["postprocessing"]["state"] == "pending"
+        assert Path(body["postprocessing"]["manifest_path"]).parent.name == "attempt-2"
+    assert len(sent) == 1

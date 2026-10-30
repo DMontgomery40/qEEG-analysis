@@ -30,7 +30,7 @@ function ReportLifecycleList({ reports }) {
     <section className="orchestration-report-lifecycle">
       <div className="orchestration-report-header">
         <div className="orchestration-section-title">Report lifecycle</div>
-        <div className="orchestration-muted">Uploaded to extracted to council to patient-facing to portal to Cathode.</div>
+        <div className="orchestration-muted">Uploaded to extracted to council to patient-facing to portal.</div>
       </div>
       <div className="orchestration-report-list">
         {reports.map((report) => {
@@ -40,7 +40,6 @@ function ReportLifecycleList({ reports }) {
             ? `Patient PDF: ${lifecycle.patient_facing_status}`
             : 'Patient PDF: pending';
           const portalLabel = lifecycle.portal_sync_status ? `Portal: ${lifecycle.portal_sync_status}` : 'Portal: unknown';
-          const cathodeLabel = lifecycle.cathode_status ? `Cathode: ${lifecycle.cathode_status}` : 'Cathode: pending';
           return (
             <div key={report.report_id} className="orchestration-report-row">
               <div>
@@ -53,7 +52,6 @@ function ReportLifecycleList({ reports }) {
                 <StatusBadge label={councilLabel} tone="neutral" />
                 <StatusBadge label={patientFacingLabel} tone="neutral" />
                 <StatusBadge label={portalLabel} tone="neutral" />
-                <StatusBadge label={cathodeLabel} tone="neutral" />
               </div>
             </div>
           );

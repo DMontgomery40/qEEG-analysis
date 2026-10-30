@@ -30,6 +30,9 @@ from sqlalchemy.orm import Session
 from . import storage
 
 
+
+OUTSTANDING_OBLIGATIONS = "outstanding execution obligations"
+
 class StaleOwner(RuntimeError):
     """The local handle or its durable fence no longer authorizes a write."""
 
@@ -86,6 +89,35 @@ def _due_filters(now):
         # A complete council with only blocked/delayed obligations has no due work.
         # All terminal obligations still allow a final execution-done checkpoint.
         or_(storage.Run.status != "complete", ~posts.exists(), due_posts.exists()),
+    )
+
+
+UNSETTLED_PAID_STATES = ("prepared", "dispatched", "unknown")
+# A prepared row was journaled but never sent: its bytes leave only after the
+# row commits dispatched. Moving to new code over it cannot pay twice, so a
+# recipe adoption steps over it and the run finishes instead of stranding.
+ADOPTION_UNSETTLED_PAID_STATES = ("dispatched", "unknown")
+
+
+def _regeneration_filters(run_id):
+    # The flock is the exclusion against a live owner; an abandoned "owned"
+    # row has no flock holder. Any unsettled paid call anywhere in the run
+    # would refuse the new attempt's first send, so none may exist.
+    blocked_post = select(storage.PostObligation.run_id).where(
+        storage.PostObligation.run_id == run_id,
+        storage.PostObligation.kind == "patient_facing",
+        storage.PostObligation.state == "blocked",
+    )
+    unsettled = select(storage.PaidRequest.run_id).where(
+        storage.PaidRequest.run_id == run_id,
+        storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+    )
+    return (
+        storage.Run.start_requested_at.is_not(None),
+        storage.Run.status == "complete",
+        storage.Run.execution_state.in_(["pending", "owned", "blocked"]),
+        blocked_post.exists(),
+        ~unsettled.exists(),
     )
 
 
@@ -162,14 +194,24 @@ class ExecutionStore:
         with Session(self.engine, expire_on_commit=False) as session:
             return list(session.scalars(query.order_by(storage.Run.id).limit(limit)))
 
-    def claim_run_owner(self, run_id: str, *, reconcile_paid: bool = False):
+    def claim_run_owner(
+        self,
+        run_id: str,
+        *,
+        reconcile_paid: bool = False,
+        regenerate_post: bool = False,
+    ):
         """Nonblocking flock first, short DB claim second; None means unavailable.
 
         Tokens are random per claim and generations increase even after process
         death. PID and owner_started_at are diagnostics, never takeover authority.
-        Explicit receipt reconciliation can claim only paid-outcome blocks;
-        ordinary consumers continue to use the due-work filter.
+        Explicit receipt reconciliation can claim only paid-outcome blocks; an
+        explicit write-up regeneration can claim only a complete run whose
+        patient-facing post is blocked and none of whose paid calls is unsettled.
+        Ordinary consumers continue to use the due-work filter.
         """
+        if reconcile_paid and regenerate_post:
+            raise ValueError("one explicit claim purpose at a time")
         self.lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         # IDs are opaque, so a digest also prevents path traversal or slash aliases.
         lock_path = self.lock_root / (
@@ -195,6 +237,8 @@ class ExecutionStore:
                                 storage.Run.blocked_reason == "paid_outcome_unknown",
                             )
                             if reconcile_paid
+                            else _regeneration_filters(run_id)
+                            if regenerate_post
                             else _due_filters(_now())
                         ),
                     )
@@ -308,7 +352,7 @@ class RunOwner:
 
     def ensure_post_obligation(self, kind: str, manifest_path: str, manifest_hash: str):
         """Create/rejoin one pinned post obligation; never reopen its saved state."""
-        if kind not in ["patient_facing", "cathode"]:
+        if kind != "patient_facing":
             raise ValueError("unsupported postprocessing kind")
         if (
             not manifest_path
@@ -378,6 +422,52 @@ class RunOwner:
             session.flush()
             return row
 
+    def reopen_blocked_post(
+        self,
+        kind: str,
+        *,
+        expected_manifest_hash: str,
+        manifest_path: str,
+        manifest_hash: str,
+    ):
+        """Fenced explicit regeneration: a blocked post takes a new attempt manifest.
+
+        Only the clinic's explicit request calls this. The earlier attempt's
+        manifest, receipts and files stay where they are; the obligation now
+        points at the new attempt and is pending again.
+        """
+        if (
+            not manifest_path
+            or len(manifest_hash) != 64
+            or any(c not in "0123456789abcdef" for c in manifest_hash)
+        ):
+            raise ValueError("post manifest needs a path and lowercase SHA-256")
+        with self.transaction() as session:
+            row = session.get(storage.PostObligation, (self.run_id, kind))
+            if row is None:
+                raise KeyError((self.run_id, kind))
+            if (row.state, row.manifest_hash) != ("blocked", expected_manifest_hash):
+                raise ExecutionConflict("postprocessing state changed")
+            unsettled = session.scalar(
+                select(storage.PaidRequest)
+                .where(
+                    storage.PaidRequest.run_id == self.run_id,
+                    storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+                )
+                .limit(1)
+            )
+            if unsettled is not None:
+                raise ExecutionConflict(
+                    f"paid call {unsettled.scope_key} is {unsettled.state}"
+                )
+            row.manifest_path, row.manifest_hash = manifest_path, manifest_hash
+            row.state, row.blocked_reason, row.next_check_at = "pending", None, None
+            row.receipt_path, row.receipt_hash = None, None
+            row.owner_token, row.owner_generation = self.token, self.generation
+            row.updated_at = _now()
+            session.flush()
+            return row
+
     def release(
         self,
         *,
@@ -393,16 +483,16 @@ class RunOwner:
         with self._mutex:
             with self.transaction() as session:
                 if state == "done":
-                    unfinished = session.scalar(
-                        select(storage.PostObligation.run_id)
+                    unfinished = session.scalars(
+                        select(storage.PostObligation)
                         .where(
                             storage.PostObligation.run_id == self.run_id,
                             storage.PostObligation.state.not_in(["done", "skipped"]),
                         )
                         .limit(1)
-                    )
-                    uncertain = session.scalar(
-                        select(storage.PaidRequest.run_id)
+                    ).first()
+                    uncertain = session.scalars(
+                        select(storage.PaidRequest)
                         .where(
                             storage.PaidRequest.run_id == self.run_id,
                             storage.PaidRequest.state.in_(
@@ -410,9 +500,18 @@ class RunOwner:
                             ),
                         )
                         .limit(1)
-                    )
-                    if unfinished or uncertain:
-                        raise ExecutionConflict("outstanding execution obligations")
+                    ).first()
+                    if unfinished is not None or uncertain is not None:
+                        # Name the obligation so the run's blocked reason says
+                        # what is still open (EN-H14).
+                        what = (
+                            f"{unfinished.kind} document {unfinished.state}"
+                            if unfinished is not None
+                            else f"paid call {uncertain.scope_key} {uncertain.state}"
+                        )
+                        raise ExecutionConflict(
+                            OUTSTANDING_OBLIGATIONS + ": " + what
+                        )
                 run = session.get(storage.Run, self.run_id)
                 run.execution_state = state
                 run.next_check_at = next_check_at
@@ -438,3 +537,52 @@ class RunOwner:
                 self.release()
         finally:
             self.close()
+
+    def close_superseded_post(
+        self,
+        kind: str,
+        *,
+        expected_manifest_hash: str,
+        reason: str,
+        receipt_path: str,
+        receipt_hash: str,
+    ):
+        """Fenced explicit close: a blocked post another run already delivered.
+
+        Only backend/scripts/close_superseded_post.py calls this, after writing
+        the immutable audit record it binds as the receipt. Nothing is sent and
+        the blocked attempt's manifest and files stay where they are; the post
+        becomes skipped, which every reader already treats as finished.
+        """
+        if (
+            not reason.strip()
+            or not receipt_path
+            or len(receipt_hash) != 64
+            or any(c not in "0123456789abcdef" for c in receipt_hash)
+        ):
+            raise ValueError("a superseded post needs a reason and its audit receipt")
+        with self.transaction() as session:
+            row = session.get(storage.PostObligation, (self.run_id, kind))
+            if row is None:
+                raise KeyError((self.run_id, kind))
+            if (row.state, row.manifest_hash) != ("blocked", expected_manifest_hash):
+                raise ExecutionConflict("postprocessing state changed")
+            unsettled = session.scalar(
+                select(storage.PaidRequest)
+                .where(
+                    storage.PaidRequest.run_id == self.run_id,
+                    storage.PaidRequest.state.in_(UNSETTLED_PAID_STATES),
+                )
+                .limit(1)
+            )
+            if unsettled is not None:
+                raise ExecutionConflict(
+                    f"paid call {unsettled.scope_key} is {unsettled.state}"
+                )
+            row.state, row.next_check_at = "skipped", None
+            row.blocked_reason = "superseded: " + reason.strip()
+            row.receipt_path, row.receipt_hash = receipt_path, receipt_hash
+            row.owner_token, row.owner_generation = self.token, self.generation
+            row.updated_at = _now()
+            session.flush()
+            return row
