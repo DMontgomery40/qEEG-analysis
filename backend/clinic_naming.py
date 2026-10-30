@@ -17,7 +17,7 @@ POLICY = {
         "speed": 1.0,
     },
 }
-_ID = re.compile(r"[A-Z]{2}_\d{2}-\d{2}-\d{4}(?:_(?:[2-9]|[1-9]\d+))?")
+_ID = re.compile(r"[A-Z]{2}_\d{2}-\d{2}-\d{4}(?:_(?:[2-9]|[1-9]\d+))?", re.ASCII)
 
 
 def canonical_filename(name: str, patient_id: str) -> str:
