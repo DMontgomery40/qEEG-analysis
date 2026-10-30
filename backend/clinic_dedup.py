@@ -3,6 +3,7 @@
 from pathlib import Path
 import hashlib
 import os
+import shutil
 import uuid
 from collections import defaultdict
 from sqlalchemy import select
@@ -144,6 +145,26 @@ def consolidate_remote(
         }
 
 
+def link_survives_move(source, target):
+    """Whether a file at ``source`` still reads the same bytes once moved to ``target``.
+
+    Local consolidation leaves named files as relative links to one ``.content``
+    body. Moving such a link to a different depth, or away from the portal
+    anchor it points at, would leave it dangling, so a chart tool asks here
+    before it plans the move. Ordinary files always survive a move.
+    """
+    source, target = Path(source), Path(target)
+    if not source.is_symlink():
+        return True
+    # The target folder may not exist yet, so read "../" in the link against
+    # the planned path rather than asking the filesystem to walk it.
+    planned = os.path.normpath(target.parent.absolute() / os.readlink(source))
+    try:
+        return Path(planned).resolve(strict=True) == source.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+
 def _digest(path):
     h = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -162,6 +183,14 @@ def consolidate_local(
     Re-running after interruption adopts the same content path. The operator must
     stop producers for the entire operation; atomic replacement is not a lock
     against a concurrent producer installing a new output at the same path.
+
+    Two consequences the operator owns:
+    - Replacing names with links changes each consolidated patient folder, so
+      the next hub watch pass re-reads those folders once. Run this in the same
+      maintenance window, with the publisher stopped.
+    - Deleting a file later removes its name, not the shared body: the bytes
+      under ``.content`` stay until someone releases bodies no name links to.
+      Nothing releases them automatically yet.
     """
     if not producers_quiescent:
         raise CatalogueConflict("Stop local producers before consolidating bodies")
@@ -216,31 +245,53 @@ def consolidate_local(
                 continue
     removed = saved = 0
     for (digest, size), names in groups.items():
-        inodes = {
-            (Path(name).stat().st_dev, Path(name).stat().st_ino) for name in names
-        }
         canonical = content_root / digest / "original"
-        if len(inodes) < 2 and not canonical.exists():
+        try:
+            inodes = {
+                (Path(name).stat().st_dev, Path(name).stat().st_ino) for name in names
+            }
+            if len(inodes) < 2 and not canonical.exists():
+                continue
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            if not canonical.exists():
+                first = _allowed_path(sorted(names)[0])
+                in_group = sum(1 for name in names if Path(name).samefile(first))
+                if first.stat().st_nlink > in_group:
+                    # A name outside this group (an export hard-linked into
+                    # place, say) shares the inode. The body becomes read-only,
+                    # so it gets its own inode and that name keeps its mode.
+                    pending = canonical.with_name(f".pending-{uuid.uuid4().hex}")
+                    try:
+                        shutil.copyfile(first, pending)
+                        os.replace(pending, canonical)
+                    finally:
+                        pending.unlink(missing_ok=True)
+                    removed -= 1
+                    saved -= size
+                else:
+                    os.link(first, canonical)
+            if _digest(canonical) != (digest, size):
+                raise CatalogueConflict("Local content path contains different bytes")
+            portal_anchor = None
+            if portal_root.is_relative_to(data_root):
+                portal_anchor = patient_root / ".content" / digest / "original"
+                portal_anchor.parent.mkdir(parents=True, exist_ok=True)
+                if not portal_anchor.exists():
+                    os.link(canonical, portal_anchor)
+                if not portal_anchor.samefile(canonical):
+                    raise CatalogueConflict(
+                        "Portal content anchor is not the retained body"
+                    )
+            # Aliases are read paths. Regeneration uses a new output or atomic
+            # replace; an accidental in-place write must not alter every
+            # historical reference.
+            if canonical.stat().st_mode & 0o777 != 0o444:
+                canonical.chmod(0o444)
+        except (OSError, ValueError) as error:
+            # One unlinkable group (a vanished file, a cross-device link) is
+            # reported with the rest; the other groups still consolidate.
+            failures.append({"path": sorted(names)[0], "error": str(error)})
             continue
-        canonical.parent.mkdir(parents=True, exist_ok=True)
-        if not canonical.exists():
-            os.link(_allowed_path(sorted(names)[0]), canonical)
-        if _digest(canonical) != (digest, size):
-            raise CatalogueConflict("Local content path contains different bytes")
-        portal_anchor = None
-        if portal_root.is_relative_to(data_root):
-            portal_anchor = patient_root / ".content" / digest / "original"
-            portal_anchor.parent.mkdir(parents=True, exist_ok=True)
-            if not portal_anchor.exists():
-                os.link(canonical, portal_anchor)
-            if not portal_anchor.samefile(canonical):
-                raise CatalogueConflict(
-                    "Portal content anchor is not the retained body"
-                )
-        # Aliases are read paths. Regeneration uses a new output or atomic replace;
-        # an accidental in-place write must not alter every historical reference.
-        if canonical.stat().st_mode & 0o777 != 0o444:
-            canonical.chmod(0o444)
         for name in sorted(names):
             path = Path(name)
             try:

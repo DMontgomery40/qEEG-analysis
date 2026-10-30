@@ -1342,8 +1342,11 @@ def test_merge_coalesces_only_verified_internal_content_anchors(
 
 
 @pytest.mark.parametrize("replan", [False, True])
+# "+" and "-" sort before ".content": a name moved ahead of its anchor dangled
+# in the new folder until a rerun linked the anchor.
+@pytest.mark.parametrize("first,second", [("report1.pdf", "report2.pdf"), ("+report1.pdf", "-report2.pdf")])
 def test_interrupted_merge_keeps_remaining_aliases_readable_and_resumes(
-    temp_data_dir, monkeypatch, replan
+    temp_data_dir, monkeypatch, replan, first, second
 ):
     from backend.clinic_dedup import consolidate_local
     from backend import patient_rekey
@@ -1352,7 +1355,7 @@ def test_interrupted_merge_keeps_remaining_aliases_readable_and_resumes(
     portal = temp_data_dir / "portal_patients"
     old = portal / patient.label
     old.mkdir(parents=True)
-    for name in ["report1.pdf", "report2.pdf"]:
+    for name in [first, second]:
         path = old / name
         path.write_bytes(b"original")
         catalogue.register_artifact(
@@ -1376,7 +1379,7 @@ def test_interrupted_merge_keeps_remaining_aliases_readable_and_resumes(
     replace = patient_rekey.os.replace
 
     def interrupted(source, target):
-        if source == old / "report2.pdf":
+        if source == old / second:
             raise OSError("interrupted merge")
         return replace(source, target)
 
@@ -1384,15 +1387,208 @@ def test_interrupted_merge_keeps_remaining_aliases_readable_and_resumes(
     with pytest.raises(OSError, match="interrupted merge"):
         patient_rekey.apply_patient_rekey(initial)
     assert (
-        (old / "report2.pdf").read_bytes()
-        == (new / "report1.pdf").read_bytes()
+        (old / second).read_bytes()
+        == (new / first).read_bytes()
         == b"original"
     )
     monkeypatch.setattr(patient_rekey.os, "replace", replace)
     patient_rekey.apply_patient_rekey(plan() if replan else initial)
     assert (
-        (new / "report1.pdf").read_bytes()
-        == (new / "report2.pdf").read_bytes()
+        (new / first).read_bytes()
+        == (new / second).read_bytes()
         == b"original"
     )
     assert not old.exists()
+
+
+def _consolidated_duplicate_chart(temp_data_dir):
+    """A duplicate chart whose two identical write-ups share one consolidated body.
+
+    The names carry a survivor run, which is the evidence merge_patient_charts
+    needs before it moves a file across.
+    """
+    from backend.clinic_dedup import consolidate_local
+    from backend.patient_identity import reserve_canonical_patient_id
+
+    with storage.session_scope() as session:
+        for label in ("ZS_02-02-2002", "XX_01-01-2003"):
+            reserve_canonical_patient_id(session, label)
+        session.commit()
+        survivor = storage.create_patient(session, label="ZS_02-02-2002").id
+        duplicate = storage.create_patient(session, label="XX_01-01-2003").id
+    report_dir = temp_data_dir / "reports" / duplicate / "r1"
+    report_dir.mkdir(parents=True)
+    (report_dir / "original.pdf").write_bytes(b"report bytes")
+    with storage.session_scope() as session:
+        report = storage.create_report(
+            session,
+            patient_id=duplicate,
+            filename="combined.pdf",
+            mime_type="application/pdf",
+            stored_path=report_dir / "original.pdf",
+            extracted_text_path=report_dir / "extracted.txt",
+        )
+        run = storage.create_run(
+            session,
+            patient_id=survivor,
+            report_id=report.id,
+            council_model_ids=["m"],
+            consolidator_model_id="m",
+        ).id
+    folder = temp_data_dir / "portal_patients" / "XX_01-01-2003"
+    names = {
+        f"XX_01-01-2003__patient-facing__auto-{run[:8]}__2026-05-09.md": b"write-up",
+        f"council/{run}/XX_01-01-2003__patient-facing__auto-{run[:8]}__copy.md": b"write-up",
+    }
+    for relative, data in names.items():
+        path = folder / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        catalogue.register_artifact(
+            patient_uuid=duplicate,
+            source_kind="original-local-history",
+            source_id=relative,
+            logical_family=relative,
+            original_name=path.name,
+            local_path=path,
+        )
+    assert consolidate_local("XX_01-01-2003", producers_quiescent=True)[
+        "removedBodies"
+    ] == 1
+    assert all((folder / relative).is_symlink() for relative in names)
+    return folder, names
+
+
+def test_merging_a_consolidated_chart_is_refused_before_anything_moves(
+    temp_data_dir, tmp_path, capsys
+):
+    # merge_patient_charts (2026-10-03) predates the .content store. Moving a
+    # named link without its anchor left the survivor's copy pointing at
+    # nothing, and the merge died part-way on FileNotFoundError.
+    from backend.scripts import merge_patient_charts
+
+    folder, names = _consolidated_duplicate_chart(temp_data_dir)
+    survivor = temp_data_dir / "portal_patients" / "ZS_02-02-2002"
+    code = merge_patient_charts.main(
+        [
+            "--duplicate", "XX_01-01-2003", "--survivor", "ZS_02-02-2002",
+            "--apply", "--yes-merge", "XX_01-01-2003:ZS_02-02-2002",
+            "--audit", str(tmp_path / "audit.json"),
+        ]
+    )
+    assert code == 2
+    assert ".content" in capsys.readouterr().err
+    assert all((folder / relative).read_bytes() == data for relative, data in names.items())
+    assert not any(p.is_symlink() or p.is_file() for p in survivor.rglob("*"))
+    with storage.session_scope() as session:
+        assert storage.find_patients_by_label(session, "XX_01-01-2003")
+
+
+def test_realigning_a_consolidated_folder_is_refused_and_stays_readable(temp_data_dir):
+    from backend.scripts import realign_patient_folder as realign
+
+    folder, names = _consolidated_duplicate_chart(temp_data_dir)
+    with storage.session_scope() as session:
+        chart = storage.find_patients_by_label(session, "XX_01-01-2003")[0]
+        storage.update_patient(session, chart.id, label="XY_01-01-2003")
+    with pytest.raises(realign.RealignRefused):
+        realign.plan_realign("XY_01-01-2003")
+    assert all((folder / relative).read_bytes() == data for relative, data in names.items())
+
+
+def test_link_survives_move_only_when_the_body_is_still_reachable(tmp_path):
+    from backend.clinic_dedup import link_survives_move
+
+    body = tmp_path / "chart" / ".content" / "abc" / "original"
+    body.parent.mkdir(parents=True)
+    body.write_bytes(b"body")
+    alias = tmp_path / "chart" / "report.pdf"
+    alias.symlink_to(".content/abc/original")
+    plain = tmp_path / "chart" / "plain.pdf"
+    plain.write_bytes(b"plain")
+    shared = tmp_path / "store" / "abc"
+    shared.parent.mkdir()
+    shared.write_bytes(b"body")
+    external = tmp_path / "reports" / "a" / "original.pdf"
+    external.parent.mkdir(parents=True)
+    external.symlink_to("../../store/abc")
+
+    assert link_survives_move(plain, tmp_path / "elsewhere" / "plain.pdf")
+    assert link_survives_move(alias, tmp_path / "chart" / "renamed.pdf")
+    assert not link_survives_move(alias, tmp_path / "other" / "report.pdf")
+    assert not link_survives_move(alias, tmp_path / "chart" / "sub" / "report.pdf")
+    # Same depth, body outside both folders: a whole-folder move keeps it.
+    assert link_survives_move(external, tmp_path / "reports" / "b" / "original.pdf")
+
+
+def test_a_hardlink_outside_the_group_keeps_its_mode_and_bytes(temp_data_dir):
+    # The read-only body must not be an inode some other name still writes to,
+    # such as an export hard-linked into place by its producer.
+    import os
+    import stat
+    from backend.clinic_dedup import consolidate_local
+
+    patient, _ = seed(temp_data_dir)
+    first = temp_data_dir / "a-first.pdf"
+    first.write_bytes(b"shared bytes")
+    os.chmod(first, 0o644)
+    outside = temp_data_dir / "exports" / "final.pdf"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    os.link(first, outside)
+    second = temp_data_dir / "b-second.pdf"
+    second.write_bytes(b"shared bytes")
+    for path in (first, second):
+        catalogue.register_artifact(
+            patient_uuid=patient.id,
+            source_kind="renderer",
+            source_id=path.name,
+            logical_family=path.name,
+            original_name=path.name,
+            local_path=path,
+        )
+    result = consolidate_local(patient.label, producers_quiescent=True)
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
+    assert outside.read_bytes() == first.read_bytes() == second.read_bytes() == b"shared bytes"
+    # The outside link keeps the first inode alive and the body is a fresh
+    # copy, so releasing the second copy saves nothing net; the count says so.
+    assert result == {"removedBodies": 0, "savedBytes": 0}
+
+
+def test_a_group_that_cannot_be_linked_is_reported_and_the_rest_continue(
+    temp_data_dir, monkeypatch
+):
+    import errno
+    from pathlib import Path
+    from backend import clinic_dedup
+    from backend.clinic_dedup import consolidate_local
+
+    patient, _ = seed(temp_data_dir)
+    for group in ("left", "right"):
+        for n in (1, 2):
+            path = temp_data_dir / f"{group}-{n}.pdf"
+            path.write_bytes(group.encode())
+            catalogue.register_artifact(
+                patient_uuid=patient.id,
+                source_kind="renderer",
+                source_id=path.name,
+                logical_family=path.name,
+                original_name=path.name,
+                local_path=path,
+            )
+    real_link = clinic_dedup.os.link
+
+    def link(source, target):
+        if Path(source).name.startswith("left"):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_link(source, target)
+
+    monkeypatch.setattr(clinic_dedup.os, "link", link)
+    with pytest.raises(catalogue.CatalogueConflict, match="left-1.pdf"):
+        consolidate_local(patient.label, producers_quiescent=True)
+    assert (temp_data_dir / "right-2.pdf").is_symlink()
+    assert not (temp_data_dir / "left-2.pdf").is_symlink()
+    assert all(
+        (temp_data_dir / f"{g}-{n}.pdf").read_bytes() == g.encode()
+        for g in ("left", "right")
+        for n in (1, 2)
+    )

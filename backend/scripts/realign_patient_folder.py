@@ -35,6 +35,7 @@ from typing import Any
 from sqlalchemy import text
 
 from backend import storage
+from backend.clinic_dedup import link_survives_move
 from backend.patient_rekey import _sha256_file, _write_json_atomic
 from backend.portal_sync import portal_patients_dir
 from backend.scripts.merge_patient_charts import (
@@ -92,6 +93,11 @@ def plan_realign(label: str) -> dict[str, Any]:
         elif source.exists():
             if _sha256_file(source) != entry["sha256"]:
                 raise RealignRefused(f"{source} no longer has the bytes the catalogue lists.")
+            if not link_survives_move(source, target):
+                raise RealignRefused(
+                    f"{source} is a consolidated link into a .content store and would point "
+                    f"at nothing from {target}; nothing was moved."
+                )
             moves.append(entry)
         else:
             raise RealignRefused(f"{source} is missing and {target} does not exist; the catalogue copy is gone.")

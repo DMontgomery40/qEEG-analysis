@@ -462,3 +462,61 @@ def test_mirror_skips_cyclic_links_and_preserves_other_files(tmp_path):
     _mirror_tree_with_hardlinks(source, dest)
     assert (dest / "report.pdf").read_bytes() == b"valid"
     assert not (dest / "loop").exists()
+
+
+def test_a_changed_shared_body_skips_the_sync_and_returns_false(tmp_path, monkeypatch):
+    # sync_patient_to_thrylen answers True or False; scripts that call it
+    # directly must not die on a corrupted .content body.
+    import hashlib
+
+    from backend import portal_sync
+
+    portal_root = tmp_path / "portal_patients"
+    folder = portal_root / "MK_01-01-2013"
+    digest = hashlib.sha256(b"original").hexdigest()
+    body = folder / ".content" / digest / "original"
+    body.parent.mkdir(parents=True)
+    body.write_bytes(b"corrupted")
+    (folder / "report.pdf").symlink_to(f".content/{digest}/original")
+    sync_repo = tmp_path / "thrylen"
+    (sync_repo / "scripts").mkdir(parents=True)
+    (sync_repo / "scripts" / "qeeg_patients_sync.mjs").write_text("// fake\n")
+    monkeypatch.setenv("QEEG_PORTAL_PATIENTS_DIR", str(portal_root))
+    monkeypatch.setenv("QEEG_PORTAL_SYNC_REPO", str(sync_repo))
+    monkeypatch.setenv("QEEG_PORTAL_NETLIFY_SYNC_ON_PUBLISH", "1")
+    monkeypatch.setattr(
+        portal_sync.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None
+    )
+    monkeypatch.setattr(
+        portal_sync.subprocess,
+        "run",
+        lambda *_a, **_k: pytest.fail("changed bytes must never be published"),
+    )
+
+    assert portal_sync.sync_patient_to_thrylen("MK_01-01-2013") is False
+
+
+def test_mirror_hashes_each_shared_body_once(tmp_path, monkeypatch):
+    import hashlib
+
+    from backend import portal_sync
+
+    src = tmp_path / "patient"
+    digest = hashlib.sha256(b"video").hexdigest()
+    body = src / ".content" / digest / "original"
+    body.parent.mkdir(parents=True)
+    body.write_bytes(b"video")
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        (src / name).symlink_to(f".content/{digest}/original")
+    opened = []
+    real_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        if self == body:
+            opened.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    portal_sync._mirror_tree_with_hardlinks(src, tmp_path / "mirror")
+    assert [(tmp_path / "mirror" / n).read_bytes() for n in ("a.mp4", "b.mp4", "c.mp4")] == [b"video"] * 3
+    assert len(opened) == 1

@@ -1834,6 +1834,42 @@ def test_page_metadata_reads_are_batched(chart, temp_data_dir, mode):
     assert len(statements) < 25
 
 
+def test_archive_paging_counts_and_walks_only_files_still_on_the_hub(
+    chart, temp_data_dir
+):
+    # PR #14 met main's archived filter in a merge: counting the unfiltered
+    # working set made totalFiles include archived files, so the archive cursor
+    # promised pages that never came.
+    from backend.clinic_feedback import record_feedback
+
+    files = [register(chart, temp_data_dir, f"paged-{i}", data=f"p{i}".encode()) for i in range(7)]
+    for file in files[:3]:
+        record_feedback(
+            key=f"archive-{file['fileId']}",
+            patient_id=chart.label,
+            file_id=file["fileId"],
+            version=file["version"],
+            action="archive",
+            actor="Synthetic",
+        )
+    listed = {f["fileId"] for f in reads.patient_files(chart.label, mode="full")["files"]}
+    on_hub = listed - {f["fileId"] for f in files[:3]}
+    assert reads.patient_files(chart.label, mode="initial")["totalFiles"] == len(on_hub)
+
+    seen, cursor = [], None
+    while True:
+        page = reads.patient_files(
+            chart.label, mode="archive", page="1" if cursor is None else None,
+            cursor=cursor, limit=2,
+        )
+        assert page["totalFiles"] == len(on_hub)
+        seen += [f["fileId"] for f in page["files"]]
+        cursor = page.get("nextCursor")
+        if not cursor:
+            break
+    assert sorted(seen) == sorted(on_hub)
+
+
 @pytest.mark.parametrize("mode", ["initial", "archive"])
 def test_page_selection_does_not_expand_the_entire_chart_into_sql_parameters(
     chart, temp_data_dir, mode

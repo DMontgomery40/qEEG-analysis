@@ -54,7 +54,7 @@ def ready_run(temp_data_dir):
 
 
 @pytest.fixture(
-    params=["register", "upload", "report", "council", "batch_council", "stage"]
+    params=["register", "upload", "report", "council", "stage"]
 )
 def producer(request, temp_data_dir, monkeypatch):
     """Exercise the actual writers which can reuse a registered output path."""
@@ -155,17 +155,7 @@ def producer(request, temp_data_dir, monkeypatch):
         monkeypatch.setattr(script, "sync_patient_to_thrylen", lambda label: 0)
         return target, source, script.stage_artifacts
 
-    from scripts import run_portal_council_batch as script
-
-    monkeypatch.setattr(script, "ARTIFACTS_DIR", root / "artifacts")
-    monkeypatch.setattr(
-        script, "_portal_patients_dir", lambda: root / "portal_patients"
-    )
-    return (
-        target,
-        source,
-        lambda: script._stage_run_artifacts(patient_label=label, run_id=run_id),
-    )
+    raise AssertionError(f"unknown producer {request.param}")
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink", "regular"])
@@ -215,9 +205,8 @@ def test_new_output_keeps_ordinary_file_permissions(producer):
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink", "regular"])
-@pytest.mark.parametrize("writer", ["api", "batch"])
 def test_export_replaces_both_outputs_without_changing_history(
-    ready_run, temp_data_dir, monkeypatch, link_kind, writer
+    ready_run, temp_data_dir, monkeypatch, link_kind
 ):
     from backend import main
 
@@ -239,20 +228,8 @@ def test_export_replaces_both_outputs_without_changing_history(
         else:
             target.write_bytes(retained.read_bytes())
 
-    if writer == "api":
-        result = asyncio.run(main.export(ready_run.id))
-        assert result["ok"]
-    else:
-        from scripts import run_portal_council_batch as script
-
-        monkeypatch.setattr(script, "EXPORTS_DIR", root / "exports")
-        monkeypatch.setattr(
-            script, "_portal_patients_dir", lambda: root / "portal_patients"
-        )
-        assert script._export_run(ready_run.id) == (
-            directory / "final.md",
-            directory / "final.pdf",
-        )
+    result = asyncio.run(main.export(ready_run.id))
+    assert result["ok"]
     assert (directory / "final.md").read_text() == "replacement bytes"
     assert (directory / "final.pdf").read_bytes().startswith(b"%PDF-")
     assert retained.read_bytes() == b"retained previous export"

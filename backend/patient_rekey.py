@@ -447,7 +447,9 @@ def apply_patient_rekey(
                         f"{target} already exists, so {path} cannot join it. "
                         f"Two patients' files meet at that name; nothing was moved."
                     )
-            for path, digest in files:
+            # Anchors first: a name that sorts before ".content" ("+", "-")
+            # must never arrive in the new folder ahead of the body it links to.
+            for path, digest in sorted(files, key=lambda item: item[0] not in content_anchors):
                 target = _merge_target(path, old_dir, new_dir, plan)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if path in content_anchors:
