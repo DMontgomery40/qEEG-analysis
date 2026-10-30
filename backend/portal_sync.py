@@ -201,19 +201,49 @@ def _mark_patient_sync_retryable(root_dir: Path, patient_id: str) -> None:
 
 
 def _mirror_tree_with_hardlinks(src_dir: Path, dest_dir: Path) -> None:
+    import hashlib
+    import re
+
+    root = src_dir.resolve()
+    # Several names can share one body; read each body once per mirror.
+    verified: set[Path] = set()
     for path in src_dir.rglob("*"):
         rel_path = path.relative_to(src_dir)
-        dest_path = dest_dir / rel_path
-        if path.is_dir():
-            dest_path.mkdir(parents=True, exist_ok=True)
+        # The byte store itself is not an additional named deliverable.
+        if rel_path.parts[0] == ".content":
             continue
+        dest_path = dest_dir / rel_path
+        source = path
         if path.is_symlink():
+            try:
+                source = path.resolve(strict=True)
+                parts = source.relative_to(root).parts
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if (
+                len(parts) != 3
+                or parts[0] != ".content"
+                or parts[2] != "original"
+                or not re.fullmatch(r"[a-f0-9]{64}", parts[1])
+                or not source.is_file()
+            ):
+                continue
+            if source not in verified:
+                digest = hashlib.sha256()
+                with source.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != parts[1]:
+                    raise ValueError("Managed content alias has changed bytes")
+                verified.add(source)
+        elif path.is_dir():
+            dest_path.mkdir(parents=True, exist_ok=True)
             continue
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            os.link(path, dest_path)
+            os.link(source, dest_path)
         except Exception:
-            shutil.copy2(path, dest_path)
+            shutil.copy2(source, dest_path)
 
 
 def _sync_command(*, temp_root_dir: Path) -> tuple[list[str], Path] | None:
@@ -311,7 +341,17 @@ def sync_patient_to_thrylen(patient_label: str) -> bool:
             temp_root = Path(temp_root_raw)
             mirrored_patient_dir = temp_root / patient_id
             mirrored_patient_dir.mkdir(parents=True, exist_ok=True)
-            _mirror_tree_with_hardlinks(patient_dir, mirrored_patient_dir)
+            try:
+                _mirror_tree_with_hardlinks(patient_dir, mirrored_patient_dir)
+            except ValueError:
+                # A consolidated body no longer matches its hash. Publishing it
+                # would send the wrong bytes under every name that shares it.
+                LOGGER.error(
+                    "portal_sync_skipped_changed_shared_body",
+                    patient_label=patient_id,
+                    operatorHint="A shared file body under this patient's .content folder no longer matches its recorded hash; nothing was synced for this patient.",
+                )
+                return False
 
             temp_state_path = _sync_state_path(temp_root)
             _write_sync_state(temp_state_path, scoped_state)

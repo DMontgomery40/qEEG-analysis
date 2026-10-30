@@ -12,6 +12,7 @@ from typing import Any
 from pypdf import PdfReader
 
 from .config import REPORTS_DIR
+from .file_updates import atomic_destination
 from .apple_vision_ocr import apple_vision_available, apple_vision_ocr_png_bytes
 
 
@@ -455,7 +456,8 @@ def save_report_upload(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     original_path = report_original_path_in_dir(out_dir, filename)
-    original_path.write_bytes(file_bytes)
+    with atomic_destination(original_path) as pending:
+        pending.write_bytes(file_bytes)
 
     extracted = ""
     if mime_type == "application/pdf" or original_path.suffix.lower() == ".pdf":

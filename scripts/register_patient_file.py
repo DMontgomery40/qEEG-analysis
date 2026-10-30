@@ -14,6 +14,7 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
 
 from backend import storage  # noqa: E402
+from backend.file_updates import atomic_destination  # noqa: E402
 from backend.patient_files import patient_file_original_path  # noqa: E402
 
 
@@ -47,7 +48,8 @@ def register_patient_file(
         if existing:
             refuse_live_portal_write(target_path, Path(existing.stored_path))
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target_path)
+        with atomic_destination(target_path) as pending:
+            shutil.copy2(source, pending)
         size_bytes = int(target_path.stat().st_size)
 
         if existing:

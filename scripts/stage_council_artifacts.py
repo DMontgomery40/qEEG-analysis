@@ -26,6 +26,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from backend.file_updates import atomic_destination  # noqa: E402
 from scripts.portal_write_guard import refuse_live_portal_write  # noqa: E402
 
 
@@ -148,7 +149,8 @@ def stage_artifacts(dry_run: bool = False) -> None:
                 else:
                     refuse_live_portal_write(dst)
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+                    with atomic_destination(dst) as pending:
+                        shutil.copy2(src, pending)
                     print(f"  Copy {src.name} -> {rel_dst}")
                 total_copied += 1
                 patient_copied += 1

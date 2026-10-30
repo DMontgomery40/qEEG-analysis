@@ -51,6 +51,7 @@ from typing import Any
 from sqlalchemy import text
 
 from backend import storage
+from backend.clinic_dedup import link_survives_move
 from backend.patient_identity import parse_canonical_patient_id
 from backend.patient_rekey import _sha256_file, _write_json_atomic, rename_in_name
 from backend.portal_sync import portal_patients_dir
@@ -372,6 +373,18 @@ def plan_merge(
                     "evidence": evidence,
                 }
             )
+
+    stranded = [
+        Path(m["from"]).relative_to(folder).as_posix()
+        for m in moves
+        if not m["already_moved"] and not link_survives_move(m["from"], m["to"])
+    ]
+    if stranded:
+        raise MergeRefused(
+            f"{duplicate} holds consolidated files that are links into its .content "
+            f"store, and moving them would leave the links pointing at nothing: "
+            f"{stranded}. Nothing was moved."
+        )
 
     conversations = []
     if conversations_dir is not None and conversations_dir.is_dir():

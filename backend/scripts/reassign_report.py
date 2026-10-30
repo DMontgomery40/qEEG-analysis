@@ -38,6 +38,7 @@ from typing import Any
 from sqlalchemy import text
 
 from backend import config, reports, storage
+from backend.clinic_dedup import link_survives_move
 from backend.patient_rekey import _sha256_file, _write_json_atomic
 
 
@@ -158,6 +159,16 @@ def plan_reassign(report_ref: str, target_label: str) -> dict[str, Any]:
         raise ReassignRefused(f"The report's folder {old_dir} is missing.")
     if new_dir.exists():
         raise ReassignRefused(f"{new_dir} already exists; nothing overwritten.")
+    stranded = [
+        str(path.relative_to(old_dir))
+        for path in sorted(old_dir.rglob("*"))
+        if not link_survives_move(path, new_dir / path.relative_to(old_dir))
+    ]
+    if stranded:
+        raise ReassignRefused(
+            f"{stranded} in {old_dir} are consolidated links that would point at "
+            f"nothing from {new_dir}; nothing was moved."
+        )
     local = [loc for loc in locations if loc["kind"] == "local"]
     for loc in local:
         if not Path(loc["key"]).resolve().is_relative_to(old_dir.resolve()):

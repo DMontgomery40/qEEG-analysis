@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .config import PATIENT_FILES_DIR
+from .file_updates import atomic_destination
 
 
 def _safe_suffix(filename: str) -> str:
@@ -48,8 +49,8 @@ def save_patient_file_upload(
     out_dir = patient_file_dir(patient_id, file_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     original_path = patient_file_original_path(patient_id, file_id, filename)
-    with original_path.open("wb") as f:
-        shutil.copyfileobj(src, f)
+    with atomic_destination(original_path) as pending:
+        with pending.open("wb") as f:
+            shutil.copyfileobj(src, f)
     size_bytes = int(original_path.stat().st_size)
     return original_path, mime_type, size_bytes
-
